@@ -4,7 +4,7 @@
 //! spellings, together with at most one local key error. It deliberately uses
 //! a compact syllable trie with joint key alignment and inspectable local
 //! language scores, then streams trie prefixes into a memoized k-best sentence
-//! lattice.
+//! lattice with explicit, penalized literal fallback for unresolved keys.
 
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -190,23 +190,40 @@ impl Spelling {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScoreBreakdown {
     /// Natural logarithm of the entry's synthetic relative frequency.
+    ///
+    /// Unresolved-input candidates use zero because they have no lexicon
+    /// frequency evidence.
     pub frequency: f64,
     /// Cost associated with the detected key correction.
     pub correction_penalty: f64,
     /// Cost associated with one-key syllable abbreviations.
     pub abbreviation_penalty: f64,
-    /// `frequency - correction_penalty - abbreviation_penalty`.
+    /// Cost for retaining keys that the lexicon cannot explain.
+    pub unresolved_input_penalty: f64,
+    /// `frequency - correction_penalty - abbreviation_penalty -
+    /// unresolved_input_penalty`.
     pub total: f64,
+}
+
+/// Origin of an explainable candidate.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CandidateSource {
+    /// A normal entry from the configured lexicon.
+    Lexicon,
+    /// Literal observed input retained without inventing pinyin or Chinese.
+    UnresolvedInput,
 }
 
 /// A decoded candidate together with its complete explanation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
-    /// Candidate Chinese text.
+    /// Whether this candidate came from the lexicon or retained raw input.
+    pub source: CandidateSource,
+    /// Candidate Chinese text, or an explicit `〔x〕` unresolved marker.
     pub text: String,
-    /// Full pinyin recorded in the public fixture.
+    /// Full pinyin recorded in the public fixture; empty when unresolved.
     pub pinyin: String,
-    /// Canonical full Ziranma code.
+    /// Canonical full Ziranma code, or the literal unresolved key.
     pub code: KeySequence,
     /// Full-code or mixed-abbreviation spelling matched by the decoder.
     pub spelling: Spelling,
@@ -247,6 +264,8 @@ pub struct SentenceCandidate {
     pub segments: Vec<SentenceSegment>,
     /// Sum of normalized unigram log probabilities and local penalties.
     pub total_score: f64,
+    /// Number of literal input keys not explained by the lexicon.
+    pub unresolved_key_count: usize,
     /// Whether the complete path consumed the global error budget.
     pub used_error: bool,
 }
@@ -264,6 +283,8 @@ pub struct DecodeConfig {
     pub extra_key_penalty: f64,
     /// Penalty for each syllable represented by only its first key.
     pub abbreviation_penalty_per_syllable: f64,
+    /// Penalty for each input key retained as explicitly unresolved.
+    pub unresolved_key_penalty: f64,
 }
 
 impl Default for DecodeConfig {
@@ -274,6 +295,7 @@ impl Default for DecodeConfig {
             missing_key_penalty: 3.00,
             extra_key_penalty: 3.00,
             abbreviation_penalty_per_syllable: 0.85,
+            unresolved_key_penalty: 8.00,
         }
     }
 }
@@ -315,8 +337,10 @@ pub struct SentenceSearchStats {
     pub alignment_states_examined: usize,
     /// Terminal segment spellings found before lattice-edge deduplication.
     pub terminal_spelling_matches: usize,
-    /// Deduplicated word edges inserted into the sentence lattice.
+    /// Deduplicated lexicon and unresolved edges in the sentence lattice.
     pub lattice_transitions: usize,
+    /// One-key unresolved-input edges included in `lattice_transitions`.
+    pub unresolved_lattice_transitions: usize,
     /// Distinct `(position, error budget, previous word)` ranking states solved.
     pub ranking_states_evaluated: usize,
     /// Reuses of an already solved ranking state.
@@ -359,6 +383,7 @@ impl Decoder {
             config.missing_key_penalty,
             config.extra_key_penalty,
             config.abbreviation_penalty_per_syllable,
+            config.unresolved_key_penalty,
         ];
         assert!(
             penalties
@@ -445,16 +470,20 @@ impl Decoder {
     ) -> Result<(Vec<SentenceCandidate>, SentenceSearchStats), KeySequenceError> {
         let observed = KeySequence::new(observed)?;
         let mut search_stats = SentenceSearchStats::default();
-        if top_k == 0 || self.lexicon.is_empty() {
+        if top_k == 0 {
             return Ok((Vec::new(), search_stats));
         }
 
-        let log_frequency_total = self
+        let frequency_total = self
             .lexicon
             .iter()
             .map(|entry| entry.frequency as f64)
-            .sum::<f64>()
-            .ln();
+            .sum::<f64>();
+        let log_frequency_total = if frequency_total > 0.0 {
+            frequency_total.ln()
+        } else {
+            0.0
+        };
         let lattice = self.build_sentence_lattice(observed.as_str(), &mut search_stats);
         let initial_state = SentenceRankingState {
             position: 0,
@@ -488,8 +517,12 @@ impl Decoder {
             if !exact_reachable[start] && !error_reachable[start] {
                 continue;
             }
-            let transitions =
+            let mut transitions =
                 self.segment_transitions(observed, start, exact_reachable[start], search_stats);
+            transitions.push(self.unresolved_transition(observed, start));
+            transitions.sort_by(segment_transition_order);
+            search_stats.lattice_transitions += 1;
+            search_stats.unresolved_lattice_transitions += 1;
 
             if exact_reachable[start] {
                 for transition in collapse_error_layers(&transitions) {
@@ -534,6 +567,7 @@ impl Decoder {
                 text: String::new(),
                 segments: Vec::new(),
                 total_score: 0.0,
+                unresolved_key_count: 0,
                 used_error: state.used_error,
             }];
             memo.insert(state, terminal.clone());
@@ -554,10 +588,10 @@ impl Decoder {
             let child_state = SentenceRankingState {
                 position: transition.end,
                 used_error: state.used_error || transition.uses_error,
-                previous_word: self
-                    .language_model
-                    .as_ref()
-                    .map(|_| transition.candidate.text.clone()),
+                previous_word: match (self.language_model.as_ref(), transition.candidate.source) {
+                    (Some(_), CandidateSource::Lexicon) => Some(transition.candidate.text.clone()),
+                    _ => None,
+                },
             };
             let suffixes = self.k_best_from_state(
                 lattice,
@@ -575,7 +609,10 @@ impl Decoder {
             );
             let edge_score = language_score.interpolated_log_probability
                 - transition.candidate.score.abbreviation_penalty
-                - transition.candidate.score.correction_penalty;
+                - transition.candidate.score.correction_penalty
+                - transition.candidate.score.unresolved_input_penalty;
+            let unresolved_key_count =
+                usize::from(transition.candidate.source == CandidateSource::UnresolvedInput);
 
             for suffix in suffixes {
                 let mut text = transition.candidate.text.clone();
@@ -591,6 +628,7 @@ impl Decoder {
                     text,
                     segments,
                     total_score: edge_score + suffix.total_score,
+                    unresolved_key_count: unresolved_key_count + suffix.unresolved_key_count,
                     used_error: suffix.used_error,
                 });
             }
@@ -610,6 +648,13 @@ impl Decoder {
         candidate: &Candidate,
         log_frequency_total: f64,
     ) -> SentenceLanguageScore {
+        if candidate.source == CandidateSource::UnresolvedInput {
+            return SentenceLanguageScore {
+                unigram_log_probability: 0.0,
+                bigram: None,
+                interpolated_log_probability: 0.0,
+            };
+        }
         let unigram_log_probability = candidate.score.frequency - log_frequency_total;
         let bigram = previous_word.and_then(|previous| {
             self.language_model
@@ -662,6 +707,36 @@ impl Decoder {
         transitions.sort_by(segment_transition_order);
         search_stats.lattice_transitions += transitions.len();
         transitions
+    }
+
+    fn unresolved_transition(&self, observed: &str, start: usize) -> SegmentTransition {
+        let observed_key = &observed[start..start + 1];
+        let key_sequence =
+            KeySequence::new(observed_key).expect("sentence input is validated lowercase ASCII");
+        let spelling = Spelling {
+            code: key_sequence.clone(),
+            abbreviated_syllables: Vec::new(),
+        };
+        SegmentTransition {
+            end: start + 1,
+            uses_error: false,
+            observed: key_sequence.clone(),
+            candidate: Candidate {
+                source: CandidateSource::UnresolvedInput,
+                text: format!("〔{observed_key}〕"),
+                pinyin: String::new(),
+                code: key_sequence,
+                spelling,
+                correction: Correction::Exact,
+                score: ScoreBreakdown {
+                    frequency: 0.0,
+                    correction_penalty: 0.0,
+                    abbreviation_penalty: 0.0,
+                    unresolved_input_penalty: self.config.unresolved_key_penalty,
+                    total: -self.config.unresolved_key_penalty,
+                },
+            },
+        }
     }
 
     #[cfg(test)]
@@ -734,6 +809,7 @@ impl Decoder {
         let abbreviation_penalty = spelling.abbreviated_syllables.len() as f64
             * self.config.abbreviation_penalty_per_syllable;
         Candidate {
+            source: CandidateSource::Lexicon,
             text: entry.text.clone(),
             pinyin: entry.pinyin.clone(),
             code: entry.code.clone(),
@@ -743,6 +819,7 @@ impl Decoder {
                 frequency,
                 correction_penalty,
                 abbreviation_penalty,
+                unresolved_input_penalty: 0.0,
                 total: frequency - correction_penalty - abbreviation_penalty,
             },
         }
@@ -1271,6 +1348,7 @@ fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: Segmen
     let duplicate = transitions.iter_mut().find(|existing| {
         existing.end == candidate.end
             && existing.uses_error == candidate.uses_error
+            && existing.candidate.source == candidate.candidate.source
             && existing.candidate.text == candidate.candidate.text
             && existing.candidate.code == candidate.candidate.code
     });
@@ -1288,6 +1366,7 @@ fn collapse_error_layers(transitions: &[SegmentTransition]) -> Vec<SegmentTransi
     for candidate in transitions {
         let duplicate = collapsed.iter_mut().find(|existing| {
             existing.end == candidate.end
+                && existing.candidate.source == candidate.candidate.source
                 && existing.candidate.text == candidate.candidate.text
                 && existing.candidate.code == candidate.candidate.code
         });
@@ -1310,8 +1389,9 @@ fn segment_transition_order(left: &SegmentTransition, right: &SegmentTransition)
 }
 
 fn sentence_order(left: &SentenceCandidate, right: &SentenceCandidate) -> Ordering {
-    left.used_error
-        .cmp(&right.used_error)
+    left.unresolved_key_count
+        .cmp(&right.unresolved_key_count)
+        .then_with(|| left.used_error.cmp(&right.used_error))
         .then_with(|| right.total_score.total_cmp(&left.total_score))
         .then_with(|| left.segments.len().cmp(&right.segments.len()))
         .then_with(|| left.text.cmp(&right.text))
@@ -1322,6 +1402,7 @@ fn candidate_order(left: &Candidate, right: &Candidate) -> Ordering {
         .score
         .total
         .total_cmp(&left.score.total)
+        .then_with(|| left.source.cmp(&right.source))
         .then_with(|| {
             left.spelling
                 .abbreviated_syllables
@@ -1661,8 +1742,8 @@ mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
 
     use super::{
-        BigramLanguageModel, Candidate, Correction, DecodeConfig, Decoder, KeySequence,
-        LexiconEntry, SentenceCandidate, SentenceLattice, SentenceRankingState,
+        BigramLanguageModel, Candidate, CandidateSource, Correction, DecodeConfig, Decoder,
+        KeySequence, LexiconEntry, SentenceCandidate, SentenceLattice, SentenceRankingState,
         SentenceSearchStats, SentenceSegment, are_qwerty_neighbors, candidate_order,
         collapse_error_layers, detect_correction, key_hypotheses, parse_lexicon_tsv,
         sentence_order, spelling_variants,
@@ -1944,6 +2025,7 @@ mod tests {
                 text: String::new(),
                 segments: Vec::new(),
                 total_score: 0.0,
+                unresolved_key_count: 0,
                 used_error: state.used_error,
             }];
         }
@@ -1962,10 +2044,11 @@ mod tests {
             let child_state = SentenceRankingState {
                 position: transition.end,
                 used_error: state.used_error || transition.uses_error,
-                previous_word: decoder
-                    .language_model
-                    .as_ref()
-                    .map(|_| transition.candidate.text.clone()),
+                previous_word: match (decoder.language_model.as_ref(), transition.candidate.source)
+                {
+                    (Some(_), CandidateSource::Lexicon) => Some(transition.candidate.text.clone()),
+                    _ => None,
+                },
             };
             let suffixes =
                 enumerate_all_sentence_paths(decoder, lattice, child_state, log_frequency_total);
@@ -1976,7 +2059,10 @@ mod tests {
             );
             let edge_score = language_score.interpolated_log_probability
                 - transition.candidate.score.abbreviation_penalty
-                - transition.candidate.score.correction_penalty;
+                - transition.candidate.score.correction_penalty
+                - transition.candidate.score.unresolved_input_penalty;
+            let unresolved_key_count =
+                usize::from(transition.candidate.source == CandidateSource::UnresolvedInput);
             for suffix in suffixes {
                 let mut text = transition.candidate.text.clone();
                 text.push_str(&suffix.text);
@@ -1991,6 +2077,7 @@ mod tests {
                     text,
                     segments,
                     total_score: edge_score + suffix.total_score,
+                    unresolved_key_count: unresolved_key_count + suffix.unresolved_key_count,
                     used_error: suffix.used_error,
                 });
             }

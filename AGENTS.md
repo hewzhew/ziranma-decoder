@@ -24,6 +24,9 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   each word silently receive its own independent correction.
 - Preserve the conservative sentence ordering that ranks complete zero-error
   paths ahead of corrected paths.
+- Rank every fully lexicon-covered sentence path ahead of any path containing
+  unresolved-input edges, and keep those edges literal, penalized, and outside
+  the global correction budget.
 - Keep trie changes covered by exhaustive-reference parity tests.
 - Keep each lexicon entry stored once in the compact syllable trie; do not
   reintroduce construction-time `2^n` spelling expansion.

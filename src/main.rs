@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ziranma_decoder::{
-    BigramLanguageModel, Candidate, Decoder, encode_pinyin_phrase, evaluate_sentence_cases,
-    evaluate_synthetic, parse_lexicon_tsv,
+    BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
+    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
 };
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -205,7 +205,11 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
     println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
     println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
-    println!("  去重后 lattice 词边：{}", stats.lattice_transitions);
+    println!("  去重后 lattice 总边：{}", stats.lattice_transitions);
+    println!(
+        "  其中逐键未解析边：{}",
+        stats.unresolved_lattice_transitions
+    );
     println!("  求解的 k-best 状态：{}", stats.ranking_states_evaluated);
     println!("  状态缓存命中：{}", stats.ranking_state_cache_hits);
     println!("  路径组合检查：{}", stats.path_combinations_considered);
@@ -236,18 +240,29 @@ fn print_sentence_candidates(
         }
     );
     if candidates.is_empty() {
-        println!("演示词典中没有能够覆盖完整按键串的分词路径。");
+        println!("没有返回候选（Top-K 可能为 0）。");
         return;
     }
 
     for (rank, candidate) in candidates.iter().enumerate() {
         println!(
-            "{}. {}  [句子分 {:.3}]",
+            "{}. {}  [句子分 {:.3}；未解析 {} 键]",
             rank + 1,
             candidate.text,
-            candidate.total_score
+            candidate.total_score,
+            candidate.unresolved_key_count
         );
         for (index, segment) in candidate.segments.iter().enumerate() {
+            if segment.candidate.source == CandidateSource::UnresolvedInput {
+                println!(
+                    "   片段 {}：{} -> {} [原样保留；未解析代价 {:.3}；不消耗纠错预算]",
+                    index + 1,
+                    segment.observed,
+                    segment.candidate.text,
+                    segment.candidate.score.unresolved_input_penalty
+                );
+                continue;
+            }
             println!(
                 "   词 {}：{} -> {} [{}；{}；{}]",
                 index + 1,

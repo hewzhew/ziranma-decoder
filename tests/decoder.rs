@@ -1,9 +1,10 @@
 use ziranma_decoder::{
-    BigramLanguageModel, Correction, Decoder, LexiconParseError, parse_lexicon_tsv,
+    BigramLanguageModel, CandidateSource, Correction, Decoder, LexiconParseError, parse_lexicon_tsv,
 };
 
 const PUBLIC_DEMO_LEXICON: &str = include_str!("fixtures/public/demo_lexicon.tsv");
 const PUBLIC_BIGRAM_CORPUS: &str = include_str!("fixtures/public/demo_bigram_corpus.tsv");
+const HELLO_LEXICON: &str = "text\tpinyin\tfrequency\n你好\tni hao\t100\n";
 
 fn demo_decoder() -> Decoder {
     Decoder::new(
@@ -163,7 +164,8 @@ fn score_breakdown_adds_up() {
     for candidate in demo_decoder().decode("nigk", 10).unwrap() {
         let reconstructed = candidate.score.frequency
             - candidate.score.correction_penalty
-            - candidate.score.abbreviation_penalty;
+            - candidate.score.abbreviation_penalty
+            - candidate.score.unresolved_input_penalty;
         assert!((reconstructed - candidate.score.total).abs() < f64::EPSILON);
     }
 }
@@ -261,6 +263,113 @@ fn sentence_decoder_prefers_complete_exact_path_over_correction() {
 }
 
 #[test]
+fn sentence_decoder_retains_unknown_keys_explicitly() {
+    let decoder = Decoder::new(parse_lexicon_tsv(HELLO_LEXICON).unwrap());
+    let (candidates, stats) = decoder.decode_sentence_with_stats("nigkz", 10).unwrap();
+    let candidate = &candidates[0];
+
+    assert_eq!(candidate.text, "你好〔z〕");
+    assert_eq!(candidate.unresolved_key_count, 1);
+    assert!(candidate.used_error);
+    assert_eq!(candidate.segments.len(), 2);
+    let unresolved = &candidate.segments[1].candidate;
+    assert_eq!(unresolved.source, CandidateSource::UnresolvedInput);
+    assert_eq!(unresolved.pinyin, "");
+    assert_eq!(unresolved.code.as_str(), "z");
+    assert_eq!(unresolved.spelling.code.as_str(), "z");
+    assert_eq!(unresolved.correction, Correction::Exact);
+    assert!(unresolved.score.unresolved_input_penalty > 0.0);
+    assert!(stats.unresolved_lattice_transitions > 0);
+    assert!(stats.lattice_transitions >= stats.unresolved_lattice_transitions);
+}
+
+#[test]
+fn fully_covered_correction_ranks_before_exact_fallback() {
+    let decoder = Decoder::new(parse_lexicon_tsv(HELLO_LEXICON).unwrap());
+    let candidates = decoder.decode_sentence("nigk", 10).unwrap();
+
+    assert_eq!(candidates[0].text, "你好");
+    assert_eq!(candidates[0].unresolved_key_count, 0);
+    assert!(candidates[0].used_error);
+    assert!(
+        candidates
+            .iter()
+            .skip(1)
+            .any(|candidate| candidate.unresolved_key_count > 0)
+    );
+    let first_fallback = candidates
+        .iter()
+        .position(|candidate| candidate.unresolved_key_count > 0)
+        .unwrap();
+    assert!(
+        candidates[..first_fallback]
+            .iter()
+            .all(|candidate| candidate.unresolved_key_count == 0)
+    );
+}
+
+#[test]
+fn unresolved_input_does_not_consume_the_global_error_budget() {
+    let decoder = Decoder::new(parse_lexicon_tsv(HELLO_LEXICON).unwrap());
+    let candidates = decoder.decode_sentence("nigkz", 10).unwrap();
+    let candidate = &candidates[0];
+
+    assert_eq!(candidate.text, "你好〔z〕");
+    assert_eq!(candidate.unresolved_key_count, 1);
+    assert!(candidate.used_error);
+    assert_eq!(
+        candidate
+            .segments
+            .iter()
+            .filter(|segment| segment.candidate.source == CandidateSource::UnresolvedInput)
+            .count(),
+        1
+    );
+    assert_eq!(
+        candidate
+            .segments
+            .iter()
+            .filter(|segment| segment.candidate.correction != Correction::Exact)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn empty_lexicon_still_returns_literal_unresolved_input() {
+    let candidates = Decoder::new(Vec::new()).decode_sentence("xyz", 1).unwrap();
+
+    assert_eq!(candidates[0].text, "〔x〕〔y〕〔z〕");
+    assert_eq!(candidates[0].unresolved_key_count, 3);
+    assert!(!candidates[0].used_error);
+    assert!(
+        candidates[0]
+            .segments
+            .iter()
+            .all(|segment| segment.candidate.source == CandidateSource::UnresolvedInput)
+    );
+}
+
+#[test]
+fn unresolved_segment_resets_bigram_context() {
+    let lexicon = parse_lexicon_tsv(HELLO_LEXICON).unwrap();
+    let model = BigramLanguageModel::from_tsv("tokens\tcount\n你好 你好\t100\n", &lexicon).unwrap();
+    let decoder = Decoder::new(lexicon).with_bigram_model(model);
+    let candidates = decoder.decode_sentence("nihkzznihk", 10).unwrap();
+    let candidate = &candidates[0];
+    let unresolved_index = candidate
+        .segments
+        .iter()
+        .position(|segment| segment.candidate.source == CandidateSource::UnresolvedInput)
+        .expect("the path should retain one unknown key");
+    let next_segment = &candidate.segments[unresolved_index + 1];
+
+    assert_eq!(candidate.unresolved_key_count, 1);
+    assert_eq!(next_segment.candidate.text, "你好");
+    assert_eq!(next_segment.language_score.bigram, None);
+}
+
+#[test]
 fn bigram_context_resolves_same_code_word_ambiguity() {
     let lexicon = parse_lexicon_tsv(PUBLIC_DEMO_LEXICON).unwrap();
     let model = BigramLanguageModel::from_tsv(PUBLIC_BIGRAM_CORPUS, &lexicon).unwrap();
@@ -311,8 +420,12 @@ fn sentence_lattice_reports_streaming_search_work() {
     assert!(stats.segment_trie_scans > 0);
     assert!(stats.trie_path_visits >= stats.segment_trie_scans);
     assert!(stats.alignment_states_examined >= stats.trie_path_visits);
-    assert!(stats.terminal_spelling_matches >= stats.lattice_transitions);
+    assert!(
+        stats.terminal_spelling_matches + stats.unresolved_lattice_transitions
+            >= stats.lattice_transitions
+    );
     assert!(stats.lattice_transitions > 0);
+    assert!(stats.unresolved_lattice_transitions > 0);
     assert!(stats.ranking_states_evaluated > 0);
     assert!(stats.path_combinations_considered > 0);
 }
