@@ -14,7 +14,14 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   adding it.
 - Keep the project as one crate until a measured need justifies a split.
 - Make decoding deterministic.
-- Every candidate must expose its correction operation and score breakdown.
+- Every candidate must expose its spelling choices, correction operation, and
+  score breakdown.
+- Keep the pinyin-to-Ziranma mapping centralized in `src/codec.rs`; fixtures
+  must not silently maintain a second manual mapping.
+- Treat `cargo run -- evaluate` as a regression instrument, not a claim of
+  real-world input accuracy.
+- Preserve the sentence decoder's explicit global error budget; do not let
+  each word silently receive its own independent correction.
 - Add focused tests with each behavioral change.
 - Do not perform broad refactors without tests that preserve behavior.
 - Treat synthetic frequency weights as experimental configuration, never as

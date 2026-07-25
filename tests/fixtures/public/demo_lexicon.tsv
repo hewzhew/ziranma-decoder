@@ -1,14 +1,53 @@
 # Public, manually constructed demo data. It contains no personal input.
 # Frequencies are synthetic relative weights, not corpus counts.
-text	pinyin	code	frequency
-你好	ni hao	nihk	1000
-自然码	zi ran ma	zirjma	760
-双拼	shuang pin	udpn	900
-解码	jie ma	jxma	620
-输入法	shu ru fa	uurufa	880
-候选	hou xuan	hbxr	540
-本地	ben di	bfdi	680
-纠错	jiu cuo	jqco	510
-测试	ce shi	ceui	600
-研究	yan jiu	yjjq	470
-项目	xiang mu	xdmu	720
+text	pinyin	frequency
+你好	ni hao	1000
+自然码	zi ran ma	760
+双拼	shuang pin	900
+解码	jie ma	620
+输入法	shu ru fa	880
+候选	hou xuan	540
+本地	ben di	680
+纠错	jiu cuo	510
+测试	ce shi	600
+研究	yan jiu	470
+项目	xiang mu	720
+键盘	jian pan	650
+按键	an jian	640
+语言	yu yan	820
+模型	mo xing	790
+词典	ci dian	580
+拼音	pin yin	850
+中文	zhong wen	930
+算法	suan fa	700
+数据	shu ju	910
+隐私	yin si	740
+解释	jie shi	610
+分数	fen shu	560
+搜索	sou suo	730
+排序	pai xu	520
+上下文	shang xia wen	770
+错误	cuo wu	690
+交换	jiao huan	500
+替换	ti huan	490
+漏键	lou jian	430
+多按	duo an	410
+全拼	quan pin	670
+简拼	jian pin	660
+词语	ci yu	840
+句子	ju zi	810
+概率	gai lv	590
+实验	shi yan	750
+基线	ji xian	570
+评测	ping ce	530
+合成	he cheng	550
+公开	gong kai	630
+个人	ge ren	780
+安全	an quan	860
+离线	li xian	710
+实时	shi shi	800
+性能	xing neng	695
+延迟	yan chi	505
+准确	zhun que	735
+召回	zhao hui	515
+词频	ci pin	545

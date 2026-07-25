@@ -18,6 +18,7 @@ fn exact_input_is_returned_without_a_correction() {
 
     assert_eq!(candidate.correction, Correction::Exact);
     assert_eq!(candidate.score.correction_penalty, 0.0);
+    assert_eq!(candidate.score.abbreviation_penalty, 0.0);
 }
 
 #[test]
@@ -68,10 +69,84 @@ fn transposition_can_cross_a_two_key_syllable_boundary() {
 }
 
 #[test]
-fn unsupported_edits_do_not_generate_a_candidate() {
-    assert!(demo_decoder().decode("niqk", 10).unwrap().is_empty());
-    assert!(demo_decoder().decode("nifj", 10).unwrap().is_empty());
-    assert!(demo_decoder().decode("nih", 10).unwrap().is_empty());
+fn one_missing_key_recovers_the_intended_entry() {
+    let candidates = demo_decoder().decode("nik", 10).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.text == "你好")
+        .expect("你好 should be recovered");
+
+    assert!(matches!(
+        candidate.correction,
+        Correction::MissingKey {
+            index: 2,
+            intended: 'h'
+        }
+    ));
+}
+
+#[test]
+fn one_extra_key_recovers_the_intended_entry() {
+    let candidates = demo_decoder().decode("niihk", 10).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.text == "你好")
+        .expect("你好 should be recovered");
+
+    assert!(matches!(
+        candidate.correction,
+        Correction::ExtraKey {
+            index: 2,
+            actual: 'i'
+        }
+    ));
+}
+
+#[test]
+fn mixed_one_and_two_key_syllables_are_explained() {
+    let candidates = demo_decoder().decode("nhk", 10).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.text == "你好")
+        .expect("你好 should be recovered");
+
+    assert_eq!(candidate.correction, Correction::Exact);
+    assert_eq!(candidate.spelling.code.as_str(), "nhk");
+    assert_eq!(candidate.spelling.abbreviated_syllables, [0]);
+    assert!(candidate.score.abbreviation_penalty > 0.0);
+}
+
+#[test]
+fn abbreviation_and_one_key_error_can_be_inferred_together() {
+    let candidates = demo_decoder().decode("ni", 10).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.text == "你好")
+        .expect("你好 should be recovered");
+
+    assert_eq!(candidate.spelling.code.as_str(), "nih");
+    assert_eq!(candidate.spelling.abbreviated_syllables, [1]);
+    assert!(matches!(
+        candidate.correction,
+        Correction::MissingKey {
+            index: 2,
+            intended: 'h'
+        }
+    ));
+}
+
+#[test]
+fn unsupported_edits_do_not_recover_the_target() {
+    for observed in ["niqk", "nifj", "nfj"] {
+        assert!(
+            demo_decoder()
+                .decode(observed, 10)
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate.text != "你好"),
+            "{observed} should not recover 你好"
+        );
+    }
 }
 
 #[test]
@@ -83,16 +158,87 @@ fn top_k_is_respected() {
 #[test]
 fn score_breakdown_adds_up() {
     for candidate in demo_decoder().decode("nigk", 10).unwrap() {
-        let reconstructed = candidate.score.frequency - candidate.score.correction_penalty;
+        let reconstructed = candidate.score.frequency
+            - candidate.score.correction_penalty
+            - candidate.score.abbreviation_penalty;
         assert!((reconstructed - candidate.score.total).abs() < f64::EPSILON);
     }
 }
 
 #[test]
 fn parser_rejects_zero_frequency() {
-    let fixture = "text\tpinyin\tcode\tfrequency\n你好\tni hao\tnihk\t0\n";
+    let fixture = "text\tpinyin\tfrequency\n你好\tni hao\t0\n";
     assert!(matches!(
         parse_lexicon_tsv(fixture),
         Err(LexiconParseError::InvalidFrequency { .. })
+    ));
+}
+
+#[test]
+fn parser_generates_canonical_codes_from_pinyin() {
+    let entries = parse_lexicon_tsv(PUBLIC_DEMO_LEXICON).unwrap();
+    let ni_hao = entries
+        .iter()
+        .find(|entry| entry.text == "你好")
+        .expect("fixture contains 你好");
+    let shu_ju = entries
+        .iter()
+        .find(|entry| entry.text == "数据")
+        .expect("fixture contains 数据");
+
+    assert_eq!(ni_hao.code.as_str(), "nihk");
+    assert_eq!(shu_ju.code.as_str(), "uujv");
+}
+
+#[test]
+fn sentence_decoder_finds_word_boundaries_with_full_abbreviations() {
+    let candidates = demo_decoder().decode_sentence("zrmurf", 10).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.text == "自然码输入法")
+        .expect("two-word sentence should be recovered");
+
+    assert_eq!(candidate.segments.len(), 2);
+    assert_eq!(candidate.segments[0].candidate.text, "自然码");
+    assert_eq!(
+        candidate.segments[0].candidate.spelling.code.as_str(),
+        "zrm"
+    );
+    assert_eq!(candidate.segments[1].candidate.text, "输入法");
+    assert_eq!(
+        candidate.segments[1].candidate.spelling.code.as_str(),
+        "urf"
+    );
+    assert!(
+        candidate
+            .segments
+            .iter()
+            .all(|segment| segment.candidate.correction == Correction::Exact)
+    );
+}
+
+#[test]
+fn sentence_decoder_shares_one_error_budget_across_words() {
+    let candidates = demo_decoder().decode_sentence("zrnurf", 10).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.text == "自然码输入法")
+        .expect("sentence with one neighbor error should be recovered");
+
+    assert_eq!(
+        candidate
+            .segments
+            .iter()
+            .filter(|segment| segment.candidate.correction != Correction::Exact)
+            .count(),
+        1
+    );
+    assert!(matches!(
+        candidate.segments[0].candidate.correction,
+        Correction::NeighborSubstitution {
+            intended: 'm',
+            actual: 'n',
+            ..
+        }
     ));
 }
