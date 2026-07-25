@@ -1,0 +1,14 @@
+# Public, manually constructed demo data. It contains no personal input.
+# Frequencies are synthetic relative weights, not corpus counts.
+text	pinyin	code	frequency
+你好	ni hao	nihk	1000
+自然码	zi ran ma	zirjma	760
+双拼	shuang pin	udpn	900
+解码	jie ma	jxma	620
+输入法	shu ru fa	uurufa	880
+候选	hou xuan	hbxr	540
+本地	ben di	bfdi	680
+纠错	jiu cuo	jqco	510
+测试	ce shi	ceui	600
+研究	yan jiu	yjjq	470
+项目	xiang mu	xdmu	720

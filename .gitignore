@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Personal typing data: never commit or sync these directories
+/data/private/
+/data/raw/
+/logs/
+
+# Private models and local databases
+/models/private/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

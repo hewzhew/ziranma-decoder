@@ -1,0 +1,8 @@
+[package]
+name = "ziranma-decoder"
+version = "0.1.0"
+edition = "2024"
+description = "A privacy-first, explainable noisy-channel decoder experiment for Ziranma double pinyin"
+publish = false
+
+[dependencies]
