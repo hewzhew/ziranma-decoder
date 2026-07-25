@@ -2,10 +2,13 @@
 //!
 //! The current research baseline supports full-code and mixed-abbreviation
 //! spellings, together with at most one local key error. It deliberately uses
-//! a compact syllable trie and inspectable local language scores.
+//! a compact syllable trie with joint key alignment and inspectable local
+//! language scores.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -289,6 +292,17 @@ pub struct DecoderIndexStats {
     pub maximum_syllables: usize,
 }
 
+/// Work performed by one word-level joint trie search.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecodeSearchStats {
+    /// Recursive trie path states visited.
+    pub trie_path_visits: usize,
+    /// Alignment states examined while consuming intended keys.
+    pub alignment_states_examined: usize,
+    /// Terminal spelling matches produced before per-entry deduplication.
+    pub terminal_spelling_matches: usize,
+}
+
 /// Trie-backed decoder over a local lexicon.
 #[derive(Clone, Debug)]
 pub struct Decoder {
@@ -363,16 +377,27 @@ impl Decoder {
 
     /// Returns at most `top_k` matching candidates in deterministic score order.
     pub fn decode(&self, observed: &str, top_k: usize) -> Result<Vec<Candidate>, KeySequenceError> {
+        self.decode_with_stats(observed, top_k)
+            .map(|(candidates, _stats)| candidates)
+    }
+
+    /// Decodes one word-level input and returns inspectable search work.
+    pub fn decode_with_stats(
+        &self,
+        observed: &str,
+        top_k: usize,
+    ) -> Result<(Vec<Candidate>, DecodeSearchStats), KeySequenceError> {
         let observed = KeySequence::new(observed)?;
         if top_k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), DecodeSearchStats::default()));
         }
 
-        let mut candidates = self.lookup_candidates(observed.as_str(), true);
+        let mut stats = DecodeSearchStats::default();
+        let mut candidates = self.lookup_candidates_with_stats(observed.as_str(), true, &mut stats);
 
         candidates.sort_by(candidate_order);
         candidates.truncate(top_k);
-        Ok(candidates)
+        Ok((candidates, stats))
     }
 
     /// Jointly infers word boundaries, mixed abbreviations, and at most one
@@ -493,23 +518,26 @@ impl Decoder {
     }
 
     fn lookup_candidates(&self, observed: &str, allow_error: bool) -> Vec<Candidate> {
+        self.lookup_candidates_with_stats(observed, allow_error, &mut DecodeSearchStats::default())
+    }
+
+    fn lookup_candidates_with_stats(
+        &self,
+        observed: &str,
+        allow_error: bool,
+        stats: &mut DecodeSearchStats,
+    ) -> Vec<Candidate> {
         let mut best_by_entry = HashMap::<usize, Candidate>::new();
-        for hypothesis in key_hypotheses(observed, allow_error) {
-            for terminal in self.trie.lookup(&hypothesis.code) {
-                let entry = &self.lexicon[terminal.entry_index];
-                let candidate = self.make_candidate(
-                    entry,
-                    terminal.spelling.clone(),
-                    hypothesis.correction.clone(),
-                );
-                match best_by_entry.entry(terminal.entry_index) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
+        for terminal in self.trie.lookup_noisy(observed, allow_error, stats) {
+            let entry = &self.lexicon[terminal.entry_index];
+            let candidate = self.make_candidate(entry, terminal.spelling, terminal.correction);
+            match best_by_entry.entry(terminal.entry_index) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if candidate_order(&candidate, slot.get()) == Ordering::Less {
                         slot.insert(candidate);
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut slot) => {
-                        if candidate_order(&candidate, slot.get()) == Ordering::Less {
-                            slot.insert(candidate);
-                        }
                     }
                 }
             }
@@ -614,6 +642,89 @@ impl SyllableTrie {
         self.nodes[node_index].terminals.push(entry_index);
     }
 
+    fn lookup_noisy(
+        &self,
+        observed: &str,
+        allow_error: bool,
+        stats: &mut DecodeSearchStats,
+    ) -> Vec<NoisyTrieTerminal> {
+        let mut search = TrieSearch {
+            observed: observed.as_bytes(),
+            allow_error,
+            intended: String::with_capacity(self.maximum_code_length),
+            abbreviated_syllables: Vec::with_capacity(self.maximum_syllables),
+            matches: Vec::new(),
+            stats,
+        };
+        let initial_state = AlignmentState {
+            observed_position: 0,
+            used_error: false,
+            transposition_pending: false,
+        };
+        self.collect_noisy_matches(0, 0, &[initial_state], &mut search);
+        search.matches
+    }
+
+    fn collect_noisy_matches(
+        &self,
+        node_index: usize,
+        syllable_index: usize,
+        states: &[AlignmentState],
+        search: &mut TrieSearch<'_>,
+    ) {
+        search.stats.trie_path_visits += 1;
+        let node = &self.nodes[node_index];
+        if !node.terminals.is_empty() && states.iter().any(|state| search.accepts_terminal(*state))
+        {
+            let correction = detect_correction(
+                std::str::from_utf8(search.observed)
+                    .expect("decoder inputs are validated lowercase ASCII"),
+                &search.intended,
+            );
+            if let Some(correction) = correction
+                && (search.allow_error || correction == Correction::Exact)
+            {
+                for &entry_index in &node.terminals {
+                    search.matches.push(NoisyTrieTerminal {
+                        entry_index,
+                        spelling: Spelling {
+                            code: KeySequence::new(search.intended.clone())
+                                .expect("trie edges contain lowercase ASCII"),
+                            abbreviated_syllables: search.abbreviated_syllables.clone(),
+                        },
+                        correction: correction.clone(),
+                    });
+                    search.stats.terminal_spelling_matches += 1;
+                }
+            }
+        }
+
+        for edge in &node.children {
+            search.intended.push(edge.code[0] as char);
+            search.intended.push(edge.code[1] as char);
+            let full_states = search.advance(states, &edge.code);
+            if !full_states.is_empty() {
+                self.collect_noisy_matches(edge.child, syllable_index + 1, &full_states, search);
+            }
+            search.intended.truncate(search.intended.len() - 2);
+
+            search.intended.push(edge.code[0] as char);
+            search.abbreviated_syllables.push(syllable_index);
+            let abbreviated_states = search.advance(states, &edge.code[..1]);
+            if !abbreviated_states.is_empty() {
+                self.collect_noisy_matches(
+                    edge.child,
+                    syllable_index + 1,
+                    &abbreviated_states,
+                    search,
+                );
+            }
+            search.abbreviated_syllables.pop();
+            search.intended.pop();
+        }
+    }
+
+    #[cfg(test)]
     fn lookup(&self, code: &str) -> Vec<TrieTerminal> {
         let Ok(original_code) = KeySequence::new(code) else {
             return Vec::new();
@@ -639,6 +750,7 @@ impl SyllableTrie {
             .collect()
     }
 
+    #[cfg(test)]
     fn collect_matches(
         &self,
         node_index: usize,
@@ -698,6 +810,7 @@ struct SyllableTrieEdge {
     child: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct TrieTerminal {
     entry_index: usize,
@@ -705,11 +818,149 @@ struct TrieTerminal {
 }
 
 #[derive(Clone, Debug)]
+struct NoisyTrieTerminal {
+    entry_index: usize,
+    spelling: Spelling,
+    correction: Correction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AlignmentState {
+    observed_position: usize,
+    used_error: bool,
+    transposition_pending: bool,
+}
+
+struct TrieSearch<'a> {
+    observed: &'a [u8],
+    allow_error: bool,
+    intended: String,
+    abbreviated_syllables: Vec<usize>,
+    matches: Vec<NoisyTrieTerminal>,
+    stats: &'a mut DecodeSearchStats,
+}
+
+impl TrieSearch<'_> {
+    fn advance(&mut self, states: &[AlignmentState], intended: &[u8]) -> Vec<AlignmentState> {
+        let mut current = states.to_vec();
+        for &intended_key in intended {
+            let mut next = Vec::new();
+            for state in current {
+                self.stats.alignment_states_examined += 1;
+                self.advance_key(state, intended_key, &mut next);
+            }
+            current = next;
+            if current.is_empty() {
+                break;
+            }
+        }
+        current
+    }
+
+    fn advance_key(&self, state: AlignmentState, intended_key: u8, next: &mut Vec<AlignmentState>) {
+        let position = state.observed_position;
+        if state.transposition_pending {
+            if self.observed.get(position) == Some(&intended_key) {
+                push_unique_alignment(
+                    next,
+                    AlignmentState {
+                        observed_position: position + 2,
+                        used_error: true,
+                        transposition_pending: false,
+                    },
+                );
+            }
+            return;
+        }
+
+        if self.observed.get(position) == Some(&intended_key) {
+            push_unique_alignment(
+                next,
+                AlignmentState {
+                    observed_position: position + 1,
+                    ..state
+                },
+            );
+        }
+        if !self.allow_error || state.used_error {
+            return;
+        }
+
+        if self
+            .observed
+            .get(position)
+            .is_some_and(|&actual| are_qwerty_neighbors(intended_key, actual))
+        {
+            push_unique_alignment(
+                next,
+                AlignmentState {
+                    observed_position: position + 1,
+                    used_error: true,
+                    transposition_pending: false,
+                },
+            );
+        }
+
+        push_unique_alignment(
+            next,
+            AlignmentState {
+                observed_position: position,
+                used_error: true,
+                transposition_pending: false,
+            },
+        );
+
+        if self.observed.get(position + 1) == Some(&intended_key) {
+            push_unique_alignment(
+                next,
+                AlignmentState {
+                    observed_position: position + 2,
+                    used_error: true,
+                    transposition_pending: false,
+                },
+            );
+        }
+
+        if position + 1 < self.observed.len()
+            && self.observed[position] != self.observed[position + 1]
+            && self.observed[position + 1] == intended_key
+        {
+            push_unique_alignment(
+                next,
+                AlignmentState {
+                    observed_position: position,
+                    used_error: true,
+                    transposition_pending: true,
+                },
+            );
+        }
+    }
+
+    fn accepts_terminal(&self, state: AlignmentState) -> bool {
+        if state.transposition_pending {
+            return false;
+        }
+        state.observed_position == self.observed.len()
+            || (self.allow_error
+                && !state.used_error
+                && state.observed_position + 1 == self.observed.len())
+    }
+}
+
+fn push_unique_alignment(states: &mut Vec<AlignmentState>, candidate: AlignmentState) {
+    if !states.contains(&candidate) {
+        states.push(candidate);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
 struct KeyHypothesis {
     code: String,
     correction: Correction,
 }
 
+#[cfg(test)]
 fn key_hypotheses(observed: &str, allow_error: bool) -> Vec<KeyHypothesis> {
     let observed_bytes = observed.as_bytes();
     let mut hypotheses = vec![KeyHypothesis {
@@ -1128,7 +1379,6 @@ impl fmt::Display for LexiconParseError {
 
 impl Error for LexiconParseError {}
 
-#[cfg(test)]
 fn detect_correction(observed: &str, intended: &str) -> Option<Correction> {
     if observed.len() + 1 == intended.len() {
         let index = single_removed_index(observed.as_bytes(), intended.as_bytes())?;
@@ -1181,7 +1431,6 @@ fn detect_correction(observed: &str, intended: &str) -> Option<Correction> {
     }
 }
 
-#[cfg(test)]
 fn single_removed_index(shorter: &[u8], longer: &[u8]) -> Option<usize> {
     if shorter.len() + 1 != longer.len() {
         return None;
@@ -1240,11 +1489,12 @@ pub(crate) fn are_qwerty_neighbors(left: u8, right: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::cmp::Ordering;
+    use std::collections::{BTreeSet, HashMap};
 
     use super::{
         Candidate, Correction, Decoder, KeySequence, are_qwerty_neighbors, candidate_order,
-        detect_correction, parse_lexicon_tsv, spelling_variants,
+        detect_correction, key_hypotheses, parse_lexicon_tsv, spelling_variants,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -1324,33 +1574,116 @@ mod tests {
     }
 
     #[test]
-    fn trie_lookup_matches_the_exhaustive_reference() {
+    fn joint_trie_search_matches_both_previous_references() {
         let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
         let decoder = Decoder::new(lexicon);
 
-        let every_spelling = decoder
+        let regression_cases = word_regression_cases(&decoder);
+        assert!(regression_cases.len() > 1_000);
+        for observed in regression_cases {
+            let actual = decoder.decode(&observed, 10).unwrap();
+            assert_eq!(
+                actual,
+                hypothesis_reference(&decoder, &observed, 10, true),
+                "hypothesis reference diverged for {observed}"
+            );
+            assert_eq!(
+                actual,
+                exhaustive_reference(&decoder, &observed, 10),
+                "exhaustive reference diverged for {observed}"
+            );
+        }
+
+        for observed in decoder
+            .lexicon
+            .iter()
+            .flat_map(|entry| spelling_variants(&entry.syllable_codes))
+            .map(|spelling| spelling.code.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+        {
+            assert_eq!(
+                decoder.lookup_candidates(&observed, false),
+                hypothesis_reference(&decoder, &observed, usize::MAX, false),
+                "exact-only lookup diverged for {observed}"
+            );
+        }
+    }
+
+    fn word_regression_cases(decoder: &Decoder) -> BTreeSet<String> {
+        let mut cases = decoder
             .lexicon
             .iter()
             .flat_map(|entry| spelling_variants(&entry.syllable_codes))
             .map(|spelling| spelling.code.as_str().to_owned())
             .collect::<BTreeSet<_>>();
-        for observed in every_spelling {
-            assert_eq!(
-                decoder.decode(&observed, 10).unwrap(),
-                exhaustive_reference(&decoder, &observed, 10),
-                "{observed}"
-            );
-        }
 
-        for observed in [
-            "nihk", "nigk", "nikh", "nik", "niihk", "nh", "ni", "zrm", "urf", "ajjp",
-        ] {
-            assert_eq!(
-                decoder.decode(observed, 10).unwrap(),
-                exhaustive_reference(&decoder, observed, 10),
-                "{observed}"
-            );
+        for entry in &decoder.lexicon {
+            let full_code = entry.code.as_str().as_bytes();
+            for index in 0..full_code.len() {
+                for actual in b'a'..=b'z' {
+                    if are_qwerty_neighbors(full_code[index], actual) {
+                        let mut observed = full_code.to_vec();
+                        observed[index] = actual;
+                        cases.insert(String::from_utf8(observed).unwrap());
+                    }
+                }
+            }
+            for start in 0..full_code.len().saturating_sub(1) {
+                if full_code[start] != full_code[start + 1] {
+                    let mut observed = full_code.to_vec();
+                    observed.swap(start, start + 1);
+                    cases.insert(String::from_utf8(observed).unwrap());
+                }
+            }
+            for index in 0..full_code.len() {
+                let mut observed = full_code.to_vec();
+                observed.remove(index);
+                cases.insert(String::from_utf8(observed).unwrap());
+            }
+            for gap in 0..=full_code.len() {
+                let repeated_key = if gap < full_code.len() {
+                    full_code[gap]
+                } else {
+                    full_code[full_code.len() - 1]
+                };
+                let mut observed = full_code.to_vec();
+                observed.insert(gap, repeated_key);
+                cases.insert(String::from_utf8(observed).unwrap());
+            }
         }
+        cases
+    }
+
+    fn hypothesis_reference(
+        decoder: &Decoder,
+        observed: &str,
+        top_k: usize,
+        allow_error: bool,
+    ) -> Vec<Candidate> {
+        let mut best_by_entry = HashMap::<usize, Candidate>::new();
+        for hypothesis in key_hypotheses(observed, allow_error) {
+            for terminal in decoder.trie.lookup(&hypothesis.code) {
+                let candidate = decoder.make_candidate(
+                    &decoder.lexicon[terminal.entry_index],
+                    terminal.spelling,
+                    hypothesis.correction.clone(),
+                );
+                match best_by_entry.entry(terminal.entry_index) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if candidate_order(&candidate, slot.get()) == Ordering::Less {
+                            slot.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        let mut candidates = best_by_entry.into_values().collect::<Vec<_>>();
+        candidates.sort_by(candidate_order);
+        candidates.truncate(top_k);
+        candidates
     }
 
     fn exhaustive_reference(decoder: &Decoder, observed: &str, top_k: usize) -> Vec<Candidate> {

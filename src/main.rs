@@ -38,6 +38,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "encode" => run_encode(&arguments[1..]),
         "evaluate" => run_evaluate(&arguments[1..]),
         "index-stats" => run_index_stats(&arguments[1..]),
+        "search-stats" => run_search_stats(&arguments[1..]),
         "decode" => run_decode(&arguments[1..]),
         "sentence" => run_sentence(&arguments[1..], true),
         "sentence-unigram" => run_sentence(&arguments[1..], false),
@@ -151,6 +152,26 @@ fn run_decode(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     decode_and_print(observed, top_k)
 }
 
+fn run_search_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some(observed) = arguments.first() else {
+        return Err("search-stats 需要一个按键串".into());
+    };
+    let top_k = parse_top_k(arguments.get(1))?;
+    if arguments.len() > 2 {
+        return Err("search-stats 参数过多".into());
+    }
+
+    let lexicon = parse_lexicon_tsv(DEMO_LEXICON)?;
+    let decoder = Decoder::new(lexicon);
+    let (candidates, stats) = decoder.decode_with_stats(observed, top_k)?;
+    print_decoded_candidates(observed, &candidates);
+    println!("联合搜索统计：");
+    println!("  trie 路径状态访问：{}", stats.trie_path_visits);
+    println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
+    println!("  去重前终点拼写匹配：{}", stats.terminal_spelling_matches);
+    Ok(())
+}
+
 fn run_sentence(arguments: &[String], use_bigram: bool) -> Result<(), Box<dyn Error>> {
     let Some(observed) = arguments.first() else {
         return Err("sentence 需要一个没有词界的按键串".into());
@@ -241,16 +262,20 @@ fn decode_and_print(observed: &str, top_k: usize) -> Result<(), Box<dyn Error>> 
     let decoder = Decoder::new(lexicon);
     let candidates = decoder.decode(observed, top_k)?;
 
+    print_decoded_candidates(observed, &candidates);
+    Ok(())
+}
+
+fn print_decoded_candidates(observed: &str, candidates: &[Candidate]) {
     println!("输入按键：{observed}");
     if candidates.is_empty() {
         println!("演示词典中没有符合当前规则的候选。");
-        return Ok(());
+        return;
     }
 
     for (index, candidate) in candidates.iter().enumerate() {
         print_candidate(index + 1, candidate);
     }
-    Ok(())
 }
 
 fn print_candidate(rank: usize, candidate: &Candidate) {
@@ -284,6 +309,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence <无词界按键串> [Top-K]
   cargo run -- sentence-unigram <按键串> [Top-K]
   cargo run -- index-stats
+  cargo run -- search-stats <按键串> [Top-K]
   cargo run -- evaluate
 
 兼容简写：
@@ -296,6 +322,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode nik
   cargo run -- sentence zrmurf
   cargo run -- index-stats
+  cargo run -- search-stats nhk
   cargo run -- evaluate
 
 程序只读取仓库内的公开演示词典，不会保存输入。"

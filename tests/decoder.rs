@@ -290,3 +290,13 @@ fn compact_syllable_index_stores_each_entry_once() {
     assert_eq!(stats.edge_count + 1, stats.node_count);
     assert!(stats.node_count < stats.represented_spelling_count);
 }
+
+#[test]
+fn joint_search_reports_inspectable_work() {
+    let (candidates, stats) = demo_decoder().decode_with_stats("nhk", 10).unwrap();
+
+    assert_eq!(candidates[0].text, "你好");
+    assert!(stats.trie_path_visits > 0);
+    assert!(stats.alignment_states_examined >= stats.trie_path_visits);
+    assert!(stats.terminal_spelling_matches >= candidates.len());
+}

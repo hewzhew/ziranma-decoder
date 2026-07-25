@@ -28,6 +28,10 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
 - Keep each lexicon entry stored once in the compact syllable trie; do not
   reintroduce construction-time `2^n` spelling expansion.
 - Keep compact-index structure statistics covered by a focused test.
+- Keep the production error channel inside the joint trie traversal; retain
+  the old generated-hypothesis search only as a test reference.
+- Keep word-search work observable without presenting raw counters as a
+  stable performance benchmark.
 - Add focused tests with each behavioral change.
 - Do not perform broad refactors without tests that preserve behavior.
 - Treat synthetic frequency weights as experimental configuration, never as
