@@ -321,8 +321,10 @@ pub struct DecoderIndexStats {
 pub struct DecodeSearchStats {
     /// Recursive trie path states visited.
     pub trie_path_visits: usize,
-    /// Alignment states examined while consuming intended keys.
+    /// Alignment states actually examined while consuming intended keys.
     pub alignment_states_examined: usize,
+    /// Alignment-state checks avoided by exact per-scan transition reuse.
+    pub alignment_states_reused: usize,
     /// Terminal spelling matches produced before per-entry deduplication.
     pub terminal_spelling_matches: usize,
 }
@@ -334,8 +336,10 @@ pub struct SentenceSearchStats {
     pub segment_trie_scans: usize,
     /// Recursive trie path states visited across all scans.
     pub trie_path_visits: usize,
-    /// Alignment states examined across all scans.
+    /// Alignment states actually examined across all scans.
     pub alignment_states_examined: usize,
+    /// Alignment-state checks avoided by exact per-scan transition reuse.
+    pub alignment_states_reused: usize,
     /// Terminal segment spellings found before lattice-edge deduplication.
     pub terminal_spelling_matches: usize,
     /// Deduplicated lexicon and unresolved edges generated for the lattice.
@@ -842,6 +846,7 @@ impl Decoder {
         word_stats.terminal_spelling_matches += matches.len();
         search_stats.trie_path_visits += word_stats.trie_path_visits;
         search_stats.alignment_states_examined += word_stats.alignment_states_examined;
+        search_stats.alignment_states_reused += word_stats.alignment_states_reused;
         search_stats.terminal_spelling_matches += word_stats.terminal_spelling_matches;
 
         let mut matches_by_identity = NoisyTerminalAccumulator::default();
@@ -1123,6 +1128,9 @@ impl SyllableTrie {
             intended: String::with_capacity(self.maximum_code_length),
             abbreviated_syllables: Vec::with_capacity(self.maximum_syllables),
             matches: Vec::new(),
+            alignment_state_ids: HashMap::new(),
+            alignment_state_sets: Vec::new(),
+            alignment_transitions: Vec::new(),
             stats,
         };
         let initial_state = AlignmentState {
@@ -1130,8 +1138,9 @@ impl SyllableTrie {
             used_error: false,
             transposition_pending: false,
         };
-        let initial_states = AlignmentStates::singleton(initial_state);
-        self.collect_noisy_matches(0, 0, &initial_states, &mut search);
+        let initial_states =
+            search.intern_alignment_states(AlignmentStates::singleton(initial_state));
+        self.collect_noisy_matches(0, 0, initial_states, &mut search);
         search.matches
     }
 
@@ -1139,7 +1148,7 @@ impl SyllableTrie {
         &self,
         node_index: usize,
         syllable_index: usize,
-        states: &AlignmentStates,
+        states: usize,
         search: &mut TrieSearch<'_>,
     ) {
         search.stats.trie_path_visits += 1;
@@ -1172,19 +1181,19 @@ impl SyllableTrie {
             search.intended.push(edge.code[0] as char);
             search.intended.push(edge.code[1] as char);
             let full_states = search.advance(states, &edge.code);
-            if !full_states.is_empty() {
-                self.collect_noisy_matches(edge.child, syllable_index + 1, &full_states, search);
+            if !search.alignment_state_sets[full_states].is_empty() {
+                self.collect_noisy_matches(edge.child, syllable_index + 1, full_states, search);
             }
             search.intended.truncate(search.intended.len() - 2);
 
             search.intended.push(edge.code[0] as char);
             search.abbreviated_syllables.push(syllable_index);
             let abbreviated_states = search.advance(states, &edge.code[..1]);
-            if !abbreviated_states.is_empty() {
+            if !search.alignment_state_sets[abbreviated_states].is_empty() {
                 self.collect_noisy_matches(
                     edge.child,
                     syllable_index + 1,
-                    &abbreviated_states,
+                    abbreviated_states,
                     search,
                 );
             }
@@ -1489,7 +1498,7 @@ fn noisy_terminal_order(
         })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct AlignmentState {
     observed_position: usize,
     used_error: bool,
@@ -1500,7 +1509,7 @@ struct AlignmentState {
 /// exact position, the three edit-distance offsets, and one pending swap.
 const MAX_ALIGNMENT_STATES: usize = 5;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct AlignmentStates {
     items: [AlignmentState; MAX_ALIGNMENT_STATES],
     len: usize,
@@ -1532,6 +1541,10 @@ impl AlignmentStates {
         self.len == 0
     }
 
+    fn len(&self) -> usize {
+        self.len
+    }
+
     fn push_unique(&mut self, candidate: AlignmentState) {
         if self.as_slice().contains(&candidate) {
             return;
@@ -1542,6 +1555,16 @@ impl AlignmentStates {
         );
         self.items[self.len] = candidate;
         self.len += 1;
+    }
+
+    fn canonicalize(&mut self) {
+        self.items[..self.len].sort_unstable_by_key(|state| {
+            (
+                state.observed_position,
+                state.used_error,
+                state.transposition_pending,
+            )
+        });
     }
 }
 
@@ -1586,24 +1609,53 @@ struct TrieSearch<'a> {
     intended: String,
     abbreviated_syllables: Vec<usize>,
     matches: Vec<NoisyTrieTerminal>,
+    alignment_state_ids: HashMap<AlignmentStates, usize>,
+    alignment_state_sets: Vec<AlignmentStates>,
+    alignment_transitions: Vec<[Option<usize>; 26]>,
     stats: &'a mut DecodeSearchStats,
 }
 
 impl TrieSearch<'_> {
-    fn advance(&mut self, states: &AlignmentStates, intended: &[u8]) -> AlignmentStates {
-        let mut current = *states;
+    fn advance(&mut self, states: usize, intended: &[u8]) -> usize {
+        let mut current = states;
         for &intended_key in intended {
-            let mut next = AlignmentStates::empty();
-            for state in current.as_slice().iter().copied() {
-                self.stats.alignment_states_examined += 1;
-                self.advance_key(state, intended_key, &mut next);
-            }
-            current = next;
-            if current.is_empty() {
+            current = self.advance_one(current, intended_key);
+            if self.alignment_state_sets[current].is_empty() {
                 break;
             }
         }
         current
+    }
+
+    fn advance_one(&mut self, states: usize, intended_key: u8) -> usize {
+        debug_assert!(intended_key.is_ascii_lowercase());
+        let key_index = usize::from(intended_key - b'a');
+        if let Some(next_id) = self.alignment_transitions[states][key_index] {
+            self.stats.alignment_states_reused += self.alignment_state_sets[states].len();
+            return next_id;
+        }
+
+        let mut next = AlignmentStates::empty();
+        for state in self.alignment_state_sets[states].as_slice().iter().copied() {
+            self.stats.alignment_states_examined += 1;
+            self.advance_key(state, intended_key, &mut next);
+        }
+        next.canonicalize();
+        let next = self.intern_alignment_states(next);
+        self.alignment_transitions[states][key_index] = Some(next);
+        next
+    }
+
+    fn intern_alignment_states(&mut self, states: AlignmentStates) -> usize {
+        if let Some(&id) = self.alignment_state_ids.get(&states) {
+            return id;
+        }
+
+        let id = self.alignment_state_sets.len();
+        self.alignment_state_ids.insert(states, id);
+        self.alignment_state_sets.push(states);
+        self.alignment_transitions.push([None; 26]);
+        id
     }
 
     fn advance_key(&self, state: AlignmentState, intended_key: u8, next: &mut AlignmentStates) {
@@ -1667,9 +1719,9 @@ impl TrieSearch<'_> {
         }
     }
 
-    fn terminal_observed_lengths(&self, states: &AlignmentStates) -> TerminalObservedLengths {
+    fn terminal_observed_lengths(&self, states: usize) -> TerminalObservedLengths {
         let mut lengths = TerminalObservedLengths::empty();
-        for state in states.as_slice() {
+        for state in self.alignment_state_sets[states].as_slice() {
             if state.transposition_pending {
                 continue;
             }

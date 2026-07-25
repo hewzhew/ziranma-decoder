@@ -54,6 +54,9 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   and keep the focused lightweight/full parity tests.
 - The one-edit alignment set may use its proven fixed bound of five states;
   never silently drop a state if that invariant changes.
+- Keep per-scan alignment transition reuse keyed only by the canonical complete
+  alignment-state set and one intended key. Do not share it across inputs or
+  error modes, and report actual versus reused checks separately.
 - Keep short sentence ranking covered by an unpruned full-path enumeration
   oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.

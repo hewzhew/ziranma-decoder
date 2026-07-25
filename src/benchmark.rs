@@ -203,6 +203,7 @@ fn add_sentence_stats(total: &mut SentenceSearchStats, sample: SentenceSearchSta
     total.segment_trie_scans += sample.segment_trie_scans;
     total.trie_path_visits += sample.trie_path_visits;
     total.alignment_states_examined += sample.alignment_states_examined;
+    total.alignment_states_reused += sample.alignment_states_reused;
     total.terminal_spelling_matches += sample.terminal_spelling_matches;
     total.lattice_transitions += sample.lattice_transitions;
     total.unresolved_lattice_transitions += sample.unresolved_lattice_transitions;

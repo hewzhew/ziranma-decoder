@@ -438,7 +438,10 @@ fn joint_search_reports_inspectable_work() {
 
     assert_eq!(candidates[0].text, "你好");
     assert!(stats.trie_path_visits > 0);
-    assert!(stats.alignment_states_examined >= stats.trie_path_visits);
+    assert!(stats.alignment_states_reused > 0);
+    assert!(
+        stats.alignment_states_examined + stats.alignment_states_reused >= stats.trie_path_visits
+    );
     assert!(stats.terminal_spelling_matches >= candidates.len());
 }
 
@@ -451,7 +454,10 @@ fn sentence_lattice_reports_streaming_search_work() {
     assert_eq!(candidates[0].text, "自然码输入法");
     assert!(stats.segment_trie_scans > 0);
     assert!(stats.trie_path_visits >= stats.segment_trie_scans);
-    assert!(stats.alignment_states_examined >= stats.trie_path_visits);
+    assert!(stats.alignment_states_reused > 0);
+    assert!(
+        stats.alignment_states_examined + stats.alignment_states_reused >= stats.trie_path_visits
+    );
     assert!(
         stats.terminal_spelling_matches + stats.unresolved_lattice_transitions
             >= stats.lattice_transitions

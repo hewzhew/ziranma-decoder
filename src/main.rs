@@ -285,9 +285,10 @@ fn print_latency(label: &str, summary: LatencySummary) {
 
 fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
     println!(
-        "  {label}：trie 扫描 {}；对齐状态 {}；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
+        "  {label}：trie 扫描 {}；对齐状态 {} 实查 + {} 复用；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
         stats.segment_trie_scans,
         stats.alignment_states_examined,
+        stats.alignment_states_reused,
         stats.lattice_transitions,
         stats.lattice_transitions_materialized,
         stats.lattice_transitions_retained,
@@ -339,7 +340,10 @@ fn run_search_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     print_decoded_candidates(observed, &candidates);
     println!("联合搜索统计：");
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
-    println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
+    println!(
+        "  按键对齐状态：{} 实查 + {} 精确复用",
+        stats.alignment_states_examined, stats.alignment_states_reused
+    );
     println!("  去重前终点拼写匹配：{}", stats.terminal_spelling_matches);
     Ok(())
 }
@@ -390,7 +394,10 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("句子 lattice 统计：");
     println!("  活跃词界 trie 扫描：{}", stats.segment_trie_scans);
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
-    println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
+    println!(
+        "  按键对齐状态：{} 实查 + {} 精确复用",
+        stats.alignment_states_examined, stats.alignment_states_reused
+    );
     println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
     println!(
         "  lattice 边生成/物化/保留：{} -> {} -> {}",
