@@ -4,10 +4,13 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ziranma_decoder::{
-    Candidate, Decoder, encode_pinyin_phrase, evaluate_synthetic, parse_lexicon_tsv,
+    BigramLanguageModel, Candidate, Decoder, encode_pinyin_phrase, evaluate_sentence_cases,
+    evaluate_synthetic, parse_lexicon_tsv,
 };
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
+const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
+const DEMO_SENTENCE_CASES: &str = include_str!("../tests/fixtures/public/demo_sentence_cases.tsv");
 
 fn main() -> ExitCode {
     match run() {
@@ -35,7 +38,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "encode" => run_encode(&arguments[1..]),
         "evaluate" => run_evaluate(&arguments[1..]),
         "decode" => run_decode(&arguments[1..]),
-        "sentence" => run_sentence(&arguments[1..]),
+        "sentence" => run_sentence(&arguments[1..], true),
+        "sentence-unigram" => run_sentence(&arguments[1..], false),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
     }
@@ -62,9 +66,14 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("evaluate 不接受额外参数".into());
     }
     let lexicon = parse_lexicon_tsv(DEMO_LEXICON)?;
-    let decoder = Decoder::new(lexicon.clone());
+    let unigram_decoder = Decoder::new(lexicon.clone());
+    let model = BigramLanguageModel::from_tsv(DEMO_BIGRAM_CORPUS, &lexicon)?;
+    let decoder = Decoder::new(lexicon.clone()).with_bigram_model(model);
     let started = Instant::now();
-    let report = evaluate_synthetic(&decoder, &lexicon);
+    let report = evaluate_synthetic(&unigram_decoder, &lexicon);
+    let unigram_sentences =
+        evaluate_sentence_cases(&unigram_decoder, &lexicon, DEMO_SENTENCE_CASES)?;
+    let bigram_sentences = evaluate_sentence_cases(&decoder, &lexicon, DEMO_SENTENCE_CASES)?;
     let elapsed = started.elapsed();
 
     println!(
@@ -90,6 +99,20 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         report.clean_top_1_exact_rate() * 100.0
     );
     println!(
+        "分离句例 unigram：{}/{} Top-1（{:.1}%），Top-5 {:.1}%",
+        unigram_sentences.hits_at_1,
+        unigram_sentences.total,
+        unigram_sentences.recall_at_1() * 100.0,
+        unigram_sentences.recall_at_5() * 100.0
+    );
+    println!(
+        "分离句例 bigram ：{}/{} Top-1（{:.1}%），Top-5 {:.1}%",
+        bigram_sentences.hits_at_1,
+        bigram_sentences.total,
+        bigram_sentences.recall_at_1() * 100.0,
+        bigram_sentences.recall_at_5() * 100.0
+    );
+    println!(
         "本次评测耗时：{:.3} ms（仅供本机观察，不是稳定基准）",
         elapsed.as_secs_f64() * 1000.0
     );
@@ -107,7 +130,7 @@ fn run_decode(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     decode_and_print(observed, top_k)
 }
 
-fn run_sentence(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+fn run_sentence(arguments: &[String], use_bigram: bool) -> Result<(), Box<dyn Error>> {
     let Some(observed) = arguments.first() else {
         return Err("sentence 需要一个没有词界的按键串".into());
     };
@@ -117,9 +140,21 @@ fn run_sentence(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let lexicon = parse_lexicon_tsv(DEMO_LEXICON)?;
-    let decoder = Decoder::new(lexicon);
+    let decoder = if use_bigram {
+        let model = BigramLanguageModel::from_tsv(DEMO_BIGRAM_CORPUS, &lexicon)?;
+        Decoder::new(lexicon).with_bigram_model(model)
+    } else {
+        Decoder::new(lexicon)
+    };
     let candidates = decoder.decode_sentence(observed, top_k)?;
-    println!("整串输入：{observed}");
+    println!(
+        "整串输入：{observed}（{}）",
+        if use_bigram {
+            "unigram + bigram"
+        } else {
+            "仅 unigram"
+        }
+    );
     if candidates.is_empty() {
         println!("演示词典中没有能够覆盖完整按键串的分词路径。");
         return Ok(());
@@ -142,6 +177,22 @@ fn run_sentence(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 segment.candidate.spelling.description(),
                 segment.candidate.correction.description()
             );
+            if let Some(bigram) = segment.language_score.bigram {
+                println!(
+                    "      语言分 {:.3} = unigram {:.3} 与 bigram {:.3} 插值；共现 {}/{}，α={:.1}",
+                    segment.language_score.interpolated_log_probability,
+                    segment.language_score.unigram_log_probability,
+                    bigram.log_probability,
+                    bigram.observed_count,
+                    bigram.predecessor_total,
+                    bigram.alpha
+                );
+            } else {
+                println!(
+                    "      语言分 {:.3}（首词或未启用 bigram，使用 unigram）",
+                    segment.language_score.interpolated_log_probability
+                );
+            }
         }
     }
     Ok(())
@@ -210,6 +261,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- encode <无声调拼音...>
   cargo run -- decode <按键串> [Top-K]
   cargo run -- sentence <无词界按键串> [Top-K]
+  cargo run -- sentence-unigram <按键串> [Top-K]
   cargo run -- evaluate
 
 兼容简写：

@@ -1,0 +1,16 @@
+# Public, manually constructed sentence-ranking cases, separate from model rows.
+# Tokens are lexicon words; observed keys are derived automatically.
+id	tokens
+ziranma_ime	自然码 输入法
+double_ime	双拼 输入法
+double_abbreviation	双拼 简拼
+key_keyboard	按键 键盘
+local_decode	本地 解码 测试
+language_model	语言 模型 概率
+lexicon_frequency	词典 词频 排序
+privacy_safety	个人 隐私 安全
+public_data	公开 数据 测试
+performance	性能 测试 延迟
+accuracy_recall	准确 召回 评测
+key_error	按键 错误 纠错
+search_rank	搜索 候选 排序

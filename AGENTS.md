@@ -22,10 +22,15 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   real-world input accuracy.
 - Preserve the sentence decoder's explicit global error budget; do not let
   each word silently receive its own independent correction.
+- Preserve the conservative sentence ordering that ranks complete zero-error
+  paths ahead of corrected paths.
+- Keep trie changes covered by exhaustive-reference parity tests.
 - Add focused tests with each behavioral change.
 - Do not perform broad refactors without tests that preserve behavior.
 - Treat synthetic frequency weights as experimental configuration, never as
   measured linguistic truth.
+- Treat the demo bigram corpus as hand-authored test configuration, not as a
+  representative Chinese corpus.
 
 ## Privacy rules
 

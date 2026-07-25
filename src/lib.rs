@@ -2,19 +2,25 @@
 //!
 //! The current research baseline supports full-code and mixed-abbreviation
 //! spellings, together with at most one local key error. It deliberately uses
-//! exhaustive search over a small public lexicon so every decision remains
-//! inspectable.
+//! a prebuilt spelling trie and inspectable local language scores.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
 mod codec;
 mod evaluation;
+mod language_model;
 
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
-pub use evaluation::{EvaluationReport, RecallMetrics, SyntheticCaseKind, evaluate_synthetic};
+pub use evaluation::{
+    EvaluationReport, RecallMetrics, SentenceCaseParseError, SentenceCaseReport, SyntheticCaseKind,
+    evaluate_sentence_cases, evaluate_synthetic,
+};
+pub use language_model::{BigramLanguageModel, BigramScore, LanguageModelParseError};
+
+const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;
 
 /// A validated, lowercase ASCII key sequence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -213,6 +219,19 @@ pub struct SentenceSegment {
     pub observed: KeySequence,
     /// Word candidate and its local spelling/error explanation.
     pub candidate: Candidate,
+    /// Context-sensitive language evidence for this segment.
+    pub language_score: SentenceLanguageScore,
+}
+
+/// Explainable unigram/bigram interpolation for one sentence segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SentenceLanguageScore {
+    /// `ln P(word)` from normalized synthetic lexicon weights.
+    pub unigram_log_probability: f64,
+    /// Conditional evidence when a previous word and bigram model exist.
+    pub bigram: Option<BigramScore>,
+    /// Language log score used by the dynamic program.
+    pub interpolated_log_probability: f64,
 }
 
 /// A complete segmentation of an unseparated key sequence.
@@ -224,9 +243,11 @@ pub struct SentenceCandidate {
     pub segments: Vec<SentenceSegment>,
     /// Sum of normalized unigram log probabilities and local penalties.
     pub total_score: f64,
+    /// Whether the complete path consumed the global error budget.
+    pub used_error: bool,
 }
 
-/// Tunable penalties for the exhaustive research baseline.
+/// Tunable penalties for the research decoder.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecodeConfig {
     /// Penalty for one QWERTY-neighbor substitution.
@@ -253,18 +274,23 @@ impl Default for DecodeConfig {
     }
 }
 
-/// Exhaustive decoder over a small lexicon.
+/// Trie-backed decoder over a local lexicon.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     lexicon: Vec<LexiconEntry>,
+    trie: SpellingTrie,
+    language_model: Option<BigramLanguageModel>,
     config: DecodeConfig,
 }
 
 impl Decoder {
     /// Creates a decoder with conservative default penalties.
     pub fn new(lexicon: Vec<LexiconEntry>) -> Self {
+        let trie = SpellingTrie::new(&lexicon);
         Self {
             lexicon,
+            trie,
+            language_model: None,
             config: DecodeConfig::default(),
         }
     }
@@ -289,7 +315,19 @@ impl Decoder {
                 .all(|penalty| penalty.is_finite() && *penalty >= 0.0),
             "all penalties must be finite and non-negative"
         );
-        Self { lexicon, config }
+        let trie = SpellingTrie::new(&lexicon);
+        Self {
+            lexicon,
+            trie,
+            language_model: None,
+            config,
+        }
+    }
+
+    /// Attaches a local bigram model for context-sensitive sentence ranking.
+    pub fn with_bigram_model(mut self, language_model: BigramLanguageModel) -> Self {
+        self.language_model = Some(language_model);
+        self
     }
 
     /// Returns at most `top_k` matching candidates in deterministic score order.
@@ -299,20 +337,7 @@ impl Decoder {
             return Ok(Vec::new());
         }
 
-        let mut candidates = self
-            .lexicon
-            .iter()
-            .filter_map(|entry| {
-                spelling_variants(&entry.syllable_codes)
-                    .into_iter()
-                    .filter_map(|spelling| {
-                        let correction =
-                            detect_correction(observed.as_str(), spelling.code.as_str())?;
-                        Some(self.make_candidate(entry, spelling, correction))
-                    })
-                    .min_by(candidate_order)
-            })
-            .collect::<Vec<_>>();
+        let mut candidates = self.lookup_candidates(observed.as_str(), true);
 
         candidates.sort_by(candidate_order);
         candidates.truncate(top_k);
@@ -367,6 +392,7 @@ impl Decoder {
                         &unused_paths,
                         &transition,
                         log_frequency_total,
+                        self.language_model.as_ref(),
                         &mut target_states[transition.end],
                     );
                 }
@@ -379,6 +405,7 @@ impl Decoder {
                         &used_paths,
                         &transition,
                         log_frequency_total,
+                        self.language_model.as_ref(),
                         &mut with_error[transition.end],
                     );
                 }
@@ -387,13 +414,19 @@ impl Decoder {
 
         let mut complete = without_error[length]
             .drain(..)
-            .chain(with_error[length].drain(..))
             .map(|path| SentenceCandidate {
                 text: path.text,
                 segments: path.segments,
                 total_score: path.total_score,
+                used_error: false,
             })
             .collect::<Vec<_>>();
+        complete.extend(with_error[length].drain(..).map(|path| SentenceCandidate {
+            text: path.text,
+            segments: path.segments,
+            total_score: path.total_score,
+            used_error: true,
+        }));
         complete.sort_by(sentence_order);
 
         let mut seen_text = HashSet::new();
@@ -409,49 +442,50 @@ impl Decoder {
         allow_error: bool,
     ) -> Vec<SegmentTransition> {
         let mut transitions = Vec::new();
-        for entry in &self.lexicon {
-            for spelling in spelling_variants(&entry.syllable_codes) {
-                let intended_length = spelling.code.as_str().len();
-                let mut observed_lengths = vec![intended_length];
-                if allow_error {
-                    if intended_length > 1 {
-                        observed_lengths.push(intended_length - 1);
-                    }
-                    observed_lengths.push(intended_length + 1);
-                }
-                observed_lengths.sort_unstable();
-                observed_lengths.dedup();
-
-                for observed_length in observed_lengths {
-                    let end = start + observed_length;
-                    if end > observed.len() {
-                        continue;
-                    }
-                    let observed_segment = &observed[start..end];
-                    let Some(correction) =
-                        detect_correction(observed_segment, spelling.code.as_str())
-                    else {
-                        continue;
-                    };
-                    let uses_error = correction != Correction::Exact;
-                    if uses_error && !allow_error {
-                        continue;
-                    }
-
-                    let transition = SegmentTransition {
-                        end,
-                        uses_error,
-                        segment: SentenceSegment {
-                            observed: KeySequence::new(observed_segment)
-                                .expect("a sentence slice is lowercase ASCII"),
-                            candidate: self.make_candidate(entry, spelling.clone(), correction),
-                        },
-                    };
-                    upsert_transition(&mut transitions, transition);
-                }
+        let maximum_length = self.trie.maximum_code_length + usize::from(allow_error);
+        let remaining = observed.len() - start;
+        for observed_length in 1..=maximum_length.min(remaining) {
+            let end = start + observed_length;
+            let observed_segment = &observed[start..end];
+            for candidate in self.lookup_candidates(observed_segment, allow_error) {
+                let transition = SegmentTransition {
+                    end,
+                    uses_error: candidate.correction != Correction::Exact,
+                    observed: KeySequence::new(observed_segment)
+                        .expect("a sentence slice is lowercase ASCII"),
+                    candidate,
+                };
+                upsert_transition(&mut transitions, transition);
             }
         }
         transitions
+    }
+
+    fn lookup_candidates(&self, observed: &str, allow_error: bool) -> Vec<Candidate> {
+        let mut best_by_entry = HashMap::<usize, Candidate>::new();
+        for hypothesis in key_hypotheses(observed, allow_error) {
+            for terminal in self.trie.lookup(&hypothesis.code) {
+                let entry = &self.lexicon[terminal.entry_index];
+                let candidate = self.make_candidate(
+                    entry,
+                    terminal.spelling.clone(),
+                    hypothesis.correction.clone(),
+                );
+                match best_by_entry.entry(terminal.entry_index) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if candidate_order(&candidate, slot.get()) == Ordering::Less {
+                            slot.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        let mut candidates = best_by_entry.into_values().collect::<Vec<_>>();
+        candidates.sort_by(candidate_order);
+        candidates
     }
 
     fn make_candidate(
@@ -491,6 +525,172 @@ impl Decoder {
 }
 
 #[derive(Clone, Debug)]
+struct SpellingTrie {
+    nodes: Vec<TrieNode>,
+    maximum_code_length: usize,
+}
+
+impl SpellingTrie {
+    fn new(lexicon: &[LexiconEntry]) -> Self {
+        let mut trie = Self {
+            nodes: vec![TrieNode::new()],
+            maximum_code_length: 0,
+        };
+        for (entry_index, entry) in lexicon.iter().enumerate() {
+            for spelling in spelling_variants(&entry.syllable_codes) {
+                trie.insert(entry_index, spelling);
+            }
+        }
+        trie
+    }
+
+    fn insert(&mut self, entry_index: usize, spelling: Spelling) {
+        self.maximum_code_length = self.maximum_code_length.max(spelling.code.as_str().len());
+        let mut node_index = 0;
+        for key in spelling.code.as_str().bytes() {
+            let child_slot = (key - b'a') as usize;
+            node_index = match self.nodes[node_index].children[child_slot] {
+                Some(child) => child,
+                None => {
+                    let child = self.nodes.len();
+                    self.nodes.push(TrieNode::new());
+                    self.nodes[node_index].children[child_slot] = Some(child);
+                    child
+                }
+            };
+        }
+        self.nodes[node_index].terminals.push(TrieTerminal {
+            entry_index,
+            spelling,
+        });
+    }
+
+    fn lookup(&self, code: &str) -> &[TrieTerminal] {
+        let mut node_index = 0;
+        for key in code.bytes() {
+            let child_slot = (key - b'a') as usize;
+            let Some(child) = self.nodes[node_index].children[child_slot] else {
+                return &[];
+            };
+            node_index = child;
+        }
+        &self.nodes[node_index].terminals
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrieNode {
+    children: [Option<usize>; 26],
+    terminals: Vec<TrieTerminal>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        Self {
+            children: [None; 26],
+            terminals: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrieTerminal {
+    entry_index: usize,
+    spelling: Spelling,
+}
+
+#[derive(Clone, Debug)]
+struct KeyHypothesis {
+    code: String,
+    correction: Correction,
+}
+
+fn key_hypotheses(observed: &str, allow_error: bool) -> Vec<KeyHypothesis> {
+    let observed_bytes = observed.as_bytes();
+    let mut hypotheses = vec![KeyHypothesis {
+        code: observed.to_owned(),
+        correction: Correction::Exact,
+    }];
+    if !allow_error {
+        return hypotheses;
+    }
+
+    for index in 0..observed_bytes.len() {
+        for intended in b'a'..=b'z' {
+            if are_qwerty_neighbors(intended, observed_bytes[index]) {
+                let mut code = observed_bytes.to_vec();
+                code[index] = intended;
+                hypotheses.push(KeyHypothesis {
+                    code: String::from_utf8(code).expect("generated keys are lowercase ASCII"),
+                    correction: Correction::NeighborSubstitution {
+                        index,
+                        intended: intended as char,
+                        actual: observed_bytes[index] as char,
+                    },
+                });
+            }
+        }
+    }
+
+    for start in 0..observed_bytes.len().saturating_sub(1) {
+        if observed_bytes[start] != observed_bytes[start + 1] {
+            let mut code = observed_bytes.to_vec();
+            code.swap(start, start + 1);
+            hypotheses.push(KeyHypothesis {
+                correction: Correction::AdjacentTransposition {
+                    start,
+                    intended_left: code[start] as char,
+                    intended_right: code[start + 1] as char,
+                },
+                code: String::from_utf8(code).expect("generated keys are lowercase ASCII"),
+            });
+        }
+    }
+
+    let mut missing_by_code = BTreeMap::new();
+    for index in 0..=observed_bytes.len() {
+        for intended in b'a'..=b'z' {
+            let mut code = observed_bytes.to_vec();
+            code.insert(index, intended);
+            missing_by_code.insert(
+                String::from_utf8(code).expect("generated keys are lowercase ASCII"),
+                Correction::MissingKey {
+                    index,
+                    intended: intended as char,
+                },
+            );
+        }
+    }
+    hypotheses.extend(
+        missing_by_code
+            .into_iter()
+            .map(|(code, correction)| KeyHypothesis { code, correction }),
+    );
+
+    if observed_bytes.len() > 1 {
+        let mut extra_by_code = BTreeMap::new();
+        for index in 0..observed_bytes.len() {
+            let mut code = observed_bytes.to_vec();
+            code.remove(index);
+            extra_by_code.insert(
+                String::from_utf8(code).expect("generated keys are lowercase ASCII"),
+                Correction::ExtraKey {
+                    index,
+                    actual: observed_bytes[index] as char,
+                },
+            );
+        }
+        hypotheses.extend(
+            extra_by_code
+                .into_iter()
+                .map(|(code, correction)| KeyHypothesis { code, correction }),
+        );
+    }
+
+    hypotheses
+}
+
+#[derive(Clone, Debug)]
 struct PartialSentence {
     text: String,
     segments: Vec<SentenceSegment>,
@@ -501,25 +701,48 @@ struct PartialSentence {
 struct SegmentTransition {
     end: usize,
     uses_error: bool,
-    segment: SentenceSegment,
+    observed: KeySequence,
+    candidate: Candidate,
 }
 
 fn extend_paths(
     paths: &[PartialSentence],
     transition: &SegmentTransition,
     log_frequency_total: f64,
+    language_model: Option<&BigramLanguageModel>,
     destination: &mut Vec<PartialSentence>,
 ) {
     for path in paths {
         let mut text = path.text.clone();
-        text.push_str(&transition.segment.candidate.text);
+        text.push_str(&transition.candidate.text);
+
+        let unigram_log_probability = transition.candidate.score.frequency - log_frequency_total;
+        let bigram = path.segments.last().and_then(|previous| {
+            language_model
+                .map(|model| model.score(&previous.candidate.text, &transition.candidate.text))
+        });
+        let interpolated_log_probability = bigram.map_or(unigram_log_probability, |bigram| {
+            (1.0 - BIGRAM_INTERPOLATION_WEIGHT) * unigram_log_probability
+                + BIGRAM_INTERPOLATION_WEIGHT * bigram.log_probability
+        });
+        let language_score = SentenceLanguageScore {
+            unigram_log_probability,
+            bigram,
+            interpolated_log_probability,
+        };
+
         let mut segments = path.segments.clone();
-        segments.push(transition.segment.clone());
+        segments.push(SentenceSegment {
+            observed: transition.observed.clone(),
+            candidate: transition.candidate.clone(),
+            language_score,
+        });
         destination.push(PartialSentence {
             text,
             segments,
-            total_score: path.total_score + transition.segment.candidate.score.total
-                - log_frequency_total,
+            total_score: path.total_score + interpolated_log_probability
+                - transition.candidate.score.abbreviation_penalty
+                - transition.candidate.score.correction_penalty,
         });
     }
 }
@@ -528,13 +751,11 @@ fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: Segmen
     let duplicate = transitions.iter_mut().find(|existing| {
         existing.end == candidate.end
             && existing.uses_error == candidate.uses_error
-            && existing.segment.candidate.text == candidate.segment.candidate.text
-            && existing.segment.candidate.code == candidate.segment.candidate.code
+            && existing.candidate.text == candidate.candidate.text
+            && existing.candidate.code == candidate.candidate.code
     });
     if let Some(existing) = duplicate {
-        if candidate_order(&candidate.segment.candidate, &existing.segment.candidate)
-            == Ordering::Less
-        {
+        if candidate_order(&candidate.candidate, &existing.candidate) == Ordering::Less {
             *existing = candidate;
         }
     } else {
@@ -544,8 +765,15 @@ fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: Segmen
 
 fn prune_partial_paths(paths: &mut Vec<PartialSentence>, beam_width: usize) {
     paths.sort_by(partial_sentence_order);
-    let mut seen_text = HashSet::new();
-    paths.retain(|path| seen_text.insert(path.text.clone()));
+    let mut seen_state = HashSet::new();
+    paths.retain(|path| {
+        let previous_word = path
+            .segments
+            .last()
+            .map(|segment| segment.candidate.text.as_str())
+            .unwrap_or("");
+        seen_state.insert((path.text.clone(), previous_word.to_owned()))
+    });
     paths.truncate(beam_width);
 }
 
@@ -558,9 +786,9 @@ fn partial_sentence_order(left: &PartialSentence, right: &PartialSentence) -> Or
 }
 
 fn sentence_order(left: &SentenceCandidate, right: &SentenceCandidate) -> Ordering {
-    right
-        .total_score
-        .total_cmp(&left.total_score)
+    left.used_error
+        .cmp(&right.used_error)
+        .then_with(|| right.total_score.total_cmp(&left.total_score))
         .then_with(|| left.segments.len().cmp(&right.segments.len()))
         .then_with(|| left.text.cmp(&right.text))
 }
@@ -795,6 +1023,7 @@ impl fmt::Display for LexiconParseError {
 
 impl Error for LexiconParseError {}
 
+#[cfg(test)]
 fn detect_correction(observed: &str, intended: &str) -> Option<Correction> {
     if observed.len() + 1 == intended.len() {
         let index = single_removed_index(observed.as_bytes(), intended.as_bytes())?;
@@ -847,6 +1076,7 @@ fn detect_correction(observed: &str, intended: &str) -> Option<Correction> {
     }
 }
 
+#[cfg(test)]
 fn single_removed_index(shorter: &[u8], longer: &[u8]) -> Option<usize> {
     if shorter.len() + 1 != longer.len() {
         return None;
@@ -906,8 +1136,11 @@ pub(crate) fn are_qwerty_neighbors(left: u8, right: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Correction, KeySequence, are_qwerty_neighbors, detect_correction, spelling_variants,
+        Candidate, Correction, Decoder, KeySequence, are_qwerty_neighbors, candidate_order,
+        detect_correction, parse_lexicon_tsv, spelling_variants,
     };
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 
     #[test]
     fn key_sequence_accepts_only_lowercase_ascii() {
@@ -981,5 +1214,40 @@ mod tests {
         assert!(detect_correction("niqk", "nihk").is_none());
         assert!(detect_correction("nifj", "nihk").is_none());
         assert!(detect_correction("ni", "nihk").is_none());
+    }
+
+    #[test]
+    fn trie_lookup_matches_the_exhaustive_reference() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let decoder = Decoder::new(lexicon);
+
+        for observed in [
+            "nihk", "nigk", "nikh", "nik", "niihk", "nh", "ni", "zrm", "urf", "ajjp",
+        ] {
+            assert_eq!(
+                decoder.decode(observed, 10).unwrap(),
+                exhaustive_reference(&decoder, observed, 10),
+                "{observed}"
+            );
+        }
+    }
+
+    fn exhaustive_reference(decoder: &Decoder, observed: &str, top_k: usize) -> Vec<Candidate> {
+        let mut candidates = decoder
+            .lexicon
+            .iter()
+            .filter_map(|entry| {
+                spelling_variants(&entry.syllable_codes)
+                    .into_iter()
+                    .filter_map(|spelling| {
+                        let correction = detect_correction(observed, spelling.code.as_str())?;
+                        Some(decoder.make_candidate(entry, spelling, correction))
+                    })
+                    .min_by(candidate_order)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(candidate_order);
+        candidates.truncate(top_k);
+        candidates
     }
 }

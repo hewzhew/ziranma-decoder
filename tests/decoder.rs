@@ -1,6 +1,9 @@
-use ziranma_decoder::{Correction, Decoder, LexiconParseError, parse_lexicon_tsv};
+use ziranma_decoder::{
+    BigramLanguageModel, Correction, Decoder, LexiconParseError, parse_lexicon_tsv,
+};
 
 const PUBLIC_DEMO_LEXICON: &str = include_str!("fixtures/public/demo_lexicon.tsv");
+const PUBLIC_BIGRAM_CORPUS: &str = include_str!("fixtures/public/demo_bigram_corpus.tsv");
 
 fn demo_decoder() -> Decoder {
     Decoder::new(
@@ -241,4 +244,33 @@ fn sentence_decoder_shares_one_error_budget_across_words() {
             ..
         }
     ));
+}
+
+#[test]
+fn sentence_decoder_prefers_complete_exact_path_over_correction() {
+    let candidates = demo_decoder().decode_sentence("ajjp", 10).unwrap();
+
+    assert_eq!(candidates[0].text, "按键简拼");
+    assert!(!candidates[0].used_error);
+    assert!(
+        candidates
+            .iter()
+            .position(|candidate| candidate.text == "按键")
+            .is_some_and(|rank| rank > 0)
+    );
+}
+
+#[test]
+fn bigram_context_resolves_same_code_word_ambiguity() {
+    let lexicon = parse_lexicon_tsv(PUBLIC_DEMO_LEXICON).unwrap();
+    let model = BigramLanguageModel::from_tsv(PUBLIC_BIGRAM_CORPUS, &lexicon).unwrap();
+    let decoder = Decoder::new(lexicon).with_bigram_model(model);
+    let candidates = decoder.decode_sentence("ajjp", 10).unwrap();
+
+    assert_eq!(candidates[0].text, "按键键盘");
+    let evidence = candidates[0].segments[1]
+        .language_score
+        .bigram
+        .expect("second word should have bigram evidence");
+    assert_eq!(evidence.observed_count, 100);
 }
