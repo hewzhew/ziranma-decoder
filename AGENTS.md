@@ -48,6 +48,12 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   same child ranking state. The current unigram-only optimization must stay
   disabled when bigram text changes the next state; keep both the focused
   bigram boundary test and the unpruned-lattice oracle.
+- Pre-materialization terminal reduction must remain transition-for-transition
+  equivalent to reducing complete candidates. Preserve `(text, canonical
+  code)` identity even for callers that construct duplicate entries directly,
+  and keep the focused lightweight/full parity tests.
+- The one-edit alignment set may use its proven fixed bound of five states;
+  never silently drop a state if that invariant changes.
 - Keep short sentence ranking covered by an unpruned full-path enumeration
   oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.

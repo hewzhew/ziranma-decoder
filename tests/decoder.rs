@@ -410,6 +410,10 @@ fn bigram_lattice_preserves_text_distinct_future_states() {
         stats.lattice_transitions_retained,
         stats.lattice_transitions
     );
+    assert_eq!(
+        stats.lattice_transitions_materialized,
+        stats.lattice_transitions
+    );
 }
 
 #[test]
@@ -453,8 +457,10 @@ fn sentence_lattice_reports_streaming_search_work() {
             >= stats.lattice_transitions
     );
     assert!(stats.lattice_transitions > 0);
+    assert!(stats.lattice_transitions_materialized > 0);
+    assert!(stats.lattice_transitions_materialized <= stats.lattice_transitions);
     assert!(stats.lattice_transitions_retained > 0);
-    assert!(stats.lattice_transitions_retained <= stats.lattice_transitions);
+    assert!(stats.lattice_transitions_retained <= stats.lattice_transitions_materialized);
     assert!(stats.unresolved_lattice_transitions > 0);
     assert!(stats.unresolved_lattice_transitions_retained <= stats.unresolved_lattice_transitions);
     assert!(stats.ranking_states_evaluated > 0);
@@ -469,6 +475,7 @@ fn sentence_lattice_exactly_reduces_same_future_state_transitions() {
         .decode_sentence_with_stats("zrmurf", 5)
         .unwrap();
 
+    assert!(stats.lattice_transitions_materialized < stats.lattice_transitions);
     assert!(stats.lattice_transitions_retained < stats.lattice_transitions);
     assert!(stats.ranking_transitions_retained <= stats.ranking_transitions_considered);
 }

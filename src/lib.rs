@@ -342,6 +342,8 @@ pub struct SentenceSearchStats {
     pub lattice_transitions: usize,
     /// One-key unresolved-input edges included in `lattice_transitions`.
     pub unresolved_lattice_transitions: usize,
+    /// Generated edges whose complete candidate objects were materialized.
+    pub lattice_transitions_materialized: usize,
     /// Generated edges retained in the final lattice after exact reduction.
     pub lattice_transitions_retained: usize,
     /// Retained unresolved-input edges.
@@ -362,6 +364,7 @@ pub struct SentenceSearchStats {
 #[derive(Clone, Debug)]
 pub struct Decoder {
     lexicon: Vec<LexiconEntry>,
+    entry_identity_ids: Vec<usize>,
     trie: SyllableTrie,
     language_model: Option<BigramLanguageModel>,
     config: DecodeConfig,
@@ -370,13 +373,7 @@ pub struct Decoder {
 impl Decoder {
     /// Creates a decoder with conservative default penalties.
     pub fn new(lexicon: Vec<LexiconEntry>) -> Self {
-        let trie = SyllableTrie::new(&lexicon);
-        Self {
-            lexicon,
-            trie,
-            language_model: None,
-            config: DecodeConfig::default(),
-        }
+        Self::with_config(lexicon, DecodeConfig::default())
     }
 
     /// Creates a decoder with explicit penalties.
@@ -401,8 +398,10 @@ impl Decoder {
             "all penalties must be finite and non-negative"
         );
         let trie = SyllableTrie::new(&lexicon);
+        let entry_identity_ids = lexicon_entry_identity_ids(&lexicon);
         Self {
             lexicon,
+            entry_identity_ids,
             trie,
             language_model: None,
             config,
@@ -533,12 +532,19 @@ impl Decoder {
             if !exact_reachable[start] && !error_reachable[start] {
                 continue;
             }
-            let mut transitions =
-                self.segment_transitions(observed, start, exact_reachable[start], search_stats);
+            let mut transitions = self.segment_transitions(
+                observed,
+                start,
+                exact_reachable[start],
+                error_reachable[start],
+                top_k,
+                search_stats,
+            );
             transitions.push(self.unresolved_transition(observed, start));
             transitions.sort_by(segment_transition_order);
             search_stats.lattice_transitions += 1;
             search_stats.unresolved_lattice_transitions += 1;
+            search_stats.lattice_transitions_materialized += 1;
 
             if self.language_model.is_none()
                 && let Some(top_k) = top_k
@@ -823,21 +829,44 @@ impl Decoder {
         &self,
         observed: &str,
         start: usize,
-        allow_error: bool,
+        exact_reachable: bool,
+        error_reachable: bool,
+        top_k: Option<usize>,
         search_stats: &mut SentenceSearchStats,
     ) -> Vec<SegmentTransition> {
         search_stats.segment_trie_scans += 1;
         let mut word_stats = DecodeSearchStats::default();
-        let mut transitions = SegmentTransitionAccumulator::default();
-        let matches = self
-            .trie
-            .lookup_prefixes(&observed[start..], allow_error, &mut word_stats);
+        let matches =
+            self.trie
+                .lookup_prefixes(&observed[start..], exact_reachable, &mut word_stats);
         word_stats.terminal_spelling_matches += matches.len();
         search_stats.trie_path_visits += word_stats.trie_path_visits;
         search_stats.alignment_states_examined += word_stats.alignment_states_examined;
         search_stats.terminal_spelling_matches += word_stats.terminal_spelling_matches;
 
+        let mut matches_by_identity = NoisyTerminalAccumulator::default();
         for terminal in matches {
+            matches_by_identity.upsert(
+                terminal,
+                &self.lexicon,
+                &self.entry_identity_ids,
+                &self.config,
+            );
+        }
+        let matches = matches_by_identity.into_matches();
+        search_stats.lattice_transitions += matches.len();
+        let matches = if self.language_model.is_none()
+            && let Some(top_k) = top_k
+        {
+            self.compact_unigram_terminal_matches(matches, exact_reachable, error_reachable, top_k)
+        } else {
+            matches
+        };
+        search_stats.lattice_transitions_materialized += matches.len();
+
+        let mut transitions = Vec::with_capacity(matches.len());
+        for scored_terminal in matches {
+            let terminal = scored_terminal.terminal;
             let end = start + terminal.observed_length;
             let observed_segment = &observed[start..end];
             let entry = &self.lexicon[terminal.entry_index];
@@ -849,12 +878,44 @@ impl Decoder {
                     .expect("a sentence slice is lowercase ASCII"),
                 candidate,
             };
-            transitions.upsert(transition);
+            transitions.push(transition);
         }
-        let mut transitions = transitions.into_transitions();
         transitions.sort_by(segment_transition_order);
-        search_stats.lattice_transitions += transitions.len();
         transitions
+    }
+
+    fn compact_unigram_terminal_matches(
+        &self,
+        matches: Vec<ScoredNoisyTerminal>,
+        exact_reachable: bool,
+        error_reachable: bool,
+        top_k: usize,
+    ) -> Vec<ScoredNoisyTerminal> {
+        debug_assert!(self.language_model.is_none());
+        let mut retained = NoisyTerminalAccumulator::default();
+        if exact_reachable {
+            for terminal in retain_noisy_top_k_by_child(
+                collapse_noisy_error_layers(&matches, &self.lexicon),
+                false,
+                top_k,
+                &self.lexicon,
+            ) {
+                retained.upsert_scored(terminal, &self.lexicon);
+            }
+        }
+        if error_reachable {
+            let exact_matches = matches
+                .iter()
+                .filter(|terminal| !terminal.uses_error())
+                .cloned()
+                .collect::<Vec<_>>();
+            for terminal in retain_noisy_top_k_by_child(exact_matches, true, top_k, &self.lexicon) {
+                retained.upsert_scored(terminal, &self.lexicon);
+            }
+        }
+        let mut retained = retained.into_matches();
+        retained.sort_by(|left, right| noisy_terminal_segment_order(left, right, &self.lexicon));
+        retained
     }
 
     fn unresolved_transition(&self, observed: &str, start: usize) -> SegmentTransition {
@@ -975,13 +1036,7 @@ impl Decoder {
     }
 
     fn correction_penalty(&self, correction: &Correction) -> f64 {
-        match correction {
-            Correction::Exact => 0.0,
-            Correction::NeighborSubstitution { .. } => self.config.neighbor_substitution_penalty,
-            Correction::AdjacentTransposition { .. } => self.config.adjacent_transposition_penalty,
-            Correction::MissingKey { .. } => self.config.missing_key_penalty,
-            Correction::ExtraKey { .. } => self.config.extra_key_penalty,
-        }
+        configured_correction_penalty(&self.config, correction)
     }
 }
 
@@ -1075,7 +1130,8 @@ impl SyllableTrie {
             used_error: false,
             transposition_pending: false,
         };
-        self.collect_noisy_matches(0, 0, &[initial_state], &mut search);
+        let initial_states = AlignmentStates::singleton(initial_state);
+        self.collect_noisy_matches(0, 0, &initial_states, &mut search);
         search.matches
     }
 
@@ -1083,14 +1139,14 @@ impl SyllableTrie {
         &self,
         node_index: usize,
         syllable_index: usize,
-        states: &[AlignmentState],
+        states: &AlignmentStates,
         search: &mut TrieSearch<'_>,
     ) {
         search.stats.trie_path_visits += 1;
         let node = &self.nodes[node_index];
         if !node.terminals.is_empty() {
             let observed_lengths = search.terminal_observed_lengths(states);
-            for observed_length in observed_lengths {
+            for &observed_length in observed_lengths.as_slice() {
                 let observed_prefix = std::str::from_utf8(&search.observed[..observed_length])
                     .expect("decoder inputs are validated lowercase ASCII");
                 if let Some(correction) = detect_correction(observed_prefix, &search.intended)
@@ -1238,11 +1294,290 @@ struct NoisyTrieTerminal {
     correction: Correction,
 }
 
+#[derive(Clone, Debug)]
+struct ScoredNoisyTerminal {
+    terminal: NoisyTrieTerminal,
+    entry_identity: usize,
+    total_score: f64,
+}
+
+impl ScoredNoisyTerminal {
+    fn new(
+        terminal: NoisyTrieTerminal,
+        lexicon: &[LexiconEntry],
+        entry_identity_ids: &[usize],
+        config: &DecodeConfig,
+    ) -> Self {
+        let entry = &lexicon[terminal.entry_index];
+        let entry_identity = entry_identity_ids[terminal.entry_index];
+        let total_score = (entry.frequency as f64).ln()
+            - configured_correction_penalty(config, &terminal.correction)
+            - terminal.spelling.abbreviated_syllables.len() as f64
+                * config.abbreviation_penalty_per_syllable;
+        Self {
+            terminal,
+            entry_identity,
+            total_score,
+        }
+    }
+
+    fn uses_error(&self) -> bool {
+        self.terminal.correction != Correction::Exact
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NoisyTerminalIdentity {
+    entry_identity: usize,
+    observed_length: usize,
+    uses_error: bool,
+}
+
+#[derive(Default)]
+struct NoisyTerminalAccumulator {
+    matches: Vec<ScoredNoisyTerminal>,
+    indices: HashMap<NoisyTerminalIdentity, usize>,
+}
+
+impl NoisyTerminalAccumulator {
+    fn upsert(
+        &mut self,
+        terminal: NoisyTrieTerminal,
+        lexicon: &[LexiconEntry],
+        entry_identity_ids: &[usize],
+        config: &DecodeConfig,
+    ) {
+        self.upsert_scored(
+            ScoredNoisyTerminal::new(terminal, lexicon, entry_identity_ids, config),
+            lexicon,
+        );
+    }
+
+    fn upsert_scored(&mut self, candidate: ScoredNoisyTerminal, lexicon: &[LexiconEntry]) {
+        let identity = NoisyTerminalIdentity {
+            entry_identity: candidate.entry_identity,
+            observed_length: candidate.terminal.observed_length,
+            uses_error: candidate.uses_error(),
+        };
+        if let Some(&index) = self.indices.get(&identity) {
+            if noisy_terminal_order(&candidate, &self.matches[index], lexicon) == Ordering::Less {
+                self.matches[index] = candidate;
+            }
+        } else {
+            self.indices.insert(identity, self.matches.len());
+            self.matches.push(candidate);
+        }
+    }
+
+    fn into_matches(self) -> Vec<ScoredNoisyTerminal> {
+        self.matches
+    }
+}
+
+fn collapse_noisy_error_layers(
+    matches: &[ScoredNoisyTerminal],
+    lexicon: &[LexiconEntry],
+) -> Vec<ScoredNoisyTerminal> {
+    let mut collapsed = Vec::<ScoredNoisyTerminal>::new();
+    let mut indices = HashMap::<(usize, usize), usize>::new();
+    for candidate in matches {
+        let identity = (candidate.terminal.observed_length, candidate.entry_identity);
+        if let Some(&index) = indices.get(&identity) {
+            if noisy_terminal_order(candidate, &collapsed[index], lexicon) == Ordering::Less {
+                collapsed[index] = candidate.clone();
+            }
+        } else {
+            indices.insert(identity, collapsed.len());
+            collapsed.push(candidate.clone());
+        }
+    }
+    collapsed.sort_by(|left, right| noisy_terminal_segment_order(left, right, lexicon));
+    collapsed
+}
+
+fn retain_noisy_top_k_by_child(
+    matches: Vec<ScoredNoisyTerminal>,
+    state_used_error: bool,
+    top_k: usize,
+    lexicon: &[LexiconEntry],
+) -> Vec<ScoredNoisyTerminal> {
+    let mut groups = Vec::<Vec<ScoredNoisyTerminal>>::new();
+    let mut group_indices = HashMap::<(usize, bool), usize>::new();
+    for terminal in matches {
+        let child = (
+            terminal.terminal.observed_length,
+            state_used_error || terminal.uses_error(),
+        );
+        if let Some(&index) = group_indices.get(&child) {
+            groups[index].push(terminal);
+        } else {
+            group_indices.insert(child, groups.len());
+            groups.push(vec![terminal]);
+        }
+    }
+
+    let mut retained = Vec::new();
+    for mut group in groups {
+        group.sort_by(|left, right| noisy_terminal_prepared_order(left, right, lexicon));
+        let mut seen_text = HashSet::new();
+        group.retain(|terminal| {
+            seen_text.insert(lexicon[terminal.terminal.entry_index].text.as_str())
+        });
+        group.truncate(top_k);
+        retained.extend(group);
+    }
+    retained
+}
+
+fn noisy_terminal_segment_order(
+    left: &ScoredNoisyTerminal,
+    right: &ScoredNoisyTerminal,
+    lexicon: &[LexiconEntry],
+) -> Ordering {
+    left.terminal
+        .observed_length
+        .cmp(&right.terminal.observed_length)
+        .then_with(|| noisy_terminal_order(left, right, lexicon))
+}
+
+fn noisy_terminal_prepared_order(
+    left: &ScoredNoisyTerminal,
+    right: &ScoredNoisyTerminal,
+    lexicon: &[LexiconEntry],
+) -> Ordering {
+    right
+        .total_score
+        .total_cmp(&left.total_score)
+        .then_with(|| {
+            lexicon[left.terminal.entry_index]
+                .text
+                .cmp(&lexicon[right.terminal.entry_index].text)
+        })
+        .then_with(|| noisy_terminal_order(left, right, lexicon))
+}
+
+fn noisy_terminal_order(
+    left: &ScoredNoisyTerminal,
+    right: &ScoredNoisyTerminal,
+    lexicon: &[LexiconEntry],
+) -> Ordering {
+    right
+        .total_score
+        .total_cmp(&left.total_score)
+        .then_with(|| {
+            left.terminal
+                .spelling
+                .abbreviated_syllables
+                .len()
+                .cmp(&right.terminal.spelling.abbreviated_syllables.len())
+        })
+        .then_with(|| {
+            correction_rank(&left.terminal.correction)
+                .cmp(&correction_rank(&right.terminal.correction))
+        })
+        .then_with(|| {
+            lexicon[left.terminal.entry_index]
+                .text
+                .cmp(&lexicon[right.terminal.entry_index].text)
+        })
+        .then_with(|| {
+            left.terminal
+                .spelling
+                .code
+                .as_str()
+                .cmp(right.terminal.spelling.code.as_str())
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AlignmentState {
     observed_position: usize,
     used_error: bool,
     transposition_pending: bool,
+}
+
+/// With at most one edit, a consumed intended prefix can occupy only the
+/// exact position, the three edit-distance offsets, and one pending swap.
+const MAX_ALIGNMENT_STATES: usize = 5;
+
+#[derive(Clone, Copy, Debug)]
+struct AlignmentStates {
+    items: [AlignmentState; MAX_ALIGNMENT_STATES],
+    len: usize,
+}
+
+impl AlignmentStates {
+    fn empty() -> Self {
+        Self {
+            items: [AlignmentState {
+                observed_position: 0,
+                used_error: false,
+                transposition_pending: false,
+            }; MAX_ALIGNMENT_STATES],
+            len: 0,
+        }
+    }
+
+    fn singleton(state: AlignmentState) -> Self {
+        let mut states = Self::empty();
+        states.push_unique(state);
+        states
+    }
+
+    fn as_slice(&self) -> &[AlignmentState] {
+        &self.items[..self.len]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push_unique(&mut self, candidate: AlignmentState) {
+        if self.as_slice().contains(&candidate) {
+            return;
+        }
+        assert!(
+            self.len < MAX_ALIGNMENT_STATES,
+            "one-edit alignment state bound exceeded"
+        );
+        self.items[self.len] = candidate;
+        self.len += 1;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalObservedLengths {
+    items: [usize; MAX_ALIGNMENT_STATES + 1],
+    len: usize,
+}
+
+impl TerminalObservedLengths {
+    fn empty() -> Self {
+        Self {
+            items: [0; MAX_ALIGNMENT_STATES + 1],
+            len: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        &self.items[..self.len]
+    }
+
+    fn push_unique(&mut self, candidate: usize) {
+        if self.as_slice().contains(&candidate) {
+            return;
+        }
+        assert!(
+            self.len < self.items.len(),
+            "terminal observed-length bound exceeded"
+        );
+        self.items[self.len] = candidate;
+        self.len += 1;
+    }
+
+    fn sort_unstable(&mut self) {
+        self.items[..self.len].sort_unstable();
+    }
 }
 
 struct TrieSearch<'a> {
@@ -1255,11 +1590,11 @@ struct TrieSearch<'a> {
 }
 
 impl TrieSearch<'_> {
-    fn advance(&mut self, states: &[AlignmentState], intended: &[u8]) -> Vec<AlignmentState> {
-        let mut current = states.to_vec();
+    fn advance(&mut self, states: &AlignmentStates, intended: &[u8]) -> AlignmentStates {
+        let mut current = *states;
         for &intended_key in intended {
-            let mut next = Vec::new();
-            for state in current {
+            let mut next = AlignmentStates::empty();
+            for state in current.as_slice().iter().copied() {
                 self.stats.alignment_states_examined += 1;
                 self.advance_key(state, intended_key, &mut next);
             }
@@ -1271,30 +1606,24 @@ impl TrieSearch<'_> {
         current
     }
 
-    fn advance_key(&self, state: AlignmentState, intended_key: u8, next: &mut Vec<AlignmentState>) {
+    fn advance_key(&self, state: AlignmentState, intended_key: u8, next: &mut AlignmentStates) {
         let position = state.observed_position;
         if state.transposition_pending {
             if self.observed.get(position) == Some(&intended_key) {
-                push_unique_alignment(
-                    next,
-                    AlignmentState {
-                        observed_position: position + 2,
-                        used_error: true,
-                        transposition_pending: false,
-                    },
-                );
+                next.push_unique(AlignmentState {
+                    observed_position: position + 2,
+                    used_error: true,
+                    transposition_pending: false,
+                });
             }
             return;
         }
 
         if self.observed.get(position) == Some(&intended_key) {
-            push_unique_alignment(
-                next,
-                AlignmentState {
-                    observed_position: position + 1,
-                    ..state
-                },
-            );
+            next.push_unique(AlignmentState {
+                observed_position: position + 1,
+                ..state
+            });
         }
         if !self.allow_error || state.used_error {
             return;
@@ -1305,77 +1634,56 @@ impl TrieSearch<'_> {
             .get(position)
             .is_some_and(|&actual| are_qwerty_neighbors(intended_key, actual))
         {
-            push_unique_alignment(
-                next,
-                AlignmentState {
-                    observed_position: position + 1,
-                    used_error: true,
-                    transposition_pending: false,
-                },
-            );
-        }
-
-        push_unique_alignment(
-            next,
-            AlignmentState {
-                observed_position: position,
+            next.push_unique(AlignmentState {
+                observed_position: position + 1,
                 used_error: true,
                 transposition_pending: false,
-            },
-        );
+            });
+        }
+
+        next.push_unique(AlignmentState {
+            observed_position: position,
+            used_error: true,
+            transposition_pending: false,
+        });
 
         if self.observed.get(position + 1) == Some(&intended_key) {
-            push_unique_alignment(
-                next,
-                AlignmentState {
-                    observed_position: position + 2,
-                    used_error: true,
-                    transposition_pending: false,
-                },
-            );
+            next.push_unique(AlignmentState {
+                observed_position: position + 2,
+                used_error: true,
+                transposition_pending: false,
+            });
         }
 
         if position + 1 < self.observed.len()
             && self.observed[position] != self.observed[position + 1]
             && self.observed[position + 1] == intended_key
         {
-            push_unique_alignment(
-                next,
-                AlignmentState {
-                    observed_position: position,
-                    used_error: true,
-                    transposition_pending: true,
-                },
-            );
+            next.push_unique(AlignmentState {
+                observed_position: position,
+                used_error: true,
+                transposition_pending: true,
+            });
         }
     }
 
-    fn terminal_observed_lengths(&self, states: &[AlignmentState]) -> Vec<usize> {
-        let mut lengths = Vec::new();
-        for state in states {
+    fn terminal_observed_lengths(&self, states: &AlignmentStates) -> TerminalObservedLengths {
+        let mut lengths = TerminalObservedLengths::empty();
+        for state in states.as_slice() {
             if state.transposition_pending {
                 continue;
             }
-            if state.observed_position > 0 && !lengths.contains(&state.observed_position) {
-                lengths.push(state.observed_position);
+            if state.observed_position > 0 {
+                lengths.push_unique(state.observed_position);
             }
             let trailing_extra_length = state.observed_position + 1;
-            if self.allow_error
-                && !state.used_error
-                && trailing_extra_length <= self.observed.len()
-                && !lengths.contains(&trailing_extra_length)
+            if self.allow_error && !state.used_error && trailing_extra_length <= self.observed.len()
             {
-                lengths.push(trailing_extra_length);
+                lengths.push_unique(trailing_extra_length);
             }
         }
         lengths.sort_unstable();
         lengths
-    }
-}
-
-fn push_unique_alignment(states: &mut Vec<AlignmentState>, candidate: AlignmentState) {
-    if !states.contains(&candidate) {
-        states.push(candidate);
     }
 }
 
@@ -1639,6 +1947,33 @@ fn correction_rank(correction: &Correction) -> u8 {
         Correction::MissingKey { .. } => 3,
         Correction::ExtraKey { .. } => 4,
     }
+}
+
+fn configured_correction_penalty(config: &DecodeConfig, correction: &Correction) -> f64 {
+    match correction {
+        Correction::Exact => 0.0,
+        Correction::NeighborSubstitution { .. } => config.neighbor_substitution_penalty,
+        Correction::AdjacentTransposition { .. } => config.adjacent_transposition_penalty,
+        Correction::MissingKey { .. } => config.missing_key_penalty,
+        Correction::ExtraKey { .. } => config.extra_key_penalty,
+    }
+}
+
+fn lexicon_entry_identity_ids(lexicon: &[LexiconEntry]) -> Vec<usize> {
+    let mut identities = HashMap::<(&str, &str), usize>::new();
+    let mut next_identity = 0;
+    lexicon
+        .iter()
+        .map(|entry| {
+            *identities
+                .entry((entry.text.as_str(), entry.code.as_str()))
+                .or_insert_with(|| {
+                    let identity = next_identity;
+                    next_identity += 1;
+                    identity
+                })
+        })
+        .collect()
 }
 
 pub(crate) fn spelling_variants(syllable_codes: &[KeySequence]) -> Vec<Spelling> {
@@ -2301,8 +2636,14 @@ name: test
             for start in 0..observed.len() {
                 for allow_error in [false, true] {
                     let mut stats = SentenceSearchStats::default();
-                    let streaming =
-                        decoder.segment_transitions(&observed, start, allow_error, &mut stats);
+                    let streaming = decoder.segment_transitions(
+                        &observed,
+                        start,
+                        allow_error,
+                        !allow_error,
+                        None,
+                        &mut stats,
+                    );
                     let streaming = if allow_error {
                         collapse_error_layers(&streaming)
                     } else {
@@ -2327,7 +2668,7 @@ name: test
         };
         let decoder = Decoder::with_config(lexicon, config);
         let mut stats = SentenceSearchStats::default();
-        let transitions = decoder.segment_transitions("nh", 0, true, &mut stats);
+        let transitions = decoder.segment_transitions("nh", 0, true, false, None, &mut stats);
         let hello = transitions
             .iter()
             .filter(|transition| transition.candidate.text == "你好")
@@ -2342,6 +2683,76 @@ name: test
             .find(|transition| transition.candidate.text == "你好")
             .unwrap();
         assert!(selected.uses_error);
+    }
+
+    #[test]
+    fn lightweight_terminal_compaction_matches_materialized_reduction() {
+        let decoder = Decoder::new(parse_lexicon_tsv(FIXTURE).unwrap());
+        let log_frequency_total = decoder
+            .lexicon
+            .iter()
+            .map(|entry| entry.frequency as f64)
+            .sum::<f64>()
+            .ln();
+
+        for observed in ["zrmurf", "nhk", "nigk", "ajjp", "nihkz"] {
+            for start in 0..observed.len() {
+                for (exact_reachable, error_reachable) in
+                    [(true, false), (false, true), (true, true)]
+                {
+                    for top_k in [1, 5, 10] {
+                        let full = decoder.segment_transitions(
+                            observed,
+                            start,
+                            exact_reachable,
+                            error_reachable,
+                            None,
+                            &mut SentenceSearchStats::default(),
+                        );
+                        let expected = decoder.compact_unigram_lattice_transitions(
+                            full,
+                            start,
+                            exact_reachable,
+                            error_reachable,
+                            top_k,
+                            log_frequency_total,
+                        );
+                        let compact = decoder.segment_transitions(
+                            observed,
+                            start,
+                            exact_reachable,
+                            error_reachable,
+                            Some(top_k),
+                            &mut SentenceSearchStats::default(),
+                        );
+
+                        assert_eq!(
+                            compact, expected,
+                            "terminal compaction diverged for {observed}, start {start}, \
+                             exact {exact_reachable}, error {error_reachable}, K {top_k}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lightweight_identity_preserves_direct_duplicate_lexicon_behavior() {
+        let mut lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let mut duplicate = lexicon[0].clone();
+        duplicate.frequency *= 2;
+        lexicon.push(duplicate);
+        let decoder = Decoder::new(lexicon);
+        let mut stats = SentenceSearchStats::default();
+        let streaming = collapse_error_layers(
+            &decoder.segment_transitions("nhk", 0, true, false, None, &mut stats),
+        );
+
+        assert_eq!(
+            streaming,
+            decoder.segment_transitions_by_slices("nhk", 0, true)
+        );
     }
 
     #[test]
