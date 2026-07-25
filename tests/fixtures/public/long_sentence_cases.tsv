@@ -1,0 +1,8 @@
+# Public, manually constructed longer cases, separate from model rows.
+# Tokens are demo-lexicon words; observed keys are derived automatically.
+id	tokens
+long_private_local	本地 离线 个人 隐私 安全 测试
+long_decoder	自然码 双拼 输入法 解码 算法 研究 项目
+long_language	中文 拼音 语言 模型 概率 评测
+long_search	实时 搜索 候选 排序 性能 延迟
+long_public_data	公开 合成 数据 测试 准确 召回 评测

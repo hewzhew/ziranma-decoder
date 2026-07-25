@@ -41,6 +41,9 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   slice-by-length reference.
 - Rank sentence paths by `(position, error state, previous word)` k-best
   memoization; do not reintroduce a cross-state heuristic beam.
+- Exact same-future-state transition reduction may retain at most K unique
+  prefixes per child state; keep its full-enumeration parity coverage and do
+  not generalize it into heuristic cross-state pruning.
 - Keep short sentence ranking covered by an unpruned full-path enumeration
   oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.
@@ -49,6 +52,14 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   measured linguistic truth.
 - Treat the demo bigram corpus as hand-authored test configuration, not as a
   representative Chinese corpus.
+- Keep third-party public data pinned to an exact upstream revision with its
+  license, attribution, source URL, checksum, and deterministic import stats.
+- Preserve the small exhaustive fixtures when adding large data; large public
+  snapshots belong behind explicit CLI paths and scale tests.
+- Run latency comparisons in release mode with the fixed, warmed benchmark
+  workload, and do not present one machine's timings as universal.
+- Report OOV fallback exposure alongside closed-lexicon recall when changing
+  conservative sentence ordering.
 
 ## Privacy rules
 

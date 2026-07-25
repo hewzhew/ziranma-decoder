@@ -19,12 +19,13 @@ mod language_model;
 
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use evaluation::{
-    EvaluationReport, RecallMetrics, SentenceCaseParseError, SentenceCaseReport, SyntheticCaseKind,
-    evaluate_sentence_cases, evaluate_synthetic,
+    EvaluationReport, OovCaseReport, RecallMetrics, SentenceCaseParseError, SentenceCaseReport,
+    SyntheticCaseKind, evaluate_oov_cases, evaluate_sentence_cases, evaluate_synthetic,
 };
 pub use language_model::{BigramLanguageModel, BigramScore, LanguageModelParseError};
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;
+const MAX_LEXICON_SYLLABLES: usize = 12;
 
 /// A validated, lowercase ASCII key sequence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -345,6 +346,10 @@ pub struct SentenceSearchStats {
     pub ranking_states_evaluated: usize,
     /// Reuses of an already solved ranking state.
     pub ranking_state_cache_hits: usize,
+    /// Lattice transitions examined across solved ranking states.
+    pub ranking_transitions_considered: usize,
+    /// Transitions retained after exact same-future-state Top-K reduction.
+    pub ranking_transitions_retained: usize,
     /// Edge/suffix combinations considered by the k-best dynamic program.
     pub path_combinations_considered: usize,
 }
@@ -583,7 +588,70 @@ impl Decoder {
         } else {
             collapse_error_layers(&lattice.outgoing[state.position])
         };
+        let groups = self.prepare_transition_groups(
+            transitions,
+            &state,
+            top_k,
+            log_frequency_total,
+            search_stats,
+        );
         let mut paths = Vec::new();
+        for group in groups {
+            let suffixes = self.k_best_from_state(
+                lattice,
+                group.child_state,
+                top_k,
+                log_frequency_total,
+                memo,
+                search_stats,
+            );
+            search_stats.path_combinations_considered += suffixes.len() * group.transitions.len();
+
+            for prepared in group.transitions {
+                for suffix in &suffixes {
+                    let mut text = prepared.transition.candidate.text.clone();
+                    text.push_str(&suffix.text);
+                    let mut segments = Vec::with_capacity(suffix.segments.len() + 1);
+                    segments.push(SentenceSegment {
+                        observed: prepared.transition.observed.clone(),
+                        candidate: prepared.transition.candidate.clone(),
+                        language_score: prepared.language_score,
+                    });
+                    segments.extend(suffix.segments.iter().cloned());
+                    paths.push(SentenceCandidate {
+                        text,
+                        segments,
+                        total_score: prepared.edge_score + suffix.total_score,
+                        unresolved_key_count: prepared.unresolved_key_count
+                            + suffix.unresolved_key_count,
+                        used_error: suffix.used_error,
+                    });
+                }
+            }
+        }
+
+        paths.sort_by(sentence_order);
+        let mut seen_text = HashSet::new();
+        paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
+        paths.truncate(top_k);
+        memo.insert(state, paths.clone());
+        paths
+    }
+
+    /// Transitions with the same child state share every possible suffix.
+    /// After duplicate prefix text is removed, an edge below the first K
+    /// cannot enter the state's Top-K: the K better prefixes can all combine
+    /// with that exact suffix. This is an exact bound, not a heuristic beam.
+    fn prepare_transition_groups(
+        &self,
+        transitions: Vec<SegmentTransition>,
+        state: &SentenceRankingState,
+        top_k: usize,
+        log_frequency_total: f64,
+        search_stats: &mut SentenceSearchStats,
+    ) -> Vec<SentenceTransitionGroup> {
+        search_stats.ranking_transitions_considered += transitions.len();
+        let mut groups = Vec::<SentenceTransitionGroup>::new();
         for transition in transitions {
             let child_state = SentenceRankingState {
                 position: transition.end,
@@ -593,15 +661,6 @@ impl Decoder {
                     _ => None,
                 },
             };
-            let suffixes = self.k_best_from_state(
-                lattice,
-                child_state,
-                top_k,
-                log_frequency_total,
-                memo,
-                search_stats,
-            );
-            search_stats.path_combinations_considered += suffixes.len();
             let language_score = self.sentence_language_score(
                 state.previous_word.as_deref(),
                 &transition.candidate,
@@ -613,33 +672,35 @@ impl Decoder {
                 - transition.candidate.score.unresolved_input_penalty;
             let unresolved_key_count =
                 usize::from(transition.candidate.source == CandidateSource::UnresolvedInput);
-
-            for suffix in suffixes {
-                let mut text = transition.candidate.text.clone();
-                text.push_str(&suffix.text);
-                let mut segments = Vec::with_capacity(suffix.segments.len() + 1);
-                segments.push(SentenceSegment {
-                    observed: transition.observed.clone(),
-                    candidate: transition.candidate.clone(),
-                    language_score,
-                });
-                segments.extend(suffix.segments);
-                paths.push(SentenceCandidate {
-                    text,
-                    segments,
-                    total_score: edge_score + suffix.total_score,
-                    unresolved_key_count: unresolved_key_count + suffix.unresolved_key_count,
-                    used_error: suffix.used_error,
+            let prepared = PreparedSentenceTransition {
+                transition,
+                language_score,
+                edge_score,
+                unresolved_key_count,
+            };
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.child_state == child_state)
+            {
+                group.transitions.push(prepared);
+            } else {
+                groups.push(SentenceTransitionGroup {
+                    child_state,
+                    transitions: vec![prepared],
                 });
             }
         }
 
-        paths.sort_by(sentence_order);
-        let mut seen_text = HashSet::new();
-        paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
-        paths.truncate(top_k);
-        memo.insert(state, paths.clone());
-        paths
+        for group in &mut groups {
+            group.transitions.sort_by(prepared_transition_order);
+            let mut seen_text = HashSet::new();
+            group
+                .transitions
+                .retain(|prepared| seen_text.insert(prepared.transition.candidate.text.clone()));
+            group.transitions.truncate(top_k);
+            search_stats.ranking_transitions_retained += group.transitions.len();
+        }
+        groups
     }
 
     fn sentence_language_score(
@@ -1344,6 +1405,20 @@ struct SegmentTransition {
     candidate: Candidate,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedSentenceTransition {
+    transition: SegmentTransition,
+    language_score: SentenceLanguageScore,
+    edge_score: f64,
+    unresolved_key_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SentenceTransitionGroup {
+    child_state: SentenceRankingState,
+    transitions: Vec<PreparedSentenceTransition>,
+}
+
 fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: SegmentTransition) {
     let duplicate = transitions.iter_mut().find(|existing| {
         existing.end == candidate.end
@@ -1386,6 +1461,22 @@ fn segment_transition_order(left: &SegmentTransition, right: &SegmentTransition)
     left.end
         .cmp(&right.end)
         .then_with(|| candidate_order(&left.candidate, &right.candidate))
+}
+
+fn prepared_transition_order(
+    left: &PreparedSentenceTransition,
+    right: &PreparedSentenceTransition,
+) -> Ordering {
+    left.unresolved_key_count
+        .cmp(&right.unresolved_key_count)
+        .then_with(|| right.edge_score.total_cmp(&left.edge_score))
+        .then_with(|| {
+            left.transition
+                .candidate
+                .text
+                .cmp(&right.transition.candidate.text)
+        })
+        .then_with(|| candidate_order(&left.transition.candidate, &right.transition.candidate))
 }
 
 fn sentence_order(left: &SentenceCandidate, right: &SentenceCandidate) -> Ordering {
@@ -1462,13 +1553,163 @@ pub(crate) fn spelling_variants(syllable_codes: &[KeySequence]) -> Vec<Spelling>
         .collect()
 }
 
+/// Result of importing a Rime YAML dictionary into the decoder's lexicon.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RimeLexiconImport {
+    /// Valid, deduplicated entries accepted by the Ziranma codec.
+    pub entries: Vec<LexiconEntry>,
+    /// Auditable source-row accounting.
+    pub stats: RimeLexiconImportStats,
+}
+
+/// Row accounting for one Rime dictionary import.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RimeLexiconImportStats {
+    /// Non-comment rows after the Rime YAML `...` marker.
+    pub source_rows: usize,
+    /// Rows retained in `RimeLexiconImport::entries`.
+    pub imported_entries: usize,
+    /// Zero source weights conservatively raised to one.
+    pub zero_weights_floored: usize,
+    /// Rows skipped because the baseline codec cannot map their pinyin.
+    pub unsupported_pinyin_rows: usize,
+    /// Rows skipped because they exceed the test baseline's syllable limit.
+    pub too_many_syllable_rows: usize,
+    /// Rows skipped because the same text and Ziranma code already appeared.
+    pub duplicate_rows: usize,
+}
+
+/// Imports the standard three-column body of a Rime YAML dictionary.
+///
+/// The upstream file is kept unchanged. Rows use
+/// `text<TAB>pinyin<TAB>weight`; zero weights are floored to one, while
+/// unsupported pinyin, overlong entries, and duplicate text/code pairs are
+/// skipped and counted explicitly.
+pub fn parse_rime_lexicon(contents: &str) -> Result<RimeLexiconImport, RimeLexiconParseError> {
+    let mut saw_document_start = false;
+    let mut saw_data_marker = false;
+    let mut entries = Vec::new();
+    let mut duplicates = HashSet::new();
+    let mut stats = RimeLexiconImportStats::default();
+
+    for (zero_based_line, raw_line) in contents.lines().enumerate() {
+        let line_number = zero_based_line + 1;
+        let line = raw_line.trim_end_matches('\r');
+        if !saw_data_marker {
+            match line {
+                "---" => saw_document_start = true,
+                "..." if saw_document_start => saw_data_marker = true,
+                _ => {}
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        stats.source_rows += 1;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+            return Err(RimeLexiconParseError::InvalidRow { line_number });
+        }
+        let source_weight =
+            fields[2]
+                .parse::<u64>()
+                .map_err(|_| RimeLexiconParseError::InvalidWeight {
+                    line_number,
+                    value: fields[2].to_owned(),
+                })?;
+        if source_weight == 0 {
+            stats.zero_weights_floored += 1;
+        }
+
+        let encoded = match encode_pinyin_phrase(fields[1]) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                stats.unsupported_pinyin_rows += 1;
+                continue;
+            }
+        };
+        if encoded.syllable_codes.len() > MAX_LEXICON_SYLLABLES {
+            stats.too_many_syllable_rows += 1;
+            continue;
+        }
+        let duplicate_key = (fields[0].to_owned(), encoded.full_code.clone());
+        if !duplicates.insert(duplicate_key) {
+            stats.duplicate_rows += 1;
+            continue;
+        }
+
+        entries.push(LexiconEntry {
+            text: fields[0].to_owned(),
+            pinyin: fields[1].to_owned(),
+            code: encoded.full_code,
+            syllable_codes: encoded.syllable_codes,
+            frequency: source_weight.max(1),
+        });
+    }
+
+    if !saw_document_start {
+        return Err(RimeLexiconParseError::MissingDocumentStart);
+    }
+    if !saw_data_marker {
+        return Err(RimeLexiconParseError::MissingDataMarker);
+    }
+    if entries.is_empty() {
+        return Err(RimeLexiconParseError::Empty);
+    }
+    stats.imported_entries = entries.len();
+    Ok(RimeLexiconImport { entries, stats })
+}
+
+/// Error returned while importing a Rime YAML dictionary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RimeLexiconParseError {
+    /// No YAML document start marker was found.
+    MissingDocumentStart,
+    /// No Rime data marker was found after the YAML header.
+    MissingDataMarker,
+    /// A data row did not have three non-empty tab-separated fields.
+    InvalidRow {
+        /// One-based source line number.
+        line_number: usize,
+    },
+    /// A source weight was not an unsigned integer.
+    InvalidWeight {
+        /// One-based source line number.
+        line_number: usize,
+        /// Invalid source value.
+        value: String,
+    },
+    /// The header was valid but no compatible entries remained.
+    Empty,
+}
+
+impl fmt::Display for RimeLexiconParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingDocumentStart => write!(formatter, "Rime 词典缺少 YAML 起始标记 ---"),
+            Self::MissingDataMarker => write!(formatter, "Rime 词典缺少数据起始标记 ..."),
+            Self::InvalidRow { line_number } => {
+                write!(formatter, "Rime 词典第 {line_number} 行字段无效")
+            }
+            Self::InvalidWeight { line_number, value } => write!(
+                formatter,
+                "Rime 词典第 {line_number} 行权重必须是非负整数，实际为 {value:?}"
+            ),
+            Self::Empty => write!(formatter, "Rime 词典没有可导入的数据行"),
+        }
+    }
+}
+
+impl Error for RimeLexiconParseError {}
+
 /// Parses the repository's auditable tab-separated demo lexicon format.
 ///
 /// The first non-comment row must be:
 /// `text<TAB>pinyin<TAB>frequency`.
 pub fn parse_lexicon_tsv(contents: &str) -> Result<Vec<LexiconEntry>, LexiconParseError> {
     const EXPECTED_HEADER: [&str; 3] = ["text", "pinyin", "frequency"];
-    const MAX_SYLLABLES: usize = 12;
 
     let mut saw_header = false;
     let mut entries = Vec::new();
@@ -1513,11 +1754,11 @@ pub fn parse_lexicon_tsv(contents: &str) -> Result<Vec<LexiconEntry>, LexiconPar
                 line_number,
                 value: fields[1].to_owned(),
             })?;
-        if encoded.syllable_codes.len() > MAX_SYLLABLES {
+        if encoded.syllable_codes.len() > MAX_LEXICON_SYLLABLES {
             return Err(LexiconParseError::TooManySyllables {
                 line_number,
                 count: encoded.syllable_codes.len(),
-                maximum: MAX_SYLLABLES,
+                maximum: MAX_LEXICON_SYLLABLES,
             });
         }
 
@@ -1746,7 +1987,7 @@ mod tests {
         KeySequence, LexiconEntry, SentenceCandidate, SentenceLattice, SentenceRankingState,
         SentenceSearchStats, SentenceSegment, are_qwerty_neighbors, candidate_order,
         collapse_error_layers, detect_correction, key_hypotheses, parse_lexicon_tsv,
-        sentence_order, spelling_variants,
+        parse_rime_lexicon, sentence_order, spelling_variants,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -1758,6 +1999,42 @@ mod tests {
         assert!(KeySequence::new("").is_err());
         assert!(KeySequence::new("NiHk").is_err());
         assert!(KeySequence::new("你好").is_err());
+    }
+
+    #[test]
+    fn rime_import_reports_every_compatibility_decision() {
+        let fixture = "\
+---
+name: test
+...
+你好\tni hao\t10
+罕\than\t0
+呒\thm\t3
+你好\tni hao\t8
+";
+        let imported = parse_rime_lexicon(fixture).unwrap();
+
+        assert_eq!(
+            imported
+                .entries
+                .iter()
+                .map(|entry| (entry.text.as_str(), entry.frequency))
+                .collect::<Vec<_>>(),
+            [("你好", 10), ("罕", 1)]
+        );
+        assert_eq!(imported.stats.source_rows, 4);
+        assert_eq!(imported.stats.imported_entries, 2);
+        assert_eq!(imported.stats.zero_weights_floored, 1);
+        assert_eq!(imported.stats.unsupported_pinyin_rows, 1);
+        assert_eq!(imported.stats.too_many_syllable_rows, 0);
+        assert_eq!(imported.stats.duplicate_rows, 1);
+    }
+
+    #[test]
+    fn rime_import_rejects_structural_drift() {
+        assert!(parse_rime_lexicon("name: test\n...\n你\tni\t1\n").is_err());
+        assert!(parse_rime_lexicon("---\nname: test\n你\tni\t1\n").is_err());
+        assert!(parse_rime_lexicon("---\n...\n你\tni\tmany\n").is_err());
     }
 
     #[test]

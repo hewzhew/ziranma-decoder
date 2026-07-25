@@ -135,6 +135,78 @@ impl SentenceCaseReport {
     }
 }
 
+/// Behavior of the top sentence candidate on words held outside the decoder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OovCaseReport {
+    /// Number of held-out words.
+    pub total: usize,
+    /// Top candidates containing at least one explicit unresolved key.
+    pub top_1_with_unresolved: usize,
+    /// Top candidates retaining every observed key as unresolved.
+    pub top_1_fully_unresolved: usize,
+    /// Top candidates finding some full lexicon coverage despite the holdout.
+    pub top_1_without_unresolved: usize,
+    /// Unresolved keys summed across all top candidates.
+    pub unresolved_keys: usize,
+    /// Canonical observed keys summed across all held-out words.
+    pub observed_keys: usize,
+}
+
+impl OovCaseReport {
+    /// Fraction of cases whose top candidate exposes unresolved input.
+    pub fn with_unresolved_rate(&self) -> f64 {
+        rate(self.top_1_with_unresolved, self.total)
+    }
+
+    /// Fraction of cases represented entirely by literal fallback.
+    pub fn fully_unresolved_rate(&self) -> f64 {
+        rate(self.top_1_fully_unresolved, self.total)
+    }
+
+    /// Fraction of held-out keys retained as explicit unresolved input.
+    pub fn unresolved_key_rate(&self) -> f64 {
+        rate(self.unresolved_keys, self.observed_keys)
+    }
+}
+
+/// Evaluates canonical codes for words deliberately absent from the decoder.
+///
+/// The held-out entries should be authored separately and parsed through the
+/// shared pinyin codec. This is a refusal/fallback probe, not a word-recall
+/// metric: other lexicon entries may legitimately share or segment the same
+/// code.
+pub fn evaluate_oov_cases(decoder: &Decoder, cases: &[LexiconEntry]) -> OovCaseReport {
+    let mut report = OovCaseReport {
+        total: 0,
+        top_1_with_unresolved: 0,
+        top_1_fully_unresolved: 0,
+        top_1_without_unresolved: 0,
+        unresolved_keys: 0,
+        observed_keys: 0,
+    };
+    for case in cases {
+        let observed_keys = case.code.as_str().len();
+        let candidate = decoder
+            .decode_sentence(case.code.as_str(), 1)
+            .expect("held-out canonical codes are lowercase ASCII")
+            .into_iter()
+            .next()
+            .expect("literal fallback guarantees a sentence candidate");
+        report.total += 1;
+        report.observed_keys += observed_keys;
+        report.unresolved_keys += candidate.unresolved_key_count;
+        if candidate.unresolved_key_count == 0 {
+            report.top_1_without_unresolved += 1;
+        } else {
+            report.top_1_with_unresolved += 1;
+        }
+        if candidate.unresolved_key_count == observed_keys {
+            report.top_1_fully_unresolved += 1;
+        }
+    }
+    report
+}
+
 /// Evaluates fully abbreviated, segmented sentence cases from a separate TSV.
 ///
 /// The first non-comment row must be `id<TAB>tokens`. Each following row uses
@@ -449,11 +521,16 @@ fn rate(hits: usize, total: usize) -> f64 {
 mod tests {
     use crate::{BigramLanguageModel, Decoder, parse_lexicon_tsv};
 
-    use super::{SyntheticCaseKind, evaluate_sentence_cases, evaluate_synthetic};
+    use super::{
+        SyntheticCaseKind, evaluate_oov_cases, evaluate_sentence_cases, evaluate_synthetic,
+    };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
     const BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
     const SENTENCE_CASES: &str = include_str!("../tests/fixtures/public/demo_sentence_cases.tsv");
+    const LONG_SENTENCE_CASES: &str =
+        include_str!("../tests/fixtures/public/long_sentence_cases.tsv");
+    const OOV_CASES: &str = include_str!("../tests/fixtures/public/oov_lexicon.tsv");
 
     #[test]
     fn deterministic_report_covers_every_case_family() {
@@ -468,6 +545,43 @@ mod tests {
         assert!(first.metrics.iter().all(|metrics| metrics.total > 0));
         assert_eq!(first.metrics[0].kind, SyntheticCaseKind::Clean);
         assert!((0.0..=1.0).contains(&first.clean_top_1_exact_rate()));
+    }
+
+    #[test]
+    fn held_out_words_report_literal_and_lexicon_coverage() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let held_out = parse_lexicon_tsv(OOV_CASES).unwrap();
+        let decoder = Decoder::new(lexicon);
+        let report = evaluate_oov_cases(&decoder, &held_out);
+
+        assert_eq!(report.total, 12);
+        assert_eq!(report.top_1_with_unresolved, 8);
+        assert_eq!(report.top_1_fully_unresolved, 0);
+        assert_eq!(report.top_1_without_unresolved, 4);
+        assert_eq!(report.unresolved_keys, 15);
+        assert_eq!(report.observed_keys, 48);
+        assert_eq!(
+            report.top_1_with_unresolved + report.top_1_without_unresolved,
+            report.total
+        );
+        assert!(report.top_1_fully_unresolved <= report.top_1_with_unresolved);
+        assert!(report.unresolved_keys <= report.observed_keys);
+        assert!((0.0..=1.0).contains(&report.with_unresolved_rate()));
+        assert!((0.0..=1.0).contains(&report.fully_unresolved_rate()));
+        assert!((0.0..=1.0).contains(&report.unresolved_key_rate()));
+    }
+
+    #[test]
+    fn longer_cases_remain_separate_from_language_model_rows() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let model = BigramLanguageModel::from_tsv(BIGRAM_CORPUS, &lexicon).unwrap();
+        let decoder = Decoder::new(lexicon.clone()).with_bigram_model(model);
+        let report = evaluate_sentence_cases(&decoder, &lexicon, LONG_SENTENCE_CASES).unwrap();
+
+        assert_eq!(report.total, 5);
+        assert_eq!(report.hits_at_1, 5);
+        assert_eq!(report.hits_at_5, 5);
+        assert_eq!(report.hits_at_10, 5);
     }
 
     #[test]

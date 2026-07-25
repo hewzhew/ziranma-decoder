@@ -5,12 +5,21 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
-    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    evaluate_oov_cases, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    parse_rime_lexicon,
 };
+
+mod benchmark;
+
+use benchmark::{LatencySummary, run_decoder_benchmark};
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
 const DEMO_SENTENCE_CASES: &str = include_str!("../tests/fixtures/public/demo_sentence_cases.tsv");
+const LONG_SENTENCE_CASES: &str = include_str!("../tests/fixtures/public/long_sentence_cases.tsv");
+const OOV_CASES: &str = include_str!("../tests/fixtures/public/oov_lexicon.tsv");
+const PUBLIC_RIME_LEXICON: &str =
+    include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
 
 fn main() -> ExitCode {
     match run() {
@@ -38,10 +47,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         "encode" => run_encode(&arguments[1..]),
         "evaluate" => run_evaluate(&arguments[1..]),
         "index-stats" => run_index_stats(&arguments[1..]),
+        "public-index-stats" => run_public_index_stats(&arguments[1..]),
+        "benchmark" => run_benchmark(&arguments[1..]),
         "search-stats" => run_search_stats(&arguments[1..]),
         "decode" => run_decode(&arguments[1..]),
+        "public-decode" => run_public_decode(&arguments[1..]),
         "sentence" => run_sentence(&arguments[1..], true),
         "sentence-unigram" => run_sentence(&arguments[1..], false),
+        "public-sentence" => run_public_sentence(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
@@ -77,6 +90,10 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let unigram_sentences =
         evaluate_sentence_cases(&unigram_decoder, &lexicon, DEMO_SENTENCE_CASES)?;
     let bigram_sentences = evaluate_sentence_cases(&decoder, &lexicon, DEMO_SENTENCE_CASES)?;
+    let long_unigram = evaluate_sentence_cases(&unigram_decoder, &lexicon, LONG_SENTENCE_CASES)?;
+    let long_bigram = evaluate_sentence_cases(&decoder, &lexicon, LONG_SENTENCE_CASES)?;
+    let oov_cases = parse_lexicon_tsv(OOV_CASES)?;
+    let oov = evaluate_oov_cases(&unigram_decoder, &oov_cases);
     let elapsed = started.elapsed();
 
     println!(
@@ -116,6 +133,31 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         bigram_sentences.recall_at_5() * 100.0
     );
     println!(
+        "长句 unigram：{}/{} Top-1（{:.1}%），Top-5 {:.1}%",
+        long_unigram.hits_at_1,
+        long_unigram.total,
+        long_unigram.recall_at_1() * 100.0,
+        long_unigram.recall_at_5() * 100.0
+    );
+    println!(
+        "长句 bigram ：{}/{} Top-1（{:.1}%），Top-5 {:.1}%",
+        long_bigram.hits_at_1,
+        long_bigram.total,
+        long_bigram.recall_at_1() * 100.0,
+        long_bigram.recall_at_5() * 100.0
+    );
+    println!(
+        "独立词外探针：{}/{} 首选含未解析键（{:.1}%）；完全原样 {}/{}；按键保留 {}/{}（{:.1}%）",
+        oov.top_1_with_unresolved,
+        oov.total,
+        oov.with_unresolved_rate() * 100.0,
+        oov.top_1_fully_unresolved,
+        oov.total,
+        oov.unresolved_keys,
+        oov.observed_keys,
+        oov.unresolved_key_rate() * 100.0
+    );
+    println!(
         "本次评测耗时：{:.3} ms（仅供本机观察，不是稳定基准）",
         elapsed.as_secs_f64() * 1000.0
     );
@@ -142,6 +184,117 @@ fn run_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_public_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-index-stats 不接受额外参数".into());
+    }
+    let import_started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let import_elapsed = import_started.elapsed();
+    let stats = imported.stats;
+    let build_started = Instant::now();
+    let decoder = Decoder::new(imported.entries);
+    let build_elapsed = build_started.elapsed();
+    let index = decoder.index_stats();
+
+    println!("Rime pinyin-simp 固定公开快照：");
+    println!("  上游数据行：{}", stats.source_rows);
+    println!("  导入词条：{}", stats.imported_entries);
+    println!("  零权重升至 1：{}", stats.zero_weights_floored);
+    println!("  跳过的不支持拼音：{}", stats.unsupported_pinyin_rows);
+    println!("  跳过的超长词条：{}", stats.too_many_syllable_rows);
+    println!("  跳过的重复词条：{}", stats.duplicate_rows);
+    println!("紧凑逐音节 trie：");
+    println!("  节点数：{}", index.node_count);
+    println!("  音节边数：{}", index.edge_count);
+    println!("  词条终点数：{}", index.terminal_count);
+    println!(
+        "  隐式表示的全码/简拼拼写数：{}",
+        index.represented_spelling_count
+    );
+    println!("  最长词条音节数：{}", index.maximum_syllables);
+    println!(
+        "  导入耗时：{:.3} ms；建索引耗时：{:.3} ms（仅供本机观察）",
+        import_elapsed.as_secs_f64() * 1000.0,
+        build_elapsed.as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn run_benchmark(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if cfg!(debug_assertions) {
+        return Err("benchmark 必须使用 cargo run --release -- benchmark [重复次数]".into());
+    }
+    let repetitions = match arguments.first() {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "benchmark 重复次数必须是 1 到 100 的整数")?,
+        None => 3,
+    };
+    if arguments.len() > 1 || !(1..=100).contains(&repetitions) {
+        return Err("benchmark 重复次数必须是 1 到 100 的整数".into());
+    }
+
+    let import_started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let import_elapsed = import_started.elapsed();
+    let imported_entries = imported.stats.imported_entries;
+    let build_started = Instant::now();
+    let decoder = Decoder::new(imported.entries);
+    let build_elapsed = build_started.elapsed();
+    let report = run_decoder_benchmark(&decoder, repetitions)?;
+
+    println!("固定公开词典 release benchmark：");
+    println!("  导入词条：{imported_entries}");
+    println!("  重复次数：{}", report.repetitions);
+    println!(
+        "  导入：{:.3} ms；建索引：{:.3} ms",
+        import_elapsed.as_secs_f64() * 1000.0,
+        build_elapsed.as_secs_f64() * 1000.0
+    );
+    print_latency(
+        &format!("单词（{} 条/轮）", report.word_queries),
+        report.word_latency,
+    );
+    print_latency(
+        &format!("短句（{} 条/轮）", report.short_sentence_queries),
+        report.short_sentence_latency,
+    );
+    print_sentence_work("短句合计工作量", report.short_sentence_work);
+    print_latency(
+        &format!("长句（{} 条/轮）", report.long_sentence_queries),
+        report.long_sentence_latency,
+    );
+    print_sentence_work("长句合计工作量", report.long_sentence_work);
+    println!("  结果校验和：{}", report.result_checksum);
+    println!("这些是固定工作负载的本机重复采样，不代表其他设备或真实输入分布。");
+    Ok(())
+}
+
+fn print_latency(label: &str, summary: LatencySummary) {
+    println!(
+        "  {label}：{} 样本；min {:.3} / median {:.3} / mean {:.3} / p95 {:.3} / max {:.3} ms",
+        summary.samples,
+        summary.minimum.as_secs_f64() * 1000.0,
+        summary.median.as_secs_f64() * 1000.0,
+        summary.mean.as_secs_f64() * 1000.0,
+        summary.p95.as_secs_f64() * 1000.0,
+        summary.maximum.as_secs_f64() * 1000.0
+    );
+}
+
+fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
+    println!(
+        "  {label}：trie 扫描 {}；对齐状态 {}；lattice 边 {}；排名转移 {} -> {}；路径组合 {}",
+        stats.segment_trie_scans,
+        stats.alignment_states_examined,
+        stats.lattice_transitions,
+        stats.ranking_transitions_considered,
+        stats.ranking_transitions_retained,
+        stats.path_combinations_considered
+    );
+}
+
 fn run_decode(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(observed) = arguments.first() else {
         return Err("decode 需要一个按键串".into());
@@ -151,6 +304,22 @@ fn run_decode(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("decode 参数过多".into());
     }
     decode_and_print(observed, top_k)
+}
+
+fn run_public_decode(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some(observed) = arguments.first() else {
+        return Err("public-decode 需要一个按键串".into());
+    };
+    let top_k = parse_top_k(arguments.get(1))?;
+    if arguments.len() > 2 {
+        return Err("public-decode 参数过多".into());
+    }
+
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let decoder = Decoder::new(imported.entries);
+    let candidates = decoder.decode(observed, top_k)?;
+    print_decoded_candidates(observed, &candidates);
+    Ok(())
 }
 
 fn run_search_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -188,6 +357,22 @@ fn run_sentence(arguments: &[String], use_bigram: bool) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+fn run_public_sentence(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some(observed) = arguments.first() else {
+        return Err("public-sentence 需要一个没有词界的按键串".into());
+    };
+    let top_k = parse_top_k(arguments.get(1))?;
+    if arguments.len() > 2 {
+        return Err("public-sentence 参数过多".into());
+    }
+
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let decoder = Decoder::new(imported.entries);
+    let candidates = decoder.decode_sentence(observed, top_k)?;
+    print_sentence_candidates(observed, false, &candidates);
+    Ok(())
+}
+
 fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(observed) = arguments.first() else {
         return Err("sentence-stats 需要一个没有词界的按键串".into());
@@ -212,6 +397,10 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     );
     println!("  求解的 k-best 状态：{}", stats.ranking_states_evaluated);
     println!("  状态缓存命中：{}", stats.ranking_state_cache_hits);
+    println!(
+        "  排名转移精确缩减：{} -> {}",
+        stats.ranking_transitions_considered, stats.ranking_transitions_retained
+    );
     println!("  路径组合检查：{}", stats.path_combinations_considered);
     Ok(())
 }
@@ -360,8 +549,12 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode <按键串> [Top-K]
   cargo run -- sentence <无词界按键串> [Top-K]
   cargo run -- sentence-unigram <按键串> [Top-K]
+  cargo run -- public-decode <按键串> [Top-K]
+  cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
+  cargo run -- public-index-stats
+  cargo run --release -- benchmark [重复次数]
   cargo run -- search-stats <按键串> [Top-K]
   cargo run -- evaluate
 
@@ -374,8 +567,11 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode nhk
   cargo run -- decode nik
   cargo run -- sentence zrmurf
+  cargo run -- public-sentence zrmurf
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
+  cargo run -- public-index-stats
+  cargo run --release -- benchmark 3
   cargo run -- search-stats nhk
   cargo run -- evaluate
 

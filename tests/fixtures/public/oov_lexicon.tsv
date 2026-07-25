@@ -1,0 +1,15 @@
+# Public, manually constructed words held outside the demo decoder lexicon.
+# Pinyin is encoded by the shared codec; the weight is only a valid placeholder.
+text	pinyin	frequency
+世界	shi jie	1
+今天	jin tian	1
+学习	xue xi	1
+朋友	peng you	1
+电脑	dian nao	1
+生活	sheng huo	1
+设计	she ji	1
+系统	xi tong	1
+方案	fang an	1
+消息	xiao xi	1
+时间	shi jian	1
+文件	wen jian	1

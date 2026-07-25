@@ -5,6 +5,8 @@ use ziranma_decoder::{
 const PUBLIC_DEMO_LEXICON: &str = include_str!("fixtures/public/demo_lexicon.tsv");
 const PUBLIC_BIGRAM_CORPUS: &str = include_str!("fixtures/public/demo_bigram_corpus.tsv");
 const HELLO_LEXICON: &str = "text\tpinyin\tfrequency\n你好\tni hao\t100\n";
+const PUBLIC_RIME_LEXICON: &str =
+    include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
 
 fn demo_decoder() -> Decoder {
     Decoder::new(
@@ -193,6 +195,19 @@ fn parser_generates_canonical_codes_from_pinyin() {
 
     assert_eq!(ni_hao.code.as_str(), "nihk");
     assert_eq!(shu_ju.code.as_str(), "uujv");
+}
+
+#[test]
+fn pinned_public_rime_snapshot_has_stable_import_accounting() {
+    let imported = ziranma_decoder::parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap();
+
+    assert_eq!(imported.stats.source_rows, 65_125);
+    assert_eq!(imported.stats.imported_entries, 65_116);
+    assert_eq!(imported.stats.zero_weights_floored, 1_714);
+    assert_eq!(imported.stats.unsupported_pinyin_rows, 8);
+    assert_eq!(imported.stats.too_many_syllable_rows, 0);
+    assert_eq!(imported.stats.duplicate_rows, 1);
+    assert_eq!(imported.entries.len(), imported.stats.imported_entries);
 }
 
 #[test]
@@ -427,5 +442,16 @@ fn sentence_lattice_reports_streaming_search_work() {
     assert!(stats.lattice_transitions > 0);
     assert!(stats.unresolved_lattice_transitions > 0);
     assert!(stats.ranking_states_evaluated > 0);
+    assert!(stats.ranking_transitions_considered > 0);
+    assert!(stats.ranking_transitions_retained <= stats.ranking_transitions_considered);
     assert!(stats.path_combinations_considered > 0);
+}
+
+#[test]
+fn sentence_ranking_exactly_reduces_same_future_state_transitions() {
+    let (_candidates, stats) = demo_decoder()
+        .decode_sentence_with_stats("zrmurf", 5)
+        .unwrap();
+
+    assert!(stats.ranking_transitions_retained < stats.ranking_transitions_considered);
 }
