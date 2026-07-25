@@ -61,6 +61,10 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   construction; lexicon entries may reference it by index until final
   materialization. Preserve full-candidate parity, including direct duplicate
   and cross-path identities.
+- Apply trie subtree score bounds only to unigram sentence Top-K search. Keep
+  exact-only evidence separate for unused-error exact, unused-error corrected,
+  and already-used-error exact lattice roles; use strict score domination so
+  ties remain observable, and disable the bound for word and bigram decoding.
 - Keep short sentence ranking covered by an unpruned full-path enumeration
   oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.

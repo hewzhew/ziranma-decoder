@@ -208,6 +208,11 @@ fn pinned_public_rime_snapshot_has_stable_import_accounting() {
     assert_eq!(imported.stats.too_many_syllable_rows, 0);
     assert_eq!(imported.stats.duplicate_rows, 1);
     assert_eq!(imported.entries.len(), imported.stats.imported_entries);
+
+    let decoder = Decoder::new(imported.entries);
+    let (candidates, stats) = decoder.decode_sentence_with_stats("zrmurf", 10).unwrap();
+    assert!(!candidates.is_empty());
+    assert!(stats.trie_subtree_prunes > 0);
 }
 
 #[test]
@@ -414,6 +419,8 @@ fn bigram_lattice_preserves_text_distinct_future_states() {
         stats.lattice_transitions_materialized,
         stats.lattice_transitions
     );
+    assert_eq!(stats.exact_prefix_prepass_visits, 0);
+    assert_eq!(stats.trie_subtree_prunes, 0);
 }
 
 #[test]
@@ -454,6 +461,7 @@ fn sentence_lattice_reports_streaming_search_work() {
     assert_eq!(candidates[0].text, "自然码输入法");
     assert!(stats.segment_trie_scans > 0);
     assert!(stats.trie_path_visits >= stats.segment_trie_scans);
+    assert!(stats.exact_prefix_prepass_visits <= stats.trie_path_visits);
     assert!(stats.alignment_states_reused > 0);
     assert!(
         stats.alignment_states_examined + stats.alignment_states_reused >= stats.trie_path_visits

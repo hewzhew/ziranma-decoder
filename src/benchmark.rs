@@ -202,6 +202,8 @@ fn update_checksum(checksum: usize, candidates: &[ziranma_decoder::Candidate]) -
 fn add_sentence_stats(total: &mut SentenceSearchStats, sample: SentenceSearchStats) {
     total.segment_trie_scans += sample.segment_trie_scans;
     total.trie_path_visits += sample.trie_path_visits;
+    total.exact_prefix_prepass_visits += sample.exact_prefix_prepass_visits;
+    total.trie_subtree_prunes += sample.trie_subtree_prunes;
     total.alignment_states_examined += sample.alignment_states_examined;
     total.alignment_states_reused += sample.alignment_states_reused;
     total.terminal_path_matches += sample.terminal_path_matches;

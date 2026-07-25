@@ -321,6 +321,8 @@ pub struct DecoderIndexStats {
 pub struct DecodeSearchStats {
     /// Recursive trie path states visited.
     pub trie_path_visits: usize,
+    /// Trie subtrees skipped by an exact unigram Top-K upper bound.
+    pub trie_subtree_prunes: usize,
     /// Alignment states actually examined while consuming intended keys.
     pub alignment_states_examined: usize,
     /// Alignment-state checks avoided by exact per-scan transition reuse.
@@ -336,6 +338,10 @@ pub struct SentenceSearchStats {
     pub segment_trie_scans: usize,
     /// Recursive trie path states visited across all scans.
     pub trie_path_visits: usize,
+    /// Path visits spent on exact-only evidence scans for prefix bounds.
+    pub exact_prefix_prepass_visits: usize,
+    /// Trie subtrees skipped by exact unigram Top-K upper bounds.
+    pub trie_subtree_prunes: usize,
     /// Alignment states actually examined across all scans.
     pub alignment_states_examined: usize,
     /// Alignment-state checks avoided by exact per-scan transition reuse.
@@ -371,6 +377,7 @@ pub struct SentenceSearchStats {
 pub struct Decoder {
     lexicon: Vec<LexiconEntry>,
     entry_identity_ids: Vec<usize>,
+    entry_identity_max_frequencies: Vec<u64>,
     trie: SyllableTrie,
     language_model: Option<BigramLanguageModel>,
     config: DecodeConfig,
@@ -403,11 +410,14 @@ impl Decoder {
                 .all(|penalty| penalty.is_finite() && *penalty >= 0.0),
             "all penalties must be finite and non-negative"
         );
-        let trie = SyllableTrie::new(&lexicon);
         let entry_identity_ids = lexicon_entry_identity_ids(&lexicon);
+        let entry_identity_max_frequencies =
+            lexicon_entry_identity_max_frequencies(&lexicon, &entry_identity_ids);
+        let trie = SyllableTrie::new(&lexicon);
         Self {
             lexicon,
             entry_identity_ids,
+            entry_identity_max_frequencies,
             trie,
             language_model: None,
             config,
@@ -842,10 +852,46 @@ impl Decoder {
     ) -> Vec<SegmentTransition> {
         search_stats.segment_trie_scans += 1;
         let mut word_stats = DecodeSearchStats::default();
-        let prefix_matches =
-            self.trie
-                .lookup_prefixes(&observed[start..], exact_reachable, &mut word_stats);
+        let pruning = if self.language_model.is_none()
+            && let Some(top_k) = top_k
+        {
+            let mut exact_stats = DecodeSearchStats::default();
+            let exact_matches =
+                self.trie
+                    .lookup_prefixes(&observed[start..], false, None, &mut exact_stats);
+            search_stats.exact_prefix_prepass_visits += exact_stats.trie_path_visits;
+            word_stats.trie_path_visits += exact_stats.trie_path_visits;
+            word_stats.alignment_states_examined += exact_stats.alignment_states_examined;
+            word_stats.alignment_states_reused += exact_stats.alignment_states_reused;
+            Some(UnigramPrefixPruningConfig {
+                lexicon: &self.lexicon,
+                entry_identity_ids: &self.entry_identity_ids,
+                config: &self.config,
+                top_k,
+                exact_reachable,
+                error_reachable,
+                exact_evidence: ExactPrefixEvidence::new(
+                    &exact_matches.paths,
+                    &self.trie,
+                    &self.lexicon,
+                    &self.entry_identity_ids,
+                    &self.entry_identity_max_frequencies,
+                    &self.config,
+                    top_k,
+                    observed.len() - start,
+                ),
+            })
+        } else {
+            None
+        };
+        let prefix_matches = self.trie.lookup_prefixes(
+            &observed[start..],
+            exact_reachable,
+            pruning,
+            &mut word_stats,
+        );
         search_stats.trie_path_visits += word_stats.trie_path_visits;
+        search_stats.trie_subtree_prunes += word_stats.trie_subtree_prunes;
         search_stats.alignment_states_examined += word_stats.alignment_states_examined;
         search_stats.alignment_states_reused += word_stats.alignment_states_reused;
         search_stats.terminal_path_matches += prefix_matches.terminal_path_matches;
@@ -1090,7 +1136,57 @@ impl SyllableTrie {
         for (entry_index, entry) in lexicon.iter().enumerate() {
             trie.insert(entry_index, &entry.syllable_codes);
         }
+        trie.finish_subtree_metadata(lexicon);
         trie
+    }
+
+    fn finish_subtree_metadata(&mut self, lexicon: &[LexiconEntry]) {
+        for node_index in (0..self.nodes.len()).rev() {
+            let mut maximum_frequency = self.nodes[node_index]
+                .terminals
+                .iter()
+                .map(|&entry_index| lexicon[entry_index].frequency)
+                .max()
+                .unwrap_or(0);
+            let mut minimum_terminal_syllables = if self.nodes[node_index].terminals.is_empty() {
+                usize::MAX
+            } else {
+                0
+            };
+            let mut maximum_terminal_syllables = 0;
+
+            for edge in &self.nodes[node_index].children {
+                debug_assert!(
+                    edge.child > node_index,
+                    "trie insertion gives every child a later topological index"
+                );
+                let child = &self.nodes[edge.child];
+                debug_assert_ne!(child.minimum_terminal_syllables, usize::MAX);
+                maximum_frequency = maximum_frequency.max(child.subtree_maximum_frequency);
+                minimum_terminal_syllables = minimum_terminal_syllables
+                    .min(child.minimum_terminal_syllables.saturating_add(1));
+                maximum_terminal_syllables = maximum_terminal_syllables
+                    .max(child.maximum_terminal_syllables.saturating_add(1));
+            }
+
+            let node = &mut self.nodes[node_index];
+            node.subtree_maximum_frequency = maximum_frequency;
+            node.minimum_terminal_syllables = minimum_terminal_syllables;
+            node.maximum_terminal_syllables = maximum_terminal_syllables;
+        }
+
+        let maximum_frequencies = self
+            .nodes
+            .iter()
+            .map(|node| node.subtree_maximum_frequency)
+            .collect::<Vec<_>>();
+        for node in &mut self.nodes {
+            node.children.sort_unstable_by(|left, right| {
+                maximum_frequencies[right.child]
+                    .cmp(&maximum_frequencies[left.child])
+                    .then_with(|| left.code.cmp(&right.code))
+            });
+        }
     }
 
     fn insert(&mut self, entry_index: usize, syllable_codes: &[KeySequence]) {
@@ -1136,7 +1232,7 @@ impl SyllableTrie {
         allow_error: bool,
         stats: &mut DecodeSearchStats,
     ) -> Vec<NoisyTrieTerminal> {
-        let prefix_matches = self.lookup_prefixes(observed, allow_error, stats);
+        let prefix_matches = self.lookup_prefixes(observed, allow_error, None, stats);
         let mut matches = Vec::new();
         for path in prefix_matches
             .paths
@@ -1159,6 +1255,7 @@ impl SyllableTrie {
         &self,
         observed: &str,
         allow_error: bool,
+        pruning: Option<UnigramPrefixPruningConfig<'_>>,
         stats: &mut DecodeSearchStats,
     ) -> TriePrefixMatches {
         let mut search = TrieSearch {
@@ -1171,6 +1268,7 @@ impl SyllableTrie {
             alignment_state_ids: HashMap::new(),
             alignment_state_sets: Vec::new(),
             alignment_transitions: Vec::new(),
+            pruning: pruning.map(|config| UnigramPrefixPruning::new(config, observed.len())),
             stats,
         };
         let initial_state = AlignmentState {
@@ -1204,6 +1302,7 @@ impl SyllableTrie {
                 if let Some(correction) = detect_correction(observed_prefix, &search.intended)
                     && (search.allow_error || correction == Correction::Exact)
                 {
+                    search.observe_terminal(node, observed_length, &correction);
                     search.terminal_path_matches += 1;
                     search.paths.push(NoisyTrieTerminalPath {
                         node_index,
@@ -1224,7 +1323,11 @@ impl SyllableTrie {
             search.intended.push(edge.code[1] as char);
             let full_states = search.advance(states, &edge.code);
             if !search.alignment_state_sets[full_states].is_empty() {
-                self.collect_noisy_matches(edge.child, syllable_index + 1, full_states, search);
+                if search.subtree_is_dominated(&self.nodes[edge.child], full_states) {
+                    search.stats.trie_subtree_prunes += 1;
+                } else {
+                    self.collect_noisy_matches(edge.child, syllable_index + 1, full_states, search);
+                }
             }
             search.intended.truncate(search.intended.len() - 2);
 
@@ -1232,12 +1335,16 @@ impl SyllableTrie {
             search.abbreviated_syllables.push(syllable_index);
             let abbreviated_states = search.advance(states, &edge.code[..1]);
             if !search.alignment_state_sets[abbreviated_states].is_empty() {
-                self.collect_noisy_matches(
-                    edge.child,
-                    syllable_index + 1,
-                    abbreviated_states,
-                    search,
-                );
+                if search.subtree_is_dominated(&self.nodes[edge.child], abbreviated_states) {
+                    search.stats.trie_subtree_prunes += 1;
+                } else {
+                    self.collect_noisy_matches(
+                        edge.child,
+                        syllable_index + 1,
+                        abbreviated_states,
+                        search,
+                    );
+                }
             }
             search.abbreviated_syllables.pop();
             search.intended.pop();
@@ -1322,6 +1429,9 @@ impl SyllableTrie {
 struct SyllableTrieNode {
     children: Vec<SyllableTrieEdge>,
     terminals: Vec<usize>,
+    subtree_maximum_frequency: u64,
+    minimum_terminal_syllables: usize,
+    maximum_terminal_syllables: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1355,6 +1465,358 @@ struct NoisyTrieTerminalPath {
 struct TriePrefixMatches {
     paths: Vec<NoisyTrieTerminalPath>,
     terminal_path_matches: usize,
+}
+
+struct UnigramPrefixPruningConfig<'a> {
+    lexicon: &'a [LexiconEntry],
+    entry_identity_ids: &'a [usize],
+    config: &'a DecodeConfig,
+    top_k: usize,
+    exact_reachable: bool,
+    error_reachable: bool,
+    exact_evidence: ExactPrefixEvidence<'a>,
+}
+
+/// Exact cutoffs are kept separately for the three lattice roles that share
+/// one trie scan: exact edges from an unused-error prefix, corrected edges
+/// from that prefix, and exact edges from an already-used-error prefix.
+/// A complete exact-only prepass certifies cross-layer identity winners.
+struct UnigramPrefixPruning<'a> {
+    lexicon: &'a [LexiconEntry],
+    entry_identity_ids: &'a [usize],
+    config: &'a DecodeConfig,
+    top_k: usize,
+    exact_reachable: bool,
+    error_reachable: bool,
+    exact_evidence: ExactPrefixEvidence<'a>,
+    unused_error_frontiers: Vec<StableTextFrontier<'a>>,
+}
+
+impl<'a> UnigramPrefixPruning<'a> {
+    fn new(config: UnigramPrefixPruningConfig<'a>, observed_length: usize) -> Self {
+        Self {
+            lexicon: config.lexicon,
+            entry_identity_ids: config.entry_identity_ids,
+            config: config.config,
+            top_k: config.top_k,
+            exact_reachable: config.exact_reachable,
+            error_reachable: config.error_reachable,
+            exact_evidence: config.exact_evidence,
+            unused_error_frontiers: (0..=observed_length)
+                .map(|_| StableTextFrontier::default())
+                .collect(),
+        }
+    }
+
+    fn observe_terminal(
+        &mut self,
+        node: &SyllableTrieNode,
+        observed_length: usize,
+        correction: &Correction,
+        abbreviation_count: usize,
+    ) {
+        for &entry_index in &node.terminals {
+            let entry = &self.lexicon[entry_index];
+            let score = (entry.frequency as f64).ln()
+                - configured_correction_penalty(self.config, correction)
+                - abbreviation_count as f64 * self.config.abbreviation_penalty_per_syllable;
+            if self.exact_reachable
+                && *correction != Correction::Exact
+                && self.error_candidate_is_stable(
+                    entry_index,
+                    observed_length,
+                    score,
+                    abbreviation_count,
+                )
+            {
+                self.unused_error_frontiers[observed_length].insert(
+                    entry.text.as_str(),
+                    score,
+                    self.top_k,
+                );
+            }
+        }
+    }
+
+    fn error_candidate_is_stable(
+        &self,
+        entry_index: usize,
+        observed_length: usize,
+        score: f64,
+        abbreviation_count: usize,
+    ) -> bool {
+        let identity = self.entry_identity_ids[entry_index];
+        let Some(exact) = self
+            .exact_evidence
+            .best_by_identity_and_end
+            .get(&(identity, observed_length))
+        else {
+            return true;
+        };
+        match score.total_cmp(&exact.score) {
+            Ordering::Greater => true,
+            Ordering::Equal => abbreviation_count < exact.abbreviation_count,
+            Ordering::Less => false,
+        }
+    }
+
+    fn subtree_is_dominated(
+        &self,
+        node: &SyllableTrieNode,
+        states: &AlignmentStates,
+        abbreviation_count: usize,
+        observed_length: usize,
+    ) -> bool {
+        // Every future correction and abbreviation cost is non-negative, so
+        // the subtree's largest log frequency minus costs already paid is an
+        // optimistic score for every descendant. Equality is never pruned.
+        let upper_score = (node.subtree_maximum_frequency as f64).ln()
+            - abbreviation_count as f64 * self.config.abbreviation_penalty_per_syllable;
+        let minimum_remaining_keys = node.minimum_terminal_syllables;
+        let maximum_remaining_keys = node.maximum_terminal_syllables.saturating_mul(2);
+        let mut has_potential_terminal = false;
+
+        for state in states.as_slice() {
+            for remaining_keys in minimum_remaining_keys..=maximum_remaining_keys {
+                if state.transposition_pending {
+                    if self.exact_reachable && remaining_keys > 0 {
+                        has_potential_terminal = true;
+                        if self.error_candidate_can_survive(
+                            state
+                                .observed_position
+                                .saturating_add(remaining_keys)
+                                .saturating_add(1),
+                            upper_score,
+                            observed_length,
+                        ) {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+
+                if state.used_error {
+                    if self.exact_reachable {
+                        has_potential_terminal = true;
+                        if self.error_candidate_can_survive(
+                            state.observed_position.saturating_add(remaining_keys),
+                            upper_score,
+                            observed_length,
+                        ) {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+
+                let exact_end = state.observed_position.saturating_add(remaining_keys);
+                if self.exact_reachable || self.error_reachable {
+                    has_potential_terminal = true;
+                    if self.exact_candidate_can_survive(exact_end, upper_score, observed_length) {
+                        return false;
+                    }
+                }
+                if self.exact_reachable {
+                    if remaining_keys > 0
+                        && (self.error_candidate_can_survive(
+                            exact_end.saturating_sub(1),
+                            upper_score,
+                            observed_length,
+                        ) || self.error_candidate_can_survive(
+                            exact_end,
+                            upper_score,
+                            observed_length,
+                        ))
+                    {
+                        return false;
+                    }
+                    has_potential_terminal = true;
+                    if self.error_candidate_can_survive(
+                        exact_end.saturating_add(1),
+                        upper_score,
+                        observed_length,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        has_potential_terminal
+    }
+
+    fn exact_candidate_can_survive(
+        &self,
+        end: usize,
+        upper_score: f64,
+        observed_length: usize,
+    ) -> bool {
+        if end == 0 || end > observed_length {
+            return false;
+        }
+        if self.exact_reachable
+            && self.exact_evidence.unused_exact_frontiers[end]
+                .cutoff(self.top_k)
+                .is_none_or(|cutoff| upper_score.total_cmp(&cutoff) != Ordering::Less)
+        {
+            return true;
+        }
+        self.error_reachable
+            && self.exact_evidence.used_error_exact_frontiers[end]
+                .cutoff(self.top_k)
+                .is_none_or(|cutoff| upper_score.total_cmp(&cutoff) != Ordering::Less)
+    }
+
+    fn error_candidate_can_survive(
+        &self,
+        end: usize,
+        upper_score: f64,
+        observed_length: usize,
+    ) -> bool {
+        if end == 0 || end > observed_length {
+            return false;
+        }
+        self.unused_error_frontiers[end]
+            .cutoff(self.top_k)
+            .is_none_or(|cutoff| upper_score.total_cmp(&cutoff) != Ordering::Less)
+    }
+}
+
+struct ExactPrefixEvidence<'a> {
+    best_by_identity_and_end: HashMap<(usize, usize), ExactCandidateRank>,
+    unused_exact_frontiers: Vec<StableTextFrontier<'a>>,
+    used_error_exact_frontiers: Vec<StableTextFrontier<'a>>,
+}
+
+impl<'a> ExactPrefixEvidence<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        paths: &[NoisyTrieTerminalPath],
+        trie: &SyllableTrie,
+        lexicon: &'a [LexiconEntry],
+        entry_identity_ids: &[usize],
+        entry_identity_max_frequencies: &[u64],
+        config: &DecodeConfig,
+        top_k: usize,
+        observed_length: usize,
+    ) -> Self {
+        let minimum_correction_penalty = [
+            config.neighbor_substitution_penalty,
+            config.adjacent_transposition_penalty,
+            config.missing_key_penalty,
+            config.extra_key_penalty,
+        ]
+        .into_iter()
+        .min_by(f64::total_cmp)
+        .expect("the error channel has correction operations");
+        let mut evidence = Self {
+            best_by_identity_and_end: HashMap::new(),
+            unused_exact_frontiers: (0..=observed_length)
+                .map(|_| StableTextFrontier::default())
+                .collect(),
+            used_error_exact_frontiers: (0..=observed_length)
+                .map(|_| StableTextFrontier::default())
+                .collect(),
+        };
+
+        for path in paths {
+            debug_assert_eq!(path.correction, Correction::Exact);
+            let abbreviation_count = path.spelling.abbreviated_syllables.len();
+            for &entry_index in &trie.nodes[path.node_index].terminals {
+                let entry = &lexicon[entry_index];
+                let score = (entry.frequency as f64).ln()
+                    - abbreviation_count as f64 * config.abbreviation_penalty_per_syllable;
+                let rank = ExactCandidateRank {
+                    score,
+                    abbreviation_count,
+                };
+                evidence
+                    .best_by_identity_and_end
+                    .entry((entry_identity_ids[entry_index], path.observed_length))
+                    .and_modify(|current| {
+                        if rank.is_better_than(current) {
+                            *current = rank;
+                        }
+                    })
+                    .or_insert(rank);
+                evidence.used_error_exact_frontiers[path.observed_length].insert(
+                    entry.text.as_str(),
+                    score,
+                    top_k,
+                );
+
+                let best_error_score = (entry_identity_max_frequencies[entry_index] as f64).ln()
+                    - minimum_correction_penalty;
+                if score.total_cmp(&best_error_score) == Ordering::Greater
+                    || (score.total_cmp(&best_error_score) == Ordering::Equal
+                        && abbreviation_count == 0)
+                {
+                    evidence.unused_exact_frontiers[path.observed_length].insert(
+                        entry.text.as_str(),
+                        score,
+                        top_k,
+                    );
+                }
+            }
+        }
+        evidence
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExactCandidateRank {
+    score: f64,
+    abbreviation_count: usize,
+}
+
+impl ExactCandidateRank {
+    fn is_better_than(&self, other: &Self) -> bool {
+        match self.score.total_cmp(&other.score) {
+            Ordering::Greater => true,
+            Ordering::Equal => self.abbreviation_count < other.abbreviation_count,
+            Ordering::Less => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct StableTextFrontier<'a> {
+    candidates: Vec<StableTextScore<'a>>,
+}
+
+impl<'a> StableTextFrontier<'a> {
+    fn insert(&mut self, text: &'a str, score: f64, top_k: usize) {
+        if let Some(candidate) = self
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.text == text)
+        {
+            if score.total_cmp(&candidate.score) == Ordering::Greater {
+                candidate.score = score;
+            }
+        } else if self.candidates.len() < top_k {
+            self.candidates.push(StableTextScore { text, score });
+        } else if score.total_cmp(&self.candidates[top_k - 1].score) == Ordering::Greater {
+            self.candidates[top_k - 1] = StableTextScore { text, score };
+        } else {
+            return;
+        }
+        self.candidates.sort_unstable_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.text.cmp(right.text))
+        });
+    }
+
+    fn cutoff(&self, top_k: usize) -> Option<f64> {
+        (self.candidates.len() == top_k).then(|| self.candidates[top_k - 1].score)
+    }
+}
+
+struct StableTextScore<'a> {
+    text: &'a str,
+    score: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1664,10 +2126,38 @@ struct TrieSearch<'a> {
     alignment_state_ids: HashMap<AlignmentStates, usize>,
     alignment_state_sets: Vec<AlignmentStates>,
     alignment_transitions: Vec<[Option<usize>; 26]>,
+    pruning: Option<UnigramPrefixPruning<'a>>,
     stats: &'a mut DecodeSearchStats,
 }
 
 impl TrieSearch<'_> {
+    fn observe_terminal(
+        &mut self,
+        node: &SyllableTrieNode,
+        observed_length: usize,
+        correction: &Correction,
+    ) {
+        if let Some(pruning) = &mut self.pruning {
+            pruning.observe_terminal(
+                node,
+                observed_length,
+                correction,
+                self.abbreviated_syllables.len(),
+            );
+        }
+    }
+
+    fn subtree_is_dominated(&self, node: &SyllableTrieNode, states: usize) -> bool {
+        self.pruning.as_ref().is_some_and(|pruning| {
+            pruning.subtree_is_dominated(
+                node,
+                &self.alignment_state_sets[states],
+                self.abbreviated_syllables.len(),
+                self.observed.len(),
+            )
+        })
+    }
+
     fn advance(&mut self, states: usize, intended: &[u8]) -> usize {
         let mut current = states;
         for &intended_key in intended {
@@ -2077,6 +2567,25 @@ fn lexicon_entry_identity_ids(lexicon: &[LexiconEntry]) -> Vec<usize> {
                     identity
                 })
         })
+        .collect()
+}
+
+fn lexicon_entry_identity_max_frequencies(
+    lexicon: &[LexiconEntry],
+    identity_ids: &[usize],
+) -> Vec<u64> {
+    let identity_count = identity_ids
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |maximum| maximum + 1);
+    let mut maximum_frequencies = vec![0; identity_count];
+    for (entry, &identity) in lexicon.iter().zip(identity_ids) {
+        maximum_frequencies[identity] = maximum_frequencies[identity].max(entry.frequency);
+    }
+    identity_ids
+        .iter()
+        .map(|&identity| maximum_frequencies[identity])
         .collect()
 }
 
@@ -2790,6 +3299,21 @@ name: test
     }
 
     #[test]
+    fn subtree_bound_keeps_equal_score_branches_for_deterministic_ties() {
+        let lexicon = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+             zeta\tni\t100\n\
+             alpha\tnao\t100\n",
+        )
+        .unwrap();
+        let decoder = Decoder::new(lexicon);
+        let (candidates, stats) = decoder.decode_sentence_with_stats("n", 1).unwrap();
+
+        assert_eq!(candidates[0].text, "alpha");
+        assert!(stats.terminal_path_matches >= 2);
+    }
+
+    #[test]
     fn lightweight_terminal_compaction_matches_materialized_reduction() {
         let decoder = Decoder::new(parse_lexicon_tsv(FIXTURE).unwrap());
         let log_frequency_total = decoder
@@ -2798,6 +3322,7 @@ name: test
             .map(|entry| entry.frequency as f64)
             .sum::<f64>()
             .ln();
+        let mut observed_exact_prune = false;
 
         for observed in ["zrmurf", "nhk", "nigk", "ajjp", "nihkz"] {
             for start in 0..observed.len() {
@@ -2821,14 +3346,16 @@ name: test
                             top_k,
                             log_frequency_total,
                         );
+                        let mut compact_stats = SentenceSearchStats::default();
                         let compact = decoder.segment_transitions(
                             observed,
                             start,
                             exact_reachable,
                             error_reachable,
                             Some(top_k),
-                            &mut SentenceSearchStats::default(),
+                            &mut compact_stats,
                         );
+                        observed_exact_prune |= compact_stats.trie_subtree_prunes > 0;
 
                         assert_eq!(
                             compact, expected,
@@ -2839,6 +3366,10 @@ name: test
                 }
             }
         }
+        assert!(
+            observed_exact_prune,
+            "the focused parity matrix must exercise the exact subtree bound"
+        );
     }
 
     #[test]

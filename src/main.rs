@@ -285,9 +285,11 @@ fn print_latency(label: &str, summary: LatencySummary) {
 
 fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
     println!(
-        "  {label}：trie 扫描 {}；路径访问 {}；对齐状态 {} 实查 + {} 复用；终点路径/词条 {} -> {}；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
+        "  {label}：trie 扫描 {}；路径访问 {}（精确预扫 {}）/子树剪枝 {}；对齐状态 {} 实查 + {} 复用；终点路径/词条 {} -> {}；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
         stats.segment_trie_scans,
         stats.trie_path_visits,
+        stats.exact_prefix_prepass_visits,
+        stats.trie_subtree_prunes,
         stats.alignment_states_examined,
         stats.alignment_states_reused,
         stats.terminal_path_matches,
@@ -343,6 +345,7 @@ fn run_search_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     print_decoded_candidates(observed, &candidates);
     println!("联合搜索统计：");
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
+    println!("  精确上界子树剪枝：{}", stats.trie_subtree_prunes);
     println!(
         "  按键对齐状态：{} 实查 + {} 精确复用",
         stats.alignment_states_examined, stats.alignment_states_reused
@@ -397,6 +400,8 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("句子 lattice 统计：");
     println!("  活跃词界 trie 扫描：{}", stats.segment_trie_scans);
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
+    println!("  其中精确证据预扫：{}", stats.exact_prefix_prepass_visits);
+    println!("  精确上界子树剪枝：{}", stats.trie_subtree_prunes);
     println!(
         "  按键对齐状态：{} 实查 + {} 精确复用",
         stats.alignment_states_examined, stats.alignment_states_reused
