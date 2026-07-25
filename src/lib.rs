@@ -207,7 +207,7 @@ pub struct ScoreBreakdown {
 }
 
 /// Origin of an explainable candidate.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CandidateSource {
     /// A normal entry from the configured lexicon.
     Lexicon,
@@ -338,10 +338,14 @@ pub struct SentenceSearchStats {
     pub alignment_states_examined: usize,
     /// Terminal segment spellings found before lattice-edge deduplication.
     pub terminal_spelling_matches: usize,
-    /// Deduplicated lexicon and unresolved edges in the sentence lattice.
+    /// Deduplicated lexicon and unresolved edges generated for the lattice.
     pub lattice_transitions: usize,
     /// One-key unresolved-input edges included in `lattice_transitions`.
     pub unresolved_lattice_transitions: usize,
+    /// Generated edges retained in the final lattice after exact reduction.
+    pub lattice_transitions_retained: usize,
+    /// Retained unresolved-input edges.
+    pub unresolved_lattice_transitions_retained: usize,
     /// Distinct `(position, error budget, previous word)` ranking states solved.
     pub ranking_states_evaluated: usize,
     /// Reuses of an already solved ranking state.
@@ -489,7 +493,12 @@ impl Decoder {
         } else {
             0.0
         };
-        let lattice = self.build_sentence_lattice(observed.as_str(), &mut search_stats);
+        let lattice = self.build_sentence_lattice(
+            observed.as_str(),
+            Some(top_k),
+            log_frequency_total,
+            &mut search_stats,
+        );
         let initial_state = SentenceRankingState {
             position: 0,
             used_error: false,
@@ -510,6 +519,8 @@ impl Decoder {
     fn build_sentence_lattice(
         &self,
         observed: &str,
+        top_k: Option<usize>,
+        log_frequency_total: f64,
         search_stats: &mut SentenceSearchStats,
     ) -> SentenceLattice {
         let length = observed.len();
@@ -528,6 +539,26 @@ impl Decoder {
             transitions.sort_by(segment_transition_order);
             search_stats.lattice_transitions += 1;
             search_stats.unresolved_lattice_transitions += 1;
+
+            if self.language_model.is_none()
+                && let Some(top_k) = top_k
+            {
+                transitions = self.compact_unigram_lattice_transitions(
+                    transitions,
+                    start,
+                    exact_reachable[start],
+                    error_reachable[start],
+                    top_k,
+                    log_frequency_total,
+                );
+            }
+            search_stats.lattice_transitions_retained += transitions.len();
+            search_stats.unresolved_lattice_transitions_retained += transitions
+                .iter()
+                .filter(|transition| {
+                    transition.candidate.source == CandidateSource::UnresolvedInput
+                })
+                .count();
 
             if exact_reachable[start] {
                 for transition in collapse_error_layers(&transitions) {
@@ -550,6 +581,62 @@ impl Decoder {
         }
 
         SentenceLattice { outgoing, length }
+    }
+
+    fn compact_unigram_lattice_transitions(
+        &self,
+        transitions: Vec<SegmentTransition>,
+        position: usize,
+        exact_reachable: bool,
+        error_reachable: bool,
+        top_k: usize,
+        log_frequency_total: f64,
+    ) -> Vec<SegmentTransition> {
+        debug_assert!(self.language_model.is_none());
+        let mut retained = SegmentTransitionAccumulator::default();
+        for used_error in [false, true] {
+            if (used_error && !error_reachable) || (!used_error && !exact_reachable) {
+                continue;
+            }
+            let state_transitions = if used_error {
+                transitions
+                    .iter()
+                    .filter(|transition| !transition.uses_error)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                collapse_error_layers(&transitions)
+            };
+            let state = SentenceRankingState {
+                position,
+                used_error,
+                previous_word: None,
+            };
+            let mut ignored_stats = SentenceSearchStats::default();
+            for group in self.prepare_transition_groups(
+                state_transitions,
+                &state,
+                top_k,
+                log_frequency_total,
+                &mut ignored_stats,
+            ) {
+                for prepared in group.transitions {
+                    retained.upsert(prepared.transition);
+                }
+            }
+        }
+        let mut retained = retained.into_transitions();
+        retained.sort_by(segment_transition_order);
+        retained
+    }
+
+    #[cfg(test)]
+    fn build_unpruned_sentence_lattice(
+        &self,
+        observed: &str,
+        search_stats: &mut SentenceSearchStats,
+    ) -> SentenceLattice {
+        self.build_sentence_lattice(observed, None, 0.0, search_stats)
     }
 
     fn k_best_from_state(
@@ -652,6 +739,7 @@ impl Decoder {
     ) -> Vec<SentenceTransitionGroup> {
         search_stats.ranking_transitions_considered += transitions.len();
         let mut groups = Vec::<SentenceTransitionGroup>::new();
+        let mut group_indices = HashMap::<SentenceRankingState, usize>::new();
         for transition in transitions {
             let child_state = SentenceRankingState {
                 position: transition.end,
@@ -678,12 +766,10 @@ impl Decoder {
                 edge_score,
                 unresolved_key_count,
             };
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|group| group.child_state == child_state)
-            {
-                group.transitions.push(prepared);
+            if let Some(&index) = group_indices.get(&child_state) {
+                groups[index].transitions.push(prepared);
             } else {
+                group_indices.insert(child_state.clone(), groups.len());
                 groups.push(SentenceTransitionGroup {
                     child_state,
                     transitions: vec![prepared],
@@ -742,7 +828,7 @@ impl Decoder {
     ) -> Vec<SegmentTransition> {
         search_stats.segment_trie_scans += 1;
         let mut word_stats = DecodeSearchStats::default();
-        let mut transitions = Vec::new();
+        let mut transitions = SegmentTransitionAccumulator::default();
         let matches = self
             .trie
             .lookup_prefixes(&observed[start..], allow_error, &mut word_stats);
@@ -763,8 +849,9 @@ impl Decoder {
                     .expect("a sentence slice is lowercase ASCII"),
                 candidate,
             };
-            upsert_transition(&mut transitions, transition);
+            transitions.upsert(transition);
         }
+        let mut transitions = transitions.into_transitions();
         transitions.sort_by(segment_transition_order);
         search_stats.lattice_transitions += transitions.len();
         transitions
@@ -807,7 +894,7 @@ impl Decoder {
         start: usize,
         allow_error: bool,
     ) -> Vec<SegmentTransition> {
-        let mut transitions = Vec::new();
+        let mut transitions = SegmentTransitionAccumulator::default();
         let maximum_length = self.trie.maximum_code_length + usize::from(allow_error);
         let remaining = observed.len() - start;
         for observed_length in 1..=maximum_length.min(remaining) {
@@ -821,9 +908,10 @@ impl Decoder {
                         .expect("a sentence slice is lowercase ASCII"),
                     candidate,
                 };
-                upsert_transition(&mut transitions, transition);
+                transitions.upsert(transition);
             }
         }
+        let mut transitions = transitions.into_transitions();
         transitions.sort_by(segment_transition_order);
         transitions
     }
@@ -1405,6 +1493,53 @@ struct SegmentTransition {
     candidate: Candidate,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SegmentTransitionIdentity {
+    end: usize,
+    uses_error: bool,
+    source: CandidateSource,
+    text: String,
+    code: KeySequence,
+}
+
+impl From<&SegmentTransition> for SegmentTransitionIdentity {
+    fn from(transition: &SegmentTransition) -> Self {
+        Self {
+            end: transition.end,
+            uses_error: transition.uses_error,
+            source: transition.candidate.source,
+            text: transition.candidate.text.clone(),
+            code: transition.candidate.code.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SegmentTransitionAccumulator {
+    transitions: Vec<SegmentTransition>,
+    indices: HashMap<SegmentTransitionIdentity, usize>,
+}
+
+impl SegmentTransitionAccumulator {
+    fn upsert(&mut self, candidate: SegmentTransition) {
+        let identity = SegmentTransitionIdentity::from(&candidate);
+        if let Some(&index) = self.indices.get(&identity) {
+            if candidate_order(&candidate.candidate, &self.transitions[index].candidate)
+                == Ordering::Less
+            {
+                self.transitions[index] = candidate;
+            }
+        } else {
+            self.indices.insert(identity, self.transitions.len());
+            self.transitions.push(candidate);
+        }
+    }
+
+    fn into_transitions(self) -> Vec<SegmentTransition> {
+        self.transitions
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreparedSentenceTransition {
     transition: SegmentTransition,
@@ -1419,37 +1554,23 @@ struct SentenceTransitionGroup {
     transitions: Vec<PreparedSentenceTransition>,
 }
 
-fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: SegmentTransition) {
-    let duplicate = transitions.iter_mut().find(|existing| {
-        existing.end == candidate.end
-            && existing.uses_error == candidate.uses_error
-            && existing.candidate.source == candidate.candidate.source
-            && existing.candidate.text == candidate.candidate.text
-            && existing.candidate.code == candidate.candidate.code
-    });
-    if let Some(existing) = duplicate {
-        if candidate_order(&candidate.candidate, &existing.candidate) == Ordering::Less {
-            *existing = candidate;
-        }
-    } else {
-        transitions.push(candidate);
-    }
-}
-
 fn collapse_error_layers(transitions: &[SegmentTransition]) -> Vec<SegmentTransition> {
     let mut collapsed = Vec::<SegmentTransition>::new();
+    let mut indices = HashMap::<(usize, CandidateSource, String, KeySequence), usize>::new();
     for candidate in transitions {
-        let duplicate = collapsed.iter_mut().find(|existing| {
-            existing.end == candidate.end
-                && existing.candidate.source == candidate.candidate.source
-                && existing.candidate.text == candidate.candidate.text
-                && existing.candidate.code == candidate.candidate.code
-        });
-        if let Some(existing) = duplicate {
-            if candidate_order(&candidate.candidate, &existing.candidate) == Ordering::Less {
-                *existing = candidate.clone();
+        let identity = (
+            candidate.end,
+            candidate.candidate.source,
+            candidate.candidate.text.clone(),
+            candidate.candidate.code.clone(),
+        );
+        if let Some(&index) = indices.get(&identity) {
+            if candidate_order(&candidate.candidate, &collapsed[index].candidate) == Ordering::Less
+            {
+                collapsed[index] = candidate.clone();
             }
         } else {
+            indices.insert(identity, collapsed.len());
             collapsed.push(candidate.clone());
         }
     }
@@ -2270,7 +2391,7 @@ name: test
         top_k: usize,
     ) -> Vec<SentenceCandidate> {
         let mut stats = SentenceSearchStats::default();
-        let lattice = decoder.build_sentence_lattice(observed, &mut stats);
+        let lattice = decoder.build_unpruned_sentence_lattice(observed, &mut stats);
         let log_frequency_total = decoder
             .lexicon
             .iter()

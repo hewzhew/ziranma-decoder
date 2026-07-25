@@ -400,6 +400,19 @@ fn bigram_context_resolves_same_code_word_ambiguity() {
 }
 
 #[test]
+fn bigram_lattice_preserves_text_distinct_future_states() {
+    let lexicon = parse_lexicon_tsv(PUBLIC_DEMO_LEXICON).unwrap();
+    let model = BigramLanguageModel::from_tsv(PUBLIC_BIGRAM_CORPUS, &lexicon).unwrap();
+    let decoder = Decoder::new(lexicon).with_bigram_model(model);
+    let (_candidates, stats) = decoder.decode_sentence_with_stats("zrmurf", 5).unwrap();
+
+    assert_eq!(
+        stats.lattice_transitions_retained,
+        stats.lattice_transitions
+    );
+}
+
+#[test]
 fn compact_syllable_index_stores_each_entry_once() {
     let lexicon = parse_lexicon_tsv(PUBLIC_DEMO_LEXICON).unwrap();
     let entry_count = lexicon.len();
@@ -440,7 +453,10 @@ fn sentence_lattice_reports_streaming_search_work() {
             >= stats.lattice_transitions
     );
     assert!(stats.lattice_transitions > 0);
+    assert!(stats.lattice_transitions_retained > 0);
+    assert!(stats.lattice_transitions_retained <= stats.lattice_transitions);
     assert!(stats.unresolved_lattice_transitions > 0);
+    assert!(stats.unresolved_lattice_transitions_retained <= stats.unresolved_lattice_transitions);
     assert!(stats.ranking_states_evaluated > 0);
     assert!(stats.ranking_transitions_considered > 0);
     assert!(stats.ranking_transitions_retained <= stats.ranking_transitions_considered);
@@ -448,10 +464,11 @@ fn sentence_lattice_reports_streaming_search_work() {
 }
 
 #[test]
-fn sentence_ranking_exactly_reduces_same_future_state_transitions() {
+fn sentence_lattice_exactly_reduces_same_future_state_transitions() {
     let (_candidates, stats) = demo_decoder()
         .decode_sentence_with_stats("zrmurf", 5)
         .unwrap();
 
-    assert!(stats.ranking_transitions_retained < stats.ranking_transitions_considered);
+    assert!(stats.lattice_transitions_retained < stats.lattice_transitions);
+    assert!(stats.ranking_transitions_retained <= stats.ranking_transitions_considered);
 }

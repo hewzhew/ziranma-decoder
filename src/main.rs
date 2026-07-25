@@ -285,10 +285,11 @@ fn print_latency(label: &str, summary: LatencySummary) {
 
 fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
     println!(
-        "  {label}：trie 扫描 {}；对齐状态 {}；lattice 边 {}；排名转移 {} -> {}；路径组合 {}",
+        "  {label}：trie 扫描 {}；对齐状态 {}；lattice 边 {} -> {}；排名转移 {} -> {}；路径组合 {}",
         stats.segment_trie_scans,
         stats.alignment_states_examined,
         stats.lattice_transitions,
+        stats.lattice_transitions_retained,
         stats.ranking_transitions_considered,
         stats.ranking_transitions_retained,
         stats.path_combinations_considered
@@ -390,10 +391,13 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
     println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
     println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
-    println!("  去重后 lattice 总边：{}", stats.lattice_transitions);
     println!(
-        "  其中逐键未解析边：{}",
-        stats.unresolved_lattice_transitions
+        "  lattice 边精确缩减：{} -> {}",
+        stats.lattice_transitions, stats.lattice_transitions_retained
+    );
+    println!(
+        "  其中逐键未解析边：{} -> {}",
+        stats.unresolved_lattice_transitions, stats.unresolved_lattice_transitions_retained
     );
     println!("  求解的 k-best 状态：{}", stats.ranking_states_evaluated);
     println!("  状态缓存命中：{}", stats.ranking_state_cache_hits);

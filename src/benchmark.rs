@@ -206,6 +206,8 @@ fn add_sentence_stats(total: &mut SentenceSearchStats, sample: SentenceSearchSta
     total.terminal_spelling_matches += sample.terminal_spelling_matches;
     total.lattice_transitions += sample.lattice_transitions;
     total.unresolved_lattice_transitions += sample.unresolved_lattice_transitions;
+    total.lattice_transitions_retained += sample.lattice_transitions_retained;
+    total.unresolved_lattice_transitions_retained += sample.unresolved_lattice_transitions_retained;
     total.ranking_states_evaluated += sample.ranking_states_evaluated;
     total.ranking_state_cache_hits += sample.ranking_state_cache_hits;
     total.ranking_transitions_considered += sample.ranking_transitions_considered;
