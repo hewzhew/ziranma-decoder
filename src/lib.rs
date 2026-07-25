@@ -3,7 +3,7 @@
 //! The current research baseline supports full-code and mixed-abbreviation
 //! spellings, together with at most one local key error. It deliberately uses
 //! a compact syllable trie with joint key alignment and inspectable local
-//! language scores.
+//! language scores, then streams trie prefixes into a sentence lattice.
 
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -303,6 +303,21 @@ pub struct DecodeSearchStats {
     pub terminal_spelling_matches: usize,
 }
 
+/// Work performed while constructing and ranking one sentence lattice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SentenceSearchStats {
+    /// Trie scans started from active word-boundary states.
+    pub segment_trie_scans: usize,
+    /// Recursive trie path states visited across all scans.
+    pub trie_path_visits: usize,
+    /// Alignment states examined across all scans.
+    pub alignment_states_examined: usize,
+    /// Terminal segment spellings found before lattice-edge deduplication.
+    pub terminal_spelling_matches: usize,
+    /// Deduplicated word edges inserted into the sentence lattice.
+    pub lattice_transitions: usize,
+}
+
 /// Trie-backed decoder over a local lexicon.
 #[derive(Clone, Debug)]
 pub struct Decoder {
@@ -411,9 +426,20 @@ impl Decoder {
         observed: &str,
         top_k: usize,
     ) -> Result<Vec<SentenceCandidate>, KeySequenceError> {
+        self.decode_sentence_with_stats(observed, top_k)
+            .map(|(candidates, _stats)| candidates)
+    }
+
+    /// Jointly decodes an unsegmented input and returns lattice search work.
+    pub fn decode_sentence_with_stats(
+        &self,
+        observed: &str,
+        top_k: usize,
+    ) -> Result<(Vec<SentenceCandidate>, SentenceSearchStats), KeySequenceError> {
         let observed = KeySequence::new(observed)?;
+        let mut search_stats = SentenceSearchStats::default();
         if top_k == 0 || self.lexicon.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), search_stats));
         }
 
         let length = observed.as_str().len();
@@ -437,8 +463,19 @@ impl Decoder {
             prune_partial_paths(&mut with_error[start], beam_width);
 
             let unused_paths = without_error[start].clone();
+            let used_paths = with_error[start].clone();
+            if unused_paths.is_empty() && used_paths.is_empty() {
+                continue;
+            }
+            let transitions = self.segment_transitions(
+                observed.as_str(),
+                start,
+                !unused_paths.is_empty(),
+                &mut search_stats,
+            );
+
             if !unused_paths.is_empty() {
-                for transition in self.segment_transitions(observed.as_str(), start, true) {
+                for transition in collapse_error_layers(&transitions) {
                     let target_states = if transition.uses_error {
                         &mut with_error
                     } else {
@@ -454,12 +491,14 @@ impl Decoder {
                 }
             }
 
-            let used_paths = with_error[start].clone();
             if !used_paths.is_empty() {
-                for transition in self.segment_transitions(observed.as_str(), start, false) {
+                for transition in transitions
+                    .iter()
+                    .filter(|transition| !transition.uses_error)
+                {
                     extend_paths(
                         &used_paths,
-                        &transition,
+                        transition,
                         log_frequency_total,
                         self.language_model.as_ref(),
                         &mut with_error[transition.end],
@@ -488,10 +527,48 @@ impl Decoder {
         let mut seen_text = HashSet::new();
         complete.retain(|candidate| seen_text.insert(candidate.text.clone()));
         complete.truncate(top_k);
-        Ok(complete)
+        Ok((complete, search_stats))
     }
 
     fn segment_transitions(
+        &self,
+        observed: &str,
+        start: usize,
+        allow_error: bool,
+        search_stats: &mut SentenceSearchStats,
+    ) -> Vec<SegmentTransition> {
+        search_stats.segment_trie_scans += 1;
+        let mut word_stats = DecodeSearchStats::default();
+        let mut transitions = Vec::new();
+        let matches = self
+            .trie
+            .lookup_prefixes(&observed[start..], allow_error, &mut word_stats);
+        word_stats.terminal_spelling_matches += matches.len();
+        search_stats.trie_path_visits += word_stats.trie_path_visits;
+        search_stats.alignment_states_examined += word_stats.alignment_states_examined;
+        search_stats.terminal_spelling_matches += word_stats.terminal_spelling_matches;
+
+        for terminal in matches {
+            let end = start + terminal.observed_length;
+            let observed_segment = &observed[start..end];
+            let entry = &self.lexicon[terminal.entry_index];
+            let candidate = self.make_candidate(entry, terminal.spelling, terminal.correction);
+            let transition = SegmentTransition {
+                end,
+                uses_error: candidate.correction != Correction::Exact,
+                observed: KeySequence::new(observed_segment)
+                    .expect("a sentence slice is lowercase ASCII"),
+                candidate,
+            };
+            upsert_transition(&mut transitions, transition);
+        }
+        transitions.sort_by(segment_transition_order);
+        search_stats.lattice_transitions += transitions.len();
+        transitions
+    }
+
+    #[cfg(test)]
+    fn segment_transitions_by_slices(
         &self,
         observed: &str,
         start: usize,
@@ -514,9 +591,11 @@ impl Decoder {
                 upsert_transition(&mut transitions, transition);
             }
         }
+        transitions.sort_by(segment_transition_order);
         transitions
     }
 
+    #[cfg(test)]
     fn lookup_candidates(&self, observed: &str, allow_error: bool) -> Vec<Candidate> {
         self.lookup_candidates_with_stats(observed, allow_error, &mut DecodeSearchStats::default())
     }
@@ -648,6 +727,18 @@ impl SyllableTrie {
         allow_error: bool,
         stats: &mut DecodeSearchStats,
     ) -> Vec<NoisyTrieTerminal> {
+        let mut matches = self.lookup_prefixes(observed, allow_error, stats);
+        matches.retain(|terminal| terminal.observed_length == observed.len());
+        stats.terminal_spelling_matches += matches.len();
+        matches
+    }
+
+    fn lookup_prefixes(
+        &self,
+        observed: &str,
+        allow_error: bool,
+        stats: &mut DecodeSearchStats,
+    ) -> Vec<NoisyTrieTerminal> {
         let mut search = TrieSearch {
             observed: observed.as_bytes(),
             allow_error,
@@ -674,27 +765,26 @@ impl SyllableTrie {
     ) {
         search.stats.trie_path_visits += 1;
         let node = &self.nodes[node_index];
-        if !node.terminals.is_empty() && states.iter().any(|state| search.accepts_terminal(*state))
-        {
-            let correction = detect_correction(
-                std::str::from_utf8(search.observed)
-                    .expect("decoder inputs are validated lowercase ASCII"),
-                &search.intended,
-            );
-            if let Some(correction) = correction
-                && (search.allow_error || correction == Correction::Exact)
-            {
-                for &entry_index in &node.terminals {
-                    search.matches.push(NoisyTrieTerminal {
-                        entry_index,
-                        spelling: Spelling {
-                            code: KeySequence::new(search.intended.clone())
-                                .expect("trie edges contain lowercase ASCII"),
-                            abbreviated_syllables: search.abbreviated_syllables.clone(),
-                        },
-                        correction: correction.clone(),
-                    });
-                    search.stats.terminal_spelling_matches += 1;
+        if !node.terminals.is_empty() {
+            let observed_lengths = search.terminal_observed_lengths(states);
+            for observed_length in observed_lengths {
+                let observed_prefix = std::str::from_utf8(&search.observed[..observed_length])
+                    .expect("decoder inputs are validated lowercase ASCII");
+                if let Some(correction) = detect_correction(observed_prefix, &search.intended)
+                    && (search.allow_error || correction == Correction::Exact)
+                {
+                    for &entry_index in &node.terminals {
+                        search.matches.push(NoisyTrieTerminal {
+                            entry_index,
+                            observed_length,
+                            spelling: Spelling {
+                                code: KeySequence::new(search.intended.clone())
+                                    .expect("trie edges contain lowercase ASCII"),
+                                abbreviated_syllables: search.abbreviated_syllables.clone(),
+                            },
+                            correction: correction.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -820,6 +910,7 @@ struct TrieTerminal {
 #[derive(Clone, Debug)]
 struct NoisyTrieTerminal {
     entry_index: usize,
+    observed_length: usize,
     spelling: Spelling,
     correction: Correction,
 }
@@ -936,14 +1027,26 @@ impl TrieSearch<'_> {
         }
     }
 
-    fn accepts_terminal(&self, state: AlignmentState) -> bool {
-        if state.transposition_pending {
-            return false;
-        }
-        state.observed_position == self.observed.len()
-            || (self.allow_error
+    fn terminal_observed_lengths(&self, states: &[AlignmentState]) -> Vec<usize> {
+        let mut lengths = Vec::new();
+        for state in states {
+            if state.transposition_pending {
+                continue;
+            }
+            if state.observed_position > 0 && !lengths.contains(&state.observed_position) {
+                lengths.push(state.observed_position);
+            }
+            let trailing_extra_length = state.observed_position + 1;
+            if self.allow_error
                 && !state.used_error
-                && state.observed_position + 1 == self.observed.len())
+                && trailing_extra_length <= self.observed.len()
+                && !lengths.contains(&trailing_extra_length)
+            {
+                lengths.push(trailing_extra_length);
+            }
+        }
+        lengths.sort_unstable();
+        lengths
     }
 }
 
@@ -1053,7 +1156,7 @@ struct PartialSentence {
     total_score: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SegmentTransition {
     end: usize,
     uses_error: bool,
@@ -1117,6 +1220,32 @@ fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: Segmen
     } else {
         transitions.push(candidate);
     }
+}
+
+fn collapse_error_layers(transitions: &[SegmentTransition]) -> Vec<SegmentTransition> {
+    let mut collapsed = Vec::<SegmentTransition>::new();
+    for candidate in transitions {
+        let duplicate = collapsed.iter_mut().find(|existing| {
+            existing.end == candidate.end
+                && existing.candidate.text == candidate.candidate.text
+                && existing.candidate.code == candidate.candidate.code
+        });
+        if let Some(existing) = duplicate {
+            if candidate_order(&candidate.candidate, &existing.candidate) == Ordering::Less {
+                *existing = candidate.clone();
+            }
+        } else {
+            collapsed.push(candidate.clone());
+        }
+    }
+    collapsed.sort_by(segment_transition_order);
+    collapsed
+}
+
+fn segment_transition_order(left: &SegmentTransition, right: &SegmentTransition) -> Ordering {
+    left.end
+        .cmp(&right.end)
+        .then_with(|| candidate_order(&left.candidate, &right.candidate))
 }
 
 fn prune_partial_paths(paths: &mut Vec<PartialSentence>, beam_width: usize) {
@@ -1493,7 +1622,8 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use super::{
-        Candidate, Correction, Decoder, KeySequence, are_qwerty_neighbors, candidate_order,
+        Candidate, Correction, DecodeConfig, Decoder, KeySequence, LexiconEntry,
+        SentenceSearchStats, are_qwerty_neighbors, candidate_order, collapse_error_layers,
         detect_correction, key_hypotheses, parse_lexicon_tsv, spelling_variants,
     };
 
@@ -1607,6 +1737,98 @@ mod tests {
                 "exact-only lookup diverged for {observed}"
             );
         }
+    }
+
+    #[test]
+    fn streaming_sentence_edges_match_slice_reference() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let decoder = Decoder::new(lexicon);
+        let mut cases = BTreeSet::new();
+
+        for pair in decoder.lexicon.windows(2) {
+            let abbreviated = format!(
+                "{}{}",
+                fully_abbreviated(&pair[0]),
+                fully_abbreviated(&pair[1])
+            );
+            cases.insert(abbreviated.clone());
+            cases.insert(format!("{}{}", pair[0].code, pair[1].code));
+
+            let bytes = abbreviated.as_bytes();
+            if bytes.len() > 1 && bytes[0] != bytes[1] {
+                let mut transposed = bytes.to_vec();
+                transposed.swap(0, 1);
+                cases.insert(String::from_utf8(transposed).unwrap());
+            }
+            let mut missing = bytes.to_vec();
+            missing.remove(bytes.len() / 2);
+            cases.insert(String::from_utf8(missing).unwrap());
+
+            let mut extra = bytes.to_vec();
+            extra.insert(bytes.len() / 2, bytes[bytes.len() / 2]);
+            cases.insert(String::from_utf8(extra).unwrap());
+
+            if let Some(neighbor) = (b'a'..=b'z').find(|&key| are_qwerty_neighbors(bytes[0], key)) {
+                let mut substituted = bytes.to_vec();
+                substituted[0] = neighbor;
+                cases.insert(String::from_utf8(substituted).unwrap());
+            }
+        }
+
+        assert!(cases.len() > 150);
+        for observed in cases {
+            for start in 0..observed.len() {
+                for allow_error in [false, true] {
+                    let mut stats = SentenceSearchStats::default();
+                    let streaming =
+                        decoder.segment_transitions(&observed, start, allow_error, &mut stats);
+                    let streaming = if allow_error {
+                        collapse_error_layers(&streaming)
+                    } else {
+                        streaming
+                    };
+                    assert_eq!(
+                        streaming,
+                        decoder.segment_transitions_by_slices(&observed, start, allow_error),
+                        "lattice edges diverged for {observed}, start {start}, allow_error {allow_error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_scan_keeps_exact_edge_for_the_used_error_layer() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let config = DecodeConfig {
+            abbreviation_penalty_per_syllable: 5.0,
+            ..DecodeConfig::default()
+        };
+        let decoder = Decoder::with_config(lexicon, config);
+        let mut stats = SentenceSearchStats::default();
+        let transitions = decoder.segment_transitions("nh", 0, true, &mut stats);
+        let hello = transitions
+            .iter()
+            .filter(|transition| transition.candidate.text == "你好")
+            .collect::<Vec<_>>();
+
+        assert!(hello.iter().any(|transition| !transition.uses_error));
+        assert!(hello.iter().any(|transition| transition.uses_error));
+
+        let collapsed = collapse_error_layers(&transitions);
+        let selected = collapsed
+            .iter()
+            .find(|transition| transition.candidate.text == "你好")
+            .unwrap();
+        assert!(selected.uses_error);
+    }
+
+    fn fully_abbreviated(entry: &LexiconEntry) -> String {
+        entry
+            .syllable_codes
+            .iter()
+            .map(|code| code.as_str().as_bytes()[0] as char)
+            .collect()
     }
 
     fn word_regression_cases(decoder: &Decoder) -> BTreeSet<String> {

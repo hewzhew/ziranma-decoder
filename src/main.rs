@@ -42,6 +42,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "decode" => run_decode(&arguments[1..]),
         "sentence" => run_sentence(&arguments[1..], true),
         "sentence-unigram" => run_sentence(&arguments[1..], false),
+        "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
     }
@@ -181,14 +182,48 @@ fn run_sentence(arguments: &[String], use_bigram: bool) -> Result<(), Box<dyn Er
         return Err("sentence 参数过多".into());
     }
 
-    let lexicon = parse_lexicon_tsv(DEMO_LEXICON)?;
-    let decoder = if use_bigram {
-        let model = BigramLanguageModel::from_tsv(DEMO_BIGRAM_CORPUS, &lexicon)?;
-        Decoder::new(lexicon).with_bigram_model(model)
-    } else {
-        Decoder::new(lexicon)
-    };
+    let decoder = demo_sentence_decoder(use_bigram)?;
     let candidates = decoder.decode_sentence(observed, top_k)?;
+    print_sentence_candidates(observed, use_bigram, &candidates);
+    Ok(())
+}
+
+fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some(observed) = arguments.first() else {
+        return Err("sentence-stats 需要一个没有词界的按键串".into());
+    };
+    let top_k = parse_top_k(arguments.get(1))?;
+    if arguments.len() > 2 {
+        return Err("sentence-stats 参数过多".into());
+    }
+
+    let decoder = demo_sentence_decoder(true)?;
+    let (candidates, stats) = decoder.decode_sentence_with_stats(observed, top_k)?;
+    print_sentence_candidates(observed, true, &candidates);
+    println!("句子 lattice 统计：");
+    println!("  活跃词界 trie 扫描：{}", stats.segment_trie_scans);
+    println!("  trie 路径状态访问：{}", stats.trie_path_visits);
+    println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
+    println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
+    println!("  去重后 lattice 词边：{}", stats.lattice_transitions);
+    Ok(())
+}
+
+fn demo_sentence_decoder(use_bigram: bool) -> Result<Decoder, Box<dyn Error>> {
+    let lexicon = parse_lexicon_tsv(DEMO_LEXICON)?;
+    if use_bigram {
+        let model = BigramLanguageModel::from_tsv(DEMO_BIGRAM_CORPUS, &lexicon)?;
+        Ok(Decoder::new(lexicon).with_bigram_model(model))
+    } else {
+        Ok(Decoder::new(lexicon))
+    }
+}
+
+fn print_sentence_candidates(
+    observed: &str,
+    use_bigram: bool,
+    candidates: &[ziranma_decoder::SentenceCandidate],
+) {
     println!(
         "整串输入：{observed}（{}）",
         if use_bigram {
@@ -199,7 +234,7 @@ fn run_sentence(arguments: &[String], use_bigram: bool) -> Result<(), Box<dyn Er
     );
     if candidates.is_empty() {
         println!("演示词典中没有能够覆盖完整按键串的分词路径。");
-        return Ok(());
+        return;
     }
 
     for (rank, candidate) in candidates.iter().enumerate() {
@@ -237,7 +272,6 @@ fn run_sentence(arguments: &[String], use_bigram: bool) -> Result<(), Box<dyn Er
             }
         }
     }
-    Ok(())
 }
 
 fn run_decode_legacy(observed: &str, remaining: &[String]) -> Result<(), Box<dyn Error>> {
@@ -308,6 +342,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode <按键串> [Top-K]
   cargo run -- sentence <无词界按键串> [Top-K]
   cargo run -- sentence-unigram <按键串> [Top-K]
+  cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- search-stats <按键串> [Top-K]
   cargo run -- evaluate
@@ -321,6 +356,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode nhk
   cargo run -- decode nik
   cargo run -- sentence zrmurf
+  cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- search-stats nhk
   cargo run -- evaluate

@@ -300,3 +300,17 @@ fn joint_search_reports_inspectable_work() {
     assert!(stats.alignment_states_examined >= stats.trie_path_visits);
     assert!(stats.terminal_spelling_matches >= candidates.len());
 }
+
+#[test]
+fn sentence_lattice_reports_streaming_search_work() {
+    let (candidates, stats) = demo_decoder()
+        .decode_sentence_with_stats("zrmurf", 10)
+        .unwrap();
+
+    assert_eq!(candidates[0].text, "自然码输入法");
+    assert!(stats.segment_trie_scans > 0);
+    assert!(stats.trie_path_visits >= stats.segment_trie_scans);
+    assert!(stats.alignment_states_examined >= stats.trie_path_visits);
+    assert!(stats.terminal_spelling_matches >= stats.lattice_transitions);
+    assert!(stats.lattice_transitions > 0);
+}
