@@ -36,6 +36,10 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   not one independent word query per possible segment length.
 - Keep streaming sentence edges covered by parity tests against the old
   slice-by-length reference.
+- Rank sentence paths by `(position, error state, previous word)` k-best
+  memoization; do not reintroduce a cross-state heuristic beam.
+- Keep short sentence ranking covered by an unpruned full-path enumeration
+  oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.
 - Do not perform broad refactors without tests that preserve behavior.
 - Treat synthetic frequency weights as experimental configuration, never as

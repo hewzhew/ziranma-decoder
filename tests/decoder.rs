@@ -313,4 +313,6 @@ fn sentence_lattice_reports_streaming_search_work() {
     assert!(stats.alignment_states_examined >= stats.trie_path_visits);
     assert!(stats.terminal_spelling_matches >= stats.lattice_transitions);
     assert!(stats.lattice_transitions > 0);
+    assert!(stats.ranking_states_evaluated > 0);
+    assert!(stats.path_combinations_considered > 0);
 }

@@ -206,6 +206,9 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  按键对齐状态检查：{}", stats.alignment_states_examined);
     println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
     println!("  去重后 lattice 词边：{}", stats.lattice_transitions);
+    println!("  求解的 k-best 状态：{}", stats.ranking_states_evaluated);
+    println!("  状态缓存命中：{}", stats.ranking_state_cache_hits);
+    println!("  路径组合检查：{}", stats.path_combinations_considered);
     Ok(())
 }
 

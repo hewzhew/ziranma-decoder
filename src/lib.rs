@@ -3,7 +3,8 @@
 //! The current research baseline supports full-code and mixed-abbreviation
 //! spellings, together with at most one local key error. It deliberately uses
 //! a compact syllable trie with joint key alignment and inspectable local
-//! language scores, then streams trie prefixes into a sentence lattice.
+//! language scores, then streams trie prefixes into a memoized k-best sentence
+//! lattice.
 
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -316,6 +317,12 @@ pub struct SentenceSearchStats {
     pub terminal_spelling_matches: usize,
     /// Deduplicated word edges inserted into the sentence lattice.
     pub lattice_transitions: usize,
+    /// Distinct `(position, error budget, previous word)` ranking states solved.
+    pub ranking_states_evaluated: usize,
+    /// Reuses of an already solved ranking state.
+    pub ranking_state_cache_hits: usize,
+    /// Edge/suffix combinations considered by the k-best dynamic program.
+    pub path_combinations_considered: usize,
 }
 
 /// Trie-backed decoder over a local lexicon.
@@ -418,9 +425,9 @@ impl Decoder {
     /// Jointly infers word boundaries, mixed abbreviations, and at most one
     /// local key error across the complete sequence.
     ///
-    /// The search uses dynamic programming by observed-key position and a
-    /// global one-error budget. A bounded beam keeps the research baseline
-    /// responsive while preserving deterministic ordering.
+    /// A streaming trie scan first builds a word lattice. A memoized k-best
+    /// dynamic program then ranks unique paths by input position, global error
+    /// budget, and previous-word language state.
     pub fn decode_sentence(
         &self,
         observed: &str,
@@ -442,92 +449,182 @@ impl Decoder {
             return Ok((Vec::new(), search_stats));
         }
 
-        let length = observed.as_str().len();
-        let beam_width = top_k.saturating_mul(8).clamp(32, 512);
         let log_frequency_total = self
             .lexicon
             .iter()
             .map(|entry| entry.frequency as f64)
             .sum::<f64>()
             .ln();
-        let mut without_error = vec![Vec::<PartialSentence>::new(); length + 1];
-        let mut with_error = vec![Vec::<PartialSentence>::new(); length + 1];
-        without_error[0].push(PartialSentence {
-            text: String::new(),
-            segments: Vec::new(),
-            total_score: 0.0,
-        });
+        let lattice = self.build_sentence_lattice(observed.as_str(), &mut search_stats);
+        let initial_state = SentenceRankingState {
+            position: 0,
+            used_error: false,
+            previous_word: None,
+        };
+        let mut memo = HashMap::new();
+        let candidates = self.k_best_from_state(
+            &lattice,
+            initial_state,
+            top_k,
+            log_frequency_total,
+            &mut memo,
+            &mut search_stats,
+        );
+        Ok((candidates, search_stats))
+    }
+
+    fn build_sentence_lattice(
+        &self,
+        observed: &str,
+        search_stats: &mut SentenceSearchStats,
+    ) -> SentenceLattice {
+        let length = observed.len();
+        let mut outgoing = vec![Vec::new(); length + 1];
+        let mut exact_reachable = vec![false; length + 1];
+        let mut error_reachable = vec![false; length + 1];
+        exact_reachable[0] = true;
 
         for start in 0..length {
-            prune_partial_paths(&mut without_error[start], beam_width);
-            prune_partial_paths(&mut with_error[start], beam_width);
-
-            let unused_paths = without_error[start].clone();
-            let used_paths = with_error[start].clone();
-            if unused_paths.is_empty() && used_paths.is_empty() {
+            if !exact_reachable[start] && !error_reachable[start] {
                 continue;
             }
-            let transitions = self.segment_transitions(
-                observed.as_str(),
-                start,
-                !unused_paths.is_empty(),
-                &mut search_stats,
-            );
+            let transitions =
+                self.segment_transitions(observed, start, exact_reachable[start], search_stats);
 
-            if !unused_paths.is_empty() {
+            if exact_reachable[start] {
                 for transition in collapse_error_layers(&transitions) {
-                    let target_states = if transition.uses_error {
-                        &mut with_error
+                    if transition.uses_error {
+                        error_reachable[transition.end] = true;
                     } else {
-                        &mut without_error
-                    };
-                    extend_paths(
-                        &unused_paths,
-                        &transition,
-                        log_frequency_total,
-                        self.language_model.as_ref(),
-                        &mut target_states[transition.end],
-                    );
+                        exact_reachable[transition.end] = true;
+                    }
                 }
             }
-
-            if !used_paths.is_empty() {
+            if error_reachable[start] {
                 for transition in transitions
                     .iter()
                     .filter(|transition| !transition.uses_error)
                 {
-                    extend_paths(
-                        &used_paths,
-                        transition,
-                        log_frequency_total,
-                        self.language_model.as_ref(),
-                        &mut with_error[transition.end],
-                    );
+                    error_reachable[transition.end] = true;
                 }
+            }
+            outgoing[start] = transitions;
+        }
+
+        SentenceLattice { outgoing, length }
+    }
+
+    fn k_best_from_state(
+        &self,
+        lattice: &SentenceLattice,
+        state: SentenceRankingState,
+        top_k: usize,
+        log_frequency_total: f64,
+        memo: &mut HashMap<SentenceRankingState, Vec<SentenceCandidate>>,
+        search_stats: &mut SentenceSearchStats,
+    ) -> Vec<SentenceCandidate> {
+        if let Some(cached) = memo.get(&state) {
+            search_stats.ranking_state_cache_hits += 1;
+            return cached.clone();
+        }
+        search_stats.ranking_states_evaluated += 1;
+
+        if state.position == lattice.length {
+            let terminal = vec![SentenceCandidate {
+                text: String::new(),
+                segments: Vec::new(),
+                total_score: 0.0,
+                used_error: state.used_error,
+            }];
+            memo.insert(state, terminal.clone());
+            return terminal;
+        }
+
+        let transitions = if state.used_error {
+            lattice.outgoing[state.position]
+                .iter()
+                .filter(|transition| !transition.uses_error)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            collapse_error_layers(&lattice.outgoing[state.position])
+        };
+        let mut paths = Vec::new();
+        for transition in transitions {
+            let child_state = SentenceRankingState {
+                position: transition.end,
+                used_error: state.used_error || transition.uses_error,
+                previous_word: self
+                    .language_model
+                    .as_ref()
+                    .map(|_| transition.candidate.text.clone()),
+            };
+            let suffixes = self.k_best_from_state(
+                lattice,
+                child_state,
+                top_k,
+                log_frequency_total,
+                memo,
+                search_stats,
+            );
+            search_stats.path_combinations_considered += suffixes.len();
+            let language_score = self.sentence_language_score(
+                state.previous_word.as_deref(),
+                &transition.candidate,
+                log_frequency_total,
+            );
+            let edge_score = language_score.interpolated_log_probability
+                - transition.candidate.score.abbreviation_penalty
+                - transition.candidate.score.correction_penalty;
+
+            for suffix in suffixes {
+                let mut text = transition.candidate.text.clone();
+                text.push_str(&suffix.text);
+                let mut segments = Vec::with_capacity(suffix.segments.len() + 1);
+                segments.push(SentenceSegment {
+                    observed: transition.observed.clone(),
+                    candidate: transition.candidate.clone(),
+                    language_score,
+                });
+                segments.extend(suffix.segments);
+                paths.push(SentenceCandidate {
+                    text,
+                    segments,
+                    total_score: edge_score + suffix.total_score,
+                    used_error: suffix.used_error,
+                });
             }
         }
 
-        let mut complete = without_error[length]
-            .drain(..)
-            .map(|path| SentenceCandidate {
-                text: path.text,
-                segments: path.segments,
-                total_score: path.total_score,
-                used_error: false,
-            })
-            .collect::<Vec<_>>();
-        complete.extend(with_error[length].drain(..).map(|path| SentenceCandidate {
-            text: path.text,
-            segments: path.segments,
-            total_score: path.total_score,
-            used_error: true,
-        }));
-        complete.sort_by(sentence_order);
-
+        paths.sort_by(sentence_order);
         let mut seen_text = HashSet::new();
-        complete.retain(|candidate| seen_text.insert(candidate.text.clone()));
-        complete.truncate(top_k);
-        Ok((complete, search_stats))
+        paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
+        paths.truncate(top_k);
+        memo.insert(state, paths.clone());
+        paths
+    }
+
+    fn sentence_language_score(
+        &self,
+        previous_word: Option<&str>,
+        candidate: &Candidate,
+        log_frequency_total: f64,
+    ) -> SentenceLanguageScore {
+        let unigram_log_probability = candidate.score.frequency - log_frequency_total;
+        let bigram = previous_word.and_then(|previous| {
+            self.language_model
+                .as_ref()
+                .map(|model| model.score(previous, &candidate.text))
+        });
+        let interpolated_log_probability = bigram.map_or(unigram_log_probability, |bigram| {
+            (1.0 - BIGRAM_INTERPOLATION_WEIGHT) * unigram_log_probability
+                + BIGRAM_INTERPOLATION_WEIGHT * bigram.log_probability
+        });
+        SentenceLanguageScore {
+            unigram_log_probability,
+            bigram,
+            interpolated_log_probability,
+        }
     }
 
     fn segment_transitions(
@@ -1150,10 +1247,16 @@ fn key_hypotheses(observed: &str, allow_error: bool) -> Vec<KeyHypothesis> {
 }
 
 #[derive(Clone, Debug)]
-struct PartialSentence {
-    text: String,
-    segments: Vec<SentenceSegment>,
-    total_score: f64,
+struct SentenceLattice {
+    outgoing: Vec<Vec<SegmentTransition>>,
+    length: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SentenceRankingState {
+    position: usize,
+    used_error: bool,
+    previous_word: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1162,48 +1265,6 @@ struct SegmentTransition {
     uses_error: bool,
     observed: KeySequence,
     candidate: Candidate,
-}
-
-fn extend_paths(
-    paths: &[PartialSentence],
-    transition: &SegmentTransition,
-    log_frequency_total: f64,
-    language_model: Option<&BigramLanguageModel>,
-    destination: &mut Vec<PartialSentence>,
-) {
-    for path in paths {
-        let mut text = path.text.clone();
-        text.push_str(&transition.candidate.text);
-
-        let unigram_log_probability = transition.candidate.score.frequency - log_frequency_total;
-        let bigram = path.segments.last().and_then(|previous| {
-            language_model
-                .map(|model| model.score(&previous.candidate.text, &transition.candidate.text))
-        });
-        let interpolated_log_probability = bigram.map_or(unigram_log_probability, |bigram| {
-            (1.0 - BIGRAM_INTERPOLATION_WEIGHT) * unigram_log_probability
-                + BIGRAM_INTERPOLATION_WEIGHT * bigram.log_probability
-        });
-        let language_score = SentenceLanguageScore {
-            unigram_log_probability,
-            bigram,
-            interpolated_log_probability,
-        };
-
-        let mut segments = path.segments.clone();
-        segments.push(SentenceSegment {
-            observed: transition.observed.clone(),
-            candidate: transition.candidate.clone(),
-            language_score,
-        });
-        destination.push(PartialSentence {
-            text,
-            segments,
-            total_score: path.total_score + interpolated_log_probability
-                - transition.candidate.score.abbreviation_penalty
-                - transition.candidate.score.correction_penalty,
-        });
-    }
 }
 
 fn upsert_transition(transitions: &mut Vec<SegmentTransition>, candidate: SegmentTransition) {
@@ -1246,28 +1307,6 @@ fn segment_transition_order(left: &SegmentTransition, right: &SegmentTransition)
     left.end
         .cmp(&right.end)
         .then_with(|| candidate_order(&left.candidate, &right.candidate))
-}
-
-fn prune_partial_paths(paths: &mut Vec<PartialSentence>, beam_width: usize) {
-    paths.sort_by(partial_sentence_order);
-    let mut seen_state = HashSet::new();
-    paths.retain(|path| {
-        let previous_word = path
-            .segments
-            .last()
-            .map(|segment| segment.candidate.text.as_str())
-            .unwrap_or("");
-        seen_state.insert((path.text.clone(), previous_word.to_owned()))
-    });
-    paths.truncate(beam_width);
-}
-
-fn partial_sentence_order(left: &PartialSentence, right: &PartialSentence) -> Ordering {
-    right
-        .total_score
-        .total_cmp(&left.total_score)
-        .then_with(|| left.segments.len().cmp(&right.segments.len()))
-        .then_with(|| left.text.cmp(&right.text))
 }
 
 fn sentence_order(left: &SentenceCandidate, right: &SentenceCandidate) -> Ordering {
@@ -1619,15 +1658,18 @@ pub(crate) fn are_qwerty_neighbors(left: u8, right: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     use super::{
-        Candidate, Correction, DecodeConfig, Decoder, KeySequence, LexiconEntry,
-        SentenceSearchStats, are_qwerty_neighbors, candidate_order, collapse_error_layers,
-        detect_correction, key_hypotheses, parse_lexicon_tsv, spelling_variants,
+        BigramLanguageModel, Candidate, Correction, DecodeConfig, Decoder, KeySequence,
+        LexiconEntry, SentenceCandidate, SentenceLattice, SentenceRankingState,
+        SentenceSearchStats, SentenceSegment, are_qwerty_neighbors, candidate_order,
+        collapse_error_layers, detect_correction, key_hypotheses, parse_lexicon_tsv,
+        sentence_order, spelling_variants,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
+    const BIGRAM_FIXTURE: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
 
     #[test]
     fn key_sequence_accepts_only_lowercase_ascii() {
@@ -1821,6 +1863,139 @@ mod tests {
             .find(|transition| transition.candidate.text == "你好")
             .unwrap();
         assert!(selected.uses_error);
+    }
+
+    #[test]
+    fn k_best_sentence_paths_match_full_enumeration() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let decoder = Decoder::new(lexicon);
+        let mut cases = decoder
+            .lexicon
+            .windows(2)
+            .map(|pair| {
+                format!(
+                    "{}{}",
+                    fully_abbreviated(&pair[0]),
+                    fully_abbreviated(&pair[1])
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        cases.extend(["ajjp", "zrmurf", "zrnurf"].into_iter().map(str::to_owned));
+
+        for observed in cases {
+            for top_k in [1, 5, 10] {
+                assert_eq!(
+                    decoder.decode_sentence(&observed, top_k).unwrap(),
+                    exhaustive_sentence_reference(&decoder, &observed, top_k),
+                    "k-best paths diverged for {observed}, K={top_k}"
+                );
+            }
+        }
+
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let model = BigramLanguageModel::from_tsv(BIGRAM_FIXTURE, &lexicon).unwrap();
+        let decoder = Decoder::new(lexicon).with_bigram_model(model);
+        for observed in ["ajjp", "zrmurf", "zrnurf"] {
+            for top_k in [1, 5, 10] {
+                assert_eq!(
+                    decoder.decode_sentence(observed, top_k).unwrap(),
+                    exhaustive_sentence_reference(&decoder, observed, top_k),
+                    "bigram k-best paths diverged for {observed}, K={top_k}"
+                );
+            }
+        }
+    }
+
+    fn exhaustive_sentence_reference(
+        decoder: &Decoder,
+        observed: &str,
+        top_k: usize,
+    ) -> Vec<SentenceCandidate> {
+        let mut stats = SentenceSearchStats::default();
+        let lattice = decoder.build_sentence_lattice(observed, &mut stats);
+        let log_frequency_total = decoder
+            .lexicon
+            .iter()
+            .map(|entry| entry.frequency as f64)
+            .sum::<f64>()
+            .ln();
+        let initial_state = SentenceRankingState {
+            position: 0,
+            used_error: false,
+            previous_word: None,
+        };
+        let mut paths =
+            enumerate_all_sentence_paths(decoder, &lattice, initial_state, log_frequency_total);
+        paths.sort_by(sentence_order);
+        let mut seen_text = HashSet::new();
+        paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
+        paths.truncate(top_k);
+        paths
+    }
+
+    fn enumerate_all_sentence_paths(
+        decoder: &Decoder,
+        lattice: &SentenceLattice,
+        state: SentenceRankingState,
+        log_frequency_total: f64,
+    ) -> Vec<SentenceCandidate> {
+        if state.position == lattice.length {
+            return vec![SentenceCandidate {
+                text: String::new(),
+                segments: Vec::new(),
+                total_score: 0.0,
+                used_error: state.used_error,
+            }];
+        }
+
+        let transitions = if state.used_error {
+            lattice.outgoing[state.position]
+                .iter()
+                .filter(|transition| !transition.uses_error)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            collapse_error_layers(&lattice.outgoing[state.position])
+        };
+        let mut paths = Vec::new();
+        for transition in transitions {
+            let child_state = SentenceRankingState {
+                position: transition.end,
+                used_error: state.used_error || transition.uses_error,
+                previous_word: decoder
+                    .language_model
+                    .as_ref()
+                    .map(|_| transition.candidate.text.clone()),
+            };
+            let suffixes =
+                enumerate_all_sentence_paths(decoder, lattice, child_state, log_frequency_total);
+            let language_score = decoder.sentence_language_score(
+                state.previous_word.as_deref(),
+                &transition.candidate,
+                log_frequency_total,
+            );
+            let edge_score = language_score.interpolated_log_probability
+                - transition.candidate.score.abbreviation_penalty
+                - transition.candidate.score.correction_penalty;
+            for suffix in suffixes {
+                let mut text = transition.candidate.text.clone();
+                text.push_str(&suffix.text);
+                let mut segments = Vec::with_capacity(suffix.segments.len() + 1);
+                segments.push(SentenceSegment {
+                    observed: transition.observed.clone(),
+                    candidate: transition.candidate.clone(),
+                    language_score,
+                });
+                segments.extend(suffix.segments);
+                paths.push(SentenceCandidate {
+                    text,
+                    segments,
+                    total_score: edge_score + suffix.total_score,
+                    used_error: suffix.used_error,
+                });
+            }
+        }
+        paths
     }
 
     fn fully_abbreviated(entry: &LexiconEntry) -> String {
