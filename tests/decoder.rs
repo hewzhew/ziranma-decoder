@@ -462,6 +462,8 @@ fn sentence_lattice_reports_streaming_search_work() {
         stats.terminal_spelling_matches + stats.unresolved_lattice_transitions
             >= stats.lattice_transitions
     );
+    assert!(stats.terminal_path_matches > 0);
+    assert!(stats.terminal_path_matches <= stats.terminal_spelling_matches);
     assert!(stats.lattice_transitions > 0);
     assert!(stats.lattice_transitions_materialized > 0);
     assert!(stats.lattice_transitions_materialized <= stats.lattice_transitions);

@@ -57,6 +57,10 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
 - Keep per-scan alignment transition reuse keyed only by the canonical complete
   alignment-state set and one intended key. Do not share it across inputs or
   error modes, and report actual versus reused checks separately.
+- Keep one owned spelling/correction object per terminal path during sentence
+  construction; lexicon entries may reference it by index until final
+  materialization. Preserve full-candidate parity, including direct duplicate
+  and cross-path identities.
 - Keep short sentence ranking covered by an unpruned full-path enumeration
   oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.

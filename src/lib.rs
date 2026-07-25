@@ -340,6 +340,8 @@ pub struct SentenceSearchStats {
     pub alignment_states_examined: usize,
     /// Alignment-state checks avoided by exact per-scan transition reuse.
     pub alignment_states_reused: usize,
+    /// Terminal spelling paths found before expanding their lexicon entries.
+    pub terminal_path_matches: usize,
     /// Terminal segment spellings found before lattice-edge deduplication.
     pub terminal_spelling_matches: usize,
     /// Deduplicated lexicon and unresolved edges generated for the lattice.
@@ -840,42 +842,61 @@ impl Decoder {
     ) -> Vec<SegmentTransition> {
         search_stats.segment_trie_scans += 1;
         let mut word_stats = DecodeSearchStats::default();
-        let matches =
+        let prefix_matches =
             self.trie
                 .lookup_prefixes(&observed[start..], exact_reachable, &mut word_stats);
-        word_stats.terminal_spelling_matches += matches.len();
         search_stats.trie_path_visits += word_stats.trie_path_visits;
         search_stats.alignment_states_examined += word_stats.alignment_states_examined;
         search_stats.alignment_states_reused += word_stats.alignment_states_reused;
-        search_stats.terminal_spelling_matches += word_stats.terminal_spelling_matches;
+        search_stats.terminal_path_matches += prefix_matches.terminal_path_matches;
+        let paths = prefix_matches.paths;
 
         let mut matches_by_identity = NoisyTerminalAccumulator::default();
-        for terminal in matches {
-            matches_by_identity.upsert(
-                terminal,
-                &self.lexicon,
-                &self.entry_identity_ids,
-                &self.config,
-            );
+        for (path_index, path) in paths.iter().enumerate() {
+            for &entry_index in &self.trie.nodes[path.node_index].terminals {
+                word_stats.terminal_spelling_matches += 1;
+                matches_by_identity.upsert(
+                    IndexedNoisyTerminal {
+                        path_index,
+                        entry_index,
+                        entry_identity: self.entry_identity_ids[entry_index],
+                        total_score: noisy_terminal_total_score(
+                            &self.lexicon[entry_index],
+                            path,
+                            &self.config,
+                        ),
+                    },
+                    &paths,
+                    &self.lexicon,
+                );
+            }
         }
+        search_stats.terminal_spelling_matches += word_stats.terminal_spelling_matches;
         let matches = matches_by_identity.into_matches();
         search_stats.lattice_transitions += matches.len();
         let matches = if self.language_model.is_none()
             && let Some(top_k) = top_k
         {
-            self.compact_unigram_terminal_matches(matches, exact_reachable, error_reachable, top_k)
+            self.compact_unigram_terminal_matches(
+                matches,
+                &paths,
+                exact_reachable,
+                error_reachable,
+                top_k,
+            )
         } else {
             matches
         };
         search_stats.lattice_transitions_materialized += matches.len();
 
         let mut transitions = Vec::with_capacity(matches.len());
-        for scored_terminal in matches {
-            let terminal = scored_terminal.terminal;
-            let end = start + terminal.observed_length;
+        for indexed_terminal in matches {
+            let path = &paths[indexed_terminal.path_index];
+            let end = start + path.observed_length;
             let observed_segment = &observed[start..end];
-            let entry = &self.lexicon[terminal.entry_index];
-            let candidate = self.make_candidate(entry, terminal.spelling, terminal.correction);
+            let entry = &self.lexicon[indexed_terminal.entry_index];
+            let candidate =
+                self.make_candidate(entry, path.spelling.clone(), path.correction.clone());
             let transition = SegmentTransition {
                 end,
                 uses_error: candidate.correction != Correction::Exact,
@@ -891,35 +912,40 @@ impl Decoder {
 
     fn compact_unigram_terminal_matches(
         &self,
-        matches: Vec<ScoredNoisyTerminal>,
+        matches: Vec<IndexedNoisyTerminal>,
+        paths: &[NoisyTrieTerminalPath],
         exact_reachable: bool,
         error_reachable: bool,
         top_k: usize,
-    ) -> Vec<ScoredNoisyTerminal> {
+    ) -> Vec<IndexedNoisyTerminal> {
         debug_assert!(self.language_model.is_none());
         let mut retained = NoisyTerminalAccumulator::default();
         if exact_reachable {
             for terminal in retain_noisy_top_k_by_child(
-                collapse_noisy_error_layers(&matches, &self.lexicon),
+                collapse_noisy_error_layers(&matches, paths, &self.lexicon),
                 false,
                 top_k,
+                paths,
                 &self.lexicon,
             ) {
-                retained.upsert_scored(terminal, &self.lexicon);
+                retained.upsert(terminal, paths, &self.lexicon);
             }
         }
         if error_reachable {
             let exact_matches = matches
                 .iter()
-                .filter(|terminal| !terminal.uses_error())
-                .cloned()
+                .filter(|terminal| !terminal.uses_error(paths))
+                .copied()
                 .collect::<Vec<_>>();
-            for terminal in retain_noisy_top_k_by_child(exact_matches, true, top_k, &self.lexicon) {
-                retained.upsert_scored(terminal, &self.lexicon);
+            for terminal in
+                retain_noisy_top_k_by_child(exact_matches, true, top_k, paths, &self.lexicon)
+            {
+                retained.upsert(terminal, paths, &self.lexicon);
             }
         }
         let mut retained = retained.into_matches();
-        retained.sort_by(|left, right| noisy_terminal_segment_order(left, right, &self.lexicon));
+        retained
+            .sort_by(|left, right| noisy_terminal_segment_order(left, right, paths, &self.lexicon));
         retained
     }
 
@@ -1110,8 +1136,21 @@ impl SyllableTrie {
         allow_error: bool,
         stats: &mut DecodeSearchStats,
     ) -> Vec<NoisyTrieTerminal> {
-        let mut matches = self.lookup_prefixes(observed, allow_error, stats);
-        matches.retain(|terminal| terminal.observed_length == observed.len());
+        let prefix_matches = self.lookup_prefixes(observed, allow_error, stats);
+        let mut matches = Vec::new();
+        for path in prefix_matches
+            .paths
+            .into_iter()
+            .filter(|path| path.observed_length == observed.len())
+        {
+            for &entry_index in &self.nodes[path.node_index].terminals {
+                matches.push(NoisyTrieTerminal {
+                    entry_index,
+                    spelling: path.spelling.clone(),
+                    correction: path.correction.clone(),
+                });
+            }
+        }
         stats.terminal_spelling_matches += matches.len();
         matches
     }
@@ -1121,13 +1160,14 @@ impl SyllableTrie {
         observed: &str,
         allow_error: bool,
         stats: &mut DecodeSearchStats,
-    ) -> Vec<NoisyTrieTerminal> {
+    ) -> TriePrefixMatches {
         let mut search = TrieSearch {
             observed: observed.as_bytes(),
             allow_error,
             intended: String::with_capacity(self.maximum_code_length),
             abbreviated_syllables: Vec::with_capacity(self.maximum_syllables),
-            matches: Vec::new(),
+            paths: Vec::new(),
+            terminal_path_matches: 0,
             alignment_state_ids: HashMap::new(),
             alignment_state_sets: Vec::new(),
             alignment_transitions: Vec::new(),
@@ -1141,7 +1181,10 @@ impl SyllableTrie {
         let initial_states =
             search.intern_alignment_states(AlignmentStates::singleton(initial_state));
         self.collect_noisy_matches(0, 0, initial_states, &mut search);
-        search.matches
+        TriePrefixMatches {
+            paths: search.paths,
+            terminal_path_matches: search.terminal_path_matches,
+        }
     }
 
     fn collect_noisy_matches(
@@ -1161,18 +1204,17 @@ impl SyllableTrie {
                 if let Some(correction) = detect_correction(observed_prefix, &search.intended)
                     && (search.allow_error || correction == Correction::Exact)
                 {
-                    for &entry_index in &node.terminals {
-                        search.matches.push(NoisyTrieTerminal {
-                            entry_index,
-                            observed_length,
-                            spelling: Spelling {
-                                code: KeySequence::new(search.intended.clone())
-                                    .expect("trie edges contain lowercase ASCII"),
-                                abbreviated_syllables: search.abbreviated_syllables.clone(),
-                            },
-                            correction: correction.clone(),
-                        });
-                    }
+                    search.terminal_path_matches += 1;
+                    search.paths.push(NoisyTrieTerminalPath {
+                        node_index,
+                        observed_length,
+                        spelling: Spelling {
+                            code: KeySequence::new(search.intended.clone())
+                                .expect("trie edges contain lowercase ASCII"),
+                            abbreviated_syllables: search.abbreviated_syllables.clone(),
+                        },
+                        correction,
+                    });
                 }
             }
         }
@@ -1298,41 +1340,46 @@ struct TrieTerminal {
 #[derive(Clone, Debug)]
 struct NoisyTrieTerminal {
     entry_index: usize,
-    observed_length: usize,
     spelling: Spelling,
     correction: Correction,
 }
 
 #[derive(Clone, Debug)]
-struct ScoredNoisyTerminal {
-    terminal: NoisyTrieTerminal,
+struct NoisyTrieTerminalPath {
+    node_index: usize,
+    observed_length: usize,
+    spelling: Spelling,
+    correction: Correction,
+}
+
+struct TriePrefixMatches {
+    paths: Vec<NoisyTrieTerminalPath>,
+    terminal_path_matches: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexedNoisyTerminal {
+    path_index: usize,
+    entry_index: usize,
     entry_identity: usize,
     total_score: f64,
 }
 
-impl ScoredNoisyTerminal {
-    fn new(
-        terminal: NoisyTrieTerminal,
-        lexicon: &[LexiconEntry],
-        entry_identity_ids: &[usize],
-        config: &DecodeConfig,
-    ) -> Self {
-        let entry = &lexicon[terminal.entry_index];
-        let entry_identity = entry_identity_ids[terminal.entry_index];
-        let total_score = (entry.frequency as f64).ln()
-            - configured_correction_penalty(config, &terminal.correction)
-            - terminal.spelling.abbreviated_syllables.len() as f64
-                * config.abbreviation_penalty_per_syllable;
-        Self {
-            terminal,
-            entry_identity,
-            total_score,
-        }
+impl IndexedNoisyTerminal {
+    fn uses_error(&self, paths: &[NoisyTrieTerminalPath]) -> bool {
+        paths[self.path_index].correction != Correction::Exact
     }
+}
 
-    fn uses_error(&self) -> bool {
-        self.terminal.correction != Correction::Exact
-    }
+fn noisy_terminal_total_score(
+    entry: &LexiconEntry,
+    path: &NoisyTrieTerminalPath,
+    config: &DecodeConfig,
+) -> f64 {
+    (entry.frequency as f64).ln()
+        - configured_correction_penalty(config, &path.correction)
+        - path.spelling.abbreviated_syllables.len() as f64
+            * config.abbreviation_penalty_per_syllable
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1344,32 +1391,27 @@ struct NoisyTerminalIdentity {
 
 #[derive(Default)]
 struct NoisyTerminalAccumulator {
-    matches: Vec<ScoredNoisyTerminal>,
+    matches: Vec<IndexedNoisyTerminal>,
     indices: HashMap<NoisyTerminalIdentity, usize>,
 }
 
 impl NoisyTerminalAccumulator {
     fn upsert(
         &mut self,
-        terminal: NoisyTrieTerminal,
+        candidate: IndexedNoisyTerminal,
+        paths: &[NoisyTrieTerminalPath],
         lexicon: &[LexiconEntry],
-        entry_identity_ids: &[usize],
-        config: &DecodeConfig,
     ) {
-        self.upsert_scored(
-            ScoredNoisyTerminal::new(terminal, lexicon, entry_identity_ids, config),
-            lexicon,
-        );
-    }
-
-    fn upsert_scored(&mut self, candidate: ScoredNoisyTerminal, lexicon: &[LexiconEntry]) {
+        let path = &paths[candidate.path_index];
         let identity = NoisyTerminalIdentity {
             entry_identity: candidate.entry_identity,
-            observed_length: candidate.terminal.observed_length,
-            uses_error: candidate.uses_error(),
+            observed_length: path.observed_length,
+            uses_error: candidate.uses_error(paths),
         };
         if let Some(&index) = self.indices.get(&identity) {
-            if noisy_terminal_order(&candidate, &self.matches[index], lexicon) == Ordering::Less {
+            if noisy_terminal_order(&candidate, &self.matches[index], paths, lexicon)
+                == Ordering::Less
+            {
                 self.matches[index] = candidate;
             }
         } else {
@@ -1378,44 +1420,51 @@ impl NoisyTerminalAccumulator {
         }
     }
 
-    fn into_matches(self) -> Vec<ScoredNoisyTerminal> {
+    fn into_matches(self) -> Vec<IndexedNoisyTerminal> {
         self.matches
     }
 }
 
 fn collapse_noisy_error_layers(
-    matches: &[ScoredNoisyTerminal],
+    matches: &[IndexedNoisyTerminal],
+    paths: &[NoisyTrieTerminalPath],
     lexicon: &[LexiconEntry],
-) -> Vec<ScoredNoisyTerminal> {
-    let mut collapsed = Vec::<ScoredNoisyTerminal>::new();
+) -> Vec<IndexedNoisyTerminal> {
+    let mut collapsed = Vec::<IndexedNoisyTerminal>::new();
     let mut indices = HashMap::<(usize, usize), usize>::new();
     for candidate in matches {
-        let identity = (candidate.terminal.observed_length, candidate.entry_identity);
+        let identity = (
+            paths[candidate.path_index].observed_length,
+            candidate.entry_identity,
+        );
         if let Some(&index) = indices.get(&identity) {
-            if noisy_terminal_order(candidate, &collapsed[index], lexicon) == Ordering::Less {
-                collapsed[index] = candidate.clone();
+            if noisy_terminal_order(candidate, &collapsed[index], paths, lexicon) == Ordering::Less
+            {
+                collapsed[index] = *candidate;
             }
         } else {
             indices.insert(identity, collapsed.len());
-            collapsed.push(candidate.clone());
+            collapsed.push(*candidate);
         }
     }
-    collapsed.sort_by(|left, right| noisy_terminal_segment_order(left, right, lexicon));
+    collapsed.sort_by(|left, right| noisy_terminal_segment_order(left, right, paths, lexicon));
     collapsed
 }
 
 fn retain_noisy_top_k_by_child(
-    matches: Vec<ScoredNoisyTerminal>,
+    matches: Vec<IndexedNoisyTerminal>,
     state_used_error: bool,
     top_k: usize,
+    paths: &[NoisyTrieTerminalPath],
     lexicon: &[LexiconEntry],
-) -> Vec<ScoredNoisyTerminal> {
-    let mut groups = Vec::<Vec<ScoredNoisyTerminal>>::new();
+) -> Vec<IndexedNoisyTerminal> {
+    let mut groups = Vec::<Vec<IndexedNoisyTerminal>>::new();
     let mut group_indices = HashMap::<(usize, bool), usize>::new();
     for terminal in matches {
+        let path = &paths[terminal.path_index];
         let child = (
-            terminal.terminal.observed_length,
-            state_used_error || terminal.uses_error(),
+            path.observed_length,
+            state_used_error || terminal.uses_error(paths),
         );
         if let Some(&index) = group_indices.get(&child) {
             groups[index].push(terminal);
@@ -1427,11 +1476,9 @@ fn retain_noisy_top_k_by_child(
 
     let mut retained = Vec::new();
     for mut group in groups {
-        group.sort_by(|left, right| noisy_terminal_prepared_order(left, right, lexicon));
+        group.sort_by(|left, right| noisy_terminal_prepared_order(left, right, paths, lexicon));
         let mut seen_text = HashSet::new();
-        group.retain(|terminal| {
-            seen_text.insert(lexicon[terminal.terminal.entry_index].text.as_str())
-        });
+        group.retain(|terminal| seen_text.insert(lexicon[terminal.entry_index].text.as_str()));
         group.truncate(top_k);
         retained.extend(group);
     }
@@ -1439,62 +1486,66 @@ fn retain_noisy_top_k_by_child(
 }
 
 fn noisy_terminal_segment_order(
-    left: &ScoredNoisyTerminal,
-    right: &ScoredNoisyTerminal,
+    left: &IndexedNoisyTerminal,
+    right: &IndexedNoisyTerminal,
+    paths: &[NoisyTrieTerminalPath],
     lexicon: &[LexiconEntry],
 ) -> Ordering {
-    left.terminal
+    paths[left.path_index]
         .observed_length
-        .cmp(&right.terminal.observed_length)
-        .then_with(|| noisy_terminal_order(left, right, lexicon))
+        .cmp(&paths[right.path_index].observed_length)
+        .then_with(|| noisy_terminal_order(left, right, paths, lexicon))
 }
 
 fn noisy_terminal_prepared_order(
-    left: &ScoredNoisyTerminal,
-    right: &ScoredNoisyTerminal,
+    left: &IndexedNoisyTerminal,
+    right: &IndexedNoisyTerminal,
+    paths: &[NoisyTrieTerminalPath],
     lexicon: &[LexiconEntry],
 ) -> Ordering {
     right
         .total_score
         .total_cmp(&left.total_score)
         .then_with(|| {
-            lexicon[left.terminal.entry_index]
+            lexicon[left.entry_index]
                 .text
-                .cmp(&lexicon[right.terminal.entry_index].text)
+                .cmp(&lexicon[right.entry_index].text)
         })
-        .then_with(|| noisy_terminal_order(left, right, lexicon))
+        .then_with(|| noisy_terminal_order(left, right, paths, lexicon))
 }
 
 fn noisy_terminal_order(
-    left: &ScoredNoisyTerminal,
-    right: &ScoredNoisyTerminal,
+    left: &IndexedNoisyTerminal,
+    right: &IndexedNoisyTerminal,
+    paths: &[NoisyTrieTerminalPath],
     lexicon: &[LexiconEntry],
 ) -> Ordering {
+    let left_path = &paths[left.path_index];
+    let right_path = &paths[right.path_index];
     right
         .total_score
         .total_cmp(&left.total_score)
         .then_with(|| {
-            left.terminal
+            left_path
                 .spelling
                 .abbreviated_syllables
                 .len()
-                .cmp(&right.terminal.spelling.abbreviated_syllables.len())
+                .cmp(&right_path.spelling.abbreviated_syllables.len())
         })
         .then_with(|| {
-            correction_rank(&left.terminal.correction)
-                .cmp(&correction_rank(&right.terminal.correction))
+            correction_rank(&left_path.correction).cmp(&correction_rank(&right_path.correction))
         })
         .then_with(|| {
-            lexicon[left.terminal.entry_index]
+            lexicon[left.entry_index]
                 .text
-                .cmp(&lexicon[right.terminal.entry_index].text)
+                .cmp(&lexicon[right.entry_index].text)
         })
         .then_with(|| {
-            left.terminal
+            left_path
                 .spelling
                 .code
                 .as_str()
-                .cmp(right.terminal.spelling.code.as_str())
+                .cmp(right_path.spelling.code.as_str())
         })
 }
 
@@ -1608,7 +1659,8 @@ struct TrieSearch<'a> {
     allow_error: bool,
     intended: String,
     abbreviated_syllables: Vec<usize>,
-    matches: Vec<NoisyTrieTerminal>,
+    paths: Vec<NoisyTrieTerminalPath>,
+    terminal_path_matches: usize,
     alignment_state_ids: HashMap<AlignmentStates, usize>,
     alignment_state_sets: Vec<AlignmentStates>,
     alignment_transitions: Vec<[Option<usize>; 26]>,
@@ -2790,20 +2842,21 @@ name: test
     }
 
     #[test]
-    fn lightweight_identity_preserves_direct_duplicate_lexicon_behavior() {
+    fn lightweight_identity_preserves_cross_path_duplicate_behavior() {
         let mut lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
         let mut duplicate = lexicon[0].clone();
         duplicate.frequency *= 2;
+        duplicate.syllable_codes[1] = KeySequence::new("hj").unwrap();
         lexicon.push(duplicate);
         let decoder = Decoder::new(lexicon);
         let mut stats = SentenceSearchStats::default();
         let streaming = collapse_error_layers(
-            &decoder.segment_transitions("nhk", 0, true, false, None, &mut stats),
+            &decoder.segment_transitions("nh", 0, true, false, None, &mut stats),
         );
 
         assert_eq!(
             streaming,
-            decoder.segment_transitions_by_slices("nhk", 0, true)
+            decoder.segment_transitions_by_slices("nh", 0, true)
         );
     }
 

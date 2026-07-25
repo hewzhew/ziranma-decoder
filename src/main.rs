@@ -285,10 +285,13 @@ fn print_latency(label: &str, summary: LatencySummary) {
 
 fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
     println!(
-        "  {label}：trie 扫描 {}；对齐状态 {} 实查 + {} 复用；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
+        "  {label}：trie 扫描 {}；路径访问 {}；对齐状态 {} 实查 + {} 复用；终点路径/词条 {} -> {}；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
         stats.segment_trie_scans,
+        stats.trie_path_visits,
         stats.alignment_states_examined,
         stats.alignment_states_reused,
+        stats.terminal_path_matches,
+        stats.terminal_spelling_matches,
         stats.lattice_transitions,
         stats.lattice_transitions_materialized,
         stats.lattice_transitions_retained,
@@ -398,6 +401,7 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "  按键对齐状态：{} 实查 + {} 精确复用",
         stats.alignment_states_examined, stats.alignment_states_reused
     );
+    println!("  终点拼写路径：{}", stats.terminal_path_matches);
     println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
     println!(
         "  lattice 边生成/物化/保留：{} -> {} -> {}",
