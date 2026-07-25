@@ -2,7 +2,7 @@
 //!
 //! The current research baseline supports full-code and mixed-abbreviation
 //! spellings, together with at most one local key error. It deliberately uses
-//! a prebuilt spelling trie and inspectable local language scores.
+//! a compact syllable trie and inspectable local language scores.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -274,11 +274,26 @@ impl Default for DecodeConfig {
     }
 }
 
+/// Inspectable structural statistics for the decoder's compact syllable index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecoderIndexStats {
+    /// Number of trie nodes, including the root.
+    pub node_count: usize,
+    /// Number of syllable-labelled edges.
+    pub edge_count: usize,
+    /// Number of stored lexicon terminals.
+    pub terminal_count: usize,
+    /// Number of full-code/abbreviation spellings represented implicitly.
+    pub represented_spelling_count: usize,
+    /// Largest syllable count among indexed entries.
+    pub maximum_syllables: usize,
+}
+
 /// Trie-backed decoder over a local lexicon.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     lexicon: Vec<LexiconEntry>,
-    trie: SpellingTrie,
+    trie: SyllableTrie,
     language_model: Option<BigramLanguageModel>,
     config: DecodeConfig,
 }
@@ -286,7 +301,7 @@ pub struct Decoder {
 impl Decoder {
     /// Creates a decoder with conservative default penalties.
     pub fn new(lexicon: Vec<LexiconEntry>) -> Self {
-        let trie = SpellingTrie::new(&lexicon);
+        let trie = SyllableTrie::new(&lexicon);
         Self {
             lexicon,
             trie,
@@ -315,7 +330,7 @@ impl Decoder {
                 .all(|penalty| penalty.is_finite() && *penalty >= 0.0),
             "all penalties must be finite and non-negative"
         );
-        let trie = SpellingTrie::new(&lexicon);
+        let trie = SyllableTrie::new(&lexicon);
         Self {
             lexicon,
             trie,
@@ -328,6 +343,22 @@ impl Decoder {
     pub fn with_bigram_model(mut self, language_model: BigramLanguageModel) -> Self {
         self.language_model = Some(language_model);
         self
+    }
+
+    /// Returns structural statistics for auditing index compactness.
+    pub fn index_stats(&self) -> DecoderIndexStats {
+        DecoderIndexStats {
+            node_count: self.trie.nodes.len(),
+            edge_count: self.trie.nodes.iter().map(|node| node.children.len()).sum(),
+            terminal_count: self
+                .trie
+                .nodes
+                .iter()
+                .map(|node| node.terminals.len())
+                .sum(),
+            represented_spelling_count: self.trie.represented_spelling_count,
+            maximum_syllables: self.trie.maximum_syllables,
+        }
     }
 
     /// Returns at most `top_k` matching candidates in deterministic score order.
@@ -525,72 +556,146 @@ impl Decoder {
 }
 
 #[derive(Clone, Debug)]
-struct SpellingTrie {
-    nodes: Vec<TrieNode>,
+struct SyllableTrie {
+    nodes: Vec<SyllableTrieNode>,
     maximum_code_length: usize,
+    represented_spelling_count: usize,
+    maximum_syllables: usize,
 }
 
-impl SpellingTrie {
+impl SyllableTrie {
     fn new(lexicon: &[LexiconEntry]) -> Self {
         let mut trie = Self {
-            nodes: vec![TrieNode::new()],
+            nodes: vec![SyllableTrieNode::default()],
             maximum_code_length: 0,
+            represented_spelling_count: 0,
+            maximum_syllables: 0,
         };
         for (entry_index, entry) in lexicon.iter().enumerate() {
-            for spelling in spelling_variants(&entry.syllable_codes) {
-                trie.insert(entry_index, spelling);
-            }
+            trie.insert(entry_index, &entry.syllable_codes);
         }
         trie
     }
 
-    fn insert(&mut self, entry_index: usize, spelling: Spelling) {
-        self.maximum_code_length = self.maximum_code_length.max(spelling.code.as_str().len());
+    fn insert(&mut self, entry_index: usize, syllable_codes: &[KeySequence]) {
+        self.maximum_code_length = self
+            .maximum_code_length
+            .max(syllable_codes.len().saturating_mul(2));
+        self.maximum_syllables = self.maximum_syllables.max(syllable_codes.len());
+        let represented_spellings = 1usize
+            .checked_shl(syllable_codes.len() as u32)
+            .unwrap_or(usize::MAX);
+        self.represented_spelling_count = self
+            .represented_spelling_count
+            .saturating_add(represented_spellings);
+
         let mut node_index = 0;
-        for key in spelling.code.as_str().bytes() {
-            let child_slot = (key - b'a') as usize;
-            node_index = match self.nodes[node_index].children[child_slot] {
+        for syllable_code in syllable_codes {
+            let bytes = syllable_code.as_str().as_bytes();
+            debug_assert_eq!(bytes.len(), 2, "canonical syllable codes have two keys");
+            let code = [bytes[0], bytes[1]];
+            let existing_child = self.nodes[node_index]
+                .children
+                .iter()
+                .find(|edge| edge.code == code)
+                .map(|edge| edge.child);
+            node_index = match existing_child {
                 Some(child) => child,
                 None => {
                     let child = self.nodes.len();
-                    self.nodes.push(TrieNode::new());
-                    self.nodes[node_index].children[child_slot] = Some(child);
+                    self.nodes.push(SyllableTrieNode::default());
+                    self.nodes[node_index]
+                        .children
+                        .push(SyllableTrieEdge { code, child });
                     child
                 }
             };
         }
-        self.nodes[node_index].terminals.push(TrieTerminal {
-            entry_index,
-            spelling,
-        });
+        self.nodes[node_index].terminals.push(entry_index);
     }
 
-    fn lookup(&self, code: &str) -> &[TrieTerminal] {
-        let mut node_index = 0;
-        for key in code.bytes() {
-            let child_slot = (key - b'a') as usize;
-            let Some(child) = self.nodes[node_index].children[child_slot] else {
-                return &[];
-            };
-            node_index = child;
+    fn lookup(&self, code: &str) -> Vec<TrieTerminal> {
+        let Ok(original_code) = KeySequence::new(code) else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        self.collect_matches(
+            0,
+            original_code.as_str().as_bytes(),
+            0,
+            0,
+            &mut Vec::new(),
+            &mut matches,
+        );
+        matches
+            .into_iter()
+            .map(|(entry_index, abbreviated_syllables)| TrieTerminal {
+                entry_index,
+                spelling: Spelling {
+                    code: original_code.clone(),
+                    abbreviated_syllables,
+                },
+            })
+            .collect()
+    }
+
+    fn collect_matches(
+        &self,
+        node_index: usize,
+        input: &[u8],
+        position: usize,
+        syllable_index: usize,
+        abbreviated_syllables: &mut Vec<usize>,
+        matches: &mut Vec<(usize, Vec<usize>)>,
+    ) {
+        let node = &self.nodes[node_index];
+        if position == input.len() {
+            for &entry_index in &node.terminals {
+                matches.push((entry_index, abbreviated_syllables.clone()));
+            }
+            return;
         }
-        &self.nodes[node_index].terminals
+
+        for edge in &node.children {
+            if position + 1 < input.len()
+                && input[position] == edge.code[0]
+                && input[position + 1] == edge.code[1]
+            {
+                self.collect_matches(
+                    edge.child,
+                    input,
+                    position + 2,
+                    syllable_index + 1,
+                    abbreviated_syllables,
+                    matches,
+                );
+            }
+            if input[position] == edge.code[0] {
+                abbreviated_syllables.push(syllable_index);
+                self.collect_matches(
+                    edge.child,
+                    input,
+                    position + 1,
+                    syllable_index + 1,
+                    abbreviated_syllables,
+                    matches,
+                );
+                abbreviated_syllables.pop();
+            }
+        }
     }
 }
 
-#[derive(Clone, Debug)]
-struct TrieNode {
-    children: [Option<usize>; 26],
-    terminals: Vec<TrieTerminal>,
+#[derive(Clone, Debug, Default)]
+struct SyllableTrieNode {
+    children: Vec<SyllableTrieEdge>,
+    terminals: Vec<usize>,
 }
 
-impl TrieNode {
-    fn new() -> Self {
-        Self {
-            children: [None; 26],
-            terminals: Vec::new(),
-        }
-    }
+#[derive(Clone, Copy, Debug)]
+struct SyllableTrieEdge {
+    code: [u8; 2],
+    child: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1135,6 +1240,8 @@ pub(crate) fn are_qwerty_neighbors(left: u8, right: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         Candidate, Correction, Decoder, KeySequence, are_qwerty_neighbors, candidate_order,
         detect_correction, parse_lexicon_tsv, spelling_variants,
@@ -1220,6 +1327,20 @@ mod tests {
     fn trie_lookup_matches_the_exhaustive_reference() {
         let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
         let decoder = Decoder::new(lexicon);
+
+        let every_spelling = decoder
+            .lexicon
+            .iter()
+            .flat_map(|entry| spelling_variants(&entry.syllable_codes))
+            .map(|spelling| spelling.code.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        for observed in every_spelling {
+            assert_eq!(
+                decoder.decode(&observed, 10).unwrap(),
+                exhaustive_reference(&decoder, &observed, 10),
+                "{observed}"
+            );
+        }
 
         for observed in [
             "nihk", "nigk", "nikh", "nik", "niihk", "nh", "ni", "zrm", "urf", "ajjp",

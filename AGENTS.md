@@ -25,6 +25,9 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
 - Preserve the conservative sentence ordering that ranks complete zero-error
   paths ahead of corrected paths.
 - Keep trie changes covered by exhaustive-reference parity tests.
+- Keep each lexicon entry stored once in the compact syllable trie; do not
+  reintroduce construction-time `2^n` spelling expansion.
+- Keep compact-index structure statistics covered by a focused test.
 - Add focused tests with each behavioral change.
 - Do not perform broad refactors without tests that preserve behavior.
 - Treat synthetic frequency weights as experimental configuration, never as

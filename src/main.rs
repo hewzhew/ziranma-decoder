@@ -37,6 +37,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command {
         "encode" => run_encode(&arguments[1..]),
         "evaluate" => run_evaluate(&arguments[1..]),
+        "index-stats" => run_index_stats(&arguments[1..]),
         "decode" => run_decode(&arguments[1..]),
         "sentence" => run_sentence(&arguments[1..], true),
         "sentence-unigram" => run_sentence(&arguments[1..], false),
@@ -116,6 +117,26 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "本次评测耗时：{:.3} ms（仅供本机观察，不是稳定基准）",
         elapsed.as_secs_f64() * 1000.0
     );
+    Ok(())
+}
+
+fn run_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("index-stats 不接受额外参数".into());
+    }
+    let lexicon = parse_lexicon_tsv(DEMO_LEXICON)?;
+    let decoder = Decoder::new(lexicon);
+    let stats = decoder.index_stats();
+
+    println!("紧凑逐音节 trie：");
+    println!("  节点数：{}", stats.node_count);
+    println!("  音节边数：{}", stats.edge_count);
+    println!("  词条终点数：{}", stats.terminal_count);
+    println!(
+        "  隐式表示的全码/简拼拼写数：{}",
+        stats.represented_spelling_count
+    );
+    println!("  最长词条音节数：{}", stats.maximum_syllables);
     Ok(())
 }
 
@@ -262,6 +283,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode <按键串> [Top-K]
   cargo run -- sentence <无词界按键串> [Top-K]
   cargo run -- sentence-unigram <按键串> [Top-K]
+  cargo run -- index-stats
   cargo run -- evaluate
 
 兼容简写：
@@ -273,6 +295,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode nhk
   cargo run -- decode nik
   cargo run -- sentence zrmurf
+  cargo run -- index-stats
   cargo run -- evaluate
 
 程序只读取仓库内的公开演示词典，不会保存输入。"

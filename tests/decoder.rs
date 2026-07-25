@@ -274,3 +274,19 @@ fn bigram_context_resolves_same_code_word_ambiguity() {
         .expect("second word should have bigram evidence");
     assert_eq!(evidence.observed_count, 100);
 }
+
+#[test]
+fn compact_syllable_index_stores_each_entry_once() {
+    let lexicon = parse_lexicon_tsv(PUBLIC_DEMO_LEXICON).unwrap();
+    let entry_count = lexicon.len();
+    let decoder = Decoder::new(lexicon);
+    let stats = decoder.index_stats();
+
+    assert_eq!(stats.terminal_count, entry_count);
+    assert_eq!(stats.node_count, 96);
+    assert_eq!(stats.edge_count, 95);
+    assert_eq!(stats.represented_spelling_count, 212);
+    assert_eq!(stats.maximum_syllables, 3);
+    assert_eq!(stats.edge_count + 1, stats.node_count);
+    assert!(stats.node_count < stats.represented_spelling_count);
+}
