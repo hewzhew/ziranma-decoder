@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
-    evaluate_oov_cases, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
-    parse_rime_lexicon,
+    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+    parse_lexicon_tsv, parse_rime_lexicon,
 };
 
 mod benchmark;
@@ -94,6 +94,12 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let long_bigram = evaluate_sentence_cases(&decoder, &lexicon, LONG_SENTENCE_CASES)?;
     let oov_cases = parse_lexicon_tsv(OOV_CASES)?;
     let oov = evaluate_oov_cases(&unigram_decoder, &oov_cases);
+    let rejection_shadow = evaluate_rejection_shadow(
+        &unigram_decoder,
+        &lexicon,
+        &[DEMO_SENTENCE_CASES, LONG_SENTENCE_CASES],
+        &oov_cases,
+    )?;
     let elapsed = started.elapsed();
 
     println!(
@@ -157,6 +163,35 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         oov.observed_keys,
         oov.unresolved_key_rate() * 100.0
     );
+    println!(
+        "拒识影子完整覆盖：已知句 {}/{}；独立词外 {}/{}（只报告，不改变候选）",
+        rejection_shadow.known_with_full_coverage,
+        rejection_shadow.known_total,
+        rejection_shadow.oov_with_full_coverage,
+        rejection_shadow.oov_total
+    );
+    if let (Some(known), Some(oov)) = (
+        rejection_shadow.known_margin_range,
+        rejection_shadow.oov_margin_range,
+    ) {
+        println!(
+            "完整路径每键分差：已知句 {:.3}～{:.3}；独立词外 {:.3}～{:.3}",
+            known.minimum_per_key, known.maximum_per_key, oov.minimum_per_key, oov.maximum_per_key
+        );
+    }
+    println!("每键最低分差   已知句保留       词外拒识");
+    for metrics in &rejection_shadow.thresholds {
+        println!(
+            "{:>10.1}   {:>3}/{:<3} ({:>5.1}%)   {:>3}/{:<3} ({:>5.1}%)",
+            metrics.threshold_per_key,
+            metrics.known_accepted,
+            metrics.known_total,
+            metrics.known_acceptance_rate() * 100.0,
+            metrics.oov_rejected,
+            metrics.oov_total,
+            metrics.oov_rejection_rate() * 100.0
+        );
+    }
     println!(
         "本次评测耗时：{:.3} ms（仅供本机观察，不是稳定基准）",
         elapsed.as_secs_f64() * 1000.0

@@ -19,8 +19,10 @@ mod language_model;
 
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use evaluation::{
-    EvaluationReport, OovCaseReport, RecallMetrics, SentenceCaseParseError, SentenceCaseReport,
-    SyntheticCaseKind, evaluate_oov_cases, evaluate_sentence_cases, evaluate_synthetic,
+    EvaluationReport, OovCaseReport, REJECTION_SHADOW_THRESHOLDS_PER_KEY, RecallMetrics,
+    RejectionMarginRange, RejectionShadowReport, RejectionThresholdMetrics, SentenceCaseParseError,
+    SentenceCaseReport, SyntheticCaseKind, evaluate_oov_cases, evaluate_rejection_shadow,
+    evaluate_sentence_cases, evaluate_synthetic,
 };
 pub use language_model::{BigramLanguageModel, BigramScore, LanguageModelParseError};
 

@@ -6,6 +6,13 @@ use crate::{
     Candidate, Correction, Decoder, LexiconEntry, are_qwerty_neighbors, spelling_variants,
 };
 
+/// Candidate per-key margins scanned by the rejection shadow evaluation.
+///
+/// A threshold accepts a fully lexicon-covered path when its normalized score
+/// margin over fully literal fallback is at least this value.
+pub const REJECTION_SHADOW_THRESHOLDS_PER_KEY: [f64; 9] =
+    [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
 /// Deterministic synthetic case families generated from public lexicon entries.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SyntheticCaseKind {
@@ -169,6 +176,126 @@ impl OovCaseReport {
     }
 }
 
+/// One threshold row from the read-only rejection calibration probe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RejectionThresholdMetrics {
+    /// Minimum normalized lexicon-over-literal score margin required to accept.
+    pub threshold_per_key: f64,
+    /// Number of separately authored known sentences.
+    pub known_total: usize,
+    /// Known sentences that would retain a fully lexicon-covered result.
+    pub known_accepted: usize,
+    /// Number of independently authored held-out words.
+    pub oov_total: usize,
+    /// Held-out words that would use fully literal fallback.
+    pub oov_rejected: usize,
+}
+
+impl RejectionThresholdMetrics {
+    /// Fraction of known sentences that would retain a lexicon result.
+    pub fn known_acceptance_rate(&self) -> f64 {
+        rate(self.known_accepted, self.known_total)
+    }
+
+    /// Fraction of held-out words that would use fully literal fallback.
+    pub fn oov_rejection_rate(&self) -> f64 {
+        rate(self.oov_rejected, self.oov_total)
+    }
+}
+
+/// Observed range of normalized margins among fully covered paths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RejectionMarginRange {
+    /// Lowest observed per-key margin.
+    pub minimum_per_key: f64,
+    /// Highest observed per-key margin.
+    pub maximum_per_key: f64,
+}
+
+/// Read-only calibration report comparing lexicon coverage with literal fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RejectionShadowReport {
+    /// Number of separately authored known sentences.
+    pub known_total: usize,
+    /// Known sentences for which a fully lexicon-covered path exists.
+    pub known_with_full_coverage: usize,
+    /// Margin range among known sentences with full coverage.
+    pub known_margin_range: Option<RejectionMarginRange>,
+    /// Number of independently authored held-out words.
+    pub oov_total: usize,
+    /// Held-out words for which a fully lexicon-covered path exists.
+    pub oov_with_full_coverage: usize,
+    /// Margin range among held-out words with full coverage.
+    pub oov_margin_range: Option<RejectionMarginRange>,
+    /// Fixed threshold scan in ascending order.
+    pub thresholds: Vec<RejectionThresholdMetrics>,
+}
+
+/// Compares the best fully covered sentence path with fully literal fallback.
+///
+/// For each non-empty observed key sequence, the shadow signal is:
+///
+/// `(best fully covered score - fully literal score) / observed key count`
+///
+/// where fully literal score is the configured unresolved-key penalty applied
+/// once per key. A threshold accepts lexicon coverage when the signal is at
+/// least the threshold; inputs without a fully covered path are rejected. This
+/// function only reports hypothetical decisions and does not change decoding.
+pub fn evaluate_rejection_shadow(
+    decoder: &Decoder,
+    lexicon: &[LexiconEntry],
+    known_sentence_sets: &[&str],
+    oov_cases: &[LexiconEntry],
+) -> Result<RejectionShadowReport, SentenceCaseParseError> {
+    let mut known_margins = Vec::new();
+    for contents in known_sentence_sets {
+        let cases = parse_sentence_cases(lexicon, contents)?;
+        known_margins.extend(
+            cases
+                .iter()
+                .map(|case| full_lexicon_margin_per_key(decoder, &case.observed)),
+        );
+    }
+    let oov_margins = oov_cases
+        .iter()
+        .map(|case| full_lexicon_margin_per_key(decoder, case.code.as_str()))
+        .collect::<Vec<_>>();
+
+    let known_total = known_margins.len();
+    let known_with_full_coverage = known_margins.iter().flatten().count();
+    let known_margin_range = rejection_margin_range(&known_margins);
+    let oov_total = oov_margins.len();
+    let oov_with_full_coverage = oov_margins.iter().flatten().count();
+    let oov_margin_range = rejection_margin_range(&oov_margins);
+    let thresholds = REJECTION_SHADOW_THRESHOLDS_PER_KEY
+        .into_iter()
+        .map(|threshold_per_key| RejectionThresholdMetrics {
+            threshold_per_key,
+            known_total,
+            known_accepted: known_margins
+                .iter()
+                .flatten()
+                .filter(|margin| **margin >= threshold_per_key)
+                .count(),
+            oov_total,
+            oov_rejected: oov_margins
+                .iter()
+                .filter(|margin| margin.is_none_or(|margin| margin < threshold_per_key))
+                .count(),
+        })
+        .collect();
+
+    Ok(RejectionShadowReport {
+        known_total,
+        known_with_full_coverage,
+        known_margin_range,
+        oov_total,
+        oov_with_full_coverage,
+        oov_margin_range,
+        thresholds,
+    })
+}
+
 /// Evaluates canonical codes for words deliberately absent from the decoder.
 ///
 /// The held-out entries should be authored separately and parsed through the
@@ -216,18 +343,51 @@ pub fn evaluate_sentence_cases(
     lexicon: &[LexiconEntry],
     contents: &str,
 ) -> Result<SentenceCaseReport, SentenceCaseParseError> {
-    let entries_by_text = lexicon
-        .iter()
-        .map(|entry| (entry.text.as_str(), entry))
-        .collect::<HashMap<_, _>>();
-    let mut saw_header = false;
-    let mut identifiers = HashSet::new();
+    let cases = parse_sentence_cases(lexicon, contents)?;
     let mut report = SentenceCaseReport {
         total: 0,
         hits_at_1: 0,
         hits_at_5: 0,
         hits_at_10: 0,
     };
+    for case in cases {
+        let candidates = decoder
+            .decode_sentence(&case.observed, 10)
+            .expect("generated sentence keys are lowercase ASCII");
+        let rank = candidates
+            .iter()
+            .position(|candidate| candidate.text == case.expected);
+        report.total += 1;
+        if rank.is_some_and(|rank| rank < 1) {
+            report.hits_at_1 += 1;
+        }
+        if rank.is_some_and(|rank| rank < 5) {
+            report.hits_at_5 += 1;
+        }
+        if rank.is_some_and(|rank| rank < 10) {
+            report.hits_at_10 += 1;
+        }
+    }
+    Ok(report)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthoredSentenceCase {
+    observed: String,
+    expected: String,
+}
+
+fn parse_sentence_cases(
+    lexicon: &[LexiconEntry],
+    contents: &str,
+) -> Result<Vec<AuthoredSentenceCase>, SentenceCaseParseError> {
+    let entries_by_text = lexicon
+        .iter()
+        .map(|entry| (entry.text.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut saw_header = false;
+    let mut identifiers = HashSet::new();
+    let mut cases = Vec::new();
 
     for (zero_based_line, raw_line) in contents.lines().enumerate() {
         let line_number = zero_based_line + 1;
@@ -270,32 +430,49 @@ pub fn evaluate_sentence_cases(
             observed.push_str(&fully_abbreviated_code(entry));
             expected.push_str(token);
         }
-
-        let candidates = decoder
-            .decode_sentence(&observed, 10)
-            .expect("generated sentence keys are lowercase ASCII");
-        let rank = candidates
-            .iter()
-            .position(|candidate| candidate.text == expected);
-        report.total += 1;
-        if rank.is_some_and(|rank| rank < 1) {
-            report.hits_at_1 += 1;
-        }
-        if rank.is_some_and(|rank| rank < 5) {
-            report.hits_at_5 += 1;
-        }
-        if rank.is_some_and(|rank| rank < 10) {
-            report.hits_at_10 += 1;
-        }
+        cases.push(AuthoredSentenceCase { observed, expected });
     }
 
     if !saw_header {
         return Err(SentenceCaseParseError::MissingHeader);
     }
-    if report.total == 0 {
+    if cases.is_empty() {
         return Err(SentenceCaseParseError::Empty);
     }
-    Ok(report)
+    Ok(cases)
+}
+
+fn full_lexicon_margin_per_key(decoder: &Decoder, observed: &str) -> Option<f64> {
+    // Sentence ordering places every fully covered path before every path with
+    // unresolved input, so Top-1 is the best full path whenever one exists.
+    let candidate = decoder
+        .decode_sentence(observed, 1)
+        .expect("evaluation keys are lowercase ASCII")
+        .into_iter()
+        .next()
+        .expect("literal fallback guarantees a sentence candidate");
+    if candidate.unresolved_key_count > 0 {
+        return None;
+    }
+    let observed_key_count = observed.len();
+    debug_assert!(observed_key_count > 0);
+    let fully_literal_score = -(observed_key_count as f64) * decoder.config.unresolved_key_penalty;
+    Some((candidate.total_score - fully_literal_score) / observed_key_count as f64)
+}
+
+fn rejection_margin_range(margins: &[Option<f64>]) -> Option<RejectionMarginRange> {
+    let mut margins = margins.iter().flatten().copied();
+    let first = margins.next()?;
+    Some(margins.fold(
+        RejectionMarginRange {
+            minimum_per_key: first,
+            maximum_per_key: first,
+        },
+        |range, margin| RejectionMarginRange {
+            minimum_per_key: range.minimum_per_key.min(margin),
+            maximum_per_key: range.maximum_per_key.max(margin),
+        },
+    ))
 }
 
 /// Error returned while parsing separate sentence-ranking cases.
@@ -522,7 +699,8 @@ mod tests {
     use crate::{BigramLanguageModel, Decoder, parse_lexicon_tsv};
 
     use super::{
-        SyntheticCaseKind, evaluate_oov_cases, evaluate_sentence_cases, evaluate_synthetic,
+        REJECTION_SHADOW_THRESHOLDS_PER_KEY, SyntheticCaseKind, evaluate_oov_cases,
+        evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -569,6 +747,80 @@ mod tests {
         assert!((0.0..=1.0).contains(&report.with_unresolved_rate()));
         assert!((0.0..=1.0).contains(&report.fully_unresolved_rate()));
         assert!((0.0..=1.0).contains(&report.unresolved_key_rate()));
+    }
+
+    #[test]
+    fn rejection_shadow_is_deterministic_monotonic_and_read_only() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let held_out = parse_lexicon_tsv(OOV_CASES).unwrap();
+        let decoder = Decoder::new(lexicon.clone());
+        let before = decoder.decode_sentence("zrmurf", 10).unwrap();
+
+        let first = evaluate_rejection_shadow(
+            &decoder,
+            &lexicon,
+            &[SENTENCE_CASES, LONG_SENTENCE_CASES],
+            &held_out,
+        )
+        .unwrap();
+        let second = evaluate_rejection_shadow(
+            &decoder,
+            &lexicon,
+            &[SENTENCE_CASES, LONG_SENTENCE_CASES],
+            &held_out,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(decoder.decode_sentence("zrmurf", 10).unwrap(), before);
+        assert_eq!(first.known_total, 18);
+        assert_eq!(first.known_with_full_coverage, 18);
+        assert_eq!(first.oov_total, 12);
+        assert_eq!(first.oov_with_full_coverage, 4);
+        let known_range = first.known_margin_range.unwrap();
+        let oov_range = first.oov_margin_range.unwrap();
+        assert!(known_range.minimum_per_key.is_finite());
+        assert!(known_range.minimum_per_key <= known_range.maximum_per_key);
+        assert!(oov_range.minimum_per_key.is_finite());
+        assert!(oov_range.minimum_per_key <= oov_range.maximum_per_key);
+        assert_eq!(
+            first
+                .thresholds
+                .iter()
+                .map(|metrics| metrics.threshold_per_key)
+                .collect::<Vec<_>>(),
+            REJECTION_SHADOW_THRESHOLDS_PER_KEY
+        );
+        assert!(first.thresholds.windows(2).all(|pair| {
+            pair[0].known_accepted >= pair[1].known_accepted
+                && pair[0].oov_rejected <= pair[1].oov_rejected
+        }));
+        assert!(first.thresholds.iter().all(|metrics| {
+            metrics.known_accepted <= metrics.known_total
+                && metrics.oov_rejected <= metrics.oov_total
+                && (0.0..=1.0).contains(&metrics.known_acceptance_rate())
+                && (0.0..=1.0).contains(&metrics.oov_rejection_rate())
+        }));
+    }
+
+    #[test]
+    fn rejection_shadow_treats_absent_full_coverage_as_rejected() {
+        let held_out = parse_lexicon_tsv(OOV_CASES).unwrap();
+        let decoder = Decoder::new(Vec::new());
+        let report = evaluate_rejection_shadow(&decoder, &[], &[], &held_out[..1]).unwrap();
+
+        assert_eq!(report.known_total, 0);
+        assert_eq!(report.known_with_full_coverage, 0);
+        assert_eq!(report.known_margin_range, None);
+        assert_eq!(report.oov_total, 1);
+        assert_eq!(report.oov_with_full_coverage, 0);
+        assert_eq!(report.oov_margin_range, None);
+        assert!(
+            report
+                .thresholds
+                .iter()
+                .all(|metrics| { metrics.known_accepted == 0 && metrics.oov_rejected == 1 })
+        );
     }
 
     #[test]
