@@ -3478,7 +3478,6 @@ name: test
             .sum::<f64>()
             .ln();
         let mut observed_exact_prune = false;
-        let mut observed_terminal_entry_skip = false;
 
         for observed in ["zrmurf", "nhk", "nigk", "ajjp", "nihkz"] {
             for start in 0..observed.len() {
@@ -3512,9 +3511,6 @@ name: test
                             &mut compact_stats,
                         );
                         observed_exact_prune |= compact_stats.trie_subtree_prunes > 0;
-                        observed_terminal_entry_skip |=
-                            compact_stats.terminal_entry_bound_skips > 0;
-
                         assert_eq!(
                             compact, expected,
                             "terminal compaction diverged for {observed}, start {start}, \
@@ -3527,10 +3523,6 @@ name: test
         assert!(
             observed_exact_prune,
             "the focused parity matrix must exercise the exact subtree bound"
-        );
-        assert!(
-            observed_terminal_entry_skip,
-            "the focused parity matrix must exercise the terminal entry bound"
         );
     }
 

@@ -42,16 +42,21 @@ pub fn encode_pinyin_syllable(syllable: &str) -> Result<KeySequence, PinyinEncod
     let normalized = normalize_syllable(syllable)?;
 
     if normalized.starts_with(['a', 'e', 'o']) {
+        // Canonical Ziranma keeps two-letter zero-initial syllables unchanged.
+        // Only one-letter vowels are doubled and three-letter syllables are
+        // compressed with the ordinary final key. Some Rime schemas also
+        // derive compatibility spellings such as `aj` for `an`; those aliases
+        // are accepted-input policy, not the canonical spelling emitted here.
         let code = match normalized.as_str() {
             "a" => "aa",
             "o" => "oo",
             "e" => "ee",
-            "ai" => "al",
-            "ei" => "ez",
-            "ao" => "ak",
-            "ou" => "ob",
-            "an" => "aj",
-            "en" => "ef",
+            "ai" => "ai",
+            "ei" => "ei",
+            "ao" => "ao",
+            "ou" => "ou",
+            "an" => "an",
+            "en" => "en",
             "ang" => "ah",
             "eng" => "eg",
             "ong" => "os",
@@ -235,12 +240,12 @@ mod tests {
             ("a", "aa"),
             ("o", "oo"),
             ("e", "ee"),
-            ("ai", "al"),
-            ("ei", "ez"),
-            ("ao", "ak"),
-            ("ou", "ob"),
-            ("an", "aj"),
-            ("en", "ef"),
+            ("ai", "ai"),
+            ("ei", "ei"),
+            ("ao", "ao"),
+            ("ou", "ou"),
+            ("an", "an"),
+            ("en", "en"),
             ("ang", "ah"),
             ("eng", "eg"),
             ("ong", "os"),
@@ -262,6 +267,8 @@ mod tests {
             ("zhi", "vi"),
             ("chi", "ii"),
             ("shi", "ui"),
+            ("chan", "ij"),
+            ("shuang", "ud"),
             ("ju", "jv"),
             ("nü", "nv"),
             ("lu:", "lv"),

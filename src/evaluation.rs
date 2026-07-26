@@ -1480,10 +1480,10 @@ mod tests {
         let report = evaluate_oov_cases(&decoder, &held_out);
 
         assert_eq!(report.total, 12);
-        assert_eq!(report.top_1_with_unresolved, 8);
+        assert_eq!(report.top_1_with_unresolved, 9);
         assert_eq!(report.top_1_fully_unresolved, 0);
-        assert_eq!(report.top_1_without_unresolved, 4);
-        assert_eq!(report.unresolved_keys, 15);
+        assert_eq!(report.top_1_without_unresolved, 3);
+        assert_eq!(report.unresolved_keys, 17);
         assert_eq!(report.observed_keys, 48);
         assert_eq!(
             report.top_1_with_unresolved + report.top_1_without_unresolved,
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(first.known_total, 18);
         assert_eq!(first.known_with_full_coverage, 18);
         assert_eq!(first.oov_total, 12);
-        assert_eq!(first.oov_with_full_coverage, 4);
+        assert_eq!(first.oov_with_full_coverage, 3);
         let known_range = first.known_margin_range.unwrap();
         let oov_range = first.oov_margin_range.unwrap();
         assert!(known_range.minimum_per_key.is_finite());

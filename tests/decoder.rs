@@ -281,8 +281,8 @@ fn sentence_decoder_prefers_complete_exact_path_over_correction() {
     assert!(
         candidates
             .iter()
-            .position(|candidate| candidate.text == "按键")
-            .is_some_and(|rank| rank > 0)
+            .skip(1)
+            .any(|candidate| candidate.used_error)
     );
 }
 
