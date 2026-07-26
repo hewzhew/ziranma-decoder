@@ -95,9 +95,15 @@ cargo run -- public-sentence zrmurf 10
 # 连续尾部简写，并单独保留一次相邻颠倒恢复
 cargo run -- public-compose mafkmm 3
 
-# 公开、只读的候选实验台：解释候选并投影字母/选择/切栏动作
+# 公开、只读的候选实验台：默认显示简洁中文
 cargo run --release -- candidate-lab mafmkm 3
-cargo run --release -- candidate-lab mafkmm 3
+
+# 只有明确请求时才显示按键颠倒候选
+cargo run --release -- candidate-lab mafkmm 3 --recovery
+
+# 研究细节与机器可读结果使用独立输出层
+cargo run --release -- candidate-lab mafmkm 3 --verbose
+cargo run --release -- candidate-lab mafmkm 3 --json
 
 # 固定公开 2～6 字双词短语的连续输入评测
 cargo run --release -- public-compose-evaluate
@@ -123,13 +129,16 @@ CLI 只读取编译进程序的公开演示数据或固定公开快照，不会�
 
 ## 候选实验台
 
-`candidate-lab` 把公开连续解码结果整理成宝宝可以直接审查的两个候选栏：
-主栏保留当前研究解码器顺序；一次锚定尾简颠倒恢复单独列出。每个候选
-报告字母键、一次选择、显式切栏、规范完整码基线、净省动作、简拼音节、
-纠错片段和未解析键。
+`candidate-lab` 默认只显示适合直接阅读的中文：普通候选、预计操作数、
+相对完整输入省下的动作，以及每个词使用完整双拼还是简拼。容易干扰正常
+输入的按键颠倒候选默认隐藏，只有显式加入 `--recovery` 才会出现。
 
-这只是统一口径的动作投影，不估算翻页与视觉查找。主栏仍可能包含自由
-混合简拼，也不等于最终输入协议。完整边界、首份实例和停止条件见
+算法评分、纠错预算与语言模型证据收进 `--verbose`；自动评测则使用
+`--json` 输出的稳定英文字段。`--verbose` 与 `--json` 互斥，三个层次
+不会再混进同一个终端界面。
+
+预计操作仍只是统一口径的投影，不估算翻页与视觉查找。普通候选仍可能
+包含自由混合简拼，也不等于最终输入协议。完整边界、首份实例和停止条件见
 [候选实验台：从程序指标到真实手感](docs/candidate-lab.md)。
 
 ## Tab 音形辅助原型

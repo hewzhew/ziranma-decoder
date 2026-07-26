@@ -4,21 +4,23 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ziranma_decoder::{
-    BigramLanguageModel, Candidate, CandidateLabCandidate, CandidateSource,
-    CharacterBigramLanguageModel, Decoder, ProtocolContextLaneReport, ProtocolIndexStats,
-    ProtocolStrategyReport, analyze_candidate_lab, audit_abbreviation_codebook,
-    audit_anchored_tail_failures, audit_continuous_composition, audit_public_protocol_context,
-    audit_public_protocols, encode_pinyin_phrase, evaluate_character_context_oracle,
-    evaluate_context_oracle, evaluate_continuous_composition, evaluate_labeled_recall,
-    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
-    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
-    parse_ud_conllu, select_public_bigram_training_sequences, select_public_calibration_cases,
-    select_public_continuous_composition_cases, select_public_protocol_audit_cases,
+    BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
+    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport, analyze_candidate_lab,
+    audit_abbreviation_codebook, audit_anchored_tail_failures, audit_continuous_composition,
+    audit_public_protocol_context, audit_public_protocols, encode_pinyin_phrase,
+    evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
+    evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases, select_public_continuous_composition_cases,
+    select_public_protocol_audit_cases,
 };
 
 mod benchmark;
+mod candidate_lab_cli;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
+use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
@@ -826,87 +828,17 @@ fn run_public_compose(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_candidate_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let Some(observed) = arguments.first() else {
-        return Err("candidate-lab 需要一个连续、没有词界的按键串".into());
-    };
-    let top_k = parse_top_k(arguments.get(1))?;
-    if arguments.len() > 2 {
-        return Err("candidate-lab 参数过多".into());
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
+        println!("{CANDIDATE_LAB_USAGE}");
+        return Ok(());
     }
 
+    let options = parse_candidate_lab_arguments(arguments)?;
     let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
     let decoder = Decoder::new(imported.entries);
-    let report = analyze_candidate_lab(&decoder, observed, top_k)?;
-
-    println!("候选实验台（固定公开词典；只读；不学习输入）");
-    println!(
-        "输入：{}；字母键 {}；每栏最多 {} 个候选",
-        report.observed,
-        report.observed.as_str().len(),
-        report.top_k
-    );
-    println!(
-        "动作口径：每个候选统一计一次选择；恢复栏另计一次显式切栏；不估算翻页、视觉查找或纠错后的重打。"
-    );
-    println!("协议提醒：主栏沿用研究解码器，仍可能出现自由混合简拼，不代表最终默认输入协议。");
-    print_candidate_lab_lane("主候选", &report.primary);
-    print_candidate_lab_lane(
-        "完整首音节 + 尾简的一次顺序颠倒恢复",
-        &report.anchored_transposition_recovery,
-    );
+    let report = analyze_candidate_lab(&decoder, &options.observed, options.top_k)?;
+    print!("{}", render_candidate_lab(&report, &options));
     Ok(())
-}
-
-fn print_candidate_lab_lane(label: &str, rows: &[CandidateLabCandidate]) {
-    println!("{label}：");
-    if rows.is_empty() {
-        println!("  （没有候选）");
-        return;
-    }
-
-    for row in rows {
-        let candidate = &row.candidate;
-        println!(
-            "{}. {}  [句子分 {:.3}；未解析 {} 键]",
-            row.rank, candidate.text, candidate.total_score, candidate.unresolved_key_count
-        );
-        match (
-            row.canonical_full_letter_keys,
-            row.net_actions_saved_vs_full,
-        ) {
-            (Some(full_letters), Some(net_saved)) => {
-                let baseline_actions = full_letters.saturating_add(row.selection_actions);
-                let comparison = if net_saved >= 0 {
-                    format!("净省 {net_saved}")
-                } else {
-                    format!("净多 {}", net_saved.unsigned_abs())
-                };
-                println!(
-                    "   动作投影：{} 字母 + {} 选择 + {} 切栏 = {}；完整码基线 {}；{comparison}",
-                    row.observed_letter_keys,
-                    row.selection_actions,
-                    row.lane_activation_actions,
-                    row.projected_actions_one_selection,
-                    baseline_actions
-                );
-            }
-            _ => println!(
-                "   动作投影：{} 字母 + {} 选择 + {} 切栏 = {}；含未解析输入，不虚构完整码基线",
-                row.observed_letter_keys,
-                row.selection_actions,
-                row.lane_activation_actions,
-                row.projected_actions_one_selection
-            ),
-        }
-        println!(
-            "   结构：{} 个词/片段；{} 个简拼音节；{} 个纠错片段；全局纠错预算{}使用",
-            candidate.segments.len(),
-            row.abbreviated_syllables,
-            row.corrected_segments,
-            if candidate.used_error { "已" } else { "未" }
-        );
-        print_sentence_candidate_segments(candidate);
-    }
 }
 
 fn run_public_compose_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1568,7 +1500,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-decode <按键串> [Top-K]
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
-  cargo run -- candidate-lab <连续按键串> [每栏 Top-K，1～10]
+  cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--recovery] [--verbose|--json]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
@@ -1594,7 +1526,8 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence zrmurf
   cargo run -- public-sentence zrmurf
   cargo run -- public-compose mafkmm 3
-  cargo run -- candidate-lab mafkmm 3
+  cargo run -- candidate-lab mafmkm 3
+  cargo run -- candidate-lab mafkmm 3 --recovery
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
