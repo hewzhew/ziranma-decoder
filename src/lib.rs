@@ -292,6 +292,21 @@ pub struct SentenceCandidate {
     pub used_error: bool,
 }
 
+/// Candidate lanes for an interactive, continuously composed key sequence.
+///
+/// The primary lane preserves the conservative exact-before-correction order.
+/// The recovery lane separately exposes one adjacent transposition inside the
+/// high-signal “full first syllable, abbreviated suffix” word shape, so a
+/// plausible typo cannot be hidden behind an arbitrarily large exact
+/// abbreviation set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SentenceCandidateLanes {
+    /// Conservatively ranked primary candidates.
+    pub primary: Vec<SentenceCandidate>,
+    /// Anchored suffix-abbreviation candidates using one transposition.
+    pub anchored_transposition_recovery: Vec<SentenceCandidate>,
+}
+
 /// Tunable penalties for the research decoder.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecodeConfig {
@@ -530,6 +545,64 @@ impl Decoder {
 
     /// Jointly decodes an unsegmented input and returns lattice search work.
     pub fn decode_sentence_with_stats(
+        &self,
+        observed: &str,
+        top_k: usize,
+    ) -> Result<(Vec<SentenceCandidate>, SentenceSearchStats), KeySequenceError> {
+        let (mut candidates, search_stats) =
+            self.decode_sentence_frontier_with_stats(observed, top_k)?;
+        candidates.sort_by(sentence_order);
+        candidates.truncate(top_k);
+        Ok((candidates, search_stats))
+    }
+
+    /// Decodes continuous input into a stable primary lane plus a small,
+    /// explicitly inspectable transposition-recovery lane.
+    ///
+    /// This is an interaction-oriented view, not a second decoder. It widens
+    /// the internal search frontier enough to keep recovery evidence,
+    /// while the ordinary `decode_sentence` result remains unchanged.
+    pub fn decode_sentence_lanes(
+        &self,
+        observed: &str,
+        top_k: usize,
+    ) -> Result<SentenceCandidateLanes, KeySequenceError> {
+        if top_k == 0 {
+            // Validate the input even when the caller requests no candidates,
+            // matching `decode_sentence`.
+            KeySequence::new(observed)?;
+            return Ok(SentenceCandidateLanes {
+                primary: Vec::new(),
+                anchored_transposition_recovery: Vec::new(),
+            });
+        }
+
+        const MINIMUM_RECOVERY_FRONTIER: usize = 40;
+        let search_k = top_k.saturating_mul(4).max(MINIMUM_RECOVERY_FRONTIER);
+        let (mut frontier, _stats) =
+            self.decode_sentence_frontier_with_stats(observed, search_k)?;
+        frontier.sort_by(sentence_order);
+
+        let mut primary = frontier.clone();
+        primary.truncate(top_k);
+        let primary_text = primary
+            .iter()
+            .map(|candidate| candidate.text.as_str())
+            .collect::<HashSet<_>>();
+        let anchored_transposition_recovery = frontier
+            .into_iter()
+            .filter(sentence_is_anchored_transposition_recovery)
+            .filter(|candidate| !primary_text.contains(candidate.text.as_str()))
+            .take(top_k)
+            .collect();
+
+        Ok(SentenceCandidateLanes {
+            primary,
+            anchored_transposition_recovery,
+        })
+    }
+
+    fn decode_sentence_frontier_with_stats(
         &self,
         observed: &str,
         top_k: usize,
@@ -784,7 +857,23 @@ impl Decoder {
         paths.sort_by(sentence_order);
         let mut seen_text = HashSet::new();
         paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
-        paths.truncate(top_k);
+        let mut exact_paths = 0;
+        let mut error_paths = 0;
+        paths.retain(|candidate| {
+            let retained = if candidate.used_error {
+                error_paths < top_k
+            } else {
+                exact_paths < top_k
+            };
+            if retained {
+                if candidate.used_error {
+                    error_paths += 1;
+                } else {
+                    exact_paths += 1;
+                }
+            }
+            retained
+        });
         memo.insert(state, paths.clone());
         paths
     }
@@ -2640,6 +2729,42 @@ fn prepared_transition_order(
                 .cmp(&right.transition.candidate.text)
         })
         .then_with(|| candidate_order(&left.transition.candidate, &right.transition.candidate))
+}
+
+fn sentence_is_anchored_transposition_recovery(candidate: &SentenceCandidate) -> bool {
+    let mut found_anchored_transposition = false;
+    for segment in &candidate.segments {
+        if segment.candidate.source != CandidateSource::Lexicon {
+            return false;
+        }
+        let abbreviated = &segment.candidate.spelling.abbreviated_syllables;
+        if !abbreviated.is_empty() && !spelling_is_anchored_suffix(&segment.candidate) {
+            return false;
+        }
+        if matches!(
+            segment.candidate.correction,
+            Correction::AdjacentTransposition { .. }
+        ) && !abbreviated.is_empty()
+        {
+            found_anchored_transposition = true;
+        }
+    }
+    found_anchored_transposition
+}
+
+fn spelling_is_anchored_suffix(candidate: &Candidate) -> bool {
+    let abbreviated = &candidate.spelling.abbreviated_syllables;
+    let Some(&first_abbreviated) = abbreviated.first() else {
+        return false;
+    };
+    let syllable_count = candidate.code.as_str().len() / 2;
+    first_abbreviated > 0
+        && first_abbreviated < syllable_count
+        && abbreviated.len() == syllable_count - first_abbreviated
+        && abbreviated
+            .iter()
+            .copied()
+            .eq(first_abbreviated..syllable_count)
 }
 
 fn sentence_order(left: &SentenceCandidate, right: &SentenceCandidate) -> Ordering {

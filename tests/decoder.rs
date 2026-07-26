@@ -217,6 +217,33 @@ fn pinned_public_rime_snapshot_has_stable_import_accounting() {
     assert!(!candidates.is_empty());
     assert!(stats.trie_subtree_prunes > 0);
     assert!(stats.terminal_entry_bound_skips > 0);
+
+    let continuous = decoder.decode_sentence("mafmkm", 10).unwrap();
+    assert_eq!(continuous[0].text, "麻烦猫猫");
+    assert_eq!(
+        continuous[0]
+            .segments
+            .iter()
+            .map(|segment| segment.observed.as_str())
+            .collect::<Vec<_>>(),
+        ["maf", "mkm"]
+    );
+
+    let lanes = decoder.decode_sentence_lanes("mafkmm", 3).unwrap();
+    assert_eq!(
+        lanes.primary,
+        decoder.decode_sentence("mafkmm", 3).unwrap(),
+        "the recovery view must not reorder the stable primary lane"
+    );
+    let recovered = lanes
+        .anchored_transposition_recovery
+        .iter()
+        .find(|candidate| candidate.text == "麻烦猫猫")
+        .expect("the anchored recovery lane should keep the intended phrase visible");
+    assert!(recovered.segments.iter().any(|segment| matches!(
+        segment.candidate.correction,
+        Correction::AdjacentTransposition { .. }
+    )));
 }
 
 #[test]

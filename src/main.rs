@@ -64,6 +64,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "sentence" => run_sentence(&arguments[1..], true),
         "sentence-unigram" => run_sentence(&arguments[1..], false),
         "public-sentence" => run_public_sentence(&arguments[1..]),
+        "public-compose" => run_public_compose(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
@@ -794,6 +795,26 @@ fn run_public_sentence(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_public_compose(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some(observed) = arguments.first() else {
+        return Err("public-compose 需要一个连续、没有词界的按键串".into());
+    };
+    let top_k = parse_top_k(arguments.get(1))?;
+    if arguments.len() > 2 {
+        return Err("public-compose 参数过多".into());
+    }
+
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let decoder = Decoder::new(imported.entries);
+    let lanes = decoder.decode_sentence_lanes(observed, top_k)?;
+    println!("连续组合输入：{observed}");
+    println!("主候选（保留稳定的零错误优先顺序）：");
+    print_sentence_candidate_list(&lanes.primary);
+    println!("完整首音节 + 尾部简写的一次顺序颠倒恢复：");
+    print_sentence_candidate_list(&lanes.anchored_transposition_recovery);
+    Ok(())
+}
+
 fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(observed) = arguments.first() else {
         return Err("sentence-stats 需要一个没有词界的按键串".into());
@@ -866,6 +887,15 @@ fn print_sentence_candidates(
     );
     if candidates.is_empty() {
         println!("没有返回候选（Top-K 可能为 0）。");
+        return;
+    }
+
+    print_sentence_candidate_list(candidates);
+}
+
+fn print_sentence_candidate_list(candidates: &[ziranma_decoder::SentenceCandidate]) {
+    if candidates.is_empty() {
+        println!("  （没有候选）");
         return;
     }
 
@@ -987,6 +1017,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence-unigram <按键串> [Top-K]
   cargo run -- public-decode <按键串> [Top-K]
   cargo run -- public-sentence <按键串> [Top-K]
+  cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- public-index-stats
@@ -1006,6 +1037,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- decode nik
   cargo run -- sentence zrmurf
   cargo run -- public-sentence zrmurf
+  cargo run -- public-compose mafkmm 3
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- public-index-stats
