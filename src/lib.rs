@@ -25,13 +25,14 @@ pub use abbreviation::{
 };
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use evaluation::{
-    CharacterAverageMarginRange, CharacterContextOracleReport, ContextOracleError,
-    ContextOracleReport, ContextScoreMarginRange, EvaluationReport, LabeledRecallReport,
-    LabeledRejectionShadowReport, LabeledRejectionThresholdMetrics, LabeledSentenceProbe,
-    OovCaseReport, ProbeSpellingMode, REJECTION_SHADOW_THRESHOLDS_PER_KEY, RecallMetrics,
-    RejectionMarginRange, RejectionShadowReport, RejectionThresholdMetrics, SentenceCaseParseError,
-    SentenceCaseReport, SyntheticCaseKind, evaluate_character_context_oracle,
-    evaluate_context_oracle, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
+    CharacterAverageMarginRange, CharacterContextOracleReport, CompositionRecallReport,
+    ContextOracleError, ContextOracleReport, ContextScoreMarginRange, ContinuousCompositionReport,
+    EvaluationReport, LabeledRecallReport, LabeledRejectionShadowReport,
+    LabeledRejectionThresholdMetrics, LabeledSentenceProbe, OovCaseReport, ProbeSpellingMode,
+    REJECTION_SHADOW_THRESHOLDS_PER_KEY, RecallMetrics, RejectionMarginRange,
+    RejectionShadowReport, RejectionThresholdMetrics, SentenceCaseParseError, SentenceCaseReport,
+    SyntheticCaseKind, evaluate_character_context_oracle, evaluate_context_oracle,
+    evaluate_continuous_composition, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
     evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
 };
 pub use language_model::{
@@ -40,9 +41,11 @@ pub use language_model::{
     LanguageModelParseError,
 };
 pub use public_corpus::{
-    PublicBigramTrainingCorpus, PublicBigramTrainingStats, PublicCalibrationSelection,
-    PublicCalibrationSelectionStats, UdCorpus, UdCorpusImportStats, UdCorpusParseError,
-    parse_ud_conllu, select_public_bigram_training_sequences, select_public_calibration_cases,
+    ContinuousCompositionProbe, ContinuousCompositionSelection,
+    ContinuousCompositionSelectionStats, PublicBigramTrainingCorpus, PublicBigramTrainingStats,
+    PublicCalibrationSelection, PublicCalibrationSelectionStats, UdCorpus, UdCorpusImportStats,
+    UdCorpusParseError, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases, select_public_continuous_composition_cases,
 };
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;
@@ -577,8 +580,8 @@ impl Decoder {
             });
         }
 
-        const MINIMUM_RECOVERY_FRONTIER: usize = 40;
-        let search_k = top_k.saturating_mul(4).max(MINIMUM_RECOVERY_FRONTIER);
+        const MINIMUM_RECOVERY_FRONTIER: usize = 20;
+        let search_k = top_k.saturating_mul(2).max(MINIMUM_RECOVERY_FRONTIER);
         let (mut frontier, _stats) =
             self.decode_sentence_frontier_with_stats(observed, search_k)?;
         frontier.sort_by(sentence_order);
@@ -859,14 +862,20 @@ impl Decoder {
         paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
         let mut exact_paths = 0;
         let mut error_paths = 0;
+        let mut anchored_transposition_paths = 0;
         paths.retain(|candidate| {
-            let retained = if candidate.used_error {
+            let anchored_transposition = sentence_is_anchored_transposition_recovery(candidate);
+            let retained = if anchored_transposition {
+                anchored_transposition_paths < top_k
+            } else if candidate.used_error {
                 error_paths < top_k
             } else {
                 exact_paths < top_k
             };
             if retained {
-                if candidate.used_error {
+                if anchored_transposition {
+                    anchored_transposition_paths += 1;
+                } else if candidate.used_error {
                     error_paths += 1;
                 } else {
                     exact_paths += 1;
@@ -880,8 +889,9 @@ impl Decoder {
 
     /// Transitions with the same child state share every possible suffix.
     /// After duplicate prefix text is removed, an edge below the first K
-    /// cannot enter the state's Top-K: the K better prefixes can all combine
-    /// with that exact suffix. This is an exact bound, not a heuristic beam.
+    /// cannot enter the ordinary Top-K: the K better prefixes can all combine
+    /// with that exact suffix. The anchored-transposition lane retains its own
+    /// first K as a typed diagnostic superset of that exact bound.
     fn prepare_transition_groups(
         &self,
         transitions: Vec<SegmentTransition>,
@@ -936,7 +946,22 @@ impl Decoder {
             group
                 .transitions
                 .retain(|prepared| seen_text.insert(prepared.transition.candidate.text.clone()));
-            group.transitions.truncate(top_k);
+            let mut globally_retained = 0;
+            let mut anchored_transpositions_retained = 0;
+            group.transitions.retain(|prepared| {
+                let anchored_transposition =
+                    candidate_is_anchored_transposition_recovery(&prepared.transition.candidate);
+                let retain_globally = globally_retained < top_k;
+                let retain_for_recovery =
+                    anchored_transposition && anchored_transpositions_retained < top_k;
+                if retain_globally {
+                    globally_retained += 1;
+                }
+                if retain_for_recovery {
+                    anchored_transpositions_retained += 1;
+                }
+                retain_globally || retain_for_recovery
+            });
             search_stats.ranking_transitions_retained += group.transitions.len();
         }
         groups
@@ -2170,10 +2195,38 @@ fn retain_noisy_top_k_by_child(
         group.sort_by(|left, right| noisy_terminal_prepared_order(left, right, paths, lexicon));
         let mut seen_text = HashSet::new();
         group.retain(|terminal| seen_text.insert(lexicon[terminal.entry_index].text.as_str()));
-        group.truncate(top_k);
+        let mut globally_retained = 0;
+        let mut anchored_transpositions_retained = 0;
+        group.retain(|terminal| {
+            let anchored_transposition =
+                noisy_terminal_is_anchored_transposition_recovery(terminal, paths, lexicon);
+            let retain_globally = globally_retained < top_k;
+            let retain_for_recovery =
+                anchored_transposition && anchored_transpositions_retained < top_k;
+            if retain_globally {
+                globally_retained += 1;
+            }
+            if retain_for_recovery {
+                anchored_transpositions_retained += 1;
+            }
+            retain_globally || retain_for_recovery
+        });
         retained.extend(group);
     }
     retained
+}
+
+fn noisy_terminal_is_anchored_transposition_recovery(
+    terminal: &IndexedNoisyTerminal,
+    paths: &[NoisyTrieTerminalPath],
+    lexicon: &[LexiconEntry],
+) -> bool {
+    let path = &paths[terminal.path_index];
+    matches!(path.correction, Correction::AdjacentTransposition { .. })
+        && spelling_indices_are_anchored_suffix(
+            &path.spelling.abbreviated_syllables,
+            lexicon[terminal.entry_index].syllable_codes.len(),
+        )
 }
 
 fn noisy_terminal_segment_order(
@@ -2741,23 +2794,31 @@ fn sentence_is_anchored_transposition_recovery(candidate: &SentenceCandidate) ->
         if !abbreviated.is_empty() && !spelling_is_anchored_suffix(&segment.candidate) {
             return false;
         }
-        if matches!(
-            segment.candidate.correction,
-            Correction::AdjacentTransposition { .. }
-        ) && !abbreviated.is_empty()
-        {
+        if candidate_is_anchored_transposition_recovery(&segment.candidate) {
             found_anchored_transposition = true;
         }
     }
     found_anchored_transposition
 }
 
+fn candidate_is_anchored_transposition_recovery(candidate: &Candidate) -> bool {
+    matches!(
+        candidate.correction,
+        Correction::AdjacentTransposition { .. }
+    ) && spelling_is_anchored_suffix(candidate)
+}
+
 fn spelling_is_anchored_suffix(candidate: &Candidate) -> bool {
-    let abbreviated = &candidate.spelling.abbreviated_syllables;
+    spelling_indices_are_anchored_suffix(
+        &candidate.spelling.abbreviated_syllables,
+        candidate.code.as_str().len() / 2,
+    )
+}
+
+fn spelling_indices_are_anchored_suffix(abbreviated: &[usize], syllable_count: usize) -> bool {
     let Some(&first_abbreviated) = abbreviated.first() else {
         return false;
     };
-    let syllable_count = candidate.code.as_str().len() / 2;
     first_abbreviated > 0
         && first_abbreviated < syllable_count
         && abbreviated.len() == syllable_count - first_abbreviated

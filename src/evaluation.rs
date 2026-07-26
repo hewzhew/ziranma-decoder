@@ -4,8 +4,8 @@ use std::fmt;
 
 use crate::{
     BIGRAM_INTERPOLATION_WEIGHT, BigramLanguageModel, Candidate, CandidateSource,
-    CharacterBigramLanguageModel, Correction, Decoder, KeySequence, LexiconEntry,
-    SentenceCandidate, are_qwerty_neighbors, spelling_variants,
+    CharacterBigramLanguageModel, ContinuousCompositionProbe, Correction, Decoder, KeySequence,
+    LexiconEntry, SentenceCandidate, are_qwerty_neighbors, spelling_variants,
 };
 
 /// Candidate per-key margins scanned by the rejection shadow evaluation.
@@ -257,6 +257,136 @@ impl LabeledRecallReport {
     pub fn recall_at_10(&self) -> f64 {
         rate(self.hits_at_10, self.total)
     }
+}
+
+/// Top-1/3/5/10 text recall for one continuous-composition candidate lane.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompositionRecallReport {
+    /// Number of evaluated public phrases.
+    pub total: usize,
+    /// Expected texts ranked first.
+    pub hits_at_1: usize,
+    /// Expected texts present in the first three candidates.
+    pub hits_at_3: usize,
+    /// Expected texts present in the first five candidates.
+    pub hits_at_5: usize,
+    /// Expected texts present in the first ten candidates.
+    pub hits_at_10: usize,
+}
+
+impl CompositionRecallReport {
+    /// Recall@1 as a value from zero to one.
+    pub fn recall_at_1(&self) -> f64 {
+        rate(self.hits_at_1, self.total)
+    }
+
+    /// Recall@3 as a value from zero to one.
+    pub fn recall_at_3(&self) -> f64 {
+        rate(self.hits_at_3, self.total)
+    }
+
+    /// Recall@5 as a value from zero to one.
+    pub fn recall_at_5(&self) -> f64 {
+        rate(self.hits_at_5, self.total)
+    }
+
+    /// Recall@10 as a value from zero to one.
+    pub fn recall_at_10(&self) -> f64 {
+        rate(self.hits_at_10, self.total)
+    }
+}
+
+/// Public short-phrase evaluation for continuous tail abbreviation and typo recovery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousCompositionReport {
+    /// Full-code baseline in the ordinary primary list.
+    pub full_code: CompositionRecallReport,
+    /// Clean tail-abbreviated input in the ordinary primary list.
+    pub tail_abbreviation: CompositionRecallReport,
+    /// Clean tail-abbreviated rank after filtering the ordinary Top-10 by length.
+    pub tail_abbreviation_same_length: CompositionRecallReport,
+    /// Transposed input in the conservative primary list.
+    pub transposed_primary: CompositionRecallReport,
+    /// Transposed input in the anchored recovery lane.
+    pub transposed_recovery: CompositionRecallReport,
+    /// Full-code key count across all probes.
+    pub full_keys: usize,
+    /// Tail-abbreviated key count across all probes.
+    pub tail_keys: usize,
+}
+
+impl ContinuousCompositionReport {
+    /// Keys saved before any candidate-selection action.
+    pub fn saved_keys(&self) -> usize {
+        self.full_keys.saturating_sub(self.tail_keys)
+    }
+
+    /// Fraction of full-code keys removed by tail abbreviation.
+    pub fn key_saving_rate(&self) -> f64 {
+        rate(self.saved_keys(), self.full_keys)
+    }
+}
+
+/// Evaluates natural two-word continuous input and one adjacent transposition.
+pub fn evaluate_continuous_composition(
+    decoder: &Decoder,
+    probes: &[ContinuousCompositionProbe],
+) -> ContinuousCompositionReport {
+    let mut report = ContinuousCompositionReport::default();
+    for probe in probes {
+        let full = decoder
+            .decode_sentence(probe.full_observed.as_str(), 10)
+            .expect("public probe keys are validated lowercase ASCII");
+        observe_composition_recall(&mut report.full_code, &probe.expected_text, &full);
+
+        let tail = decoder
+            .decode_sentence(probe.tail_abbreviated_observed.as_str(), 10)
+            .expect("public probe keys are validated lowercase ASCII");
+        observe_composition_recall(&mut report.tail_abbreviation, &probe.expected_text, &tail);
+        let expected_length = probe.expected_text.chars().count();
+        let same_length = tail
+            .iter()
+            .filter(|candidate| candidate.text.chars().count() == expected_length)
+            .cloned()
+            .collect::<Vec<_>>();
+        observe_composition_recall(
+            &mut report.tail_abbreviation_same_length,
+            &probe.expected_text,
+            &same_length,
+        );
+
+        let lanes = decoder
+            .decode_sentence_lanes(probe.transposed_observed.as_str(), 10)
+            .expect("public probe keys are validated lowercase ASCII");
+        observe_composition_recall(
+            &mut report.transposed_primary,
+            &probe.expected_text,
+            &lanes.primary,
+        );
+        observe_composition_recall(
+            &mut report.transposed_recovery,
+            &probe.expected_text,
+            &lanes.anchored_transposition_recovery,
+        );
+        report.full_keys += probe.full_observed.as_str().len();
+        report.tail_keys += probe.tail_abbreviated_observed.as_str().len();
+    }
+    report
+}
+
+fn observe_composition_recall(
+    report: &mut CompositionRecallReport,
+    expected_text: &str,
+    candidates: &[SentenceCandidate],
+) {
+    let rank = candidates
+        .iter()
+        .position(|candidate| candidate.text == expected_text);
+    report.total += 1;
+    report.hits_at_1 += usize::from(rank.is_some_and(|rank| rank < 1));
+    report.hits_at_3 += usize::from(rank.is_some_and(|rank| rank < 3));
+    report.hits_at_5 += usize::from(rank.is_some_and(|rank| rank < 5));
+    report.hits_at_10 += usize::from(rank.is_some_and(|rank| rank < 10));
 }
 
 /// Measures whether public expected text is recalled before changing ranking.

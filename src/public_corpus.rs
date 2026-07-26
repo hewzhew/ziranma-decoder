@@ -83,6 +83,53 @@ pub struct PublicCalibrationSelectionStats {
     pub selected_held_out_tokens: usize,
 }
 
+/// One natural two-word phrase entered without a word-confirmation key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousCompositionProbe {
+    /// Stable upstream-derived identifier.
+    pub id: String,
+    /// Full two-key syllable spelling with no word separator.
+    pub full_observed: KeySequence,
+    /// Each word keeps its first syllable full and abbreviates its suffix.
+    pub tail_abbreviated_observed: KeySequence,
+    /// Tail-abbreviated input with one adjacent pair reversed.
+    pub transposed_observed: KeySequence,
+    /// Natural public text expected from the input.
+    pub expected_text: String,
+    /// The two exact Rime words used to construct the input.
+    pub expected_segments: Vec<String>,
+}
+
+/// Deterministic short-phrase probes and auditable selection counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousCompositionSelection {
+    /// Selected two-word continuous-composition probes.
+    pub probes: Vec<ContinuousCompositionProbe>,
+    /// Filtering, selection, and key-saving counts.
+    pub stats: ContinuousCompositionSelectionStats,
+}
+
+/// Selection accounting for continuous short-phrase probes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousCompositionSelectionStats {
+    /// Adjacent non-punctuation two-token windows examined.
+    pub source_windows: usize,
+    /// Windows containing 2 to 6 Han characters.
+    pub han_length_eligible: usize,
+    /// Eligible windows whose two complete tokens both exist in Rime.
+    pub exact_word_coverable: usize,
+    /// Coverable windows that save at least one key with tail abbreviation.
+    pub key_saving_eligible: usize,
+    /// Saving-eligible windows with a reversible distinct first-syllable pair.
+    pub transposition_eligible: usize,
+    /// Unique probes retained under the requested limit.
+    pub selected: usize,
+    /// Full-code keys across retained probes.
+    pub selected_full_keys: usize,
+    /// Tail-abbreviated keys across retained probes.
+    pub selected_tail_keys: usize,
+}
+
 /// Train-only segmented sequences mapped into the Rime word vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicBigramTrainingCorpus {
@@ -328,6 +375,103 @@ pub fn select_public_calibration_cases(
     }
 }
 
+/// Selects natural, exact-word, two-token spans for continuous composition.
+///
+/// Each word keeps its first syllable as a two-key anchor and abbreviates every
+/// later syllable to one key. Source order is preserved, no word separator is
+/// inserted, and one distinct two-key anchor is deterministically transposed.
+pub fn select_public_continuous_composition_cases(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+    limit: usize,
+) -> ContinuousCompositionSelection {
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut stats = ContinuousCompositionSelectionStats::default();
+    let mut probes = Vec::new();
+    let mut seen_text = HashSet::new();
+
+    for sentence in &corpus.sentences {
+        let tokens = sentence
+            .tokens
+            .iter()
+            .filter(|token| token.upos != "PUNCT")
+            .collect::<Vec<_>>();
+        for (window_index, window) in tokens.windows(2).enumerate() {
+            stats.source_windows += 1;
+            let expected_text = window
+                .iter()
+                .map(|token| token.form.as_str())
+                .collect::<String>();
+            let character_count = expected_text.chars().count();
+            if !(2..=6).contains(&character_count) || !expected_text.chars().all(is_han_character) {
+                continue;
+            }
+            stats.han_length_eligible += 1;
+
+            let Some(first_entry) = entries_by_text.get(window[0].form.as_str()).copied() else {
+                continue;
+            };
+            let Some(second_entry) = entries_by_text.get(window[1].form.as_str()).copied() else {
+                continue;
+            };
+            let entries = [first_entry, second_entry];
+            stats.exact_word_coverable += 1;
+
+            let full_code = entries
+                .iter()
+                .map(|entry| entry.code.as_str())
+                .collect::<String>();
+            let tail_codes = entries
+                .iter()
+                .map(|entry| anchored_tail_code(entry))
+                .collect::<Vec<_>>();
+            let tail_code = tail_codes.concat();
+            if tail_code.len() >= full_code.len() {
+                continue;
+            }
+            stats.key_saving_eligible += 1;
+
+            let offsets = [0, tail_codes[0].len()];
+            let transposition = entries.iter().zip(&tail_codes).enumerate().rev().find_map(
+                |(index, (entry, code))| {
+                    if entry.syllable_codes.len() < 2 {
+                        return None;
+                    }
+                    let bytes = code.as_bytes();
+                    (bytes[0] != bytes[1]).then_some(offsets[index])
+                },
+            );
+            let Some(transposition) = transposition else {
+                continue;
+            };
+            stats.transposition_eligible += 1;
+            if probes.len() >= limit || !seen_text.insert(expected_text.clone()) {
+                continue;
+            }
+
+            let mut transposed = tail_code.as_bytes().to_vec();
+            transposed.swap(transposition, transposition + 1);
+            let transposed =
+                String::from_utf8(transposed).expect("Rime-derived codes are lowercase ASCII");
+            stats.selected_full_keys += full_code.len();
+            stats.selected_tail_keys += tail_code.len();
+            probes.push(ContinuousCompositionProbe {
+                id: format!("{}:continuous-{}", sentence.id, window_index + 1),
+                full_observed: KeySequence::new(full_code)
+                    .expect("Rime-derived full codes are lowercase ASCII"),
+                tail_abbreviated_observed: KeySequence::new(tail_code)
+                    .expect("Rime-derived tail abbreviations are lowercase ASCII"),
+                transposed_observed: KeySequence::new(transposed)
+                    .expect("Rime-derived transpositions are lowercase ASCII"),
+                expected_text,
+                expected_segments: entries.iter().map(|entry| entry.text.clone()).collect(),
+            });
+        }
+    }
+    stats.selected = probes.len();
+    ContinuousCompositionSelection { probes, stats }
+}
+
 /// Maps the pinned train split into Rime word sequences for bigram training.
 ///
 /// Punctuation is omitted. Sentences containing non-Han text or an
@@ -461,6 +605,21 @@ fn append_entry_codes(entry: &LexiconEntry, observed: &mut ObservedSpellings) {
         }));
 }
 
+fn anchored_tail_code(entry: &LexiconEntry) -> String {
+    let mut codes = entry.syllable_codes.iter();
+    let first = codes
+        .next()
+        .expect("a parsed lexicon entry has at least one syllable");
+    let mut observed = first.as_str().to_owned();
+    observed.extend(codes.map(|code| {
+        code.as_str()
+            .chars()
+            .next()
+            .expect("a Rime syllable code is non-empty")
+    }));
+    observed
+}
+
 fn is_han_character(character: char) -> bool {
     matches!(
         character,
@@ -557,6 +716,7 @@ mod tests {
     use crate::{
         BigramLanguageModel, CharacterBigramLanguageModel, parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
+        select_public_continuous_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -665,6 +825,26 @@ mod tests {
                         && !probe.observed.as_str().is_empty()
                 })
         );
+
+        let continuous = select_public_continuous_composition_cases(&corpus, &lexicon, 64);
+        let continuous_again = select_public_continuous_composition_cases(&corpus, &lexicon, 64);
+        assert_eq!(continuous, continuous_again);
+        assert_eq!(continuous.stats.source_windows, 9_819);
+        assert_eq!(continuous.stats.han_length_eligible, 8_891);
+        assert_eq!(continuous.stats.exact_word_coverable, 7_465);
+        assert_eq!(continuous.stats.key_saving_eligible, 5_919);
+        assert_eq!(continuous.stats.transposition_eligible, 5_796);
+        assert_eq!(continuous.stats.selected, 64);
+        assert_eq!(continuous.stats.selected_full_keys, 430);
+        assert_eq!(continuous.stats.selected_tail_keys, 343);
+        assert!(continuous.probes.iter().all(|probe| {
+            probe.expected_segments.len() == 2
+                && probe.full_observed.as_str().len()
+                    > probe.tail_abbreviated_observed.as_str().len()
+                && probe.tail_abbreviated_observed.as_str().len()
+                    == probe.transposed_observed.as_str().len()
+                && probe.tail_abbreviated_observed != probe.transposed_observed
+        }));
     }
 
     #[test]

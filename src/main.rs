@@ -6,10 +6,11 @@ use std::time::Instant;
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
     audit_abbreviation_codebook, encode_pinyin_phrase, evaluate_character_context_oracle,
-    evaluate_context_oracle, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
-    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
-    parse_lexicon_tsv, parse_rime_lexicon, parse_ud_conllu,
-    select_public_bigram_training_sequences, select_public_calibration_cases,
+    evaluate_context_oracle, evaluate_continuous_composition, evaluate_labeled_recall,
+    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
+    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
+    parse_ud_conllu, select_public_bigram_training_sequences, select_public_calibration_cases,
+    select_public_continuous_composition_cases,
 };
 
 mod benchmark;
@@ -65,6 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "sentence-unigram" => run_sentence(&arguments[1..], false),
         "public-sentence" => run_public_sentence(&arguments[1..]),
         "public-compose" => run_public_compose(&arguments[1..]),
+        "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
@@ -815,6 +817,86 @@ fn run_public_compose(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_public_compose_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-compose-evaluate 不接受额外参数".into());
+    }
+
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let selection = select_public_continuous_composition_cases(&corpus, &imported.entries, 64);
+    let decoder = Decoder::new(imported.entries);
+    let report = evaluate_continuous_composition(&decoder, &selection.probes);
+    let stats = selection.stats;
+
+    println!("公开连续组合短语评测：UD test 相邻两词、2～6 个汉字、固定前 64 条");
+    println!(
+        "筛选：{} 个双词窗口；{} 个长度合格纯汉字；{} 个整词可覆盖；{} 个可省键；{} 个可构造颠倒；最终 {} 条",
+        stats.source_windows,
+        stats.han_length_eligible,
+        stats.exact_word_coverable,
+        stats.key_saving_eligible,
+        stats.transposition_eligible,
+        stats.selected
+    );
+    println!(
+        "按键：完整 {}，尾部简写 {}，节省 {}（{:.1}%）",
+        report.full_keys,
+        report.tail_keys,
+        report.saved_keys(),
+        report.key_saving_rate() * 100.0
+    );
+    println!("轨道                       Top-1       Top-3       Top-5      Top-10");
+    print_composition_recall("完整码主榜", report.full_code);
+    print_composition_recall("尾部简写主榜", report.tail_abbreviation);
+    print_composition_recall("尾部简写同字数", report.tail_abbreviation_same_length);
+    print_composition_recall("颠倒输入主榜", report.transposed_primary);
+    print_composition_recall("颠倒恢复栏", report.transposed_recovery);
+    print_composition_visibility("尾部简写主榜", report.tail_abbreviation);
+    print_composition_visibility("颠倒恢复栏", report.transposed_recovery);
+    let visible_selection_actions =
+        report.tail_abbreviation.hits_at_10 - report.tail_abbreviation.hits_at_1;
+    println!(
+        "乐观操作账：首屏内非首选若各需 1 次选择，尾部简写为省 {} 键、增加 {} 次选择；另有 {} 条仍在 Top-10 外，不能计作净节省",
+        report.saved_keys(),
+        visible_selection_actions,
+        report.tail_abbreviation.total - report.tail_abbreviation.hits_at_10
+    );
+    println!(
+        "本次连续组合评测耗时：{:.3} ms（固定本机观察）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn print_composition_recall(label: &str, report: ziranma_decoder::CompositionRecallReport) {
+    println!(
+        "{label:<18} {:>3}/{:<3} {:>6.1}%  {:>3}/{:<3} {:>6.1}%  {:>3}/{:<3} {:>6.1}%  {:>3}/{:<3} {:>6.1}%",
+        report.hits_at_1,
+        report.total,
+        report.recall_at_1() * 100.0,
+        report.hits_at_3,
+        report.total,
+        report.recall_at_3() * 100.0,
+        report.hits_at_5,
+        report.total,
+        report.recall_at_5() * 100.0,
+        report.hits_at_10,
+        report.total,
+        report.recall_at_10() * 100.0,
+    );
+}
+
+fn print_composition_visibility(label: &str, report: ziranma_decoder::CompositionRecallReport) {
+    println!(
+        "{label}可见性：{} 条直接首选；{} 条在第 2～10；{} 条在 Top-10 外",
+        report.hits_at_1,
+        report.hits_at_10 - report.hits_at_1,
+        report.total - report.hits_at_10
+    );
+}
+
 fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(observed) = arguments.first() else {
         return Err("sentence-stats 需要一个没有词界的按键串".into());
@@ -1018,6 +1100,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-decode <按键串> [Top-K]
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
+  cargo run --release -- public-compose-evaluate
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- public-index-stats
@@ -1038,6 +1121,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence zrmurf
   cargo run -- public-sentence zrmurf
   cargo run -- public-compose mafkmm 3
+  cargo run --release -- public-compose-evaluate
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- public-index-stats
