@@ -1000,6 +1000,7 @@ mod tests {
             path
         }
 
+        #[cfg(windows)]
         fn relative_protected(&self, name: &str) -> PathBuf {
             Path::new("data/private/continuous-capture").join(name)
         }
