@@ -5,6 +5,9 @@ use std::fmt;
 use crate::LexiconEntry;
 
 const DEFAULT_ALPHA: f64 = 0.5;
+const CHARACTER_BEGIN: u32 = 0x11_0000;
+const CHARACTER_END: u32 = 0x11_0001;
+const CHARACTER_UNKNOWN: u32 = 0x11_0002;
 
 /// Locally trained add-alpha bigram model over lexicon words.
 #[derive(Clone, Debug)]
@@ -217,6 +220,205 @@ pub struct BigramLanguageModelStats {
     pub observed_pair_instances: u128,
 }
 
+/// Add-alpha character bigram model trained only from public text.
+#[derive(Clone, Debug)]
+pub struct CharacterBigramLanguageModel {
+    pair_counts: HashMap<(u32, u32), u64>,
+    predecessor_totals: HashMap<u32, u64>,
+    vocabulary: HashSet<char>,
+    alpha: f64,
+    stats: CharacterBigramLanguageModelStats,
+}
+
+impl CharacterBigramLanguageModel {
+    /// Estimates character bigrams from unweighted non-empty text sequences.
+    ///
+    /// Each sequence receives explicit begin/end transitions. An additional
+    /// unknown-character output bucket keeps held-out scoring finite.
+    pub fn from_text_sequences(sequences: &[String]) -> Result<Self, CharacterLanguageModelError> {
+        if sequences.is_empty() {
+            return Err(CharacterLanguageModelError::EmptyCorpus);
+        }
+        let mut vocabulary = HashSet::new();
+        for (sequence_index, sequence) in sequences.iter().enumerate() {
+            if sequence.is_empty() {
+                return Err(CharacterLanguageModelError::EmptySequence {
+                    sequence_number: sequence_index + 1,
+                });
+            }
+            vocabulary.extend(sequence.chars());
+        }
+
+        let mut pair_counts = HashMap::<(u32, u32), u64>::new();
+        let mut predecessor_totals = HashMap::<u32, u64>::new();
+        let mut character_instances = 0_u128;
+        for (sequence_index, sequence) in sequences.iter().enumerate() {
+            let sequence_number = sequence_index + 1;
+            let mut previous = CHARACTER_BEGIN;
+            for character in sequence.chars() {
+                let current = u32::from(character);
+                checked_add_character(
+                    pair_counts.entry((previous, current)).or_insert(0),
+                    sequence_number,
+                )?;
+                checked_add_character(
+                    predecessor_totals.entry(previous).or_insert(0),
+                    sequence_number,
+                )?;
+                previous = current;
+                character_instances += 1;
+            }
+            checked_add_character(
+                pair_counts.entry((previous, CHARACTER_END)).or_insert(0),
+                sequence_number,
+            )?;
+            checked_add_character(
+                predecessor_totals.entry(previous).or_insert(0),
+                sequence_number,
+            )?;
+        }
+
+        let stats = CharacterBigramLanguageModelStats {
+            sequences: sequences.len(),
+            character_instances,
+            vocabulary_size: vocabulary.len() + 2,
+            observed_pair_types: pair_counts.len(),
+            observed_pair_instances: character_instances + sequences.len() as u128,
+        };
+        Ok(Self {
+            pair_counts,
+            predecessor_totals,
+            vocabulary,
+            alpha: DEFAULT_ALPHA,
+            stats,
+        })
+    }
+
+    /// Scores a complete text including its end-of-sequence transition.
+    pub fn score_text(&self, text: &str) -> CharacterSequenceScore {
+        let mut previous = CHARACTER_BEGIN;
+        let mut log_probability = 0.0;
+        let mut observed_pairs = 0;
+        let mut pair_count = 0;
+        for character in text.chars() {
+            let current = if self.vocabulary.contains(&character) {
+                u32::from(character)
+            } else {
+                CHARACTER_UNKNOWN
+            };
+            let score = self.score_pair(previous, current);
+            log_probability += score.log_probability;
+            observed_pairs += usize::from(score.observed_count > 0);
+            pair_count += 1;
+            previous = current;
+        }
+        let score = self.score_pair(previous, CHARACTER_END);
+        log_probability += score.log_probability;
+        observed_pairs += usize::from(score.observed_count > 0);
+        pair_count += 1;
+        CharacterSequenceScore {
+            log_probability,
+            observed_pairs,
+            pair_count,
+        }
+    }
+
+    /// Returns deterministic training statistics.
+    pub fn stats(&self) -> CharacterBigramLanguageModelStats {
+        self.stats
+    }
+
+    fn score_pair(&self, previous: u32, current: u32) -> BigramScore {
+        let observed_count = self
+            .pair_counts
+            .get(&(previous, current))
+            .copied()
+            .unwrap_or(0);
+        let predecessor_total = self.predecessor_totals.get(&previous).copied().unwrap_or(0);
+        let numerator = observed_count as f64 + self.alpha;
+        let denominator = predecessor_total as f64 + self.alpha * self.stats.vocabulary_size as f64;
+        BigramScore {
+            observed_count,
+            predecessor_total,
+            alpha: self.alpha,
+            vocabulary_size: self.stats.vocabulary_size,
+            log_probability: (numerator / denominator).ln(),
+        }
+    }
+}
+
+/// Auditable structure and counts for a character bigram model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CharacterBigramLanguageModelStats {
+    /// Non-empty public text sequences used for training.
+    pub sequences: usize,
+    /// Han character instances across all sequences.
+    pub character_instances: u128,
+    /// Seen characters plus unknown and end output symbols.
+    pub vocabulary_size: usize,
+    /// Distinct observed character transitions, including boundaries.
+    pub observed_pair_types: usize,
+    /// Total transitions, including one end transition per sequence.
+    pub observed_pair_instances: u128,
+}
+
+/// Aggregate evidence for one complete character sequence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterSequenceScore {
+    /// Sum of add-alpha log conditional probabilities.
+    pub log_probability: f64,
+    /// Transitions observed at least once in training.
+    pub observed_pairs: usize,
+    /// Character transitions plus the final end transition.
+    pub pair_count: usize,
+}
+
+/// Error returned while estimating a public character model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CharacterLanguageModelError {
+    /// No training sequence was supplied.
+    EmptyCorpus,
+    /// One supplied sequence had no characters.
+    EmptySequence {
+        /// One-based sequence number.
+        sequence_number: usize,
+    },
+    /// A transition count exceeded `u64`.
+    CountOverflow {
+        /// One-based sequence number.
+        sequence_number: usize,
+    },
+}
+
+impl fmt::Display for CharacterLanguageModelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyCorpus => write!(formatter, "字级语言模型语料不能为空"),
+            Self::EmptySequence { sequence_number } => {
+                write!(formatter, "字级语言模型第 {sequence_number} 个序列为空")
+            }
+            Self::CountOverflow { sequence_number } => {
+                write!(
+                    formatter,
+                    "字级语言模型累计到第 {sequence_number} 个序列时计数溢出"
+                )
+            }
+        }
+    }
+}
+
+impl Error for CharacterLanguageModelError {}
+
+fn checked_add_character(
+    destination: &mut u64,
+    sequence_number: usize,
+) -> Result<(), CharacterLanguageModelError> {
+    *destination = destination
+        .checked_add(1)
+        .ok_or(CharacterLanguageModelError::CountOverflow { sequence_number })?;
+    Ok(())
+}
+
 /// Full evidence behind one conditional word probability.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BigramScore {
@@ -324,7 +526,10 @@ fn checked_add(
 mod tests {
     use crate::parse_lexicon_tsv;
 
-    use super::{BigramLanguageModel, LanguageModelParseError};
+    use super::{
+        BigramLanguageModel, CharacterBigramLanguageModel, CharacterLanguageModelError,
+        LanguageModelParseError,
+    };
 
     const LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 
@@ -369,5 +574,27 @@ mod tests {
         assert_eq!(stats.observed_pair_types, 2);
         assert_eq!(stats.observed_predecessor_types, 1);
         assert_eq!(stats.observed_pair_instances, 3);
+    }
+
+    #[test]
+    fn character_bigram_prefers_observed_continuation_and_tracks_boundaries() {
+        let sequences = vec!["按键键盘".to_owned(), "简拼".to_owned()];
+        let model = CharacterBigramLanguageModel::from_text_sequences(&sequences).unwrap();
+        let expected = model.score_text("按键键盘");
+        let alternative = model.score_text("按键简拼");
+        let stats = model.stats();
+
+        assert!(expected.log_probability > alternative.log_probability);
+        assert_eq!(expected.pair_count, 5);
+        assert_eq!(expected.observed_pairs, 5);
+        assert!(alternative.observed_pairs < alternative.pair_count);
+        assert_eq!(stats.sequences, 2);
+        assert_eq!(stats.character_instances, 6);
+        assert_eq!(stats.vocabulary_size, 7);
+        assert_eq!(stats.observed_pair_instances, 8);
+        assert!(matches!(
+            CharacterBigramLanguageModel::from_text_sequences(&[]),
+            Err(CharacterLanguageModelError::EmptyCorpus)
+        ));
     }
 }

@@ -4,11 +4,12 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ziranma_decoder::{
-    BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
-    evaluate_context_oracle, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
-    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
-    parse_lexicon_tsv, parse_rime_lexicon, parse_ud_conllu,
-    select_public_bigram_training_sequences, select_public_calibration_cases,
+    BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
+    encode_pinyin_phrase, evaluate_character_context_oracle, evaluate_context_oracle,
+    evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases,
 };
 
 mod benchmark;
@@ -218,6 +219,14 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let language_model =
         BigramLanguageModel::from_token_sequences(&training.sequences, &imported.entries)?;
     let language_model_stats = language_model.stats();
+    let character_training_texts = training
+        .sequences
+        .iter()
+        .map(|sequence| sequence.concat())
+        .collect::<Vec<_>>();
+    let character_language_model =
+        CharacterBigramLanguageModel::from_text_sequences(&character_training_texts)?;
+    let character_language_model_stats = character_language_model.stats();
     let selection = select_public_calibration_cases(&test_corpus, &imported.entries, 64, 128);
     let imported_stats = imported.stats;
     let lexicon = imported.entries;
@@ -262,6 +271,26 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         &lexicon,
         &selection.held_out_token_abbreviation_probes,
     )?;
+    let sentence_full_character_context = evaluate_character_context_oracle(
+        &decoder,
+        &character_language_model,
+        &selection.sentence_full_code_probes,
+    );
+    let sentence_abbreviation_character_context = evaluate_character_context_oracle(
+        &decoder,
+        &character_language_model,
+        &selection.sentence_abbreviation_probes,
+    );
+    let held_out_token_full_character_context = evaluate_character_context_oracle(
+        &decoder,
+        &character_language_model,
+        &selection.held_out_token_full_code_probes,
+    );
+    let held_out_token_abbreviation_character_context = evaluate_character_context_oracle(
+        &decoder,
+        &character_language_model,
+        &selection.held_out_token_abbreviation_probes,
+    );
     let elapsed = started.elapsed();
 
     println!(
@@ -289,6 +318,13 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         language_model_stats.vocabulary_size,
         language_model_stats.observed_pair_types,
         language_model_stats.observed_pair_instances
+    );
+    println!(
+        "字级模型：{} 字实例、{} 输出符号、{} 二元组类型、{} 二元组实例",
+        character_language_model_stats.character_instances,
+        character_language_model_stats.vocabulary_size,
+        character_language_model_stats.observed_pair_types,
+        character_language_model_stats.observed_pair_instances
     );
     println!(
         "自然句筛选：长度合格 {}，纯汉字 {}，Rime 可覆盖 {}，固定取前 {}",
@@ -319,6 +355,14 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     print_context_oracle_report("自然句全简拼", &sentence_abbreviation_context);
     print_context_oracle_report("未收整词完整码", &held_out_token_full_context);
     print_context_oracle_report("未收整词全简拼", &held_out_token_abbreviation_context);
+    println!("字级上下文双文本诊断（只比较文本语言分，不含 Rime 词频或拼写代价）：");
+    print_character_context_oracle_report("自然句完整码", &sentence_full_character_context);
+    print_character_context_oracle_report("自然句全简拼", &sentence_abbreviation_character_context);
+    print_character_context_oracle_report("未收整词完整码", &held_out_token_full_character_context);
+    print_character_context_oracle_report(
+        "未收整词全简拼",
+        &held_out_token_abbreviation_character_context,
+    );
     println!(
         "本次公开校准耗时：{:.3} ms（固定本机观察，不代表真实输入准确率）",
         elapsed.as_secs_f64() * 1000.0
@@ -361,6 +405,61 @@ fn print_context_oracle_report(label: &str, report: &ziranma_decoder::ContextOra
         report.oracle_pair_matches_expected,
         report.total,
         report.oracle_pair_accuracy() * 100.0
+    );
+}
+
+fn print_character_context_oracle_report(
+    label: &str,
+    report: &ziranma_decoder::CharacterContextOracleReport,
+) {
+    println!(
+        "{label}：原始相符 {}/{}；原始不符中答案文本胜 {}、平 {}、原 Top-1 文本胜 {}",
+        report.unigram_top_1_matches_expected,
+        report.total,
+        report.incorrect_expected_text_preferred,
+        report.incorrect_context_ties,
+        report.incorrect_baseline_text_preferred
+    );
+    if let Some(range) = report.incorrect_margin_range {
+        println!(
+            "{label}答案减原 Top-1 的字级每键分差：{:.3}～{:.3}",
+            range.minimum_per_key, range.maximum_per_key
+        );
+    }
+    println!(
+        "{label}字级双文本上限：{}/{}（{:.1}%）",
+        report.oracle_pair_matches_expected,
+        report.total,
+        report.oracle_pair_accuracy() * 100.0
+    );
+    println!(
+        "{label}原始不符文本长度：答案更长 {}、等长 {}、答案更短 {}",
+        report.incorrect_expected_text_longer,
+        report.incorrect_equal_text_length,
+        report.incorrect_expected_text_shorter
+    );
+    if report.incorrect_equal_text_length > 0 {
+        println!(
+            "{label}等长样本字级胜负：答案胜 {}、平 {}、原 Top-1 胜 {}",
+            report.incorrect_equal_length_expected_preferred,
+            report.incorrect_equal_length_ties,
+            report.incorrect_equal_length_baseline_preferred
+        );
+    }
+    if let Some(range) = report.incorrect_average_margin_range {
+        println!(
+            "{label}答案减原 Top-1 的字级平均分差：{:.3}～{:.3}",
+            range.minimum, range.maximum
+        );
+    }
+    println!(
+        "{label}按字符转移平均后的双文本上限：{}/{}（{:.1}%；答案胜 {}、平 {}、原 Top-1 胜 {}）",
+        report.average_oracle_pair_matches_expected,
+        report.total,
+        report.average_oracle_pair_accuracy() * 100.0,
+        report.incorrect_average_expected_preferred,
+        report.incorrect_average_context_ties,
+        report.incorrect_average_baseline_preferred
     );
 }
 

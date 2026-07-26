@@ -3,8 +3,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    BIGRAM_INTERPOLATION_WEIGHT, BigramLanguageModel, Candidate, CandidateSource, Correction,
-    Decoder, KeySequence, LexiconEntry, SentenceCandidate, are_qwerty_neighbors, spelling_variants,
+    BIGRAM_INTERPOLATION_WEIGHT, BigramLanguageModel, Candidate, CandidateSource,
+    CharacterBigramLanguageModel, Correction, Decoder, KeySequence, LexiconEntry,
+    SentenceCandidate, are_qwerty_neighbors, spelling_variants,
 };
 
 /// Candidate per-key margins scanned by the rejection shadow evaluation.
@@ -336,6 +337,181 @@ impl ContextOracleReport {
     }
 }
 
+/// Pairwise text diagnostic for a train-only character bigram model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CharacterContextOracleReport {
+    /// Number of held-out public probes.
+    pub total: usize,
+    /// Probes already correct under the unmodified unigram Top-1.
+    pub unigram_top_1_matches_expected: usize,
+    /// Probes incorrect under the unmodified unigram Top-1.
+    pub unigram_top_1_differs: usize,
+    /// Incorrect probes whose expected text receives the higher character
+    /// language score.
+    pub incorrect_expected_text_preferred: usize,
+    /// Incorrect probes whose two character scores are exactly equal.
+    pub incorrect_context_ties: usize,
+    /// Incorrect probes whose original Top-1 receives the higher score.
+    pub incorrect_baseline_text_preferred: usize,
+    /// Correct results plus incorrect results repaired by the text oracle.
+    pub oracle_pair_matches_expected: usize,
+    /// Expected-minus-baseline character score range per observed key.
+    pub incorrect_margin_range: Option<ContextScoreMarginRange>,
+    /// Incorrect probes whose expected text has more characters.
+    pub incorrect_expected_text_longer: usize,
+    /// Incorrect probes whose two texts have the same character count.
+    pub incorrect_equal_text_length: usize,
+    /// Incorrect probes whose expected text has fewer characters.
+    pub incorrect_expected_text_shorter: usize,
+    /// Equal-length incorrect probes whose expected text scores higher.
+    pub incorrect_equal_length_expected_preferred: usize,
+    /// Equal-length incorrect probes whose character scores tie.
+    pub incorrect_equal_length_ties: usize,
+    /// Equal-length incorrect probes whose original Top-1 scores higher.
+    pub incorrect_equal_length_baseline_preferred: usize,
+    /// Incorrect probes whose expected text has the higher average
+    /// log-probability per character transition.
+    pub incorrect_average_expected_preferred: usize,
+    /// Incorrect probes tied after character-length normalization.
+    pub incorrect_average_context_ties: usize,
+    /// Incorrect probes whose original Top-1 has the higher normalized score.
+    pub incorrect_average_baseline_preferred: usize,
+    /// Correct results plus normalized-score repairs.
+    pub average_oracle_pair_matches_expected: usize,
+    /// Expected-minus-baseline average-score range.
+    pub incorrect_average_margin_range: Option<CharacterAverageMarginRange>,
+}
+
+impl CharacterContextOracleReport {
+    /// Fraction correct under the optimistic pairwise text oracle.
+    pub fn oracle_pair_accuracy(&self) -> f64 {
+        rate(self.oracle_pair_matches_expected, self.total)
+    }
+
+    /// Fraction correct under the character-length-normalized pairwise oracle.
+    pub fn average_oracle_pair_accuracy(&self) -> f64 {
+        rate(self.average_oracle_pair_matches_expected, self.total)
+    }
+}
+
+/// Range of average character log-score differences.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterAverageMarginRange {
+    /// Lowest expected-minus-baseline average log score.
+    pub minimum: f64,
+    /// Highest expected-minus-baseline average log score.
+    pub maximum: f64,
+}
+
+/// Compares expected public text with unigram Top-1 using character bigrams.
+///
+/// This optimistic diagnostic ignores decoder and spelling scores. It asks
+/// only whether denser train-only character evidence distinguishes the two
+/// known texts before any production search integration is attempted.
+pub fn evaluate_character_context_oracle(
+    decoder: &Decoder,
+    language_model: &CharacterBigramLanguageModel,
+    probes: &[LabeledSentenceProbe],
+) -> CharacterContextOracleReport {
+    let mut unigram_top_1_matches_expected = 0;
+    let mut incorrect_expected_text_preferred = 0;
+    let mut incorrect_context_ties = 0;
+    let mut incorrect_baseline_text_preferred = 0;
+    let mut incorrect_margins = Vec::new();
+    let mut incorrect_expected_text_longer = 0;
+    let mut incorrect_equal_text_length = 0;
+    let mut incorrect_expected_text_shorter = 0;
+    let mut incorrect_equal_length_expected_preferred = 0;
+    let mut incorrect_equal_length_ties = 0;
+    let mut incorrect_equal_length_baseline_preferred = 0;
+    let mut incorrect_average_expected_preferred = 0;
+    let mut incorrect_average_context_ties = 0;
+    let mut incorrect_average_baseline_preferred = 0;
+    let mut incorrect_average_margins = Vec::new();
+
+    for probe in probes {
+        let candidate = decoder
+            .decode_sentence(probe.observed.as_str(), 1)
+            .expect("public probe keys are validated lowercase ASCII")
+            .into_iter()
+            .next()
+            .expect("literal fallback guarantees a sentence candidate");
+        if candidate.text == probe.expected_text {
+            unigram_top_1_matches_expected += 1;
+            continue;
+        }
+
+        let expected_evidence = language_model.score_text(&probe.expected_text);
+        let baseline_evidence = language_model.score_text(&candidate.text);
+        let expected_score = expected_evidence.log_probability;
+        let baseline_score = baseline_evidence.log_probability;
+        let margin_per_key =
+            (expected_score - baseline_score) / probe.observed.as_str().len() as f64;
+        incorrect_margins.push(margin_per_key);
+        match expected_score.total_cmp(&baseline_score) {
+            std::cmp::Ordering::Greater => incorrect_expected_text_preferred += 1,
+            std::cmp::Ordering::Equal => incorrect_context_ties += 1,
+            std::cmp::Ordering::Less => incorrect_baseline_text_preferred += 1,
+        }
+        let length_ordering = probe
+            .expected_text
+            .chars()
+            .count()
+            .cmp(&candidate.text.chars().count());
+        match length_ordering {
+            std::cmp::Ordering::Greater => incorrect_expected_text_longer += 1,
+            std::cmp::Ordering::Equal => {
+                incorrect_equal_text_length += 1;
+                match expected_score.total_cmp(&baseline_score) {
+                    std::cmp::Ordering::Greater => {
+                        incorrect_equal_length_expected_preferred += 1;
+                    }
+                    std::cmp::Ordering::Equal => incorrect_equal_length_ties += 1,
+                    std::cmp::Ordering::Less => {
+                        incorrect_equal_length_baseline_preferred += 1;
+                    }
+                }
+            }
+            std::cmp::Ordering::Less => incorrect_expected_text_shorter += 1,
+        }
+        let expected_average =
+            expected_evidence.log_probability / expected_evidence.pair_count as f64;
+        let baseline_average =
+            baseline_evidence.log_probability / baseline_evidence.pair_count as f64;
+        incorrect_average_margins.push(expected_average - baseline_average);
+        match expected_average.total_cmp(&baseline_average) {
+            std::cmp::Ordering::Greater => incorrect_average_expected_preferred += 1,
+            std::cmp::Ordering::Equal => incorrect_average_context_ties += 1,
+            std::cmp::Ordering::Less => incorrect_average_baseline_preferred += 1,
+        }
+    }
+
+    let unigram_top_1_differs = probes.len() - unigram_top_1_matches_expected;
+    CharacterContextOracleReport {
+        total: probes.len(),
+        unigram_top_1_matches_expected,
+        unigram_top_1_differs,
+        incorrect_expected_text_preferred,
+        incorrect_context_ties,
+        incorrect_baseline_text_preferred,
+        oracle_pair_matches_expected: unigram_top_1_matches_expected
+            + incorrect_expected_text_preferred,
+        incorrect_margin_range: context_margin_range(&incorrect_margins),
+        incorrect_expected_text_longer,
+        incorrect_equal_text_length,
+        incorrect_expected_text_shorter,
+        incorrect_equal_length_expected_preferred,
+        incorrect_equal_length_ties,
+        incorrect_equal_length_baseline_preferred,
+        incorrect_average_expected_preferred,
+        incorrect_average_context_ties,
+        incorrect_average_baseline_preferred,
+        average_oracle_pair_matches_expected: unigram_top_1_matches_expected
+            + incorrect_average_expected_preferred,
+        incorrect_average_margin_range: character_average_margin_range(&incorrect_average_margins),
+    }
+}
+
 /// Compares the expected public path with the current unigram Top-1 path.
 ///
 /// Both fixed paths are rescored with the supplied train-only bigram model and
@@ -505,6 +681,21 @@ fn context_margin_range(margins: &[f64]) -> Option<ContextScoreMarginRange> {
         |range, margin| ContextScoreMarginRange {
             minimum_per_key: range.minimum_per_key.min(margin),
             maximum_per_key: range.maximum_per_key.max(margin),
+        },
+    ))
+}
+
+fn character_average_margin_range(margins: &[f64]) -> Option<CharacterAverageMarginRange> {
+    let mut margins = margins.iter().copied();
+    let first = margins.next()?;
+    Some(margins.fold(
+        CharacterAverageMarginRange {
+            minimum: first,
+            maximum: first,
+        },
+        |range, margin| CharacterAverageMarginRange {
+            minimum: range.minimum.min(margin),
+            maximum: range.maximum.max(margin),
         },
     ))
 }
@@ -1143,13 +1334,15 @@ fn rate(hits: usize, total: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BigramLanguageModel, Decoder, KeySequence, parse_lexicon_tsv};
+    use crate::{
+        BigramLanguageModel, CharacterBigramLanguageModel, Decoder, KeySequence, parse_lexicon_tsv,
+    };
 
     use super::{
         LabeledSentenceProbe, ProbeSpellingMode, REJECTION_SHADOW_THRESHOLDS_PER_KEY,
-        SyntheticCaseKind, evaluate_context_oracle, evaluate_labeled_recall,
-        evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
-        evaluate_sentence_cases, evaluate_synthetic,
+        SyntheticCaseKind, evaluate_character_context_oracle, evaluate_context_oracle,
+        evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+        evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -1207,6 +1400,50 @@ mod tests {
         let range = report.incorrect_margin_range.unwrap();
         assert!(range.minimum_per_key > 0.0);
         assert_eq!(range.minimum_per_key, range.maximum_per_key);
+    }
+
+    #[test]
+    fn character_context_oracle_is_read_only_and_prefers_seen_text() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let model = CharacterBigramLanguageModel::from_text_sequences(&[
+            "按键键盘".to_owned(),
+            "简拼".to_owned(),
+        ])
+        .unwrap();
+        let decoder = Decoder::new(lexicon);
+        let before = decoder.decode_sentence("ajjp", 10).unwrap();
+        let report = evaluate_character_context_oracle(
+            &decoder,
+            &model,
+            &[LabeledSentenceProbe {
+                id: "key-keyboard".to_owned(),
+                observed: KeySequence::new("ajjp").unwrap(),
+                expected_text: "按键键盘".to_owned(),
+                expected_segments: vec!["按键".to_owned(), "键盘".to_owned()],
+                spelling_mode: ProbeSpellingMode::FullyAbbreviated,
+            }],
+        );
+
+        assert_eq!(decoder.decode_sentence("ajjp", 10).unwrap(), before);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.unigram_top_1_matches_expected, 0);
+        assert_eq!(report.unigram_top_1_differs, 1);
+        assert_eq!(report.incorrect_expected_text_preferred, 1);
+        assert_eq!(report.incorrect_context_ties, 0);
+        assert_eq!(report.incorrect_baseline_text_preferred, 0);
+        assert_eq!(report.oracle_pair_matches_expected, 1);
+        assert!(report.incorrect_margin_range.unwrap().minimum_per_key > 0.0);
+        assert_eq!(report.incorrect_expected_text_longer, 0);
+        assert_eq!(report.incorrect_equal_text_length, 1);
+        assert_eq!(report.incorrect_expected_text_shorter, 0);
+        assert_eq!(report.incorrect_equal_length_expected_preferred, 1);
+        assert_eq!(report.incorrect_equal_length_ties, 0);
+        assert_eq!(report.incorrect_equal_length_baseline_preferred, 0);
+        assert_eq!(report.incorrect_average_expected_preferred, 1);
+        assert_eq!(report.incorrect_average_context_ties, 0);
+        assert_eq!(report.incorrect_average_baseline_preferred, 0);
+        assert_eq!(report.average_oracle_pair_matches_expected, 1);
+        assert!(report.incorrect_average_margin_range.unwrap().minimum > 0.0);
     }
 
     #[test]

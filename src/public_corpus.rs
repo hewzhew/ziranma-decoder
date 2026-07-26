@@ -555,7 +555,7 @@ impl Error for UdCorpusParseError {}
 #[cfg(test)]
 mod tests {
     use crate::{
-        BigramLanguageModel, parse_rime_lexicon, parse_ud_conllu,
+        BigramLanguageModel, CharacterBigramLanguageModel, parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
     };
 
@@ -594,6 +594,19 @@ mod tests {
         assert_eq!(stats.observed_pair_types, 40_299);
         assert_eq!(stats.observed_predecessor_types, 8_890);
         assert_eq!(stats.observed_pair_instances, 49_373);
+
+        let texts = first
+            .sequences
+            .iter()
+            .map(|sequence| sequence.concat())
+            .collect::<Vec<_>>();
+        let character_model = CharacterBigramLanguageModel::from_text_sequences(&texts).unwrap();
+        let character_stats = character_model.stats();
+        assert_eq!(character_stats.sequences, 2_339);
+        assert_eq!(character_stats.character_instances, 74_381);
+        assert_eq!(character_stats.vocabulary_size, 2_995);
+        assert_eq!(character_stats.observed_pair_types, 43_048);
+        assert_eq!(character_stats.observed_pair_instances, 76_720);
     }
 
     #[test]
