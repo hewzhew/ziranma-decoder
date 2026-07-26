@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A privacy-first, explainable noisy-channel decoder experiment for Ziranma double pinyin"
 license = "MPL-2.0"
+repository = "https://github.com/hewzhew/ziranma-decoder"
 publish = false
 default-run = "ziranma-decoder"
 
