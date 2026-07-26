@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
-    evaluate_context_oracle, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
-    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
-    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
-    select_public_calibration_cases,
+    evaluate_context_oracle, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
+    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+    parse_lexicon_tsv, parse_rime_lexicon, parse_ud_conllu,
+    select_public_bigram_training_sequences, select_public_calibration_cases,
 };
 
 mod benchmark;
@@ -222,6 +222,14 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let imported_stats = imported.stats;
     let lexicon = imported.entries;
     let decoder = Decoder::new(lexicon.clone());
+    let sentence_full_recall =
+        evaluate_labeled_recall(&decoder, &selection.sentence_full_code_probes);
+    let sentence_abbreviation_recall =
+        evaluate_labeled_recall(&decoder, &selection.sentence_abbreviation_probes);
+    let held_out_token_full_recall =
+        evaluate_labeled_recall(&decoder, &selection.held_out_token_full_code_probes);
+    let held_out_token_abbreviation_recall =
+        evaluate_labeled_recall(&decoder, &selection.held_out_token_abbreviation_probes);
     let sentence_full =
         evaluate_labeled_rejection_shadow(&decoder, &selection.sentence_full_code_probes);
     let sentence_abbreviation =
@@ -297,6 +305,11 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "未收整词探针：合格唯一 token {}，固定取前 {}",
         selection.stats.held_out_token_eligible, selection.stats.selected_held_out_tokens
     );
+    println!("现行 unigram 候选召回（只读 Top-K）：");
+    print_labeled_recall_report("自然句完整码", &sentence_full_recall);
+    print_labeled_recall_report("自然句全简拼", &sentence_abbreviation_recall);
+    print_labeled_recall_report("未收整词完整码", &held_out_token_full_recall);
+    print_labeled_recall_report("未收整词全简拼", &held_out_token_abbreviation_recall);
     print_labeled_rejection_report("自然句完整码", &sentence_full);
     print_labeled_rejection_report("自然句全简拼", &sentence_abbreviation);
     print_labeled_rejection_report("未收整词完整码", &held_out_token_full);
@@ -311,6 +324,21 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         elapsed.as_secs_f64() * 1000.0
     );
     Ok(())
+}
+
+fn print_labeled_recall_report(label: &str, report: &ziranma_decoder::LabeledRecallReport) {
+    println!(
+        "{label}：Top-1 {}/{}（{:.1}%），Top-5 {}/{}（{:.1}%），Top-10 {}/{}（{:.1}%）",
+        report.hits_at_1,
+        report.total,
+        report.recall_at_1() * 100.0,
+        report.hits_at_5,
+        report.total,
+        report.recall_at_5() * 100.0,
+        report.hits_at_10,
+        report.total,
+        report.recall_at_10() * 100.0
+    );
 }
 
 fn print_context_oracle_report(label: &str, report: &ziranma_decoder::ContextOracleReport) {

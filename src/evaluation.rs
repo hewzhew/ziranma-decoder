@@ -228,6 +228,67 @@ pub struct LabeledSentenceProbe {
     pub spelling_mode: ProbeSpellingMode,
 }
 
+/// Top-K text recall against independently sourced public expectations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LabeledRecallReport {
+    /// Number of public probes.
+    pub total: usize,
+    /// Expected texts ranked first.
+    pub hits_at_1: usize,
+    /// Expected texts present in the first five unique candidates.
+    pub hits_at_5: usize,
+    /// Expected texts present in the first ten unique candidates.
+    pub hits_at_10: usize,
+}
+
+impl LabeledRecallReport {
+    /// Fraction of expected texts ranked first.
+    pub fn recall_at_1(&self) -> f64 {
+        rate(self.hits_at_1, self.total)
+    }
+
+    /// Fraction of expected texts present in the first five candidates.
+    pub fn recall_at_5(&self) -> f64 {
+        rate(self.hits_at_5, self.total)
+    }
+
+    /// Fraction of expected texts present in the first ten candidates.
+    pub fn recall_at_10(&self) -> f64 {
+        rate(self.hits_at_10, self.total)
+    }
+}
+
+/// Measures whether public expected text is recalled before changing ranking.
+///
+/// The production unigram decoder and its ordering remain unchanged. This
+/// separates failures where the expected text is absent from the visible
+/// candidate set from failures where it is present but ranked too low.
+pub fn evaluate_labeled_recall(
+    decoder: &Decoder,
+    probes: &[LabeledSentenceProbe],
+) -> LabeledRecallReport {
+    let mut report = LabeledRecallReport::default();
+    for probe in probes {
+        let candidates = decoder
+            .decode_sentence(probe.observed.as_str(), 10)
+            .expect("public probe keys are validated lowercase ASCII");
+        let rank = candidates
+            .iter()
+            .position(|candidate| candidate.text == probe.expected_text);
+        report.total += 1;
+        if rank.is_some_and(|rank| rank < 1) {
+            report.hits_at_1 += 1;
+        }
+        if rank.is_some_and(|rank| rank < 5) {
+            report.hits_at_5 += 1;
+        }
+        if rank.is_some_and(|rank| rank < 10) {
+            report.hits_at_10 += 1;
+        }
+    }
+    report
+}
+
 /// Uniform spelling mode used to construct one public probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeSpellingMode {
@@ -1086,8 +1147,9 @@ mod tests {
 
     use super::{
         LabeledSentenceProbe, ProbeSpellingMode, REJECTION_SHADOW_THRESHOLDS_PER_KEY,
-        SyntheticCaseKind, evaluate_context_oracle, evaluate_labeled_rejection_shadow,
-        evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+        SyntheticCaseKind, evaluate_context_oracle, evaluate_labeled_recall,
+        evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
+        evaluate_sentence_cases, evaluate_synthetic,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -1145,6 +1207,32 @@ mod tests {
         let range = report.incorrect_margin_range.unwrap();
         assert!(range.minimum_per_key > 0.0);
         assert_eq!(range.minimum_per_key, range.maximum_per_key);
+    }
+
+    #[test]
+    fn labeled_recall_separates_top_one_from_visible_candidate_recall() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let decoder = Decoder::new(lexicon);
+        let before = decoder.decode_sentence("ajjp", 10).unwrap();
+        let report = evaluate_labeled_recall(
+            &decoder,
+            &[LabeledSentenceProbe {
+                id: "key-keyboard".to_owned(),
+                observed: KeySequence::new("ajjp").unwrap(),
+                expected_text: "按键键盘".to_owned(),
+                expected_segments: vec!["按键".to_owned(), "键盘".to_owned()],
+                spelling_mode: ProbeSpellingMode::FullyAbbreviated,
+            }],
+        );
+
+        assert_eq!(decoder.decode_sentence("ajjp", 10).unwrap(), before);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.hits_at_1, 0);
+        assert_eq!(report.hits_at_5, 1);
+        assert_eq!(report.hits_at_10, 1);
+        assert_eq!(report.recall_at_1(), 0.0);
+        assert_eq!(report.recall_at_5(), 1.0);
+        assert_eq!(report.recall_at_10(), 1.0);
     }
 
     #[test]
