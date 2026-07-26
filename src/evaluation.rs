@@ -3,7 +3,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Candidate, Correction, Decoder, LexiconEntry, are_qwerty_neighbors, spelling_variants,
+    Candidate, Correction, Decoder, KeySequence, LexiconEntry, SentenceCandidate,
+    are_qwerty_neighbors, spelling_variants,
 };
 
 /// Candidate per-key margins scanned by the rejection shadow evaluation.
@@ -210,6 +211,129 @@ pub struct RejectionMarginRange {
     pub minimum_per_key: f64,
     /// Highest observed per-key margin.
     pub maximum_per_key: f64,
+}
+
+/// One public probe with independently sourced expected text and observed keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LabeledSentenceProbe {
+    /// Stable upstream-derived identifier.
+    pub id: String,
+    /// Deterministically constructed lowercase ASCII input keys.
+    pub observed: KeySequence,
+    /// Text that the top sentence candidate is expected to reproduce.
+    pub expected_text: String,
+}
+
+/// One threshold row split by whether the unmodified Top-1 text was correct.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabeledRejectionThresholdMetrics {
+    /// Minimum normalized lexicon-over-literal score margin required to accept.
+    pub threshold_per_key: f64,
+    /// Probes whose unmodified Top-1 text matched the public source text.
+    pub correct_total: usize,
+    /// Correct Top-1 results that the hypothetical threshold would retain.
+    pub correct_accepted: usize,
+    /// Probes whose unmodified Top-1 text differed from the public source text.
+    pub incorrect_total: usize,
+    /// Incorrect Top-1 results that the hypothetical threshold would reject.
+    pub incorrect_rejected: usize,
+}
+
+impl LabeledRejectionThresholdMetrics {
+    /// Fraction of correct unmodified results retained by the threshold.
+    pub fn correct_acceptance_rate(&self) -> f64 {
+        rate(self.correct_accepted, self.correct_total)
+    }
+
+    /// Fraction of incorrect unmodified results rejected by the threshold.
+    pub fn incorrect_rejection_rate(&self) -> f64 {
+        rate(self.incorrect_rejected, self.incorrect_total)
+    }
+}
+
+/// Read-only threshold scan labeled by actual Top-1 text equality.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabeledRejectionShadowReport {
+    /// Number of public probes.
+    pub total: usize,
+    /// Probes whose unmodified Top-1 text matched the expected text.
+    pub top_1_matches_expected: usize,
+    /// Probes whose unmodified Top-1 text differed from the expected text.
+    pub top_1_differs: usize,
+    /// Incorrect Top-1 results that nevertheless had full lexicon coverage.
+    pub incorrect_with_full_coverage: usize,
+    /// Margin range among correct Top-1 results with full coverage.
+    pub correct_margin_range: Option<RejectionMarginRange>,
+    /// Margin range among incorrect Top-1 results with full coverage.
+    pub incorrect_margin_range: Option<RejectionMarginRange>,
+    /// Fixed threshold scan in ascending order.
+    pub thresholds: Vec<LabeledRejectionThresholdMetrics>,
+}
+
+/// Evaluates hypothetical rejection against independently sourced expected text.
+///
+/// The decoder is run exactly once per probe. Its unmodified Top-1 text labels
+/// that probe as correct or incorrect, while the same normalized
+/// lexicon-over-literal margin used by [`evaluate_rejection_shadow`] determines
+/// whether each fixed threshold would accept or reject it. No candidate or
+/// ranking behavior is changed.
+pub fn evaluate_labeled_rejection_shadow(
+    decoder: &Decoder,
+    probes: &[LabeledSentenceProbe],
+) -> LabeledRejectionShadowReport {
+    let observations = probes
+        .iter()
+        .map(|probe| {
+            let (candidate, margin) = top_sentence_and_margin(decoder, probe.observed.as_str());
+            (candidate.text == probe.expected_text, margin)
+        })
+        .collect::<Vec<_>>();
+    let correct_total = observations
+        .iter()
+        .filter(|(correct, _margin)| *correct)
+        .count();
+    let incorrect_total = observations.len() - correct_total;
+    let correct_margins = observations
+        .iter()
+        .filter_map(|(correct, margin)| correct.then_some(*margin).flatten())
+        .map(Some)
+        .collect::<Vec<_>>();
+    let incorrect_margins = observations
+        .iter()
+        .filter_map(|(correct, margin)| (!correct).then_some(*margin).flatten())
+        .map(Some)
+        .collect::<Vec<_>>();
+    let incorrect_with_full_coverage = incorrect_margins.len();
+    let thresholds = REJECTION_SHADOW_THRESHOLDS_PER_KEY
+        .into_iter()
+        .map(|threshold_per_key| LabeledRejectionThresholdMetrics {
+            threshold_per_key,
+            correct_total,
+            correct_accepted: observations
+                .iter()
+                .filter(|(correct, margin)| {
+                    *correct && margin.is_some_and(|margin| margin >= threshold_per_key)
+                })
+                .count(),
+            incorrect_total,
+            incorrect_rejected: observations
+                .iter()
+                .filter(|(correct, margin)| {
+                    !*correct && margin.is_none_or(|margin| margin < threshold_per_key)
+                })
+                .count(),
+        })
+        .collect();
+
+    LabeledRejectionShadowReport {
+        total: observations.len(),
+        top_1_matches_expected: correct_total,
+        top_1_differs: incorrect_total,
+        incorrect_with_full_coverage,
+        correct_margin_range: rejection_margin_range(&correct_margins),
+        incorrect_margin_range: rejection_margin_range(&incorrect_margins),
+        thresholds,
+    }
 }
 
 /// Read-only calibration report comparing lexicon coverage with literal fallback.
@@ -443,6 +567,10 @@ fn parse_sentence_cases(
 }
 
 fn full_lexicon_margin_per_key(decoder: &Decoder, observed: &str) -> Option<f64> {
+    top_sentence_and_margin(decoder, observed).1
+}
+
+fn top_sentence_and_margin(decoder: &Decoder, observed: &str) -> (SentenceCandidate, Option<f64>) {
     // Sentence ordering places every fully covered path before every path with
     // unresolved input, so Top-1 is the best full path whenever one exists.
     let candidate = decoder
@@ -452,12 +580,13 @@ fn full_lexicon_margin_per_key(decoder: &Decoder, observed: &str) -> Option<f64>
         .next()
         .expect("literal fallback guarantees a sentence candidate");
     if candidate.unresolved_key_count > 0 {
-        return None;
+        return (candidate, None);
     }
     let observed_key_count = observed.len();
     debug_assert!(observed_key_count > 0);
     let fully_literal_score = -(observed_key_count as f64) * decoder.config.unresolved_key_penalty;
-    Some((candidate.total_score - fully_literal_score) / observed_key_count as f64)
+    let margin = (candidate.total_score - fully_literal_score) / observed_key_count as f64;
+    (candidate, Some(margin))
 }
 
 fn rejection_margin_range(margins: &[Option<f64>]) -> Option<RejectionMarginRange> {
@@ -696,11 +825,12 @@ fn rate(hits: usize, total: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BigramLanguageModel, Decoder, parse_lexicon_tsv};
+    use crate::{BigramLanguageModel, Decoder, KeySequence, parse_lexicon_tsv};
 
     use super::{
-        REJECTION_SHADOW_THRESHOLDS_PER_KEY, SyntheticCaseKind, evaluate_oov_cases,
-        evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+        LabeledSentenceProbe, REJECTION_SHADOW_THRESHOLDS_PER_KEY, SyntheticCaseKind,
+        evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
+        evaluate_sentence_cases, evaluate_synthetic,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -820,6 +950,65 @@ mod tests {
                 .thresholds
                 .iter()
                 .all(|metrics| { metrics.known_accepted == 0 && metrics.oov_rejected == 1 })
+        );
+    }
+
+    #[test]
+    fn labeled_rejection_shadow_uses_top_text_without_changing_it() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let decoder = Decoder::new(lexicon);
+        let observed = KeySequence::new("nihk").unwrap();
+        let before = decoder.decode_sentence(observed.as_str(), 10).unwrap();
+        let expected = before[0].text.clone();
+        let probes = vec![
+            LabeledSentenceProbe {
+                id: "correct".to_owned(),
+                observed: observed.clone(),
+                expected_text: expected,
+            },
+            LabeledSentenceProbe {
+                id: "incorrect".to_owned(),
+                observed,
+                expected_text: "不相符".to_owned(),
+            },
+        ];
+
+        let first = evaluate_labeled_rejection_shadow(&decoder, &probes);
+        let second = evaluate_labeled_rejection_shadow(&decoder, &probes);
+
+        assert_eq!(first, second);
+        assert_eq!(decoder.decode_sentence("nihk", 10).unwrap(), before);
+        assert_eq!(first.total, 2);
+        assert_eq!(first.top_1_matches_expected, 1);
+        assert_eq!(first.top_1_differs, 1);
+        assert_eq!(first.incorrect_with_full_coverage, 1);
+        assert!(first.correct_margin_range.is_some());
+        assert!(first.incorrect_margin_range.is_some());
+        assert!(first.thresholds.windows(2).all(|pair| {
+            pair[0].correct_accepted >= pair[1].correct_accepted
+                && pair[0].incorrect_rejected <= pair[1].incorrect_rejected
+        }));
+    }
+
+    #[test]
+    fn labeled_rejection_shadow_rejects_uncovered_incorrect_text() {
+        let decoder = Decoder::new(Vec::new());
+        let probes = vec![LabeledSentenceProbe {
+            id: "uncovered".to_owned(),
+            observed: KeySequence::new("zz").unwrap(),
+            expected_text: "词典外".to_owned(),
+        }];
+        let report = evaluate_labeled_rejection_shadow(&decoder, &probes);
+
+        assert_eq!(report.top_1_matches_expected, 0);
+        assert_eq!(report.top_1_differs, 1);
+        assert_eq!(report.incorrect_with_full_coverage, 0);
+        assert_eq!(report.incorrect_margin_range, None);
+        assert!(
+            report
+                .thresholds
+                .iter()
+                .all(|metrics| metrics.incorrect_rejected == 1)
         );
     }
 

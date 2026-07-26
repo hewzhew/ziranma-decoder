@@ -14,3 +14,21 @@ snapshot hash, and transformation notes are retained beside the data.
 
 This notice applies to the vendored dictionary data. It does not imply that
 Rime, Android, or their contributors endorse this experiment.
+
+## UD Chinese GSDSimp
+
+The unchanged public CoNLL-U test snapshot under
+`data/public/ud-chinese-gsdsimp/` comes from
+[`UniversalDependencies/UD_Chinese-GSDSimp`](https://github.com/UniversalDependencies/UD_Chinese-GSDSimp),
+pinned to commit `4231dfd59866fa5999ad4a6bc1fdecd7985b3b59`.
+
+The upstream metadata names Peng Qi and Koichi Yasuoka as contributors and
+licenses the treebank under Creative Commons Attribution-ShareAlike 4.0
+International. The upstream license notice and README, exact source URL,
+snapshot hash, and row accounting are retained beside the data.
+
+The upstream changelog says the license permission applies to the UD
+annotations and that Google claims no ownership or copyright over the
+underlying content. This repository preserves that qualification and does not
+make a broader ownership claim. This notice does not imply endorsement by
+Universal Dependencies, Google, or the named contributors.

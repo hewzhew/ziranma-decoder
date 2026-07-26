@@ -16,15 +16,21 @@ use std::fmt;
 mod codec;
 mod evaluation;
 mod language_model;
+mod public_corpus;
 
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use evaluation::{
-    EvaluationReport, OovCaseReport, REJECTION_SHADOW_THRESHOLDS_PER_KEY, RecallMetrics,
+    EvaluationReport, LabeledRejectionShadowReport, LabeledRejectionThresholdMetrics,
+    LabeledSentenceProbe, OovCaseReport, REJECTION_SHADOW_THRESHOLDS_PER_KEY, RecallMetrics,
     RejectionMarginRange, RejectionShadowReport, RejectionThresholdMetrics, SentenceCaseParseError,
-    SentenceCaseReport, SyntheticCaseKind, evaluate_oov_cases, evaluate_rejection_shadow,
-    evaluate_sentence_cases, evaluate_synthetic,
+    SentenceCaseReport, SyntheticCaseKind, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
 };
 pub use language_model::{BigramLanguageModel, BigramScore, LanguageModelParseError};
+pub use public_corpus::{
+    PublicCalibrationSelection, PublicCalibrationSelectionStats, UdCorpus, UdCorpusImportStats,
+    UdCorpusParseError, parse_ud_conllu, select_public_calibration_cases,
+};
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;
 const MAX_LEXICON_SYLLABLES: usize = 12;

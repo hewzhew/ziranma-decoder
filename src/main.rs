@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
-    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
-    parse_lexicon_tsv, parse_rime_lexicon,
+    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
+    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
+    parse_ud_conllu, select_public_calibration_cases,
 };
 
 mod benchmark;
@@ -20,6 +21,8 @@ const LONG_SENTENCE_CASES: &str = include_str!("../tests/fixtures/public/long_se
 const OOV_CASES: &str = include_str!("../tests/fixtures/public/oov_lexicon.tsv");
 const PUBLIC_RIME_LEXICON: &str =
     include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+const PUBLIC_UD_TEST: &str =
+    include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu");
 
 fn main() -> ExitCode {
     match run() {
@@ -46,6 +49,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command {
         "encode" => run_encode(&arguments[1..]),
         "evaluate" => run_evaluate(&arguments[1..]),
+        "public-calibrate" => run_public_calibrate(&arguments[1..]),
         "index-stats" => run_index_stats(&arguments[1..]),
         "public-index-stats" => run_public_index_stats(&arguments[1..]),
         "benchmark" => run_benchmark(&arguments[1..]),
@@ -197,6 +201,97 @@ fn run_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         elapsed.as_secs_f64() * 1000.0
     );
     Ok(())
+}
+
+fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-calibrate 不接受额外参数".into());
+    }
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let selection = select_public_calibration_cases(&corpus, &imported.entries, 64, 128);
+    let decoder = Decoder::new(imported.entries);
+    let sentence_full =
+        evaluate_labeled_rejection_shadow(&decoder, &selection.sentence_full_code_probes);
+    let sentence_abbreviation =
+        evaluate_labeled_rejection_shadow(&decoder, &selection.sentence_abbreviation_probes);
+    let held_out_token_full =
+        evaluate_labeled_rejection_shadow(&decoder, &selection.held_out_token_full_code_probes);
+    let held_out_token_abbreviation =
+        evaluate_labeled_rejection_shadow(&decoder, &selection.held_out_token_abbreviation_probes);
+    let elapsed = started.elapsed();
+
+    println!(
+        "公开独立校准：UD Chinese GSDSimp test {} 句、{} 个 token；Rime 词典 {} 项",
+        corpus.stats.sentences, corpus.stats.syntactic_tokens, imported.stats.imported_entries
+    );
+    println!(
+        "UD 行统计：{} 行，标点 token {}，特殊 token 行 {}",
+        corpus.stats.source_lines, corpus.stats.punctuation_tokens, corpus.stats.special_token_rows
+    );
+    println!(
+        "自然句筛选：长度合格 {}，纯汉字 {}，Rime 可覆盖 {}，固定取前 {}",
+        selection.stats.sentence_length_eligible,
+        selection.stats.sentence_han_only,
+        selection.stats.sentence_lexicon_coverable,
+        selection.stats.selected_sentences
+    );
+    println!(
+        "选中句读音来源：整词 {} 次，逐字回退 {} 次",
+        selection.stats.selected_exact_token_uses, selection.stats.selected_character_fallback_uses
+    );
+    println!(
+        "未收整词探针：合格唯一 token {}，固定取前 {}",
+        selection.stats.held_out_token_eligible, selection.stats.selected_held_out_tokens
+    );
+    print_labeled_rejection_report("自然句完整码", &sentence_full);
+    print_labeled_rejection_report("自然句全简拼", &sentence_abbreviation);
+    print_labeled_rejection_report("未收整词完整码", &held_out_token_full);
+    print_labeled_rejection_report("未收整词全简拼", &held_out_token_abbreviation);
+    println!(
+        "本次公开校准耗时：{:.3} ms（固定本机观察，不代表真实输入准确率）",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn print_labeled_rejection_report(
+    label: &str,
+    report: &ziranma_decoder::LabeledRejectionShadowReport,
+) {
+    println!(
+        "{label}现行 Top-1：文本相符 {}/{}；不符 {}（其中完整覆盖 {}）",
+        report.top_1_matches_expected,
+        report.total,
+        report.top_1_differs,
+        report.incorrect_with_full_coverage
+    );
+    if let Some(range) = report.correct_margin_range {
+        println!(
+            "{label}相符结果每键分差：{:.3}～{:.3}",
+            range.minimum_per_key, range.maximum_per_key
+        );
+    }
+    if let Some(range) = report.incorrect_margin_range {
+        println!(
+            "{label}不符完整路径每键分差：{:.3}～{:.3}",
+            range.minimum_per_key, range.maximum_per_key
+        );
+    }
+    println!("每键最低分差   相符结果保留       不符结果拒识");
+    for metrics in &report.thresholds {
+        println!(
+            "{:>10.1}   {:>3}/{:<3} ({:>5.1}%)   {:>3}/{:<3} ({:>5.1}%)",
+            metrics.threshold_per_key,
+            metrics.correct_accepted,
+            metrics.correct_total,
+            metrics.correct_acceptance_rate() * 100.0,
+            metrics.incorrect_rejected,
+            metrics.incorrect_total,
+            metrics.incorrect_rejection_rate() * 100.0
+        );
+    }
 }
 
 fn run_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -625,6 +720,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run --release -- benchmark [重复次数]
   cargo run -- search-stats <按键串> [Top-K]
   cargo run -- evaluate
+  cargo run --release -- public-calibrate
 
 兼容简写：
   cargo run -- <按键串> [Top-K]
@@ -642,6 +738,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run --release -- benchmark 3
   cargo run -- search-stats nhk
   cargo run -- evaluate
+  cargo run --release -- public-calibrate
 
 程序只读取仓库内的公开演示词典，不会保存输入。"
     );
