@@ -22,11 +22,18 @@
 - Train accounting: 118,599 lines, 3,997 sentences, 98,614 syntactic tokens,
   and 13,627 punctuation tokens
 - License: Creative Commons Attribution-ShareAlike 4.0 International
+- Complete license source:
+  https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt
+- Stored complete license: `CC-BY-SA-4.0.txt`
+- Stored complete license SHA-256:
+  `28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5`
 
 `LICENSE.txt` and `UPSTREAM_README.md` are copied byte-for-byte from the same
-revision. The upstream metadata says the treebank includes text and identifies
-its genre as wiki. Its changelog also notes that the license permission applies
-to the UD annotations and that Google claims no ownership or copyright over the
+revision. `CC-BY-SA-4.0.txt` is the complete legal code retrieved from Creative
+Commons; it supplements rather than replaces the unchanged upstream notice.
+The upstream metadata says the treebank includes text and identifies its genre
+as wiki. Its changelog also notes that the license permission applies to the UD
+annotations and that Google claims no ownership or copyright over the
 underlying content. This repository therefore preserves the upstream notice,
 attribution, revision, and source rather than making a broader ownership claim.
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -130,6 +130,93 @@ pub struct ContinuousCompositionSelectionStats {
     pub selected_full_keys: usize,
     /// Tail-abbreviated keys across retained probes.
     pub selected_tail_keys: usize,
+}
+
+/// One held-out public phrase used to compare bounded abbreviation protocols.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicProtocolProbe {
+    /// Stable upstream-derived identifier.
+    pub id: String,
+    /// Complete two-key syllable spelling with no word separator.
+    pub full_observed: KeySequence,
+    /// Each source word keeps its first syllable full and abbreviates its tail.
+    pub anchored_tail_observed: KeySequence,
+    /// Each multi-syllable word abbreviates only its final syllable.
+    pub conservative_tail_observed: KeySequence,
+    /// Every syllable contributes one first key inside an explicit mode.
+    pub explicit_abbreviation_observed: KeySequence,
+    /// Natural public text expected from the input.
+    pub expected_text: String,
+    /// The two exact Rime words used to construct the input.
+    pub expected_segments: Vec<String>,
+    /// Whether the fit-only phrase whitelist contains this exact shortcut.
+    pub whitelist_available: bool,
+}
+
+/// Deterministic fit/dev protocol probes and auditable selection counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicProtocolSelection {
+    /// Fit-only public word sequences available for auditable context models.
+    pub fit_context_sequences: Vec<Vec<String>>,
+    /// Held-out development phrases selected without consulting decoder output.
+    pub probes: Vec<PublicProtocolProbe>,
+    /// Held-out phrases containing at least one three-or-more-syllable word.
+    pub long_word_probes: Vec<PublicProtocolProbe>,
+    /// Fit/dev, whitelist, and key accounting.
+    pub stats: PublicProtocolSelectionStats,
+}
+
+/// Accounting for the public abbreviation-protocol selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicProtocolSelectionStats {
+    /// Source sentences assigned to fit by the fixed positional split.
+    pub fit_source_sentences: usize,
+    /// Source sentences assigned to development by the fixed positional split.
+    pub dev_source_sentences: usize,
+    /// Adjacent fit windows examined.
+    pub fit_source_windows: usize,
+    /// Fit sentences fully mapped into at least two Rime words.
+    pub fit_context_sequences: usize,
+    /// Rime word instances in fit-only context sequences.
+    pub fit_context_words: usize,
+    /// Fit windows with two exact Rime words and a key-saving tail spelling.
+    pub fit_eligible_windows: usize,
+    /// Distinct eligible fit phrases.
+    pub fit_distinct_phrases: usize,
+    /// Distinct all-short codes observed in fit.
+    pub fit_shortcut_codes: usize,
+    /// Fit shortcut codes associated with more than one phrase.
+    pub fit_colliding_shortcut_codes: usize,
+    /// Collision-free fit shortcuts observed at least twice.
+    pub fit_repeated_collision_free_shortcuts: usize,
+    /// Adjacent development windows examined.
+    pub dev_source_windows: usize,
+    /// Development windows with two exact Rime words and a key-saving tail spelling.
+    pub dev_eligible_windows: usize,
+    /// Unique one-per-sentence development representatives.
+    pub dev_sentence_representatives: usize,
+    /// Unique development representatives containing a 3+ syllable word.
+    pub dev_long_word_representatives: usize,
+    /// Representatives retained under the requested limit.
+    pub selected: usize,
+    /// Long-word representatives retained under the requested limit.
+    pub selected_long_word: usize,
+    /// Selected probes covered by the fit-only phrase whitelist.
+    pub selected_whitelist_covered: usize,
+    /// Complete-code letters across selected probes.
+    pub selected_full_keys: usize,
+    /// Anchored-tail letters across selected probes.
+    pub selected_anchored_tail_keys: usize,
+    /// Conservative one-shortening-per-word letters across selected probes.
+    pub selected_conservative_tail_keys: usize,
+    /// All-short letters across selected probes.
+    pub selected_explicit_abbreviation_keys: usize,
+    /// Complete-code letters across selected long-word probes.
+    pub selected_long_word_full_keys: usize,
+    /// Anchored-tail letters across selected long-word probes.
+    pub selected_long_word_anchored_tail_keys: usize,
+    /// Conservative-tail letters across selected long-word probes.
+    pub selected_long_word_conservative_tail_keys: usize,
 }
 
 /// Train-only segmented sequences mapped into the Rime word vocabulary.
@@ -496,6 +583,283 @@ pub fn select_public_continuous_composition_cases(
     ContinuousCompositionSelection { probes, stats }
 }
 
+/// Builds a deterministic fit/dev comparison for bounded abbreviation protocols.
+///
+/// Every fifth source sentence is assigned to development; the other four are
+/// fit-only. The fit side builds a phrase shortcut whitelist from codes that
+/// map to exactly one phrase and occur at least twice. Development retains at
+/// most one unique eligible two-token span per sentence and is spread evenly
+/// under `limit`. Decoder output never influences splitting or selection.
+pub fn select_public_protocol_audit_cases(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+    limit: usize,
+) -> PublicProtocolSelection {
+    const DEV_STRIDE: usize = 5;
+    const MIN_SHORTCUT_OCCURRENCES: usize = 2;
+
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut stats = PublicProtocolSelectionStats::default();
+    let mut fit_shortcuts = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    let mut fit_phrases = HashSet::new();
+    let mut fit_context_sequences = Vec::new();
+    let mut dev_representatives = Vec::new();
+    let mut dev_long_word_representatives = Vec::new();
+    let mut seen_dev_text = HashSet::new();
+    let mut seen_dev_long_word_text = HashSet::new();
+
+    for (sentence_index, sentence) in corpus.sentences.iter().enumerate() {
+        let is_dev = sentence_index % DEV_STRIDE == DEV_STRIDE - 1;
+        if is_dev {
+            stats.dev_source_sentences += 1;
+        } else {
+            stats.fit_source_sentences += 1;
+        }
+        let tokens = sentence
+            .tokens
+            .iter()
+            .filter(|token| token.upos != "PUNCT")
+            .collect::<Vec<_>>();
+        if !is_dev
+            && let Some((_observed, words, _exact_uses, _character_fallback_uses)) =
+                observed_for_tokens(&tokens, &entries_by_text)
+            && words.len() >= 2
+        {
+            stats.fit_context_words += words.len();
+            stats.fit_context_sequences += 1;
+            fit_context_sequences.push(words);
+        }
+        let mut dev_representative = None;
+        let mut dev_long_word_representative = None;
+
+        for (window_index, window) in tokens.windows(2).enumerate() {
+            if is_dev {
+                stats.dev_source_windows += 1;
+            } else {
+                stats.fit_source_windows += 1;
+            }
+            let Some(window) = protocol_window(window, &entries_by_text) else {
+                continue;
+            };
+
+            if is_dev {
+                stats.dev_eligible_windows += 1;
+                if dev_representative.is_none()
+                    && seen_dev_text.insert(window.expected_text.clone())
+                {
+                    dev_representative = Some((
+                        format!("{}:protocol-{}", sentence.id, window_index + 1),
+                        window.clone(),
+                    ));
+                }
+                if window.has_long_word
+                    && dev_long_word_representative.is_none()
+                    && seen_dev_long_word_text.insert(window.expected_text.clone())
+                {
+                    dev_long_word_representative = Some((
+                        format!("{}:protocol-long-{}", sentence.id, window_index + 1),
+                        window,
+                    ));
+                }
+            } else {
+                stats.fit_eligible_windows += 1;
+                fit_phrases.insert(window.expected_text.clone());
+                *fit_shortcuts
+                    .entry(window.explicit_abbreviation)
+                    .or_default()
+                    .entry(window.expected_text)
+                    .or_default() += 1;
+            }
+        }
+        if let Some(representative) = dev_representative {
+            dev_representatives.push(representative);
+        }
+        if let Some(representative) = dev_long_word_representative {
+            dev_long_word_representatives.push(representative);
+        }
+    }
+
+    stats.fit_distinct_phrases = fit_phrases.len();
+    stats.fit_shortcut_codes = fit_shortcuts.len();
+    stats.fit_colliding_shortcut_codes = fit_shortcuts
+        .values()
+        .filter(|phrases| phrases.len() > 1)
+        .count();
+    let whitelist = fit_shortcuts
+        .into_iter()
+        .filter_map(|(code, phrases)| {
+            let [(text, occurrences)] = phrases.into_iter().collect::<Vec<_>>().try_into().ok()?;
+            (occurrences >= MIN_SHORTCUT_OCCURRENCES).then_some((code, text))
+        })
+        .collect::<HashMap<_, _>>();
+    stats.fit_repeated_collision_free_shortcuts = whitelist.len();
+    stats.dev_sentence_representatives = dev_representatives.len();
+    stats.dev_long_word_representatives = dev_long_word_representatives.len();
+
+    let probes = spread_protocol_probes(&dev_representatives, limit, &whitelist);
+    let long_word_probes =
+        spread_protocol_probes(&dev_long_word_representatives, limit, &whitelist);
+    stats.selected = probes.len();
+    stats.selected_long_word = long_word_probes.len();
+    stats.selected_whitelist_covered = probes
+        .iter()
+        .filter(|probe| probe.whitelist_available)
+        .count();
+    stats.selected_full_keys = probes
+        .iter()
+        .map(|probe| probe.full_observed.as_str().len())
+        .sum();
+    stats.selected_anchored_tail_keys = probes
+        .iter()
+        .map(|probe| probe.anchored_tail_observed.as_str().len())
+        .sum();
+    stats.selected_conservative_tail_keys = probes
+        .iter()
+        .map(|probe| probe.conservative_tail_observed.as_str().len())
+        .sum();
+    stats.selected_explicit_abbreviation_keys = probes
+        .iter()
+        .map(|probe| probe.explicit_abbreviation_observed.as_str().len())
+        .sum();
+    stats.selected_long_word_full_keys = long_word_probes
+        .iter()
+        .map(|probe| probe.full_observed.as_str().len())
+        .sum();
+    stats.selected_long_word_anchored_tail_keys = long_word_probes
+        .iter()
+        .map(|probe| probe.anchored_tail_observed.as_str().len())
+        .sum();
+    stats.selected_long_word_conservative_tail_keys = long_word_probes
+        .iter()
+        .map(|probe| probe.conservative_tail_observed.as_str().len())
+        .sum();
+
+    PublicProtocolSelection {
+        fit_context_sequences,
+        probes,
+        long_word_probes,
+        stats,
+    }
+}
+
+fn spread_protocol_probes(
+    representatives: &[(String, ProtocolWindow)],
+    limit: usize,
+    whitelist: &HashMap<String, String>,
+) -> Vec<PublicProtocolProbe> {
+    let selected = limit.min(representatives.len());
+    (0..selected)
+        .map(|index| {
+            let spread_index =
+                (index * representatives.len() + representatives.len() / 2) / selected;
+            let (id, window) = &representatives[spread_index];
+            let whitelist_available = whitelist
+                .get(window.explicit_abbreviation.as_str())
+                .is_some_and(|text| text == &window.expected_text);
+            PublicProtocolProbe {
+                id: id.clone(),
+                full_observed: KeySequence::new(window.full_code.clone())
+                    .expect("Rime-derived full codes are lowercase ASCII"),
+                anchored_tail_observed: KeySequence::new(window.anchored_tail.clone())
+                    .expect("Rime-derived tail abbreviations are lowercase ASCII"),
+                conservative_tail_observed: KeySequence::new(window.conservative_tail.clone())
+                    .expect("Rime-derived conservative abbreviations are lowercase ASCII"),
+                explicit_abbreviation_observed: KeySequence::new(
+                    window.explicit_abbreviation.clone(),
+                )
+                .expect("Rime-derived abbreviations are lowercase ASCII"),
+                expected_text: window.expected_text.clone(),
+                expected_segments: window.expected_segments.clone(),
+                whitelist_available,
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct ProtocolWindow {
+    expected_text: String,
+    expected_segments: Vec<String>,
+    full_code: String,
+    anchored_tail: String,
+    conservative_tail: String,
+    explicit_abbreviation: String,
+    has_long_word: bool,
+}
+
+fn protocol_window(
+    window: &[&UdToken],
+    entries_by_text: &HashMap<&str, &LexiconEntry>,
+) -> Option<ProtocolWindow> {
+    let expected_text = window
+        .iter()
+        .map(|token| token.form.as_str())
+        .collect::<String>();
+    if !(2..=6).contains(&expected_text.chars().count())
+        || !expected_text.chars().all(is_han_character)
+    {
+        return None;
+    }
+    let first = entries_by_text
+        .get(window.first()?.form.as_str())
+        .copied()?;
+    let second = entries_by_text.get(window.get(1)?.form.as_str()).copied()?;
+    let entries = [first, second];
+    let full_code = entries
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<String>();
+    let anchored_tail = entries
+        .iter()
+        .map(|entry| anchored_tail_code(entry))
+        .collect::<String>();
+    if anchored_tail.len() >= full_code.len() {
+        return None;
+    }
+    let explicit_abbreviation = entries
+        .iter()
+        .flat_map(|entry| entry.syllable_codes.iter())
+        .map(|code| {
+            code.as_str()
+                .chars()
+                .next()
+                .expect("a Rime syllable code is non-empty")
+        })
+        .collect::<String>();
+    let conservative_tail = entries
+        .iter()
+        .map(|entry| conservative_tail_code(entry))
+        .collect::<String>();
+    Some(ProtocolWindow {
+        expected_text,
+        expected_segments: entries.iter().map(|entry| entry.text.clone()).collect(),
+        full_code,
+        anchored_tail,
+        conservative_tail,
+        explicit_abbreviation,
+        has_long_word: entries.iter().any(|entry| entry.syllable_codes.len() >= 3),
+    })
+}
+
+fn conservative_tail_code(entry: &LexiconEntry) -> String {
+    if entry.syllable_codes.len() < 2 {
+        return entry.code.as_str().to_owned();
+    }
+    let split = entry.syllable_codes.len() - 1;
+    let mut code = entry.syllable_codes[..split]
+        .iter()
+        .map(KeySequence::as_str)
+        .collect::<String>();
+    code.push(
+        entry.syllable_codes[split]
+            .as_str()
+            .chars()
+            .next()
+            .expect("a parsed syllable code is non-empty"),
+    );
+    code
+}
+
 /// Maps the pinned train split into Rime word sequences for bigram training.
 ///
 /// Punctuation is omitted. Sentences containing non-Han text or an
@@ -740,9 +1104,10 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        BigramLanguageModel, CharacterBigramLanguageModel, parse_rime_lexicon, parse_ud_conllu,
+        BigramLanguageModel, CharacterBigramLanguageModel, audit_anchored_tail_failures,
+        audit_public_protocol_context, audit_public_protocols, parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
-        select_public_continuous_composition_cases,
+        select_public_continuous_composition_cases, select_public_protocol_audit_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -793,6 +1158,146 @@ mod tests {
         assert_eq!(character_stats.vocabulary_size, 2_995);
         assert_eq!(character_stats.observed_pair_types, 43_048);
         assert_eq!(character_stats.observed_pair_instances, 76_720);
+
+        let protocol = select_public_protocol_audit_cases(&corpus, &lexicon, 128);
+        let protocol_again = select_public_protocol_audit_cases(&corpus, &lexicon, 128);
+        assert_eq!(protocol, protocol_again);
+        assert_eq!(protocol.stats.fit_source_sentences, 3_198);
+        assert_eq!(protocol.stats.dev_source_sentences, 799);
+        assert_eq!(protocol.stats.fit_source_windows, 64_820);
+        assert_eq!(protocol.stats.fit_context_sequences, 1_889);
+        assert_eq!(protocol.stats.fit_context_words, 41_965);
+        assert_eq!(protocol.stats.fit_eligible_windows, 39_094);
+        assert_eq!(protocol.stats.fit_distinct_phrases, 32_711);
+        assert_eq!(protocol.stats.fit_shortcut_codes, 19_184);
+        assert_eq!(protocol.stats.fit_colliding_shortcut_codes, 5_015);
+        assert_eq!(protocol.stats.fit_repeated_collision_free_shortcuts, 826);
+        assert_eq!(protocol.stats.dev_source_windows, 16_170);
+        assert_eq!(protocol.stats.dev_eligible_windows, 9_665);
+        assert_eq!(protocol.stats.dev_sentence_representatives, 793);
+        assert_eq!(protocol.stats.dev_long_word_representatives, 116);
+        assert_eq!(protocol.stats.selected, 128);
+        assert_eq!(protocol.stats.selected_long_word, 116);
+        assert_eq!(protocol.stats.selected_whitelist_covered, 0);
+        assert_eq!(protocol.stats.selected_full_keys, 840);
+        assert_eq!(protocol.stats.selected_anchored_tail_keys, 676);
+        assert_eq!(protocol.stats.selected_conservative_tail_keys, 683);
+        assert_eq!(protocol.stats.selected_explicit_abbreviation_keys, 420);
+        assert_eq!(protocol.stats.selected_long_word_full_keys, 1_082);
+        assert_eq!(protocol.stats.selected_long_word_anchored_tail_keys, 773);
+        assert_eq!(
+            protocol.stats.selected_long_word_conservative_tail_keys,
+            922
+        );
+        assert!(protocol.probes.iter().all(|probe| {
+            probe.expected_segments.len() == 2
+                && probe.full_observed.as_str().len() > probe.anchored_tail_observed.as_str().len()
+                && probe.conservative_tail_observed.as_str().len()
+                    >= probe.anchored_tail_observed.as_str().len()
+                && probe.anchored_tail_observed.as_str().len()
+                    >= probe.explicit_abbreviation_observed.as_str().len()
+        }));
+        assert!(protocol.long_word_probes.iter().all(|probe| {
+            probe.conservative_tail_observed.as_str().len()
+                > probe.anchored_tail_observed.as_str().len()
+        }));
+
+        let protocol_report = audit_public_protocols(&lexicon, &protocol.probes);
+        assert_eq!(
+            (
+                protocol_report.full_code.hits_at_1,
+                protocol_report.full_code.hits_at_5,
+                protocol_report.full_code.hits_at_10,
+            ),
+            (89, 118, 122)
+        );
+        assert_eq!(
+            (
+                protocol_report.conservative_tail.hits_at_1,
+                protocol_report.conservative_tail.hits_at_5,
+                protocol_report.conservative_tail.hits_at_10,
+            ),
+            (52, 93, 104)
+        );
+        assert_eq!(
+            (
+                protocol_report.anchored_tail.hits_at_1,
+                protocol_report.anchored_tail.hits_at_5,
+                protocol_report.anchored_tail.hits_at_10,
+            ),
+            (52, 93, 104)
+        );
+        assert_eq!(
+            (
+                protocol_report.explicit_abbreviation.hits_at_1,
+                protocol_report.explicit_abbreviation.hits_at_5,
+                protocol_report.explicit_abbreviation.hits_at_10,
+            ),
+            (8, 20, 25)
+        );
+
+        let long_report = audit_public_protocols(&lexicon, &protocol.long_word_probes);
+        assert_eq!(
+            (
+                long_report.full_code.hits_at_1,
+                long_report.full_code.hits_at_5,
+                long_report.full_code.hits_at_10,
+            ),
+            (87, 115, 115)
+        );
+        assert_eq!(
+            (
+                long_report.conservative_tail.hits_at_1,
+                long_report.conservative_tail.hits_at_5,
+                long_report.conservative_tail.hits_at_10,
+            ),
+            (76, 111, 113)
+        );
+        assert_eq!(
+            (
+                long_report.anchored_tail.hits_at_1,
+                long_report.anchored_tail.hits_at_5,
+                long_report.anchored_tail.hits_at_10,
+            ),
+            (72, 110, 113)
+        );
+
+        let failure_report = audit_anchored_tail_failures(&lexicon, &protocol.probes, 10, 100);
+        assert_eq!(failure_report.baseline_visible, 104);
+        assert_eq!(failure_report.deeper_visible, 23);
+        assert_eq!(failure_report.outside_audit_depth, 1);
+        assert_eq!(failure_report.boundary_recovered_visible, 1);
+        assert_eq!(failure_report.boundary_recovered_at_1, 0);
+        assert_eq!(failure_report.baseline_top_same_length, 24);
+        assert_eq!(failure_report.failures_with_word_code_collision, 24);
+        assert_eq!(failure_report.maximum_expected_word_code_fanout, 312);
+        assert_eq!(failure_report.recovered_net_actions_saved, 0);
+
+        let fit_model =
+            BigramLanguageModel::from_token_sequences(&protocol.fit_context_sequences, &lexicon)
+                .unwrap();
+        let context_report =
+            audit_public_protocol_context(&lexicon, &protocol.probes, &fit_model, 100);
+        assert_eq!(
+            (
+                context_report.full_code.context_hits_at_1,
+                context_report.full_code.context_hits_at_5,
+                context_report.full_code.context_hits_at_10,
+                context_report.full_code.repaired_into_top_10,
+                context_report.full_code.dropped_out_of_top_10,
+            ),
+            (87, 116, 120, 1, 3)
+        );
+        assert_eq!(
+            (
+                context_report.anchored_tail.context_hits_at_1,
+                context_report.anchored_tail.context_hits_at_5,
+                context_report.anchored_tail.context_hits_at_10,
+                context_report.anchored_tail.repaired_into_top_10,
+                context_report.anchored_tail.dropped_out_of_top_10,
+            ),
+            (54, 89, 102, 2, 4)
+        );
     }
 
     #[test]

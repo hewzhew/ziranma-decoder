@@ -4,7 +4,8 @@
 
 长期目标，是研究怎样从可能误触、按键颠倒、漏键、混合简拼且没有
 显式词界的自然码按键串中，生成可信的中文候选。当前仓库是离线研究
-基线，不是完整输入法，也不收集真实输入。
+基线，不是完整输入法。实验性的 Codex 单应用追踪探针必须手动武装，
+默认不采集按键、不显示文本，也不写入磁盘。
 
 如果只想先弄清“项目在做什么、做到哪一步、何时停止”，请看
 [项目地图](docs/project-map.md)。
@@ -46,7 +47,7 @@
 均单独保留的公开 Rime 词典与 UD Chinese GSDSimp train/test 快照。
 
 ```powershell
-cd D:\IME\ziranma-decoder
+Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
 
 # 查看全拼怎样映射成自然码
 cargo run -- encode ni hao
@@ -100,12 +101,35 @@ cargo run --release -- public-compose-evaluate
 # 深查首屏外样本，并用 train-only 上下文重排同一冻结候选池
 cargo run --release -- public-compose-audit
 
+# 在公开 train 内固定切 fit/dev，对照四种受限简写协议
+cargo run --release -- public-protocol-audit
+
+# 深查锚定尾简首屏外样本，并模拟一个明确词界
+cargo run --release -- public-protocol-failure-audit
+
+# 用 fit-only 词上下文重排冻结候选池，同时检查完整码是否退化
+cargo run --release -- public-protocol-context-audit
+
 # release 模式固定工作负载、预热后重复采样
 cargo run --release -- benchmark 3
 ```
 
 CLI 只读取编译进程序的公开演示数据或固定公开快照，不会把输入写入
 磁盘。
+
+## Tab 音形辅助原型
+
+对于“已经知道读音，但目标生僻字在同音候选中很靠后”的情况，仓库现有
+一个独立的显式 Tab 筛选原型。它在普通解码完成后冻结候选池，使用
+`h/s/p/n/z` 五类笔画前缀或有序部件拼音首字母做稳定过滤；不改变原分数、
+原顺序，也不自动上屏。两套字母解释同时命中时会保留两条可审查证据，
+不会暗中猜优先级。
+
+现在已有一份固定到确切提交、保留 CC BY 4.0 署名与完整账目的真实五类
+笔画快照，以及拒绝畸形或越界输入的严格导入器；一个字的替代笔顺不会被
+静默丢掉。真实部件数据库和 Tab 热键仍未接入。覆盖率、地区字形偏差与
+净操作成本通过验证以前，它不会进入实时主线。设计与停止条件见
+[Tab 音形辅助：显式的第二阶段筛选](docs/tab-shape-refinement.md)。
 
 ## 自然码 codec
 
@@ -142,6 +166,18 @@ codec 支持 `v`、`ü` 和 `u:` 三种 ü 写法，并保留逐音节边界供�
 - 锚定尾部简写的一次相邻颠倒单列恢复候选，其他简写纠错继续隔离研究。
 
 可用 `cargo run --release -- abbreviation-audit` 复核码本计数与直接反例。
+
+`public-protocol-audit` 已进一步把公开 train 固定切成 fit/dev，对照
+显式快捷短语白名单、每词最多省一键、锚定尾简和显式全简模式。128 条
+held-out 短语中，完整码、保守尾简、锚定尾简、显式全简的 Top-10
+分别为 `122/104/104/25`。另有 116 条 3+ 音节词压力层：完整码、
+保守尾简、锚定尾简为 `115/113/113`；后两者分别少 160/309 个字母，
+首选为 76/72。
+fit-only 的 826 条重复且不互撞快捷短语没有覆盖任何一条所选 dev
+短语。结论是：保守尾简与锚定尾简都值得进入真实操作成本对照；全简
+模式不能成为通用默认；快捷码应学习宝宝真正重复的表达，而不是期待
+公开短语白名单自动泛化。完整方法、冲突口径和停止条件见
+[受限简写协议审计](docs/protocol-audit.md)。
 
 ## 连续组合：不按词确认
 
@@ -407,13 +443,235 @@ benchmark；新的确认结论需要尚未用于选择的公开 holdout。未知
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+& .\scripts\release-audit.ps1
 ```
+
+提交补丁和首次公开前的完整要求见[贡献指南](CONTRIBUTING.md)。最终发布
+候选还必须在干净工作树上通过
+`& .\scripts\release-audit.ps1 -RequireClean`；脚本只审查 Git 候选文件、
+历史路径名和固定公开快照，不扫描 Git 已忽略的私人目录。
+
+## Codex 单应用追踪探针
+
+Codex 的 ProseMirror 输入框已通过一次 B 级兼容性体检：UIA 能报告完整
+拼音组合，普通文本变化能确认最终上屏，但没有观察到
+`CompositionFinalized`。仓库因此只提供一个手动、内存态、PID 白名单的
+局部实验，不把它当作通用采集器：
+
+```powershell
+# 只核对目标属性，不读文字、不监听
+cargo run --bin tracker-probe -- --pid <PID> --check
+
+# 默认只报告长度，不显示文本，不捕获原始按键
+cargo run --bin tracker-probe -- --pid <PID> --arm
+
+# 只对人工短句显式开启内容预览和限域按键配对
+cargo run --bin tracker-probe -- --pid <PID> --arm --preview-text --capture-keys
+
+# 纯内存候选预览；时间边界必须由本次实验明确给出
+cargo run --bin tracker-probe -- --pid <PID> --arm --preview-candidates `
+  --candidate-gap-ms 5000
+
+# 可选：仅新建一份脱敏汇总，不保存原子事件或候选明细
+cargo run --bin tracker-probe -- --pid <PID> --arm --capture-keys `
+  --preview-candidates --candidate-gap-ms 5000 `
+  --save-summary data/private/session-summaries/run-001.json
+
+# 可选：只读合并操作者逐个点名的脱敏摘要；不扫描目录、不写文件
+cargo run --bin summary-report -- `
+  --input data/private/session-summaries/run-001.json `
+  --input data/private/session-summaries/run-002.json
+
+# 私人明文事件胶囊：必须显式捕获按键、给出新路径并单独确认未加密保存
+cargo run --bin tracker-probe -- --pid <PID> --arm --capture-keys `
+  --save-capsule data/private/event-capsules/manual-001.zic `
+  --allow-private-plaintext
+
+# 只读回放逐个点名的胶囊；紧凑模式只输出核心脱敏聚合
+cargo run --release --bin capsule-replay -- `
+  --input data/private/event-capsules/manual-001.zic `
+  --window-gap-ms 5000 `
+  --public-context `
+  --compact
+
+# 最后一个公开对照：同一冻结候选池改用平均字符 bigram 分数重排
+# 与 --public-context 互斥，仍只读、脱敏且不使用胶囊训练
+cargo run --release --bin capsule-replay -- `
+  --input data/private/event-capsules/manual-001.zic `
+  --window-gap-ms 5000 `
+  --public-character-context `
+  --compact
+
+# 因果个人词缓存：预测后学习，文档重叠编辑可撤销，纯内存、不导出
+cargo run --release --bin capsule-replay -- `
+  --input data/private/event-capsules/manual-001.zic `
+  --window-gap-ms 5000 `
+  --personal-cache `
+  --compact
+
+# 有序个人词对：包含相同词频底座，跨连续提交学习顺序，总提升仍封顶三位
+cargo run --release --bin capsule-replay -- `
+  --input data/private/event-capsules/manual-001.zic `
+  --window-gap-ms 5000 `
+  --personal-pair-cache `
+  --compact
+
+# 严格过去/未来分离：旧胶囊只训练，最终成绩只统计后续评测胶囊
+cargo run --release --bin capsule-replay -- `
+  --history-input data/private/event-capsules/natural-001.zic `
+  --input data/private/event-capsules/natural-002.zic `
+  --window-gap-ms 15000 `
+  --personal-pair-cache `
+  --compact
+```
+
+按键配对模式启动后，要在精确目标输入框内按 `Ctrl+Shift+F11` 并看到
+`KEY_CAPTURE_READY` 才开始输入；用 `Ctrl+Shift+F12` 停止。完整隐私
+边界、事件证据与人工测试清单见[追踪探针说明](docs/tracker-probe.md)。
+原子事件之上的纯内存、非意图标签归并见
+[纠错候选说明](docs/correction-candidates.md)；提交同时保留拼音上屏差分
+与组合前后文档净差分，因此能区分普通补入和非歧义的直接选中替换。
+候选预览默认继续脱敏且没有磁盘输出；显示内容仍需另加
+`--preview-text`。停止时会附加一条不含文字、拼音或具体按键值的
+`SESSION_SUMMARY`，汇总原子记录、证据完整性、候选形态和先删后补间隔。
+只有显式给出 `--save-summary` 时，这一条聚合才会以
+`ziranma-session-summary-v1` JSON 保存到 Git 已忽略的固定私有目录；
+目标必须尚不存在，程序不覆盖、不追加，也不保存候选明细。
+保存后的多次会话可由只读 `summary-report` 显式合并；它只打开逐个
+`--input` 点名的文件，拒绝不兼容口径，输出仍不含文字。完整边界见
+[脱敏会话摘要汇总](docs/summary-report.md)。
+若要比较真实按键与有限的反事实简写，必须另行显式创建包含私人明文的
+事件胶囊；其知情开关、上限、删除边界和只读回放见
+[私人事件胶囊与离线回放](docs/event-capsules.md)。
+
+## Codex 专用持续记录器
+
+短时探针之外，仓库现在提供一个独立的 `codex-recorder`，用于一次启动后
+持续积累 Codex 输入框的新差分。它不依赖固定 PID；Codex 退出、重启或
+重建输入元素时会解除旧绑定并等待唯一的精确目标重新出现。先做完全
+只读的目标体检：
+
+```powershell
+cargo run --bin codex-recorder -- --check
+```
+
+确认 `candidates=1` 后，手动启动一个日常会话：
+
+```powershell
+cargo build --release --bin codex-recorder
+.\target\release\codex-recorder.exe --run --session-kind daily
+```
+
+已经建立本地版本槽后，也可以用 `recorderctl` 管理后台运行而不依赖滚动的
+终端：
+
+```powershell
+cargo build --release --bin recorderctl
+.\target\release\recorderctl.exe status
+.\target\release\recorderctl.exe run --session-kind daily --background
+```
+
+`status` 默认用中文显示“正在运行、当前版、待升级版、可回退版、下一步”；
+脚本需要稳定字段时使用 `status --machine`。两者都只读取
+`.local/recorder/` 中的版本指针并查询同名进程，不读取 `data/private/`、
+不初始化 UIA、不写盘。支持 `active-v1` 的记录器还会显示会话号、运行
+时长、连接/暂停状态、已安全保存的分段与事件数和最近刷新时间。这份状态
+不含正文或按键，只在启动、连接变化、暂停和非空分段落盘时原子更新，
+没有每秒心跳。`drain` 是显式的正常排空操作；
+它只向唯一且路径受管理的记录器发送固定停止消息，等待记录器自行解绑、
+加密刷新和退出，从不强杀进程：
+
+```powershell
+.\target\release\recorderctl.exe drain
+```
+
+候选版用 `stage <明确路径>` 复制到不可变本地构建并执行 `--check`。
+`promote` 和 `rollback` 只在没有任何记录器进程时更新一个原子版本指针，
+不会改写旧会话；完整命令和失败边界见
+[持续记录器的本地换代协议](docs/recorder-lifecycle.md)。
+
+记录器默认每 128 个事件或 60 秒轮换一次 `.zcs`。每段在内存中成形后先
+由 Windows 当前用户 DPAPI 保护，再原子发布到
+`data/private/continuous-capture/`；磁盘临时文件也已经加密。已有输入
+只作内存基线，不保存为事件。`Ctrl+Shift+F10` 暂停/恢复并在暂停时刷新，
+`Ctrl+Shift+F12` 停止并刷新。终端状态全程脱敏、不显示具体文字或按键。
+发送消息或切换任务造成的短暂编辑框重建会合并成一条 `REBOUND`，不会
+把新框的既有草稿重复保存；路径回执也隐藏 Windows 内部的 `\\?\` 前缀。
+
+加密段可由原回放器逐个点名读取：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --input data/private/continuous-capture/segment-<会话号>-00000000.zcs `
+  --window-gap-ms 15000 `
+  --compact
+```
+
+正常停止会打印包含会话号、段数和事件数的脱敏
+`CODEX_RECORDER_FEEDBACK`，以及一条可直接运行的 `FEEDBACK_COMMAND`。
+整次会话也可以用一个显式 selector 回放；它只按连续的可预测文件名展开，
+不扫描私有目录：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --session <会话号> `
+  --window-gap-ms 15000 `
+  --compact
+```
+
+记录过程中只想快速检查数量和采集完整性时，可跳过候选解码：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --session <会话号> `
+  --health-only
+```
+
+完整报告里的 `noncanonical_code_observations` 是中性观察，不会把用户
+自定义词码直接当作打错。
+
+记录器空闲轮询使用 Windows 消息等待，热键仍会立即唤醒；完整回放会在
+一次提交内复用相同码串，并复用逐提交阶段已经获得的窗口分词。两者都不
+持久化候选缓存，也不跨历史/评测边界学习。
+
+每个加密段还在密文内保存记录器版本与 `codex-uia-v1` 采集口径。根据旧
+报告做出的改动不能再用同一会话证明有效；旧会话用
+`--history-session` 学习，下一次独立会话才用 `--session` 评测。完整
+接受、回退和停止判据见
+[反馈驱动升级闭环](docs/feedback-upgrade-loop.md)。
+
+当前代码**没有**给 Windows 安装启动项，也没有托盘、跨应用监听、自动
+保留期限或私人模型导出；`daily/course/theme` 只是加密会话类别骨架。
+完整目标策略、加密限制、崩溃边界、回放和后续自启动决策见
+[Codex 专用持续记录器](docs/continuous-recorder.md)。版本候选、会话
+排空、提升和回滚见
+[持续记录器的本地换代协议](docs/recorder-lifecycle.md)。
+
+## 开源许可
+
+除文件或相邻目录另有说明外，本项目原创的源代码、测试、文档和配置采用
+[Mozilla Public License 2.0](LICENSE)：
+
+> This Source Code Form is subject to the terms of the Mozilla Public License,
+> v. 2.0. If a copy of the MPL was not distributed with this file, You can
+> obtain one at https://mozilla.org/MPL/2.0/.
+
+`data/public/` 中的第三方快照不重新许可为 MPL；它们继续采用各自目录
+记录的上游许可证、署名与使用条件。完整归属见
+[第三方通知](THIRD_PARTY_NOTICES.md)和
+[开源边界审计](docs/open-source-boundary-audit.md)。
+参与方式与素材来源要求见[贡献指南](CONTRIBUTING.md)。
+
+MPL 授权不包含真实聊天、按键记录、个人词典、私人模型或其他没有进入
+公开发行包的用户数据。详细边界见 [隐私政策](PRIVACY.md)。
 
 ## 隐私边界
 
 公开、人工构造或合成数据可以进入 `tests/fixtures/public/`。真实输入、
-原始按键记录、日志、个人词典和个人模型不得提交。以下本地目录已被
-Git 忽略：
+原始按键记录、探针预览、日志、个人词典和个人模型不得提交。追踪探针
+默认没有磁盘输出；只有显式脱敏摘要、同时通过知情开关的私人明文事件
+胶囊，或明确运行的 DPAPI 加密持续记录器能写入以下已被 Git 忽略的
+本地目录：
 
 ```text
 data/private/

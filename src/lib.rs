@@ -14,16 +14,42 @@ use std::error::Error;
 use std::fmt;
 
 mod abbreviation;
+mod capsule_replay;
 mod codec;
+mod continuous_capture;
+mod correction_episode;
 mod evaluation;
+mod event_capsule;
 mod language_model;
+mod protocol_audit;
 mod public_corpus;
+mod session_summary;
+mod shape_refinement;
+mod stroke_data;
+mod tracker;
 
 pub use abbreviation::{
     AbbreviationAuditError, AbbreviationCodebookAudit, ImmediateAmbiguityWitness,
     audit_abbreviation_codebook,
 };
+pub use capsule_replay::{
+    CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
+    KeyInterpretationError, MAX_REPLAY_CODE_KEYS, PairedReplayStrategyStats,
+    PersonalCacheReplayError, PersonalCacheReplayState, ReplayStrategyStats, effective_letter_code,
+};
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
+#[cfg(windows)]
+pub use continuous_capture::WindowsUserDataProtector;
+pub use continuous_capture::{
+    CODEX_CAPTURE_PROFILE_V1, CONTINUOUS_PRODUCER_VERSION, CONTINUOUS_SEGMENT_SCHEMA_V1,
+    CaptureSessionKind, ContinuousCaptureError, ContinuousSegmentMetadata, ContinuousSegmentV1,
+    DataProtector, PROTECTED_SEGMENT_SCHEMA_V1, ProtectedSegmentEnvelopeV1, ProtectedSegmentWriter,
+    ProtectedSegmentWriterConfig, SegmentWriteReceipt,
+};
+pub use correction_episode::{
+    CorrectionCandidate, CorrectionCandidateDetector, CorrectionCandidateForm,
+    CorrectionCandidateKind, CorrectionDetectorError,
+};
 pub use evaluation::{
     CharacterAverageMarginRange, CharacterContextOracleReport, CompositionRecallReport,
     ContextOracleError, ContextOracleReport, ContextScoreMarginRange,
@@ -37,17 +63,48 @@ pub use evaluation::{
     evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
     evaluate_sentence_cases, evaluate_synthetic,
 };
+pub use event_capsule::{
+    EVENT_CAPSULE_SCHEMA_V1, EventCapsuleError, EventCapsuleRecorder, EventCapsuleV1,
+    MAX_EVENT_CAPSULE_EVENTS, MAX_EVENT_CAPSULE_KEYS_PER_EVENT,
+    MAX_EVENT_CAPSULE_TEXT_BYTES_PER_FIELD, MAX_EVENT_CAPSULE_TOTAL_TEXT_BYTES, TimedTrackerOutput,
+};
 pub use language_model::{
     BigramLanguageModel, BigramLanguageModelStats, BigramScore, CharacterBigramLanguageModel,
     CharacterBigramLanguageModelStats, CharacterLanguageModelError, CharacterSequenceScore,
     LanguageModelParseError,
 };
+pub use protocol_audit::{
+    AnchoredTailFailureAuditReport, AnchoredTailFailureCase, ProtocolContextLaneReport,
+    ProtocolIndexStats, ProtocolStrategyReport, PublicProtocolAuditReport,
+    PublicProtocolContextAuditReport, WhitelistProtocolReport, audit_anchored_tail_failures,
+    audit_public_protocol_context, audit_public_protocols,
+};
 pub use public_corpus::{
     ContinuousCompositionProbe, ContinuousCompositionSelection,
     ContinuousCompositionSelectionStats, PublicBigramTrainingCorpus, PublicBigramTrainingStats,
-    PublicCalibrationSelection, PublicCalibrationSelectionStats, UdCorpus, UdCorpusImportStats,
+    PublicCalibrationSelection, PublicCalibrationSelectionStats, PublicProtocolProbe,
+    PublicProtocolSelection, PublicProtocolSelectionStats, UdCorpus, UdCorpusImportStats,
     UdCorpusParseError, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_calibration_cases, select_public_continuous_composition_cases,
+    select_public_protocol_audit_cases,
+};
+pub use session_summary::{
+    AggregatedSessionSummary, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryError,
+    SessionSummaryV1,
+};
+pub use shape_refinement::{
+    CharacterShape, CharacterShapeIndex, RefinedCandidate, ShapeMatchEvidence,
+    ShapeRefinementError, TabShapeQuery, TabShapeRefinementReport,
+};
+pub use stroke_data::{
+    LexiconShapeCoverageStats, MAX_STROKE_DATA_ASSIGNMENTS, MAX_STROKE_DATA_LINE_BYTES,
+    MAX_STROKE_DATA_ROWS, MAX_STROKE_SEQUENCE_LENGTH, MAX_STROKE_SEQUENCES_PER_CHARACTER,
+    StrokeDataParseError, StrokeSequenceImport, StrokeSequenceImportStats,
+    audit_lexicon_shape_coverage, parse_stroke_sequence_tsv,
+};
+pub use tracker::{
+    CommitRecord, DeltaPositionEvidence, LocalInputTracker, RawKey, RevisionRecord, TextDelta,
+    TextSelection, TrackerOutput, single_span_delta, single_span_delta_with_selection,
 };
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;

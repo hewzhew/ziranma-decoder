@@ -5,12 +5,15 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
-    audit_abbreviation_codebook, audit_continuous_composition, encode_pinyin_phrase,
+    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport,
+    audit_abbreviation_codebook, audit_anchored_tail_failures, audit_continuous_composition,
+    audit_public_protocol_context, audit_public_protocols, encode_pinyin_phrase,
     evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
     evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
     evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
     parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_calibration_cases, select_public_continuous_composition_cases,
+    select_public_protocol_audit_cases,
 };
 
 mod benchmark;
@@ -68,6 +71,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "public-compose" => run_public_compose(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
         "public-compose-audit" => run_public_compose_audit(&arguments[1..]),
+        "public-protocol-audit" => run_public_protocol_audit(&arguments[1..]),
+        "public-protocol-failure-audit" => run_public_protocol_failure_audit(&arguments[1..]),
+        "public-protocol-context-audit" => run_public_protocol_context_audit(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
@@ -951,6 +957,294 @@ fn run_public_compose_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+fn run_public_protocol_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-protocol-audit 不接受额外参数".into());
+    }
+
+    const DEV_LIMIT: usize = 128;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let selection = select_public_protocol_audit_cases(&corpus, &imported.entries, DEV_LIMIT);
+    let report = audit_public_protocols(&imported.entries, &selection.probes);
+    let long_word_report = audit_public_protocols(&imported.entries, &selection.long_word_probes);
+    let stats = selection.stats;
+
+    println!("公开受限简写协议审计：UD train 固定按源句 4:1 切为 fit/dev");
+    println!(
+        "切分：fit {} 句 / dev {} 句；fit {} 个窗口中 {} 个合格；dev {} 个窗口中 {} 个合格",
+        stats.fit_source_sentences,
+        stats.dev_source_sentences,
+        stats.fit_source_windows,
+        stats.fit_eligible_windows,
+        stats.dev_source_windows,
+        stats.dev_eligible_windows
+    );
+    println!(
+        "dev：{} 个独立句代表，等距保留 {} 条；完整码共 {} 个字母",
+        stats.dev_sentence_representatives, stats.selected, stats.selected_full_keys
+    );
+    println!(
+        "fit 快捷短语：{} 个短语 / {} 个码；{} 个码互撞；重复至少两次且不互撞的白名单 {} 条",
+        stats.fit_distinct_phrases,
+        stats.fit_shortcut_codes,
+        stats.fit_colliding_shortcut_codes,
+        stats.fit_repeated_collision_free_shortcuts
+    );
+    println!("固定语法索引（每个词在每种协议中只有一种拼写）：");
+    println!("协议                 不同码     冲突码   单码最多文本   最长码");
+    print_protocol_index("完整双拼", report.full_code_index);
+    print_protocol_index("每词省一键", report.conservative_tail_index);
+    print_protocol_index("锚定尾简", report.anchored_tail_index);
+    print_protocol_index("显式全简", report.explicit_abbreviation_index);
+    println!("held-out dev 排名与操作账（Top-10 外成本未知，不冒充净节省）：");
+    println!(
+        "协议                 字母  模式动作  字母差  动作后差    Top-1    Top-5   Top-10  可见非首选  可见省字母"
+    );
+    print_protocol_strategy("完整双拼", report.full_code, report.full_code.input_letters);
+    print_protocol_strategy(
+        "每词省一键",
+        report.conservative_tail,
+        report.full_code.input_letters,
+    );
+    print_protocol_strategy(
+        "锚定尾简",
+        report.anchored_tail,
+        report.full_code.input_letters,
+    );
+    print_protocol_strategy(
+        "显式全简",
+        report.explicit_abbreviation,
+        report.full_code.input_letters,
+    );
+    println!(
+        "长词压力层：dev 中含至少一个 3+ 音节词的独立代表 {} 条，固定保留 {} 条",
+        stats.dev_long_word_representatives, stats.selected_long_word
+    );
+    println!(
+        "协议                 字母  模式动作  字母差  动作后差    Top-1    Top-5   Top-10  可见非首选  可见省字母"
+    );
+    print_protocol_strategy(
+        "完整双拼",
+        long_word_report.full_code,
+        long_word_report.full_code.input_letters,
+    );
+    print_protocol_strategy(
+        "每词省一键",
+        long_word_report.conservative_tail,
+        long_word_report.full_code.input_letters,
+    );
+    print_protocol_strategy(
+        "锚定尾简",
+        long_word_report.anchored_tail,
+        long_word_report.full_code.input_letters,
+    );
+    println!(
+        "快捷白名单：dev 覆盖 {}/{}，其余 {} 条回退完整码；省 {} 字母，需 {} 次显式快捷栏选择，净省 {} 次物理动作",
+        report.whitelist.covered,
+        report.whitelist.attempts,
+        report.whitelist.full_code_fallbacks,
+        report.whitelist.saved_letters,
+        report.whitelist.lane_selection_actions,
+        report.whitelist.net_actions_saved()
+    );
+    println!(
+        "边界：显式全简的 1 次模式动作已经计入；候选确认是各协议共有成本，未重复计入。白名单只保证快捷栏内部不互撞，不宣称能静默上屏。"
+    );
+    println!(
+        "本次协议审计耗时：{:.3} ms（固定本机观察）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn run_public_protocol_failure_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let details = match arguments {
+        [] => false,
+        [argument] if argument == "--details" => true,
+        _ => {
+            return Err("public-protocol-failure-audit 只接受可选的 --details".into());
+        }
+    };
+
+    const DEV_LIMIT: usize = 128;
+    const VISIBLE_K: usize = 10;
+    const AUDIT_DEPTH: usize = 100;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let selection = select_public_protocol_audit_cases(&corpus, &imported.entries, DEV_LIMIT);
+    let report =
+        audit_anchored_tail_failures(&imported.entries, &selection.probes, VISIBLE_K, AUDIT_DEPTH);
+    let failures = report.total - report.baseline_visible;
+
+    println!("公开锚定尾简失败审计：同一固定 held-out dev，严格固定拼写语法");
+    println!(
+        "基线：{}/{} 在 Top-{}；失败 {} 条",
+        report.baseline_visible, report.total, report.visible_k, failures
+    );
+    println!(
+        "无词界加深：{} 条在第 {}～{}；{} 条仍在 Top-{} 外",
+        report.deeper_visible,
+        report.visible_k + 1,
+        report.audit_depth,
+        report.outside_audit_depth,
+        report.audit_depth
+    );
+    println!(
+        "只补 1 个真实词界：{} 条救回 Top-{}，其中 {} 条升到第一；另有 {} 条仅在第 {}～{}，{} 条仍在 Top-{} 外",
+        report.boundary_recovered_visible,
+        report.visible_k,
+        report.boundary_recovered_at_1,
+        report.boundary_deeper_visible,
+        report.visible_k + 1,
+        report.audit_depth,
+        report.boundary_outside_audit_depth,
+        report.audit_depth
+    );
+    println!(
+        "失败首选字数：比答案短 {}，等长 {}，比答案长 {}",
+        report.baseline_top_shorter, report.baseline_top_same_length, report.baseline_top_longer
+    );
+    println!(
+        "词内码冲突：{} / {} 条失败至少有一个预期词码对应多个文本；最大单词码扇出 {}",
+        report.failures_with_word_code_collision,
+        failures,
+        report.maximum_expected_word_code_fanout
+    );
+    println!(
+        "若只给被救回的失败补一个边界标记，它们相对完整码合计净省 {} 次物理动作；未救回样本不计收益",
+        report.recovered_net_actions_saved
+    );
+    if details {
+        println!("逐例公开账目：深层排名 / 补词界排名 / 预期两词码扇出；原首选 [分词]");
+        for case in &report.failures {
+            println!(
+                "  {}  {} -> {}；{} / {} / {}；{} [{}]",
+                case.id,
+                case.observed,
+                case.expected_text,
+                format_audit_rank(case.deeper_rank, report.audit_depth),
+                format_audit_rank(case.boundary_rank, report.audit_depth),
+                case.expected_word_code_fanouts
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                case.baseline_top_text,
+                case.baseline_top_segments.join(" | ")
+            );
+        }
+    } else {
+        println!("逐例内容默认不展开；需要复核固定公开样本时追加 --details（不读取私人数据）。");
+    }
+    println!(
+        "本次失败审计耗时：{:.3} ms（固定本机观察）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn run_public_protocol_context_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-protocol-context-audit 不接受额外参数".into());
+    }
+
+    const DEV_LIMIT: usize = 128;
+    const POOL_DEPTH: usize = 100;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let selection = select_public_protocol_audit_cases(&corpus, &imported.entries, DEV_LIMIT);
+    let language_model = BigramLanguageModel::from_token_sequences(
+        &selection.fit_context_sequences,
+        &imported.entries,
+    )?;
+    let model_stats = language_model.stats();
+    let report = audit_public_protocol_context(
+        &imported.entries,
+        &selection.probes,
+        &language_model,
+        POOL_DEPTH,
+    );
+
+    println!("公开受限协议上下文审计：fit-only 词 bigram 重排冻结候选池");
+    println!(
+        "隔离：fit {} 句映射为 {} 条上下文序列、{} 个词；held-out dev {} 条从不参与训练",
+        selection.stats.fit_source_sentences,
+        selection.stats.fit_context_sequences,
+        selection.stats.fit_context_words,
+        selection.stats.selected
+    );
+    println!(
+        "模型：{} 个词对类型、{} 个词对实例；每条输入先冻结 unigram Top-{}，上下文不能创造路径",
+        model_stats.observed_pair_types, model_stats.observed_pair_instances, report.pool_depth
+    );
+    println!(
+        "协议                 池内   基线 Top1/5/10      上下文 Top1/5/10    救回/掉出 Top10    排名升/平/降"
+    );
+    print_protocol_context_lane("完整双拼", report.full_code);
+    print_protocol_context_lane("锚定尾简", report.anchored_tail);
+    println!(
+        "判定规则：只有锚定尾简净救回且完整双拼不退化，才值得进入下一轮；否则该 word-bigram 分支停止。"
+    );
+    println!(
+        "本次上下文审计耗时：{:.3} ms（固定本机观察）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn print_protocol_context_lane(label: &str, report: ProtocolContextLaneReport) {
+    println!(
+        "{label:<18} {:>3}/{:<3} {:>3}/{:<3}/{:<3}       {:>3}/{:<3}/{:<3}          {:>3}/{:<3}          {:>3}/{:<3}/{:<3}",
+        report.pool_visible,
+        report.total,
+        report.baseline_hits_at_1,
+        report.baseline_hits_at_5,
+        report.baseline_hits_at_10,
+        report.context_hits_at_1,
+        report.context_hits_at_5,
+        report.context_hits_at_10,
+        report.repaired_into_top_10,
+        report.dropped_out_of_top_10,
+        report.improved_ranks,
+        report.unchanged_ranks,
+        report.worsened_ranks
+    );
+}
+
+fn print_protocol_index(label: &str, stats: ProtocolIndexStats) {
+    println!(
+        "{label:<18} {:>7} {:>10} {:>14} {:>10}",
+        stats.distinct_codes,
+        stats.colliding_codes,
+        stats.maximum_texts_per_code,
+        stats.maximum_code_keys
+    );
+}
+
+fn print_protocol_strategy(label: &str, report: ProtocolStrategyReport, baseline_letters: usize) {
+    let letter_difference = baseline_letters as isize - report.input_letters as isize;
+    let action_difference = letter_difference - report.activation_actions as isize;
+    println!(
+        "{label:<18} {:>6} {:>9} {:>8} {:>9} {:>5}/{:<3} {:>5}/{:<3} {:>5}/{:<3} {:>11} {:>12}",
+        report.input_letters,
+        report.activation_actions,
+        letter_difference,
+        action_difference,
+        report.hits_at_1,
+        report.attempts,
+        report.hits_at_5,
+        report.attempts,
+        report.hits_at_10,
+        report.attempts,
+        report.visible_nonfirst,
+        report.visible_letter_savings
+    );
+}
+
 fn format_audit_rank(rank: Option<usize>, audit_depth: usize) -> String {
     rank.map_or_else(|| format!(">{audit_depth}"), |rank| rank.to_string())
 }
@@ -1187,6 +1481,9 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
+  cargo run --release -- public-protocol-audit
+  cargo run --release -- public-protocol-failure-audit [--details]
+  cargo run --release -- public-protocol-context-audit
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- public-index-stats
@@ -1209,6 +1506,9 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-compose mafkmm 3
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
+  cargo run --release -- public-protocol-audit
+  cargo run --release -- public-protocol-failure-audit --details
+  cargo run --release -- public-protocol-context-audit
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- public-index-stats

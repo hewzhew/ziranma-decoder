@@ -2,3 +2,4 @@
 data/public/rime-pinyin-simp/* -text
 data/public/ud-chinese-gsdsimp/* -text
 data/public/ud-chinese-gsdsimp/*.conllu -whitespace
+data/public/conway-stroke-data/* -text

@@ -18,6 +18,7 @@
 *.sqlite3
 
 # Local editor and operating-system files
+/.local/
 .vscode/
 .idea/
 .DS_Store
