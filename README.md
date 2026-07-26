@@ -95,6 +95,10 @@ cargo run -- public-sentence zrmurf 10
 # 连续尾部简写，并单独保留一次相邻颠倒恢复
 cargo run -- public-compose mafkmm 3
 
+# 公开、只读的候选实验台：解释候选并投影字母/选择/切栏动作
+cargo run --release -- candidate-lab mafmkm 3
+cargo run --release -- candidate-lab mafkmm 3
+
 # 固定公开 2～6 字双词短语的连续输入评测
 cargo run --release -- public-compose-evaluate
 
@@ -116,6 +120,17 @@ cargo run --release -- benchmark 3
 
 CLI 只读取编译进程序的公开演示数据或固定公开快照，不会把输入写入
 磁盘。
+
+## 候选实验台
+
+`candidate-lab` 把公开连续解码结果整理成宝宝可以直接审查的两个候选栏：
+主栏保留当前研究解码器顺序；一次锚定尾简颠倒恢复单独列出。每个候选
+报告字母键、一次选择、显式切栏、规范完整码基线、净省动作、简拼音节、
+纠错片段和未解析键。
+
+这只是统一口径的动作投影，不估算翻页与视觉查找。主栏仍可能包含自由
+混合简拼，也不等于最终输入协议。完整边界、首份实例和停止条件见
+[候选实验台：从程序指标到真实手感](docs/candidate-lab.md)。
 
 ## Tab 音形辅助原型
 

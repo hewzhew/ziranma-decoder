@@ -14,6 +14,7 @@ use std::error::Error;
 use std::fmt;
 
 mod abbreviation;
+mod candidate_lab;
 mod capsule_replay;
 mod codec;
 mod continuous_capture;
@@ -31,6 +32,10 @@ mod tracker;
 pub use abbreviation::{
     AbbreviationAuditError, AbbreviationCodebookAudit, ImmediateAmbiguityWitness,
     audit_abbreviation_codebook,
+};
+pub use candidate_lab::{
+    CandidateLabCandidate, CandidateLabError, CandidateLabLane, CandidateLabReport,
+    MAX_CANDIDATE_LAB_TOP_K, analyze_candidate_lab,
 };
 pub use capsule_replay::{
     CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
