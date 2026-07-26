@@ -210,9 +210,13 @@ fn pinned_public_rime_snapshot_has_stable_import_accounting() {
     assert_eq!(imported.entries.len(), imported.stats.imported_entries);
 
     let decoder = Decoder::new(imported.entries);
+    let index = decoder.index_stats();
+    assert_eq!(index.terminal_node_count, 39_027);
+    assert_eq!(index.maximum_terminal_fanout, 312);
     let (candidates, stats) = decoder.decode_sentence_with_stats("zrmurf", 10).unwrap();
     assert!(!candidates.is_empty());
     assert!(stats.trie_subtree_prunes > 0);
+    assert!(stats.terminal_entry_bound_skips > 0);
 }
 
 #[test]
@@ -420,7 +424,9 @@ fn bigram_lattice_preserves_text_distinct_future_states() {
         stats.lattice_transitions
     );
     assert_eq!(stats.exact_prefix_prepass_visits, 0);
+    assert_eq!(stats.exact_prefix_prepass_entry_visits, 0);
     assert_eq!(stats.trie_subtree_prunes, 0);
+    assert_eq!(stats.terminal_entry_bound_skips, 0);
 }
 
 #[test]
@@ -431,6 +437,10 @@ fn compact_syllable_index_stores_each_entry_once() {
     let stats = decoder.index_stats();
 
     assert_eq!(stats.terminal_count, entry_count);
+    assert!(stats.terminal_node_count > 0);
+    assert!(stats.terminal_node_count <= stats.terminal_count);
+    assert!(stats.maximum_terminal_fanout > 0);
+    assert!(stats.maximum_terminal_fanout <= stats.terminal_count);
     assert_eq!(stats.node_count, 96);
     assert_eq!(stats.edge_count, 95);
     assert_eq!(stats.represented_spelling_count, 212);
@@ -462,6 +472,7 @@ fn sentence_lattice_reports_streaming_search_work() {
     assert!(stats.segment_trie_scans > 0);
     assert!(stats.trie_path_visits >= stats.segment_trie_scans);
     assert!(stats.exact_prefix_prepass_visits <= stats.trie_path_visits);
+    assert!(stats.exact_prefix_prepass_entry_visits > 0);
     assert!(stats.alignment_states_reused > 0);
     assert!(
         stats.alignment_states_examined + stats.alignment_states_reused >= stats.trie_path_visits
@@ -471,7 +482,10 @@ fn sentence_lattice_reports_streaming_search_work() {
             >= stats.lattice_transitions
     );
     assert!(stats.terminal_path_matches > 0);
-    assert!(stats.terminal_path_matches <= stats.terminal_spelling_matches);
+    assert!(
+        stats.terminal_path_matches
+            <= stats.terminal_spelling_matches + stats.terminal_entry_bound_skips
+    );
     assert!(stats.lattice_transitions > 0);
     assert!(stats.lattice_transitions_materialized > 0);
     assert!(stats.lattice_transitions_materialized <= stats.lattice_transitions);

@@ -65,6 +65,11 @@ IME, GUI, Rime integration, Windows TSF service, or neural model.
   exact-only evidence separate for unused-error exact, unused-error corrected,
   and already-used-error exact lattice roles; use strict score domination so
   ties remain observable, and disable the bound for word and bigram decoding.
+- Keep each terminal node's entries in descending frequency order. Stop
+  unigram sentence expansion only when every remaining entry is strictly below
+  every exact/corrected frontier it could enter or displace; retain equal-score
+  entries and preserve duplicate-identity parity. Keep this disabled for word
+  and bigram decoding.
 - Keep short sentence ranking covered by an unpruned full-path enumeration
   oracle for both unigram and bigram modes.
 - Add focused tests with each behavioral change.

@@ -176,6 +176,8 @@ fn run_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  节点数：{}", stats.node_count);
     println!("  音节边数：{}", stats.edge_count);
     println!("  词条终点数：{}", stats.terminal_count);
+    println!("  非空终点节点数：{}", stats.terminal_node_count);
+    println!("  单节点最大词条数：{}", stats.maximum_terminal_fanout);
     println!(
         "  隐式表示的全码/简拼拼写数：{}",
         stats.represented_spelling_count
@@ -208,6 +210,8 @@ fn run_public_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  节点数：{}", index.node_count);
     println!("  音节边数：{}", index.edge_count);
     println!("  词条终点数：{}", index.terminal_count);
+    println!("  非空终点节点数：{}", index.terminal_node_count);
+    println!("  单节点最大词条数：{}", index.maximum_terminal_fanout);
     println!(
         "  隐式表示的全码/简拼拼写数：{}",
         index.represented_spelling_count
@@ -285,15 +289,17 @@ fn print_latency(label: &str, summary: LatencySummary) {
 
 fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
     println!(
-        "  {label}：trie 扫描 {}；路径访问 {}（精确预扫 {}）/子树剪枝 {}；对齐状态 {} 实查 + {} 复用；终点路径/词条 {} -> {}；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
+        "  {label}：trie 扫描 {}；路径访问 {}（精确预扫 {} 路径/{} 词条）/子树剪枝 {}；对齐状态 {} 实查 + {} 复用；终点路径/展开词条 {} -> {}（跳过 {}）；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
         stats.segment_trie_scans,
         stats.trie_path_visits,
         stats.exact_prefix_prepass_visits,
+        stats.exact_prefix_prepass_entry_visits,
         stats.trie_subtree_prunes,
         stats.alignment_states_examined,
         stats.alignment_states_reused,
         stats.terminal_path_matches,
         stats.terminal_spelling_matches,
+        stats.terminal_entry_bound_skips,
         stats.lattice_transitions,
         stats.lattice_transitions_materialized,
         stats.lattice_transitions_retained,
@@ -400,7 +406,10 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("句子 lattice 统计：");
     println!("  活跃词界 trie 扫描：{}", stats.segment_trie_scans);
     println!("  trie 路径状态访问：{}", stats.trie_path_visits);
-    println!("  其中精确证据预扫：{}", stats.exact_prefix_prepass_visits);
+    println!(
+        "  其中精确证据预扫：{} 路径 / {} 词条",
+        stats.exact_prefix_prepass_visits, stats.exact_prefix_prepass_entry_visits
+    );
     println!("  精确上界子树剪枝：{}", stats.trie_subtree_prunes);
     println!(
         "  按键对齐状态：{} 实查 + {} 精确复用",
@@ -408,6 +417,7 @@ fn run_sentence_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     );
     println!("  终点拼写路径：{}", stats.terminal_path_matches);
     println!("  去重前终点片段匹配：{}", stats.terminal_spelling_matches);
+    println!("  终点词条上界跳过：{}", stats.terminal_entry_bound_skips);
     println!(
         "  lattice 边生成/物化/保留：{} -> {} -> {}",
         stats.lattice_transitions,

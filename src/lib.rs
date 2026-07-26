@@ -310,6 +310,10 @@ pub struct DecoderIndexStats {
     pub edge_count: usize,
     /// Number of stored lexicon terminals.
     pub terminal_count: usize,
+    /// Trie nodes that hold at least one lexicon terminal.
+    pub terminal_node_count: usize,
+    /// Largest number of homophonous entries stored at one terminal node.
+    pub maximum_terminal_fanout: usize,
     /// Number of full-code/abbreviation spellings represented implicitly.
     pub represented_spelling_count: usize,
     /// Largest syllable count among indexed entries.
@@ -340,6 +344,8 @@ pub struct SentenceSearchStats {
     pub trie_path_visits: usize,
     /// Path visits spent on exact-only evidence scans for prefix bounds.
     pub exact_prefix_prepass_visits: usize,
+    /// Lexicon entries inspected while building exact-only prefix evidence.
+    pub exact_prefix_prepass_entry_visits: usize,
     /// Trie subtrees skipped by exact unigram Top-K upper bounds.
     pub trie_subtree_prunes: usize,
     /// Alignment states actually examined across all scans.
@@ -348,8 +354,10 @@ pub struct SentenceSearchStats {
     pub alignment_states_reused: usize,
     /// Terminal spelling paths found before expanding their lexicon entries.
     pub terminal_path_matches: usize,
-    /// Terminal segment spellings found before lattice-edge deduplication.
+    /// Terminal lexicon entries expanded after exact entry-bound stopping.
     pub terminal_spelling_matches: usize,
+    /// Sorted terminal entries skipped by exact unigram Top-K cutoffs.
+    pub terminal_entry_bound_skips: usize,
     /// Deduplicated lexicon and unresolved edges generated for the lattice.
     pub lattice_transitions: usize,
     /// One-key unresolved-input edges included in `lattice_transitions`.
@@ -441,6 +449,19 @@ impl Decoder {
                 .iter()
                 .map(|node| node.terminals.len())
                 .sum(),
+            terminal_node_count: self
+                .trie
+                .nodes
+                .iter()
+                .filter(|node| !node.terminals.is_empty())
+                .count(),
+            maximum_terminal_fanout: self
+                .trie
+                .nodes
+                .iter()
+                .map(|node| node.terminals.len())
+                .max()
+                .unwrap_or(0),
             represented_spelling_count: self.trie.represented_spelling_count,
             maximum_syllables: self.trie.maximum_syllables,
         }
@@ -863,6 +884,17 @@ impl Decoder {
             word_stats.trie_path_visits += exact_stats.trie_path_visits;
             word_stats.alignment_states_examined += exact_stats.alignment_states_examined;
             word_stats.alignment_states_reused += exact_stats.alignment_states_reused;
+            let exact_evidence = ExactPrefixEvidence::new(
+                &exact_matches.paths,
+                &self.trie,
+                &self.lexicon,
+                &self.entry_identity_ids,
+                &self.entry_identity_max_frequencies,
+                &self.config,
+                top_k,
+                observed.len() - start,
+            );
+            search_stats.exact_prefix_prepass_entry_visits += exact_evidence.entry_visits;
             Some(UnigramPrefixPruningConfig {
                 lexicon: &self.lexicon,
                 entry_identity_ids: &self.entry_identity_ids,
@@ -870,16 +902,7 @@ impl Decoder {
                 top_k,
                 exact_reachable,
                 error_reachable,
-                exact_evidence: ExactPrefixEvidence::new(
-                    &exact_matches.paths,
-                    &self.trie,
-                    &self.lexicon,
-                    &self.entry_identity_ids,
-                    &self.entry_identity_max_frequencies,
-                    &self.config,
-                    top_k,
-                    observed.len() - start,
-                ),
+                exact_evidence,
             })
         } else {
             None
@@ -895,22 +918,29 @@ impl Decoder {
         search_stats.alignment_states_examined += word_stats.alignment_states_examined;
         search_stats.alignment_states_reused += word_stats.alignment_states_reused;
         search_stats.terminal_path_matches += prefix_matches.terminal_path_matches;
+        let terminal_entry_bounds = prefix_matches.terminal_entry_bounds;
         let paths = prefix_matches.paths;
 
         let mut matches_by_identity = NoisyTerminalAccumulator::default();
         for (path_index, path) in paths.iter().enumerate() {
-            for &entry_index in &self.trie.nodes[path.node_index].terminals {
+            let terminals = &self.trie.nodes[path.node_index].terminals;
+            for (terminal_offset, &entry_index) in terminals.iter().enumerate() {
+                let total_score =
+                    noisy_terminal_total_score(&self.lexicon[entry_index], path, &self.config);
+                if terminal_entry_bounds
+                    .as_ref()
+                    .is_some_and(|bounds| bounds.score_is_dominated(path, total_score))
+                {
+                    search_stats.terminal_entry_bound_skips += terminals.len() - terminal_offset;
+                    break;
+                }
                 word_stats.terminal_spelling_matches += 1;
                 matches_by_identity.upsert(
                     IndexedNoisyTerminal {
                         path_index,
                         entry_index,
                         entry_identity: self.entry_identity_ids[entry_index],
-                        total_score: noisy_terminal_total_score(
-                            &self.lexicon[entry_index],
-                            path,
-                            &self.config,
-                        ),
+                        total_score,
                     },
                     &paths,
                     &self.lexicon,
@@ -1181,6 +1211,12 @@ impl SyllableTrie {
             .map(|node| node.subtree_maximum_frequency)
             .collect::<Vec<_>>();
         for node in &mut self.nodes {
+            node.terminals.sort_unstable_by(|&left, &right| {
+                lexicon[right]
+                    .frequency
+                    .cmp(&lexicon[left].frequency)
+                    .then_with(|| left.cmp(&right))
+            });
             node.children.sort_unstable_by(|left, right| {
                 maximum_frequencies[right.child]
                     .cmp(&maximum_frequencies[left.child])
@@ -1279,9 +1315,14 @@ impl SyllableTrie {
         let initial_states =
             search.intern_alignment_states(AlignmentStates::singleton(initial_state));
         self.collect_noisy_matches(0, 0, initial_states, &mut search);
+        let terminal_entry_bounds = search
+            .pruning
+            .take()
+            .map(UnigramPrefixPruning::into_terminal_entry_bounds);
         TriePrefixMatches {
             paths: search.paths,
             terminal_path_matches: search.terminal_path_matches,
+            terminal_entry_bounds,
         }
     }
 
@@ -1465,6 +1506,41 @@ struct NoisyTrieTerminalPath {
 struct TriePrefixMatches {
     paths: Vec<NoisyTrieTerminalPath>,
     terminal_path_matches: usize,
+    terminal_entry_bounds: Option<TerminalEntryBounds>,
+}
+
+struct TerminalEntryBounds {
+    exact_reachable: bool,
+    error_reachable: bool,
+    unused_exact_cutoffs: Vec<Option<f64>>,
+    unused_error_cutoffs: Vec<Option<f64>>,
+    used_error_exact_cutoffs: Vec<Option<f64>>,
+}
+
+impl TerminalEntryBounds {
+    fn score_is_dominated(&self, path: &NoisyTrieTerminalPath, score: f64) -> bool {
+        let end = path.observed_length;
+        // An entry can either enter its own error layer or displace the same
+        // canonical identity from the other layer. Requiring strict
+        // domination in both unused-error frontiers preserves both effects.
+        if self.exact_reachable
+            && (!score_is_strictly_below(self.unused_exact_cutoffs[end], score)
+                || !score_is_strictly_below(self.unused_error_cutoffs[end], score))
+        {
+            return false;
+        }
+        if path.correction == Correction::Exact
+            && self.error_reachable
+            && !score_is_strictly_below(self.used_error_exact_cutoffs[end], score)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+fn score_is_strictly_below(cutoff: Option<f64>, score: f64) -> bool {
+    cutoff.is_some_and(|cutoff| score.total_cmp(&cutoff) == Ordering::Less)
 }
 
 struct UnigramPrefixPruningConfig<'a> {
@@ -1515,13 +1591,18 @@ impl<'a> UnigramPrefixPruning<'a> {
         correction: &Correction,
         abbreviation_count: usize,
     ) {
+        if *correction == Correction::Exact {
+            return;
+        }
         for &entry_index in &node.terminals {
             let entry = &self.lexicon[entry_index];
             let score = (entry.frequency as f64).ln()
                 - configured_correction_penalty(self.config, correction)
                 - abbreviation_count as f64 * self.config.abbreviation_penalty_per_syllable;
+            if self.error_score_is_dominated(observed_length, score) {
+                break;
+            }
             if self.exact_reachable
-                && *correction != Correction::Exact
                 && self.error_candidate_is_stable(
                     entry_index,
                     observed_length,
@@ -1536,6 +1617,15 @@ impl<'a> UnigramPrefixPruning<'a> {
                 );
             }
         }
+    }
+
+    fn error_score_is_dominated(&self, end: usize, score: f64) -> bool {
+        self.exact_reachable
+            && score_is_strictly_below(
+                self.exact_evidence.unused_exact_frontiers[end].cutoff(self.top_k),
+                score,
+            )
+            && score_is_strictly_below(self.unused_error_frontiers[end].cutoff(self.top_k), score)
     }
 
     fn error_candidate_is_stable(
@@ -1680,12 +1770,39 @@ impl<'a> UnigramPrefixPruning<'a> {
             .cutoff(self.top_k)
             .is_none_or(|cutoff| upper_score.total_cmp(&cutoff) != Ordering::Less)
     }
+
+    fn into_terminal_entry_bounds(self) -> TerminalEntryBounds {
+        TerminalEntryBounds {
+            exact_reachable: self.exact_reachable,
+            error_reachable: self.error_reachable,
+            unused_exact_cutoffs: stable_frontier_cutoffs(
+                self.exact_evidence.unused_exact_frontiers,
+                self.top_k,
+            ),
+            unused_error_cutoffs: stable_frontier_cutoffs(self.unused_error_frontiers, self.top_k),
+            used_error_exact_cutoffs: stable_frontier_cutoffs(
+                self.exact_evidence.used_error_exact_frontiers,
+                self.top_k,
+            ),
+        }
+    }
+}
+
+fn stable_frontier_cutoffs(
+    frontiers: Vec<StableTextFrontier<'_>>,
+    top_k: usize,
+) -> Vec<Option<f64>> {
+    frontiers
+        .into_iter()
+        .map(|frontier| frontier.cutoff(top_k))
+        .collect()
 }
 
 struct ExactPrefixEvidence<'a> {
     best_by_identity_and_end: HashMap<(usize, usize), ExactCandidateRank>,
     unused_exact_frontiers: Vec<StableTextFrontier<'a>>,
     used_error_exact_frontiers: Vec<StableTextFrontier<'a>>,
+    entry_visits: usize,
 }
 
 impl<'a> ExactPrefixEvidence<'a> {
@@ -1717,12 +1834,14 @@ impl<'a> ExactPrefixEvidence<'a> {
             used_error_exact_frontiers: (0..=observed_length)
                 .map(|_| StableTextFrontier::default())
                 .collect(),
+            entry_visits: 0,
         };
 
         for path in paths {
             debug_assert_eq!(path.correction, Correction::Exact);
             let abbreviation_count = path.spelling.abbreviated_syllables.len();
             for &entry_index in &trie.nodes[path.node_index].terminals {
+                evidence.entry_visits += 1;
                 let entry = &lexicon[entry_index];
                 let score = (entry.frequency as f64).ln()
                     - abbreviation_count as f64 * config.abbreviation_penalty_per_syllable;
@@ -3314,6 +3433,21 @@ name: test
     }
 
     #[test]
+    fn terminal_entry_bound_keeps_equal_score_text_ties() {
+        let lexicon = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+             zeta\tni\t100\n\
+             alpha\tni\t100\n",
+        )
+        .unwrap();
+        let decoder = Decoder::new(lexicon);
+        let (candidates, stats) = decoder.decode_sentence_with_stats("ni", 1).unwrap();
+
+        assert_eq!(candidates[0].text, "alpha");
+        assert!(stats.terminal_spelling_matches >= 2);
+    }
+
+    #[test]
     fn lightweight_terminal_compaction_matches_materialized_reduction() {
         let decoder = Decoder::new(parse_lexicon_tsv(FIXTURE).unwrap());
         let log_frequency_total = decoder
@@ -3323,6 +3457,7 @@ name: test
             .sum::<f64>()
             .ln();
         let mut observed_exact_prune = false;
+        let mut observed_terminal_entry_skip = false;
 
         for observed in ["zrmurf", "nhk", "nigk", "ajjp", "nihkz"] {
             for start in 0..observed.len() {
@@ -3356,6 +3491,8 @@ name: test
                             &mut compact_stats,
                         );
                         observed_exact_prune |= compact_stats.trie_subtree_prunes > 0;
+                        observed_terminal_entry_skip |=
+                            compact_stats.terminal_entry_bound_skips > 0;
 
                         assert_eq!(
                             compact, expected,
@@ -3369,6 +3506,10 @@ name: test
         assert!(
             observed_exact_prune,
             "the focused parity matrix must exercise the exact subtree bound"
+        );
+        assert!(
+            observed_terminal_entry_skip,
+            "the focused parity matrix must exercise the terminal entry bound"
         );
     }
 
@@ -3389,6 +3530,30 @@ name: test
             streaming,
             decoder.segment_transitions_by_slices("nh", 0, true)
         );
+
+        let log_frequency_total = decoder
+            .lexicon
+            .iter()
+            .map(|entry| entry.frequency as f64)
+            .sum::<f64>()
+            .ln();
+        let expected = decoder.compact_unigram_lattice_transitions(
+            streaming,
+            0,
+            true,
+            false,
+            1,
+            log_frequency_total,
+        );
+        let bounded = decoder.segment_transitions(
+            "nh",
+            0,
+            true,
+            false,
+            Some(1),
+            &mut SentenceSearchStats::default(),
+        );
+        assert_eq!(bounded, expected);
     }
 
     #[test]
