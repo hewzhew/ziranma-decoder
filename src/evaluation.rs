@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Candidate, Correction, Decoder, KeySequence, LexiconEntry, SentenceCandidate,
-    are_qwerty_neighbors, spelling_variants,
+    BIGRAM_INTERPOLATION_WEIGHT, BigramLanguageModel, Candidate, CandidateSource, Correction,
+    Decoder, KeySequence, LexiconEntry, SentenceCandidate, are_qwerty_neighbors, spelling_variants,
 };
 
 /// Candidate per-key margins scanned by the rejection shadow evaluation.
@@ -222,7 +222,264 @@ pub struct LabeledSentenceProbe {
     pub observed: KeySequence,
     /// Text that the top sentence candidate is expected to reproduce.
     pub expected_text: String,
+    /// Rime word sequence used to construct the expected path.
+    pub expected_segments: Vec<String>,
+    /// Whether expected syllables use full codes or one-key abbreviations.
+    pub spelling_mode: ProbeSpellingMode,
 }
+
+/// Uniform spelling mode used to construct one public probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeSpellingMode {
+    /// Every syllable uses its canonical two-key code.
+    FullCode,
+    /// Every syllable uses only the first key of its canonical code.
+    FullyAbbreviated,
+}
+
+/// Range of expected-minus-baseline context score margins per observed key.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContextScoreMarginRange {
+    /// Lowest observed normalized margin.
+    pub minimum_per_key: f64,
+    /// Highest observed normalized margin.
+    pub maximum_per_key: f64,
+}
+
+/// Two-path diagnostic for a train-only public context model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextOracleReport {
+    /// Number of held-out public probes.
+    pub total: usize,
+    /// Probes already correct under the unmodified unigram Top-1.
+    pub unigram_top_1_matches_expected: usize,
+    /// Probes incorrect under the unmodified unigram Top-1.
+    pub unigram_top_1_differs: usize,
+    /// Incorrect probes whose expected path scores above the unigram Top-1
+    /// after applying public bigram evidence to both paths.
+    pub incorrect_expected_path_preferred: usize,
+    /// Incorrect probes whose two context scores are exactly equal.
+    pub incorrect_context_ties: usize,
+    /// Incorrect probes whose original Top-1 still scores above expectation.
+    pub incorrect_baseline_path_preferred: usize,
+    /// Correct results plus incorrect results repaired by the two-path oracle.
+    pub oracle_pair_matches_expected: usize,
+    /// Margin range among originally incorrect probes.
+    pub incorrect_margin_range: Option<ContextScoreMarginRange>,
+}
+
+impl ContextOracleReport {
+    /// Fraction correct when choosing only between expected and unigram Top-1.
+    pub fn oracle_pair_accuracy(&self) -> f64 {
+        rate(self.oracle_pair_matches_expected, self.total)
+    }
+}
+
+/// Compares the expected public path with the current unigram Top-1 path.
+///
+/// Both fixed paths are rescored with the supplied train-only bigram model and
+/// the decoder's existing 35/65 interpolation. This is an oracle diagnostic:
+/// it measures whether context evidence prefers the known expected path, but
+/// it does not insert that path into production search or alter any ranking.
+pub fn evaluate_context_oracle(
+    decoder: &Decoder,
+    language_model: &BigramLanguageModel,
+    lexicon: &[LexiconEntry],
+    probes: &[LabeledSentenceProbe],
+) -> Result<ContextOracleReport, ContextOracleError> {
+    let frequency_total = lexicon
+        .iter()
+        .map(|entry| entry.frequency as f64)
+        .sum::<f64>();
+    let log_frequency_total = if frequency_total > 0.0 {
+        frequency_total.ln()
+    } else {
+        0.0
+    };
+    let entries_by_text = best_evaluation_entries_by_text(lexicon);
+    let mut unigram_top_1_matches_expected = 0;
+    let mut incorrect_expected_path_preferred = 0;
+    let mut incorrect_context_ties = 0;
+    let mut incorrect_baseline_path_preferred = 0;
+    let mut incorrect_margins = Vec::new();
+
+    for probe in probes {
+        if probe.expected_segments.is_empty() {
+            return Err(ContextOracleError::EmptyExpectedPath {
+                probe_id: probe.id.clone(),
+            });
+        }
+        let candidate = decoder
+            .decode_sentence(probe.observed.as_str(), 1)
+            .expect("public probe keys are validated lowercase ASCII")
+            .into_iter()
+            .next()
+            .expect("literal fallback guarantees a sentence candidate");
+        if candidate.text == probe.expected_text {
+            unigram_top_1_matches_expected += 1;
+            continue;
+        }
+
+        let expected_score = score_expected_context_path(
+            probe,
+            language_model,
+            &entries_by_text,
+            log_frequency_total,
+            decoder.config.abbreviation_penalty_per_syllable,
+        )?;
+        let baseline_score =
+            score_candidate_with_context(&candidate, language_model, log_frequency_total);
+        let margin_per_key =
+            (expected_score - baseline_score) / probe.observed.as_str().len() as f64;
+        incorrect_margins.push(margin_per_key);
+        match expected_score.total_cmp(&baseline_score) {
+            std::cmp::Ordering::Greater => incorrect_expected_path_preferred += 1,
+            std::cmp::Ordering::Equal => incorrect_context_ties += 1,
+            std::cmp::Ordering::Less => incorrect_baseline_path_preferred += 1,
+        }
+    }
+
+    let unigram_top_1_differs = probes.len() - unigram_top_1_matches_expected;
+    Ok(ContextOracleReport {
+        total: probes.len(),
+        unigram_top_1_matches_expected,
+        unigram_top_1_differs,
+        incorrect_expected_path_preferred,
+        incorrect_context_ties,
+        incorrect_baseline_path_preferred,
+        oracle_pair_matches_expected: unigram_top_1_matches_expected
+            + incorrect_expected_path_preferred,
+        incorrect_margin_range: context_margin_range(&incorrect_margins),
+    })
+}
+
+fn score_expected_context_path(
+    probe: &LabeledSentenceProbe,
+    language_model: &BigramLanguageModel,
+    entries_by_text: &HashMap<&str, &LexiconEntry>,
+    log_frequency_total: f64,
+    abbreviation_penalty_per_syllable: f64,
+) -> Result<f64, ContextOracleError> {
+    let mut total_score = 0.0;
+    let mut previous_word = None::<&str>;
+    for word in &probe.expected_segments {
+        let entry = entries_by_text.get(word.as_str()).ok_or_else(|| {
+            ContextOracleError::UnknownExpectedSegment {
+                probe_id: probe.id.clone(),
+                segment: word.clone(),
+            }
+        })?;
+        let unigram = (entry.frequency as f64).ln() - log_frequency_total;
+        let language_score = previous_word.map_or(unigram, |previous| {
+            (1.0 - BIGRAM_INTERPOLATION_WEIGHT) * unigram
+                + BIGRAM_INTERPOLATION_WEIGHT
+                    * language_model.score(previous, &entry.text).log_probability
+        });
+        let abbreviation_penalty = match probe.spelling_mode {
+            ProbeSpellingMode::FullCode => 0.0,
+            ProbeSpellingMode::FullyAbbreviated => {
+                entry.syllable_codes.len() as f64 * abbreviation_penalty_per_syllable
+            }
+        };
+        total_score += language_score - abbreviation_penalty;
+        previous_word = Some(&entry.text);
+    }
+    Ok(total_score)
+}
+
+fn score_candidate_with_context(
+    candidate: &SentenceCandidate,
+    language_model: &BigramLanguageModel,
+    log_frequency_total: f64,
+) -> f64 {
+    let mut total_score = 0.0;
+    let mut previous_word = None::<&str>;
+    for segment in &candidate.segments {
+        if segment.candidate.source == CandidateSource::UnresolvedInput {
+            total_score -= segment.candidate.score.unresolved_input_penalty;
+            previous_word = None;
+            continue;
+        }
+        let unigram = segment.candidate.score.frequency - log_frequency_total;
+        let language_score = previous_word.map_or(unigram, |previous| {
+            (1.0 - BIGRAM_INTERPOLATION_WEIGHT) * unigram
+                + BIGRAM_INTERPOLATION_WEIGHT
+                    * language_model
+                        .score(previous, &segment.candidate.text)
+                        .log_probability
+        });
+        total_score += language_score
+            - segment.candidate.score.abbreviation_penalty
+            - segment.candidate.score.correction_penalty;
+        previous_word = Some(&segment.candidate.text);
+    }
+    total_score
+}
+
+fn best_evaluation_entries_by_text(lexicon: &[LexiconEntry]) -> HashMap<&str, &LexiconEntry> {
+    let mut entries = HashMap::<&str, &LexiconEntry>::new();
+    for entry in lexicon {
+        match entries.get(entry.text.as_str()) {
+            Some(current)
+                if entry.frequency < current.frequency
+                    || (entry.frequency == current.frequency
+                        && (entry.pinyin.as_str(), entry.code.as_str())
+                            >= (current.pinyin.as_str(), current.code.as_str())) => {}
+            _ => {
+                entries.insert(entry.text.as_str(), entry);
+            }
+        }
+    }
+    entries
+}
+
+fn context_margin_range(margins: &[f64]) -> Option<ContextScoreMarginRange> {
+    let mut margins = margins.iter().copied();
+    let first = margins.next()?;
+    Some(margins.fold(
+        ContextScoreMarginRange {
+            minimum_per_key: first,
+            maximum_per_key: first,
+        },
+        |range, margin| ContextScoreMarginRange {
+            minimum_per_key: range.minimum_per_key.min(margin),
+            maximum_per_key: range.maximum_per_key.max(margin),
+        },
+    ))
+}
+
+/// Error returned when a public oracle probe cannot be mapped to the lexicon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextOracleError {
+    /// A probe did not record any expected Rime word.
+    EmptyExpectedPath {
+        /// Stable probe identifier.
+        probe_id: String,
+    },
+    /// An expected word was absent from the supplied lexicon.
+    UnknownExpectedSegment {
+        /// Stable probe identifier.
+        probe_id: String,
+        /// Missing word.
+        segment: String,
+    },
+}
+
+impl fmt::Display for ContextOracleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyExpectedPath { probe_id } => {
+                write!(formatter, "公开探针 {probe_id:?} 没有预期词路径")
+            }
+            Self::UnknownExpectedSegment { probe_id, segment } => write!(
+                formatter,
+                "公开探针 {probe_id:?} 的预期词 {segment:?} 不在词典中"
+            ),
+        }
+    }
+}
+
+impl Error for ContextOracleError {}
 
 /// One threshold row split by whether the unmodified Top-1 text was correct.
 #[derive(Clone, Debug, PartialEq)]
@@ -828,9 +1085,9 @@ mod tests {
     use crate::{BigramLanguageModel, Decoder, KeySequence, parse_lexicon_tsv};
 
     use super::{
-        LabeledSentenceProbe, REJECTION_SHADOW_THRESHOLDS_PER_KEY, SyntheticCaseKind,
-        evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
-        evaluate_sentence_cases, evaluate_synthetic,
+        LabeledSentenceProbe, ProbeSpellingMode, REJECTION_SHADOW_THRESHOLDS_PER_KEY,
+        SyntheticCaseKind, evaluate_context_oracle, evaluate_labeled_rejection_shadow,
+        evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -853,6 +1110,41 @@ mod tests {
         assert!(first.metrics.iter().all(|metrics| metrics.total > 0));
         assert_eq!(first.metrics[0].kind, SyntheticCaseKind::Clean);
         assert!((0.0..=1.0).contains(&first.clean_top_1_exact_rate()));
+    }
+
+    #[test]
+    fn context_oracle_is_read_only_and_prefers_known_demo_bigram() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let model = BigramLanguageModel::from_tsv(BIGRAM_CORPUS, &lexicon).unwrap();
+        let decoder = Decoder::new(lexicon.clone());
+        let before = decoder.decode_sentence("ajjp", 10).unwrap();
+        assert_eq!(before[0].text, "按键简拼");
+
+        let report = evaluate_context_oracle(
+            &decoder,
+            &model,
+            &lexicon,
+            &[LabeledSentenceProbe {
+                id: "key-keyboard".to_owned(),
+                observed: KeySequence::new("ajjp").unwrap(),
+                expected_text: "按键键盘".to_owned(),
+                expected_segments: vec!["按键".to_owned(), "键盘".to_owned()],
+                spelling_mode: ProbeSpellingMode::FullyAbbreviated,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(decoder.decode_sentence("ajjp", 10).unwrap(), before);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.unigram_top_1_matches_expected, 0);
+        assert_eq!(report.unigram_top_1_differs, 1);
+        assert_eq!(report.incorrect_expected_path_preferred, 1);
+        assert_eq!(report.incorrect_context_ties, 0);
+        assert_eq!(report.incorrect_baseline_path_preferred, 0);
+        assert_eq!(report.oracle_pair_matches_expected, 1);
+        let range = report.incorrect_margin_range.unwrap();
+        assert!(range.minimum_per_key > 0.0);
+        assert_eq!(range.minimum_per_key, range.maximum_per_key);
     }
 
     #[test]
@@ -965,11 +1257,15 @@ mod tests {
                 id: "correct".to_owned(),
                 observed: observed.clone(),
                 expected_text: expected,
+                expected_segments: vec!["你好".to_owned()],
+                spelling_mode: ProbeSpellingMode::FullCode,
             },
             LabeledSentenceProbe {
                 id: "incorrect".to_owned(),
                 observed,
                 expected_text: "不相符".to_owned(),
+                expected_segments: vec!["不相符".to_owned()],
+                spelling_mode: ProbeSpellingMode::FullCode,
             },
         ];
 
@@ -997,6 +1293,8 @@ mod tests {
             id: "uncovered".to_owned(),
             observed: KeySequence::new("zz").unwrap(),
             expected_text: "词典外".to_owned(),
+            expected_segments: vec!["词典外".to_owned()],
+            spelling_mode: ProbeSpellingMode::FullCode,
         }];
         let report = evaluate_labeled_rejection_shadow(&decoder, &probes);
 

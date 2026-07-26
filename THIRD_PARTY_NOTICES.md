@@ -24,8 +24,8 @@ pinned to commit `4231dfd59866fa5999ad4a6bc1fdecd7985b3b59`.
 
 The upstream metadata names Peng Qi and Koichi Yasuoka as contributors and
 licenses the treebank under Creative Commons Attribution-ShareAlike 4.0
-International. The upstream license notice and README, exact source URL,
-snapshot hash, and row accounting are retained beside the data.
+International. The upstream license notice and README, exact train/test source
+URLs, snapshot hashes, and row accounting are retained beside the data.
 
 The upstream changelog says the license permission applies to the UD
 annotations and that Google claims no ownership or copyright over the

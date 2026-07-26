@@ -110,6 +110,80 @@ impl BigramLanguageModel {
         })
     }
 
+    /// Estimates add-alpha bigram counts from unweighted segmented sequences.
+    ///
+    /// Every sequence must contain at least two words and every word must
+    /// exist in the supplied decoder lexicon.
+    pub fn from_token_sequences(
+        sequences: &[Vec<String>],
+        lexicon: &[LexiconEntry],
+    ) -> Result<Self, LanguageModelParseError> {
+        let vocabulary = lexicon
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<HashSet<_>>();
+        if vocabulary.is_empty() {
+            return Err(LanguageModelParseError::EmptyVocabulary);
+        }
+        if sequences.is_empty() {
+            return Err(LanguageModelParseError::EmptyCorpus);
+        }
+
+        let mut pair_counts = HashMap::<(String, String), u64>::new();
+        let mut predecessor_totals = HashMap::<String, u64>::new();
+        for (sequence_index, tokens) in sequences.iter().enumerate() {
+            let source_number = sequence_index + 1;
+            if tokens.len() < 2 {
+                return Err(LanguageModelParseError::TooFewTokens {
+                    line_number: source_number,
+                });
+            }
+            for token in tokens {
+                if !vocabulary.contains(token.as_str()) {
+                    return Err(LanguageModelParseError::UnknownToken {
+                        line_number: source_number,
+                        token: token.clone(),
+                    });
+                }
+            }
+            for pair in tokens.windows(2) {
+                checked_add(
+                    pair_counts
+                        .entry((pair[0].clone(), pair[1].clone()))
+                        .or_insert(0),
+                    1,
+                    source_number,
+                )?;
+                checked_add(
+                    predecessor_totals.entry(pair[0].clone()).or_insert(0),
+                    1,
+                    source_number,
+                )?;
+            }
+        }
+
+        Ok(Self {
+            pair_counts,
+            predecessor_totals,
+            vocabulary_size: vocabulary.len(),
+            alpha: DEFAULT_ALPHA,
+        })
+    }
+
+    /// Returns deterministic structural and count statistics.
+    pub fn stats(&self) -> BigramLanguageModelStats {
+        BigramLanguageModelStats {
+            vocabulary_size: self.vocabulary_size,
+            observed_pair_types: self.pair_counts.len(),
+            observed_predecessor_types: self.predecessor_totals.len(),
+            observed_pair_instances: self
+                .pair_counts
+                .values()
+                .map(|count| u128::from(*count))
+                .sum(),
+        }
+    }
+
     /// Returns an explainable add-alpha conditional score.
     pub fn score(&self, previous: &str, current: &str) -> BigramScore {
         let observed_count = self
@@ -128,6 +202,19 @@ impl BigramLanguageModel {
             log_probability: (numerator / denominator).ln(),
         }
     }
+}
+
+/// Auditable structure and count statistics for a bigram model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BigramLanguageModelStats {
+    /// Distinct word texts in the decoder lexicon.
+    pub vocabulary_size: usize,
+    /// Distinct observed `(previous, current)` pairs.
+    pub observed_pair_types: usize,
+    /// Distinct words observed with at least one successor.
+    pub observed_predecessor_types: usize,
+    /// Total observed pair instances across all sequences.
+    pub observed_pair_instances: u128,
 }
 
 /// Full evidence behind one conditional word probability.
@@ -264,5 +351,23 @@ mod tests {
             BigramLanguageModel::from_tsv("tokens\tcount\n自然码 不存在\t1\n", &lexicon),
             Err(LanguageModelParseError::UnknownToken { .. })
         ));
+    }
+
+    #[test]
+    fn token_sequences_share_the_same_add_alpha_evidence() {
+        let lexicon = parse_lexicon_tsv(LEXICON).unwrap();
+        let sequences = vec![
+            vec!["自然码".to_owned(), "输入法".to_owned()],
+            vec!["自然码".to_owned(), "输入法".to_owned()],
+            vec!["自然码".to_owned(), "项目".to_owned()],
+        ];
+        let model = BigramLanguageModel::from_token_sequences(&sequences, &lexicon).unwrap();
+        let stats = model.stats();
+
+        assert_eq!(model.score("自然码", "输入法").observed_count, 2);
+        assert_eq!(model.score("自然码", "项目").observed_count, 1);
+        assert_eq!(stats.observed_pair_types, 2);
+        assert_eq!(stats.observed_predecessor_types, 1);
+        assert_eq!(stats.observed_pair_instances, 3);
     }
 }

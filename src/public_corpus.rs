@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::{KeySequence, LabeledSentenceProbe, LexiconEntry};
+use crate::{KeySequence, LabeledSentenceProbe, LexiconEntry, ProbeSpellingMode};
 
 /// Parsed public UD corpus and auditable row accounting.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +81,34 @@ pub struct PublicCalibrationSelectionStats {
     pub held_out_token_eligible: usize,
     /// Held-out-token probes retained under the configured limit.
     pub selected_held_out_tokens: usize,
+}
+
+/// Train-only segmented sequences mapped into the Rime word vocabulary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicBigramTrainingCorpus {
+    /// Each sequence contains at least two Rime word texts.
+    pub sequences: Vec<Vec<String>>,
+    /// Auditable filtering and mapping counts.
+    pub stats: PublicBigramTrainingStats,
+}
+
+/// Filtering and mapping counts for public bigram training.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicBigramTrainingStats {
+    /// Source sentences in the pinned train split.
+    pub source_sentences: usize,
+    /// Sentences whose non-punctuation text contains only Han characters.
+    pub han_only_sentences: usize,
+    /// Han-only sentences fully expressible with the Rime vocabulary.
+    pub lexicon_coverable_sentences: usize,
+    /// Coverable sequences containing at least two Rime words.
+    pub training_sequences: usize,
+    /// Rime word instances across retained sequences.
+    pub training_words: usize,
+    /// Source tokens mapped through an exact complete Rime entry.
+    pub exact_token_uses: usize,
+    /// Individual Rime characters used for missing complete source tokens.
+    pub character_fallback_uses: usize,
 }
 
 /// Parses the integer-token layer of a CoNLL-U corpus.
@@ -217,7 +245,7 @@ pub fn select_public_calibration_cases(
             continue;
         }
         stats.sentence_han_only += 1;
-        let Some((observed, exact_token_uses, character_fallback_uses)) =
+        let Some((observed, expected_segments, exact_token_uses, character_fallback_uses)) =
             observed_for_tokens(&source_tokens, &entries_by_text)
         else {
             continue;
@@ -231,12 +259,16 @@ pub fn select_public_calibration_cases(
                 observed: KeySequence::new(observed.full_code)
                     .expect("Rime-derived full codes are lowercase ASCII"),
                 expected_text: expected_text.clone(),
+                expected_segments: expected_segments.clone(),
+                spelling_mode: ProbeSpellingMode::FullCode,
             });
             sentence_abbreviation_probes.push(LabeledSentenceProbe {
                 id: format!("{}:abbreviation", sentence.id),
                 observed: KeySequence::new(observed.abbreviated_code)
                     .expect("Rime-derived abbreviations are lowercase ASCII"),
                 expected_text,
+                expected_segments,
+                spelling_mode: ProbeSpellingMode::FullyAbbreviated,
             });
         }
     }
@@ -255,7 +287,9 @@ pub fn select_public_calibration_cases(
             {
                 continue;
             }
-            let Some(observed) = observed_for_characters(&token.form, &entries_by_text) else {
+            let Some((observed, expected_segments)) =
+                observed_for_characters(&token.form, &entries_by_text)
+            else {
                 continue;
             };
             if !seen_held_out_text.insert(token.form.clone()) {
@@ -269,12 +303,16 @@ pub fn select_public_calibration_cases(
                     observed: KeySequence::new(observed.full_code)
                         .expect("Rime-derived full codes are lowercase ASCII"),
                     expected_text: token.form.clone(),
+                    expected_segments: expected_segments.clone(),
+                    spelling_mode: ProbeSpellingMode::FullCode,
                 });
                 held_out_token_abbreviation_probes.push(LabeledSentenceProbe {
                     id: format!("{id}:abbreviation"),
                     observed: KeySequence::new(observed.abbreviated_code)
                         .expect("Rime-derived abbreviations are lowercase ASCII"),
                     expected_text: token.form.clone(),
+                    expected_segments,
+                    spelling_mode: ProbeSpellingMode::FullyAbbreviated,
                 });
             }
         }
@@ -288,6 +326,55 @@ pub fn select_public_calibration_cases(
         held_out_token_abbreviation_probes,
         stats,
     }
+}
+
+/// Maps the pinned train split into Rime word sequences for bigram training.
+///
+/// Punctuation is omitted. Sentences containing non-Han text or an
+/// unresolvable token are excluded as a whole. This function does not inspect
+/// the held-out test probes or any decoder result.
+pub fn select_public_bigram_training_sequences(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+) -> PublicBigramTrainingCorpus {
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut stats = PublicBigramTrainingStats {
+        source_sentences: corpus.stats.sentences,
+        ..PublicBigramTrainingStats::default()
+    };
+    let mut sequences = Vec::new();
+
+    for sentence in &corpus.sentences {
+        let source_tokens = sentence
+            .tokens
+            .iter()
+            .filter(|token| token.upos != "PUNCT")
+            .collect::<Vec<_>>();
+        if source_tokens
+            .iter()
+            .flat_map(|token| token.form.chars())
+            .any(|character| !is_han_character(character))
+        {
+            continue;
+        }
+        stats.han_only_sentences += 1;
+        let Some((_observed, words, exact_token_uses, character_fallback_uses)) =
+            observed_for_tokens(&source_tokens, &entries_by_text)
+        else {
+            continue;
+        };
+        stats.lexicon_coverable_sentences += 1;
+        if words.len() < 2 {
+            continue;
+        }
+        stats.training_sequences += 1;
+        stats.training_words += words.len();
+        stats.exact_token_uses += exact_token_uses;
+        stats.character_fallback_uses += character_fallback_uses;
+        sequences.push(words);
+    }
+
+    PublicBigramTrainingCorpus { sequences, stats }
 }
 
 struct ObservedSpellings {
@@ -318,16 +405,18 @@ fn entry_precedes(left: &LexiconEntry, right: &LexiconEntry) -> bool {
 fn observed_for_tokens(
     tokens: &[&UdToken],
     entries_by_text: &HashMap<&str, &LexiconEntry>,
-) -> Option<(ObservedSpellings, usize, usize)> {
+) -> Option<(ObservedSpellings, Vec<String>, usize, usize)> {
     let mut observed = ObservedSpellings {
         full_code: String::new(),
         abbreviated_code: String::new(),
     };
+    let mut words = Vec::new();
     let mut exact_token_uses = 0;
     let mut character_fallback_uses = 0;
     for token in tokens {
         if let Some(entry) = entries_by_text.get(token.form.as_str()) {
             append_entry_codes(entry, &mut observed);
+            words.push(entry.text.clone());
             exact_token_uses += 1;
             continue;
         }
@@ -335,26 +424,29 @@ fn observed_for_tokens(
             let character = character.to_string();
             let entry = entries_by_text.get(character.as_str())?;
             append_entry_codes(entry, &mut observed);
+            words.push(entry.text.clone());
             character_fallback_uses += 1;
         }
     }
-    Some((observed, exact_token_uses, character_fallback_uses))
+    Some((observed, words, exact_token_uses, character_fallback_uses))
 }
 
 fn observed_for_characters(
     text: &str,
     entries_by_text: &HashMap<&str, &LexiconEntry>,
-) -> Option<ObservedSpellings> {
+) -> Option<(ObservedSpellings, Vec<String>)> {
     let mut observed = ObservedSpellings {
         full_code: String::new(),
         abbreviated_code: String::new(),
     };
+    let mut words = Vec::new();
     for character in text.chars() {
         let character = character.to_string();
         let entry = entries_by_text.get(character.as_str())?;
         append_entry_codes(entry, &mut observed);
+        words.push(entry.text.clone());
     }
-    Some(observed)
+    Some((observed, words))
 }
 
 fn append_entry_codes(entry: &LexiconEntry, observed: &mut ObservedSpellings) {
@@ -462,11 +554,47 @@ impl Error for UdCorpusParseError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::{parse_rime_lexicon, parse_ud_conllu, select_public_calibration_cases};
+    use crate::{
+        BigramLanguageModel, parse_rime_lexicon, parse_ud_conllu,
+        select_public_bigram_training_sequences, select_public_calibration_cases,
+    };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+    const UD_TRAIN: &str =
+        include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu");
     const UD_TEST: &str =
         include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu");
+
+    #[test]
+    fn pinned_ud_train_snapshot_has_stable_bigram_mapping() {
+        assert_eq!(UD_TRAIN.len(), 9_321_012);
+        let corpus = parse_ud_conllu(UD_TRAIN).unwrap();
+        assert_eq!(corpus.stats.source_lines, 118_599);
+        assert_eq!(corpus.stats.sentences, 3_997);
+        assert_eq!(corpus.stats.syntactic_tokens, 98_614);
+        assert_eq!(corpus.stats.punctuation_tokens, 13_627);
+        assert_eq!(corpus.stats.special_token_rows, 0);
+
+        let lexicon = parse_rime_lexicon(RIME).unwrap().entries;
+        let first = select_public_bigram_training_sequences(&corpus, &lexicon);
+        let second = select_public_bigram_training_sequences(&corpus, &lexicon);
+        assert_eq!(first, second);
+        assert_eq!(first.stats.source_sentences, 3_997);
+        assert_eq!(first.stats.han_only_sentences, 2_346);
+        assert_eq!(first.stats.lexicon_coverable_sentences, 2_339);
+        assert_eq!(first.stats.training_sequences, 2_339);
+        assert_eq!(first.stats.training_words, 51_712);
+        assert_eq!(first.stats.exact_token_uses, 42_745);
+        assert_eq!(first.stats.character_fallback_uses, 8_967);
+        assert_eq!(first.sequences.len(), first.stats.training_sequences);
+
+        let model = BigramLanguageModel::from_token_sequences(&first.sequences, &lexicon).unwrap();
+        let stats = model.stats();
+        assert_eq!(stats.vocabulary_size, 64_422);
+        assert_eq!(stats.observed_pair_types, 40_299);
+        assert_eq!(stats.observed_predecessor_types, 8_890);
+        assert_eq!(stats.observed_pair_instances, 49_373);
+    }
 
     #[test]
     fn pinned_ud_test_snapshot_has_stable_accounting_and_selection() {

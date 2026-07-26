@@ -5,9 +5,10 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, Decoder, encode_pinyin_phrase,
-    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
-    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
-    parse_ud_conllu, select_public_calibration_cases,
+    evaluate_context_oracle, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases,
 };
 
 mod benchmark;
@@ -23,6 +24,8 @@ const PUBLIC_RIME_LEXICON: &str =
     include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
 const PUBLIC_UD_TEST: &str =
     include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu");
+const PUBLIC_UD_TRAIN: &str =
+    include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu");
 
 fn main() -> ExitCode {
     match run() {
@@ -209,9 +212,16 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let started = Instant::now();
     let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
-    let corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
-    let selection = select_public_calibration_cases(&corpus, &imported.entries, 64, 128);
-    let decoder = Decoder::new(imported.entries);
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let test_corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let training = select_public_bigram_training_sequences(&train_corpus, &imported.entries);
+    let language_model =
+        BigramLanguageModel::from_token_sequences(&training.sequences, &imported.entries)?;
+    let language_model_stats = language_model.stats();
+    let selection = select_public_calibration_cases(&test_corpus, &imported.entries, 64, 128);
+    let imported_stats = imported.stats;
+    let lexicon = imported.entries;
+    let decoder = Decoder::new(lexicon.clone());
     let sentence_full =
         evaluate_labeled_rejection_shadow(&decoder, &selection.sentence_full_code_probes);
     let sentence_abbreviation =
@@ -220,15 +230,57 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         evaluate_labeled_rejection_shadow(&decoder, &selection.held_out_token_full_code_probes);
     let held_out_token_abbreviation =
         evaluate_labeled_rejection_shadow(&decoder, &selection.held_out_token_abbreviation_probes);
+    let sentence_full_context = evaluate_context_oracle(
+        &decoder,
+        &language_model,
+        &lexicon,
+        &selection.sentence_full_code_probes,
+    )?;
+    let sentence_abbreviation_context = evaluate_context_oracle(
+        &decoder,
+        &language_model,
+        &lexicon,
+        &selection.sentence_abbreviation_probes,
+    )?;
+    let held_out_token_full_context = evaluate_context_oracle(
+        &decoder,
+        &language_model,
+        &lexicon,
+        &selection.held_out_token_full_code_probes,
+    )?;
+    let held_out_token_abbreviation_context = evaluate_context_oracle(
+        &decoder,
+        &language_model,
+        &lexicon,
+        &selection.held_out_token_abbreviation_probes,
+    )?;
     let elapsed = started.elapsed();
 
     println!(
-        "公开独立校准：UD Chinese GSDSimp test {} 句、{} 个 token；Rime 词典 {} 项",
-        corpus.stats.sentences, corpus.stats.syntactic_tokens, imported.stats.imported_entries
+        "公开独立校准：UD Chinese GSDSimp train {} 句、test {} 句；Rime 词典 {} 项",
+        train_corpus.stats.sentences, test_corpus.stats.sentences, imported_stats.imported_entries
     );
     println!(
-        "UD 行统计：{} 行，标点 token {}，特殊 token 行 {}",
-        corpus.stats.source_lines, corpus.stats.punctuation_tokens, corpus.stats.special_token_rows
+        "测试集统计：{} 行，{} 个 token，标点 token {}，特殊 token 行 {}",
+        test_corpus.stats.source_lines,
+        test_corpus.stats.syntactic_tokens,
+        test_corpus.stats.punctuation_tokens,
+        test_corpus.stats.special_token_rows
+    );
+    println!(
+        "训练集筛选：纯汉字 {}，Rime 可覆盖 {}，保留 {} 序列、{} 词实例",
+        training.stats.han_only_sentences,
+        training.stats.lexicon_coverable_sentences,
+        training.stats.training_sequences,
+        training.stats.training_words
+    );
+    println!(
+        "训练集映射：整词 {} 次，逐字回退 {} 次；模型 {} 词、{} 二元组类型、{} 二元组实例",
+        training.stats.exact_token_uses,
+        training.stats.character_fallback_uses,
+        language_model_stats.vocabulary_size,
+        language_model_stats.observed_pair_types,
+        language_model_stats.observed_pair_instances
     );
     println!(
         "自然句筛选：长度合格 {}，纯汉字 {}，Rime 可覆盖 {}，固定取前 {}",
@@ -249,11 +301,39 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     print_labeled_rejection_report("自然句全简拼", &sentence_abbreviation);
     print_labeled_rejection_report("未收整词完整码", &held_out_token_full);
     print_labeled_rejection_report("未收整词全简拼", &held_out_token_abbreviation);
+    println!("上下文双路径诊断（仅比较已知预期路径与原始 Top-1，不代表完整搜索）：");
+    print_context_oracle_report("自然句完整码", &sentence_full_context);
+    print_context_oracle_report("自然句全简拼", &sentence_abbreviation_context);
+    print_context_oracle_report("未收整词完整码", &held_out_token_full_context);
+    print_context_oracle_report("未收整词全简拼", &held_out_token_abbreviation_context);
     println!(
         "本次公开校准耗时：{:.3} ms（固定本机观察，不代表真实输入准确率）",
         elapsed.as_secs_f64() * 1000.0
     );
     Ok(())
+}
+
+fn print_context_oracle_report(label: &str, report: &ziranma_decoder::ContextOracleReport) {
+    println!(
+        "{label}：原始相符 {}/{}；原始不符中预期路径胜 {}、平 {}、原 Top-1 胜 {}",
+        report.unigram_top_1_matches_expected,
+        report.total,
+        report.incorrect_expected_path_preferred,
+        report.incorrect_context_ties,
+        report.incorrect_baseline_path_preferred
+    );
+    if let Some(range) = report.incorrect_margin_range {
+        println!(
+            "{label}预期减原 Top-1 的上下文每键分差：{:.3}～{:.3}",
+            range.minimum_per_key, range.maximum_per_key
+        );
+    }
+    println!(
+        "{label}双路径上限：{}/{}（{:.1}%）",
+        report.oracle_pair_matches_expected,
+        report.total,
+        report.oracle_pair_accuracy() * 100.0
+    );
 }
 
 fn print_labeled_rejection_report(
