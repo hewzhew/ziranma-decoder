@@ -5,11 +5,11 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
-    encode_pinyin_phrase, evaluate_character_context_oracle, evaluate_context_oracle,
-    evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
-    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
-    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
-    select_public_calibration_cases,
+    audit_abbreviation_codebook, encode_pinyin_phrase, evaluate_character_context_oracle,
+    evaluate_context_oracle, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
+    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+    parse_lexicon_tsv, parse_rime_lexicon, parse_ud_conllu,
+    select_public_bigram_training_sequences, select_public_calibration_cases,
 };
 
 mod benchmark;
@@ -54,6 +54,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "encode" => run_encode(&arguments[1..]),
         "evaluate" => run_evaluate(&arguments[1..]),
         "public-calibrate" => run_public_calibrate(&arguments[1..]),
+        "abbreviation-audit" => run_abbreviation_audit(&arguments[1..]),
         "index-stats" => run_index_stats(&arguments[1..]),
         "public-index-stats" => run_public_index_stats(&arguments[1..]),
         "benchmark" => run_benchmark(&arguments[1..]),
@@ -67,6 +68,71 @@ fn run() -> Result<(), Box<dyn Error>> {
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
     }
+}
+
+fn run_abbreviation_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("abbreviation-audit 不接受额外参数".into());
+    }
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let audit = audit_abbreviation_codebook(&imported.entries)?;
+
+    println!("自由混合简拼码本审计（固定公开 Rime 快照）：");
+    println!("  不同拼音音节：{}", audit.distinct_pinyin_syllables);
+    println!("  不同完整双拼码：{}", audit.distinct_full_codes);
+    println!(
+        "  完整码碰撞组：{}；单码最多 {} 个拼音标签",
+        audit.full_code_collision_groups, audit.maximum_pinyin_labels_per_full_code
+    );
+    println!(
+        "  可作一键简拼的键：{}/26；其中 {} 个键对应多个拼音，单键最多 {} 个",
+        audit.abbreviation_keys,
+        audit.ambiguous_abbreviation_keys,
+        audit.maximum_pinyin_labels_per_abbreviation_key
+    );
+    println!(
+        "  可同时切成两个一键简拼的完整码：{}/{}",
+        audit.full_codes_split_as_two_abbreviations, audit.distinct_full_codes
+    );
+    println!(
+        "  两键字符串的最大拼音标签路径数：{}（输入 {}）",
+        audit.maximum_labeled_paths_for_two_keys, audit.maximum_labeled_paths_code
+    );
+    println!(
+        "  码字边界唯一可解码：{}",
+        if audit.unique_decodability_is_refuted() {
+            "否（已有直接反例）"
+        } else {
+            "本审计未由两键反例判定"
+        }
+    );
+    if let Some(witness) = &audit.immediate_ambiguity_witness {
+        println!(
+            "  直接反例：{} = 完整音节 {}，也 = 简拼音节 {} + {}",
+            witness.observed,
+            witness.full_syllable,
+            witness.first_abbreviated_syllable,
+            witness.second_abbreviated_syllable
+        );
+    }
+    if let Some(key) = audit.fibonacci_witness_key {
+        println!("  指数边界反例：重复键 {key:?} 同时允许一键 {key} 与两键 {key}{key}");
+        for length in [8, 16, 32] {
+            println!(
+                "    {length} 键仅边界就有 {} 种解释",
+                audit
+                    .fibonacci_boundary_parses(length)
+                    .expect("the reported witness guarantees a bounded Fibonacci count")
+            );
+        }
+    }
+    println!(
+        "  信息量下界：区分这些拼音至少需 {:.2} bit；一个字母键最多 {:.2} bit",
+        (audit.distinct_pinyin_syllables as f64).log2(),
+        26_f64.log2()
+    );
+    println!("结论：逐音节任意一键/两键混输不是唯一可解码协议；语言模型只能排序歧义，不能消除它。");
+    Ok(())
 }
 
 fn run_encode(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -924,6 +990,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- public-index-stats
+  cargo run -- abbreviation-audit
   cargo run --release -- benchmark [重复次数]
   cargo run -- search-stats <按键串> [Top-K]
   cargo run -- evaluate
@@ -942,6 +1009,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- public-index-stats
+  cargo run -- abbreviation-audit
   cargo run --release -- benchmark 3
   cargo run -- search-stats nhk
   cargo run -- evaluate

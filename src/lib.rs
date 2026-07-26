@@ -13,11 +13,16 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
+mod abbreviation;
 mod codec;
 mod evaluation;
 mod language_model;
 mod public_corpus;
 
+pub use abbreviation::{
+    AbbreviationAuditError, AbbreviationCodebookAudit, ImmediateAmbiguityWitness,
+    audit_abbreviation_codebook,
+};
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use evaluation::{
     CharacterAverageMarginRange, CharacterContextOracleReport, ContextOracleError,
