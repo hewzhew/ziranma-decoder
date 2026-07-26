@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
-    audit_abbreviation_codebook, encode_pinyin_phrase, evaluate_character_context_oracle,
-    evaluate_context_oracle, evaluate_continuous_composition, evaluate_labeled_recall,
-    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
-    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
-    parse_ud_conllu, select_public_bigram_training_sequences, select_public_calibration_cases,
-    select_public_continuous_composition_cases,
+    audit_abbreviation_codebook, audit_continuous_composition, encode_pinyin_phrase,
+    evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
+    evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases, select_public_continuous_composition_cases,
 };
 
 mod benchmark;
@@ -67,6 +67,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "public-sentence" => run_public_sentence(&arguments[1..]),
         "public-compose" => run_public_compose(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
+        "public-compose-audit" => run_public_compose_audit(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
@@ -830,14 +831,15 @@ fn run_public_compose_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error
     let report = evaluate_continuous_composition(&decoder, &selection.probes);
     let stats = selection.stats;
 
-    println!("公开连续组合短语评测：UD test 相邻两词、2～6 个汉字、固定前 64 条");
+    println!("公开连续组合短语评测：UD test 相邻两词、2～6 个汉字、跨句均匀取 64 条");
     println!(
-        "筛选：{} 个双词窗口；{} 个长度合格纯汉字；{} 个整词可覆盖；{} 个可省键；{} 个可构造颠倒；最终 {} 条",
+        "筛选：{} 个双词窗口；{} 个长度合格纯汉字；{} 个整词可覆盖；{} 个可省键；{} 个可构造颠倒；{} 个独立句代表；最终 {} 条",
         stats.source_windows,
         stats.han_length_eligible,
         stats.exact_word_coverable,
         stats.key_saving_eligible,
         stats.transposition_eligible,
+        stats.sentence_representatives,
         stats.selected
     );
     println!(
@@ -868,6 +870,89 @@ fn run_public_compose_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error
         started.elapsed().as_secs_f64() * 1000.0
     );
     Ok(())
+}
+
+fn run_public_compose_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-compose-audit 不接受额外参数".into());
+    }
+
+    const BASELINE_K: usize = 10;
+    const AUDIT_DEPTH: usize = 100;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let test_corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let training = select_public_bigram_training_sequences(&train_corpus, &imported.entries);
+    let word_language_model =
+        BigramLanguageModel::from_token_sequences(&training.sequences, &imported.entries)?;
+    let character_training_texts = training
+        .sequences
+        .iter()
+        .map(|sequence| sequence.concat())
+        .collect::<Vec<_>>();
+    let character_language_model =
+        CharacterBigramLanguageModel::from_text_sequences(&character_training_texts)?;
+    let selection = select_public_continuous_composition_cases(&test_corpus, &imported.entries, 64);
+    let lexicon = imported.entries;
+    let decoder = Decoder::new(lexicon.clone());
+    let report = audit_continuous_composition(
+        &decoder,
+        &word_language_model,
+        &character_language_model,
+        &lexicon,
+        &selection.probes,
+        BASELINE_K,
+        AUDIT_DEPTH,
+    );
+    let failures = report.total - report.baseline_visible;
+
+    println!("公开连续组合失败审计：固定 64 条尾部简写，主榜 Top-{BASELINE_K}");
+    println!(
+        "基线：{} 条首屏可见；{} 条首屏外，其中 {} 条在第 {}～{}、{} 条仍在 Top-{} 外",
+        report.baseline_visible,
+        failures,
+        report.deeper_visible,
+        BASELINE_K + 1,
+        AUDIT_DEPTH,
+        report.outside_audit_depth,
+        AUDIT_DEPTH
+    );
+    println!(
+        "首屏失败的错误 Top-1 字数：比答案短 {}，等长 {}，比答案长 {}",
+        report.baseline_top_shorter, report.baseline_top_same_length, report.baseline_top_longer
+    );
+    println!(
+        "冻结同一 Top-{AUDIT_DEPTH} 池后，train-only 词级上下文：{} 条升至 Top-1，{} 条回到 Top-{BASELINE_K}",
+        report.word_context_reranked_at_1, report.word_context_reranked_visible
+    );
+    println!(
+        "纯字符平均上下文：{} 条升至 Top-1，{} 条回到 Top-{BASELINE_K}（只作诊断，不是生产评分）",
+        report.character_average_reranked_at_1, report.character_average_reranked_visible
+    );
+    println!("逐例账目（基线排名 / 词上下文排名 / 字符平均排名）：");
+    for case in &report.failures {
+        println!(
+            "  {}  {} -> {}；{} / {} / {}；原首选 {} [{}]",
+            case.id,
+            case.observed,
+            case.expected_text,
+            format_audit_rank(case.baseline_rank, AUDIT_DEPTH),
+            format_audit_rank(case.word_context_rank, AUDIT_DEPTH),
+            format_audit_rank(case.character_average_rank, AUDIT_DEPTH),
+            case.baseline_top_text,
+            case.baseline_top_segments.join(" | ")
+        );
+    }
+    println!(
+        "本次失败审计耗时：{:.3} ms（固定本机观察）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn format_audit_rank(rank: Option<usize>, audit_depth: usize) -> String {
+    rank.map_or_else(|| format!(">{audit_depth}"), |rank| rank.to_string())
 }
 
 fn print_composition_recall(label: &str, report: ziranma_decoder::CompositionRecallReport) {
@@ -1101,6 +1186,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run --release -- public-compose-evaluate
+  cargo run --release -- public-compose-audit
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- public-index-stats
@@ -1122,6 +1208,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-sentence zrmurf
   cargo run -- public-compose mafkmm 3
   cargo run --release -- public-compose-evaluate
+  cargo run --release -- public-compose-audit
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- public-index-stats

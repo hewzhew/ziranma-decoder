@@ -26,14 +26,16 @@ pub use abbreviation::{
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use evaluation::{
     CharacterAverageMarginRange, CharacterContextOracleReport, CompositionRecallReport,
-    ContextOracleError, ContextOracleReport, ContextScoreMarginRange, ContinuousCompositionReport,
+    ContextOracleError, ContextOracleReport, ContextScoreMarginRange,
+    ContinuousCompositionAuditCase, ContinuousCompositionAuditReport, ContinuousCompositionReport,
     EvaluationReport, LabeledRecallReport, LabeledRejectionShadowReport,
     LabeledRejectionThresholdMetrics, LabeledSentenceProbe, OovCaseReport, ProbeSpellingMode,
     REJECTION_SHADOW_THRESHOLDS_PER_KEY, RecallMetrics, RejectionMarginRange,
     RejectionShadowReport, RejectionThresholdMetrics, SentenceCaseParseError, SentenceCaseReport,
-    SyntheticCaseKind, evaluate_character_context_oracle, evaluate_context_oracle,
-    evaluate_continuous_composition, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
-    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+    SyntheticCaseKind, audit_continuous_composition, evaluate_character_context_oracle,
+    evaluate_context_oracle, evaluate_continuous_composition, evaluate_labeled_recall,
+    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
+    evaluate_sentence_cases, evaluate_synthetic,
 };
 pub use language_model::{
     BigramLanguageModel, BigramLanguageModelStats, BigramScore, CharacterBigramLanguageModel,

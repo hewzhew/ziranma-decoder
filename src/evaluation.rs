@@ -327,6 +327,204 @@ impl ContinuousCompositionReport {
     }
 }
 
+/// One tail-abbreviation case that missed the ordinary visible candidate list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousCompositionAuditCase {
+    /// Stable upstream-derived probe identifier.
+    pub id: String,
+    /// Continuous tail-abbreviated keys.
+    pub observed: String,
+    /// Natural public text expected from those keys.
+    pub expected_text: String,
+    /// Ordinary unigram first candidate.
+    pub baseline_top_text: String,
+    /// Word segmentation used by the ordinary first candidate.
+    pub baseline_top_segments: Vec<String>,
+    /// One-based ordinary rank inside the deeper audit pool, if visible.
+    pub baseline_rank: Option<usize>,
+    /// One-based rank after train-only word-bigram rescoring of the same pool.
+    pub word_context_rank: Option<usize>,
+    /// One-based rank after pure average character-bigram rescoring of the pool.
+    pub character_average_rank: Option<usize>,
+}
+
+/// Read-only failure audit over a wider, unchanged unigram candidate pool.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousCompositionAuditReport {
+    /// Number of public phrases examined.
+    pub total: usize,
+    /// Size of the ordinary user-visible list being audited.
+    pub baseline_k: usize,
+    /// Maximum ordinary unigram rank inspected for failures.
+    pub audit_depth: usize,
+    /// Expected texts already visible in the ordinary first `baseline_k`.
+    pub baseline_visible: usize,
+    /// Misses from the visible list found later in the audit pool.
+    pub deeper_visible: usize,
+    /// Misses still absent at `audit_depth`.
+    pub outside_audit_depth: usize,
+    /// Failure rows whose ordinary first candidate has fewer characters.
+    pub baseline_top_shorter: usize,
+    /// Failure rows whose ordinary first candidate has the same character count.
+    pub baseline_top_same_length: usize,
+    /// Failure rows whose ordinary first candidate has more characters.
+    pub baseline_top_longer: usize,
+    /// Visible failures reranked first by train-only word context.
+    pub word_context_reranked_at_1: usize,
+    /// Visible failures reranked into the first `baseline_k` by word context.
+    pub word_context_reranked_visible: usize,
+    /// Visible failures reranked first by average train-only character context.
+    pub character_average_reranked_at_1: usize,
+    /// Visible failures reranked into the first `baseline_k` by character context.
+    pub character_average_reranked_visible: usize,
+    /// Per-case evidence for every ordinary visible-list miss.
+    pub failures: Vec<ContinuousCompositionAuditCase>,
+}
+
+/// Audits tail-abbreviation misses without changing production search or ranking.
+///
+/// The ordinary first `baseline_k` candidates remain the reference. Only its
+/// misses receive a deeper unigram pool. Two train-only models then rescore
+/// exactly that frozen pool, so this diagnostic cannot manufacture a path that
+/// the decoder did not already expose.
+pub fn audit_continuous_composition(
+    decoder: &Decoder,
+    word_language_model: &BigramLanguageModel,
+    character_language_model: &CharacterBigramLanguageModel,
+    lexicon: &[LexiconEntry],
+    probes: &[ContinuousCompositionProbe],
+    baseline_k: usize,
+    audit_depth: usize,
+) -> ContinuousCompositionAuditReport {
+    let baseline_k = baseline_k.max(1);
+    let audit_depth = audit_depth.max(baseline_k);
+    let frequency_total = lexicon
+        .iter()
+        .map(|entry| entry.frequency as f64)
+        .sum::<f64>();
+    let log_frequency_total = if frequency_total > 0.0 {
+        frequency_total.ln()
+    } else {
+        0.0
+    };
+    let mut report = ContinuousCompositionAuditReport {
+        total: probes.len(),
+        baseline_k,
+        audit_depth,
+        ..ContinuousCompositionAuditReport::default()
+    };
+
+    for probe in probes {
+        let baseline = decoder
+            .decode_sentence(probe.tail_abbreviated_observed.as_str(), baseline_k)
+            .expect("public probe keys are validated lowercase ASCII");
+        if baseline
+            .iter()
+            .any(|candidate| candidate.text == probe.expected_text)
+        {
+            report.baseline_visible += 1;
+            continue;
+        }
+
+        let top = baseline
+            .first()
+            .expect("literal fallback guarantees a sentence candidate");
+        match top
+            .text
+            .chars()
+            .count()
+            .cmp(&probe.expected_text.chars().count())
+        {
+            std::cmp::Ordering::Less => report.baseline_top_shorter += 1,
+            std::cmp::Ordering::Equal => report.baseline_top_same_length += 1,
+            std::cmp::Ordering::Greater => report.baseline_top_longer += 1,
+        }
+
+        let pool = if audit_depth == baseline_k {
+            baseline.clone()
+        } else {
+            decoder
+                .decode_sentence(probe.tail_abbreviated_observed.as_str(), audit_depth)
+                .expect("public probe keys are validated lowercase ASCII")
+        };
+        debug_assert_eq!(
+            baseline
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>(),
+            pool.iter()
+                .take(baseline.len())
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>(),
+            "increasing Top-K must preserve the ordinary candidate prefix"
+        );
+        let baseline_rank = text_rank(&pool, &probe.expected_text);
+        if baseline_rank.is_some() {
+            report.deeper_visible += 1;
+        } else {
+            report.outside_audit_depth += 1;
+        }
+
+        let word_context_rank = reranked_text_rank(&pool, &probe.expected_text, |candidate| {
+            score_candidate_with_context(candidate, word_language_model, log_frequency_total)
+        });
+        let character_average_rank = reranked_text_rank(&pool, &probe.expected_text, |candidate| {
+            let evidence = character_language_model.score_text(&candidate.text);
+            evidence.log_probability / evidence.pair_count as f64
+        });
+        report.word_context_reranked_at_1 += usize::from(word_context_rank == Some(1));
+        report.word_context_reranked_visible +=
+            usize::from(word_context_rank.is_some_and(|rank| rank <= baseline_k));
+        report.character_average_reranked_at_1 += usize::from(character_average_rank == Some(1));
+        report.character_average_reranked_visible +=
+            usize::from(character_average_rank.is_some_and(|rank| rank <= baseline_k));
+        report.failures.push(ContinuousCompositionAuditCase {
+            id: probe.id.clone(),
+            observed: probe.tail_abbreviated_observed.as_str().to_owned(),
+            expected_text: probe.expected_text.clone(),
+            baseline_top_text: top.text.clone(),
+            baseline_top_segments: top
+                .segments
+                .iter()
+                .map(|segment| segment.candidate.text.clone())
+                .collect(),
+            baseline_rank,
+            word_context_rank,
+            character_average_rank,
+        });
+    }
+    report
+}
+
+fn text_rank(candidates: &[SentenceCandidate], expected_text: &str) -> Option<usize> {
+    candidates
+        .iter()
+        .position(|candidate| candidate.text == expected_text)
+        .map(|rank| rank + 1)
+}
+
+fn reranked_text_rank(
+    candidates: &[SentenceCandidate],
+    expected_text: &str,
+    mut score: impl FnMut(&SentenceCandidate) -> f64,
+) -> Option<usize> {
+    let mut scored = candidates
+        .iter()
+        .enumerate()
+        .map(|(baseline_rank, candidate)| (baseline_rank, candidate, score(candidate)))
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored
+        .iter()
+        .position(|(_, candidate, _)| candidate.text == expected_text)
+        .map(|rank| rank + 1)
+}
+
 /// Evaluates natural two-word continuous input and one adjacent transposition.
 pub fn evaluate_continuous_composition(
     decoder: &Decoder,
@@ -1465,14 +1663,15 @@ fn rate(hits: usize, total: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        BigramLanguageModel, CharacterBigramLanguageModel, Decoder, KeySequence, parse_lexicon_tsv,
+        BigramLanguageModel, CharacterBigramLanguageModel, ContinuousCompositionProbe, Decoder,
+        KeySequence, parse_lexicon_tsv,
     };
 
     use super::{
         LabeledSentenceProbe, ProbeSpellingMode, REJECTION_SHADOW_THRESHOLDS_PER_KEY,
-        SyntheticCaseKind, evaluate_character_context_oracle, evaluate_context_oracle,
-        evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
-        evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+        SyntheticCaseKind, audit_continuous_composition, evaluate_character_context_oracle,
+        evaluate_context_oracle, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
+        evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -1530,6 +1729,50 @@ mod tests {
         let range = report.incorrect_margin_range.unwrap();
         assert!(range.minimum_per_key > 0.0);
         assert_eq!(range.minimum_per_key, range.maximum_per_key);
+    }
+
+    #[test]
+    fn continuous_audit_only_reranks_its_frozen_deeper_pool() {
+        let lexicon = parse_lexicon_tsv(FIXTURE).unwrap();
+        let word_model = BigramLanguageModel::from_tsv(BIGRAM_CORPUS, &lexicon).unwrap();
+        let character_model = CharacterBigramLanguageModel::from_text_sequences(&[
+            "按键键盘".to_owned(),
+            "简拼".to_owned(),
+        ])
+        .unwrap();
+        let decoder = Decoder::new(lexicon.clone());
+        let before = decoder.decode_sentence("ajjp", 10).unwrap();
+        let observed = KeySequence::new("ajjp").unwrap();
+        let report = audit_continuous_composition(
+            &decoder,
+            &word_model,
+            &character_model,
+            &lexicon,
+            &[ContinuousCompositionProbe {
+                id: "key-keyboard".to_owned(),
+                full_observed: observed.clone(),
+                tail_abbreviated_observed: observed.clone(),
+                transposed_observed: observed,
+                expected_text: "按键键盘".to_owned(),
+                expected_segments: vec!["按键".to_owned(), "键盘".to_owned()],
+            }],
+            1,
+            10,
+        );
+
+        assert_eq!(decoder.decode_sentence("ajjp", 10).unwrap(), before);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.baseline_visible, 0);
+        assert_eq!(report.deeper_visible, 1);
+        assert_eq!(report.outside_audit_depth, 0);
+        assert_eq!(report.failures.len(), 1);
+        let failure = &report.failures[0];
+        assert!(failure.baseline_rank.is_some_and(|rank| rank > 1));
+        assert!(
+            failure
+                .word_context_rank
+                .is_some_and(|rank| rank < failure.baseline_rank.unwrap())
+        );
     }
 
     #[test]

@@ -122,6 +122,8 @@ pub struct ContinuousCompositionSelectionStats {
     pub key_saving_eligible: usize,
     /// Saving-eligible windows with a reversible distinct first-syllable pair.
     pub transposition_eligible: usize,
+    /// Unique one-per-sentence representatives available before spreading.
+    pub sentence_representatives: usize,
     /// Unique probes retained under the requested limit.
     pub selected: usize,
     /// Full-code keys across retained probes.
@@ -378,8 +380,9 @@ pub fn select_public_calibration_cases(
 /// Selects natural, exact-word, two-token spans for continuous composition.
 ///
 /// Each word keeps its first syllable as a two-key anchor and abbreviates every
-/// later syllable to one key. Source order is preserved, no word separator is
-/// inserted, and one distinct two-key anchor is deterministically transposed.
+/// later syllable to one key. At most one unique span is retained per source
+/// sentence, then the requested limit is spread evenly over those sentence
+/// representatives. No decoder result influences selection.
 pub fn select_public_continuous_composition_cases(
     corpus: &UdCorpus,
     lexicon: &[LexiconEntry],
@@ -387,10 +390,11 @@ pub fn select_public_continuous_composition_cases(
 ) -> ContinuousCompositionSelection {
     let entries_by_text = best_entries_by_text(lexicon);
     let mut stats = ContinuousCompositionSelectionStats::default();
-    let mut probes = Vec::new();
+    let mut sentence_representatives = Vec::new();
     let mut seen_text = HashSet::new();
 
     for sentence in &corpus.sentences {
+        let mut sentence_representative = None;
         let tokens = sentence
             .tokens
             .iter()
@@ -445,7 +449,7 @@ pub fn select_public_continuous_composition_cases(
                 continue;
             };
             stats.transposition_eligible += 1;
-            if probes.len() >= limit || !seen_text.insert(expected_text.clone()) {
+            if sentence_representative.is_some() || !seen_text.insert(expected_text.clone()) {
                 continue;
             }
 
@@ -453,9 +457,7 @@ pub fn select_public_continuous_composition_cases(
             transposed.swap(transposition, transposition + 1);
             let transposed =
                 String::from_utf8(transposed).expect("Rime-derived codes are lowercase ASCII");
-            stats.selected_full_keys += full_code.len();
-            stats.selected_tail_keys += tail_code.len();
-            probes.push(ContinuousCompositionProbe {
+            sentence_representative = Some(ContinuousCompositionProbe {
                 id: format!("{}:continuous-{}", sentence.id, window_index + 1),
                 full_observed: KeySequence::new(full_code)
                     .expect("Rime-derived full codes are lowercase ASCII"),
@@ -467,8 +469,30 @@ pub fn select_public_continuous_composition_cases(
                 expected_segments: entries.iter().map(|entry| entry.text.clone()).collect(),
             });
         }
+        if let Some(probe) = sentence_representative {
+            sentence_representatives.push(probe);
+        }
     }
+
+    stats.sentence_representatives = sentence_representatives.len();
+    let selected = limit.min(sentence_representatives.len());
+    let probes = (0..selected)
+        .map(|index| {
+            let spread_index = (index * sentence_representatives.len()
+                + sentence_representatives.len() / 2)
+                / selected;
+            sentence_representatives[spread_index].clone()
+        })
+        .collect::<Vec<_>>();
     stats.selected = probes.len();
+    stats.selected_full_keys = probes
+        .iter()
+        .map(|probe| probe.full_observed.as_str().len())
+        .sum();
+    stats.selected_tail_keys = probes
+        .iter()
+        .map(|probe| probe.tail_abbreviated_observed.as_str().len())
+        .sum();
     ContinuousCompositionSelection { probes, stats }
 }
 
@@ -713,6 +737,8 @@ impl Error for UdCorpusParseError {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use crate::{
         BigramLanguageModel, CharacterBigramLanguageModel, parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
@@ -834,9 +860,19 @@ mod tests {
         assert_eq!(continuous.stats.exact_word_coverable, 7_465);
         assert_eq!(continuous.stats.key_saving_eligible, 5_919);
         assert_eq!(continuous.stats.transposition_eligible, 5_796);
+        assert_eq!(continuous.stats.sentence_representatives, 489);
         assert_eq!(continuous.stats.selected, 64);
-        assert_eq!(continuous.stats.selected_full_keys, 430);
-        assert_eq!(continuous.stats.selected_tail_keys, 343);
+        assert_eq!(continuous.stats.selected_full_keys, 418);
+        assert_eq!(continuous.stats.selected_tail_keys, 337);
+        assert_eq!(
+            continuous
+                .probes
+                .iter()
+                .map(|probe| probe.id.split(':').next().unwrap())
+                .collect::<HashSet<_>>()
+                .len(),
+            continuous.probes.len()
+        );
         assert!(continuous.probes.iter().all(|probe| {
             probe.expected_segments.len() == 2
                 && probe.full_observed.as_str().len()
