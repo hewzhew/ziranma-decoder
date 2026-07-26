@@ -446,6 +446,9 @@ cargo test
 & .\scripts\release-audit.ps1
 ```
 
+GitHub Actions 会在 Linux 与 Windows 上重复运行 Rust 检查，并在 Windows
+任务中执行严格发布审计。工作流只有仓库内容读取权限，不保留检出凭据。
+
 提交补丁和首次公开前的完整要求见[贡献指南](CONTRIBUTING.md)。最终发布
 候选还必须在干净工作树上通过
 `& .\scripts\release-audit.ps1 -RequireClean`；脚本只审查 Git 候选文件、

@@ -276,6 +276,7 @@ foreach ($relativePath in $candidatePaths) {
 }
 
 $requiredFiles = @(
+    '.github/workflows/ci.yml',
     '.gitattributes',
     '.gitignore',
     'Cargo.lock',
