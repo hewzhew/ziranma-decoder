@@ -12,6 +12,7 @@ pub const CANDIDATE_LAB_USAGE: &str = "\
   cargo run --release -- candidate-lab <连续按键串> [每栏显示数，1～10] [选项]
 
 选项：
+  --expect <文字>  检查目标文字在当前显示候选中的名次
   --recovery  显示可能的相邻按键颠倒候选
   --verbose   显示算法评分、纠错预算和语言模型细节
   --json      输出使用稳定英文字段名的机器可读 JSON
@@ -29,6 +30,7 @@ pub enum CandidateLabOutputMode {
 pub struct CandidateLabCliOptions {
     pub observed: String,
     pub top_k: usize,
+    pub expected_text: Option<String>,
     pub show_recovery: bool,
     pub output_mode: CandidateLabOutputMode,
 }
@@ -38,11 +40,27 @@ pub fn parse_candidate_lab_arguments(
 ) -> Result<CandidateLabCliOptions, Box<dyn Error>> {
     let mut observed = None;
     let mut top_k = None;
+    let mut expected_text = None;
     let mut show_recovery = false;
     let mut output_mode = CandidateLabOutputMode::Concise;
 
-    for argument in arguments {
+    let mut argument_index = 0;
+    while argument_index < arguments.len() {
+        let argument = &arguments[argument_index];
         match argument.as_str() {
+            "--expect" => {
+                if expected_text.is_some() {
+                    return Err("candidate-lab 的 --expect 只能使用一次".into());
+                }
+                argument_index = argument_index.saturating_add(1);
+                let value = arguments
+                    .get(argument_index)
+                    .ok_or("candidate-lab 的 --expect 后面需要目标文字")?;
+                if value.starts_with('-') {
+                    return Err("candidate-lab 的 --expect 后面需要目标文字".into());
+                }
+                expected_text = Some(value.to_owned());
+            }
             "--recovery" => show_recovery = true,
             "--verbose" => {
                 if output_mode == CandidateLabOutputMode::Json {
@@ -69,6 +87,7 @@ pub fn parse_candidate_lab_arguments(
             }
             _ => return Err("candidate-lab 参数过多；请运行 candidate-lab --help".into()),
         }
+        argument_index = argument_index.saturating_add(1);
     }
 
     let observed = observed.ok_or("candidate-lab 需要一个连续、没有词界的小写字母按键串")?;
@@ -76,6 +95,7 @@ pub fn parse_candidate_lab_arguments(
     Ok(CandidateLabCliOptions {
         observed,
         top_k: top_k.unwrap_or(10),
+        expected_text,
         show_recovery,
         output_mode,
     })
@@ -86,17 +106,29 @@ pub fn render_candidate_lab(
     options: &CandidateLabCliOptions,
 ) -> String {
     match options.output_mode {
-        CandidateLabOutputMode::Concise => {
-            render_candidate_lab_concise(report, options.show_recovery)
-        }
-        CandidateLabOutputMode::Verbose => {
-            render_candidate_lab_verbose(report, options.show_recovery)
-        }
-        CandidateLabOutputMode::Json => render_candidate_lab_json(report, options.show_recovery),
+        CandidateLabOutputMode::Concise => render_candidate_lab_concise(
+            report,
+            options.show_recovery,
+            options.expected_text.as_deref(),
+        ),
+        CandidateLabOutputMode::Verbose => render_candidate_lab_verbose(
+            report,
+            options.show_recovery,
+            options.expected_text.as_deref(),
+        ),
+        CandidateLabOutputMode::Json => render_candidate_lab_json(
+            report,
+            options.show_recovery,
+            options.expected_text.as_deref(),
+        ),
     }
 }
 
-fn render_candidate_lab_concise(report: &CandidateLabReport, show_recovery: bool) -> String {
+fn render_candidate_lab_concise(
+    report: &CandidateLabReport,
+    show_recovery: bool,
+    expected_text: Option<&str>,
+) -> String {
     let mut output = String::new();
     writeln!(output, "候选实验台").expect("writing to String cannot fail");
     writeln!(
@@ -121,6 +153,11 @@ fn render_candidate_lab_concise(report: &CandidateLabReport, show_recovery: bool
         );
     }
 
+    if let Some(expected_text) = expected_text {
+        writeln!(output).expect("writing to String cannot fail");
+        render_expectation(&mut output, report, show_recovery, expected_text);
+    }
+
     writeln!(output).expect("writing to String cannot fail");
     writeln!(output, "这是实验排序，不代表最终输入法效果。")
         .expect("writing to String cannot fail");
@@ -131,6 +168,43 @@ fn render_candidate_lab_concise(report: &CandidateLabReport, show_recovery: bool
     writeln!(output, "如需算法评分与完整解释，请加 --verbose。")
         .expect("writing to String cannot fail");
     output
+}
+
+fn render_expectation(
+    output: &mut String,
+    report: &CandidateLabReport,
+    show_recovery: bool,
+    expected_text: &str,
+) {
+    writeln!(output, "目标检查").expect("writing to String cannot fail");
+    writeln!(output, "目标：{expected_text}").expect("writing to String cannot fail");
+
+    let primary_rank = matching_rank(&report.primary, expected_text);
+    let recovery_rank = show_recovery
+        .then(|| matching_rank(&report.anchored_transposition_recovery, expected_text))
+        .flatten();
+    let primary_result = match primary_rank {
+        Some(rank) => format!("普通候选第 {rank} 名"),
+        None => format!("普通候选前 {} 项未找到", report.top_k),
+    };
+    let recovery_result = if show_recovery {
+        match recovery_rank {
+            Some(rank) => format!("按键颠倒候选第 {rank} 名"),
+            None => format!("按键颠倒候选前 {} 项未找到", report.top_k),
+        }
+    } else {
+        "按键颠倒栏未检查".to_owned()
+    };
+    writeln!(output, "结果：{primary_result}；{recovery_result}。")
+        .expect("writing to String cannot fail");
+    writeln!(output, "口径：只做目标文字的精确比较，不推断同义表达。")
+        .expect("writing to String cannot fail");
+}
+
+fn matching_rank(rows: &[CandidateLabCandidate], expected_text: &str) -> Option<usize> {
+    rows.iter()
+        .find(|row| row.candidate.text == expected_text)
+        .map(|row| row.rank)
 }
 
 fn render_concise_lane(output: &mut String, label: &str, rows: &[CandidateLabCandidate]) {
@@ -207,7 +281,11 @@ fn concise_action_summary(row: &CandidateLabCandidate) -> String {
     }
 }
 
-fn render_candidate_lab_verbose(report: &CandidateLabReport, show_recovery: bool) -> String {
+fn render_candidate_lab_verbose(
+    report: &CandidateLabReport,
+    show_recovery: bool,
+    expected_text: Option<&str>,
+) -> String {
     let mut output = String::new();
     writeln!(
         output,
@@ -243,6 +321,9 @@ fn render_candidate_lab_verbose(report: &CandidateLabReport, show_recovery: bool
     } else {
         writeln!(output, "按键颠倒恢复候选默认隐藏；需要时请加 --recovery。")
             .expect("writing to String cannot fail");
+    }
+    if let Some(expected_text) = expected_text {
+        render_expectation(&mut output, report, show_recovery, expected_text);
     }
     output
 }
@@ -355,18 +436,24 @@ fn render_verbose_segments(output: &mut String, candidate: &ziranma_decoder::Sen
     }
 }
 
-fn render_candidate_lab_json(report: &CandidateLabReport, show_recovery: bool) -> String {
+fn render_candidate_lab_json(
+    report: &CandidateLabReport,
+    show_recovery: bool,
+    expected_text: Option<&str>,
+) -> String {
     let mut output = String::new();
     output.push_str("{\"schema\":\"ziranma-candidate-lab-v1\",\"input\":");
     push_json_string(&mut output, report.observed.as_str());
     write!(
         output,
-        ",\"input_letter_keys\":{},\"top_k\":{},\"recovery_included\":{},\"lanes\":{{\"primary\":",
+        ",\"input_letter_keys\":{},\"top_k\":{},\"recovery_included\":{},\"expectation\":",
         report.observed.as_str().len(),
         report.top_k,
         show_recovery
     )
     .expect("writing to String cannot fail");
+    push_json_expectation(&mut output, report, show_recovery, expected_text);
+    output.push_str(",\"lanes\":{\"primary\":");
     push_json_lane(&mut output, &report.primary);
     output.push_str(",\"anchored_transposition_recovery\":");
     if show_recovery {
@@ -376,6 +463,37 @@ fn render_candidate_lab_json(report: &CandidateLabReport, show_recovery: bool) -
     }
     output.push_str("}}\n");
     output
+}
+
+fn push_json_expectation(
+    output: &mut String,
+    report: &CandidateLabReport,
+    show_recovery: bool,
+    expected_text: Option<&str>,
+) {
+    let Some(expected_text) = expected_text else {
+        output.push_str("null");
+        return;
+    };
+
+    output.push_str("{\"text\":");
+    push_json_string(output, expected_text);
+    output.push_str(",\"match\":\"exact_text\",\"primary_rank\":");
+    push_json_optional_usize(output, matching_rank(&report.primary, expected_text));
+    write!(
+        output,
+        ",\"recovery_checked\":{show_recovery},\"recovery_rank\":"
+    )
+    .expect("writing to String cannot fail");
+    if show_recovery {
+        push_json_optional_usize(
+            output,
+            matching_rank(&report.anchored_transposition_recovery, expected_text),
+        );
+    } else {
+        output.push_str("null");
+    }
+    output.push('}');
 }
 
 fn push_json_lane(output: &mut String, rows: &[CandidateLabCandidate]) {
@@ -580,6 +698,7 @@ text\tpinyin\tfrequency
         CandidateLabCliOptions {
             observed: observed.to_owned(),
             top_k,
+            expected_text: None,
             show_recovery,
             output_mode,
         }
@@ -598,6 +717,26 @@ text\tpinyin\tfrequency
             parsed,
             options("mafmkm", 3, true, CandidateLabOutputMode::Verbose)
         );
+    }
+
+    #[test]
+    fn argument_parser_accepts_one_explicit_course_target() {
+        let parsed = parse_candidate_lab_arguments(&[
+            "mafmkm".to_owned(),
+            "3".to_owned(),
+            "--expect".to_owned(),
+            "麻烦猫猫".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.expected_text.as_deref(), Some("麻烦猫猫"));
+
+        let missing = parse_candidate_lab_arguments(&[
+            "mafmkm".to_owned(),
+            "--expect".to_owned(),
+            "--json".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(missing.to_string().contains("需要目标文字"));
     }
 
     #[test]
@@ -645,6 +784,26 @@ text\tpinyin\tfrequency
     }
 
     #[test]
+    fn expectation_reports_only_checked_visible_lanes() {
+        let ordinary_report = report("mafmkm", 3);
+        let mut ordinary_options = options("mafmkm", 3, false, CandidateLabOutputMode::Concise);
+        ordinary_options.expected_text = Some("麻烦猫猫".to_owned());
+        let ordinary = render_candidate_lab(&ordinary_report, &ordinary_options);
+        assert!(ordinary.contains("普通候选第 1 名；按键颠倒栏未检查"));
+
+        let mut recovery_report = report("mafmkm", 3);
+        let mut recovery_row = recovery_report.primary.remove(0);
+        recovery_row.lane = CandidateLabLane::AnchoredTranspositionRecovery;
+        let recovery_target = recovery_row.candidate.text.clone();
+        recovery_report.anchored_transposition_recovery = vec![recovery_row];
+        let mut recovery_options = options("mafmkm", 3, true, CandidateLabOutputMode::Concise);
+        recovery_options.expected_text = Some(recovery_target);
+        let recovery = render_candidate_lab(&recovery_report, &recovery_options);
+        assert!(recovery.contains("普通候选前 3 项未找到；按键颠倒候选第 1 名"));
+        assert!(recovery.contains("只做目标文字的精确比较"));
+    }
+
+    #[test]
     fn json_output_uses_stable_fields_and_escapes_strings() {
         let report = report("mafmkm", 1);
         let output = render_candidate_lab(
@@ -653,11 +812,23 @@ text\tpinyin\tfrequency
         );
         assert!(output.starts_with("{\"schema\":\"ziranma-candidate-lab-v1\""));
         assert!(output.contains("\"recovery_included\":false"));
+        assert!(output.contains("\"expectation\":null"));
         assert!(output.contains("\"anchored_transposition_recovery\":[]"));
         assert!(!output.contains("候选实验台"));
 
         let mut escaped = String::new();
         push_json_string(&mut escaped, "\"猫\\\n");
         assert_eq!(escaped, "\"\\\"猫\\\\\\n\"");
+    }
+
+    #[test]
+    fn json_expectation_distinguishes_unchecked_recovery() {
+        let report = report("mafmkm", 1);
+        let mut options = options("mafmkm", 1, false, CandidateLabOutputMode::Json);
+        options.expected_text = Some("麻烦猫猫".to_owned());
+        let output = render_candidate_lab(&report, &options);
+        assert!(output.contains(
+            "\"expectation\":{\"text\":\"麻烦猫猫\",\"match\":\"exact_text\",\"primary_rank\":1,\"recovery_checked\":false,\"recovery_rank\":null}"
+        ));
     }
 }

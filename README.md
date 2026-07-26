@@ -98,8 +98,11 @@ cargo run -- public-compose mafkmm 3
 # 公开、只读的候选实验台：默认显示简洁中文
 cargo run --release -- candidate-lab mafmkm 3
 
+# 课程式检查：直接报告目标文字在当前显示候选中的名次
+cargo run --release -- candidate-lab mafmkm 3 --expect 麻烦猫猫
+
 # 只有明确请求时才显示按键颠倒候选
-cargo run --release -- candidate-lab mafkmm 3 --recovery
+cargo run --release -- candidate-lab mafkmm 3 --recovery --expect 麻烦猫猫
 
 # 研究细节与机器可读结果使用独立输出层
 cargo run --release -- candidate-lab mafmkm 3 --verbose
@@ -132,6 +135,10 @@ CLI 只读取编译进程序的公开演示数据或固定公开快照，不会�
 `candidate-lab` 默认只显示适合直接阅读的中文：普通候选、预计操作数、
 相对完整输入省下的动作，以及每个词使用完整双拼还是简拼。容易干扰正常
 输入的按键颠倒候选默认隐藏，只有显式加入 `--recovery` 才会出现。
+
+`--expect <目标文字>` 增加一次课程式精确检查，直接报告目标在普通栏或
+已开启恢复栏中的名次。它只检查当前显示的 1～10 项；没找到时不会声称
+整个候选空间都没有，恢复栏未开启时也会明确写“未检查”。
 
 算法评分、纠错预算与语言模型证据收进 `--verbose`；自动评测则使用
 `--json` 输出的稳定英文字段。`--verbose` 与 `--json` 互斥，三个层次

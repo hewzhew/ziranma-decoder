@@ -1500,7 +1500,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-decode <按键串> [Top-K]
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
-  cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--recovery] [--verbose|--json]
+  cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--expect <文字>] [--recovery] [--verbose|--json]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
@@ -1527,6 +1527,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-sentence zrmurf
   cargo run -- public-compose mafkmm 3
   cargo run -- candidate-lab mafmkm 3
+  cargo run -- candidate-lab mafmkm 3 --expect 麻烦猫猫
   cargo run -- candidate-lab mafkmm 3 --recovery
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit

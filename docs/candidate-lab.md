@@ -10,7 +10,8 @@
 
 ```powershell
 cargo run --release -- candidate-lab mafmkm 3
-cargo run --release -- candidate-lab mafkmm 3 --recovery
+cargo run --release -- candidate-lab mafmkm 3 --expect 麻烦猫猫
+cargo run --release -- candidate-lab mafkmm 3 --recovery --expect 麻烦猫猫
 cargo run --release -- candidate-lab mafmkm 3 --verbose
 cargo run --release -- candidate-lab mafmkm 3 --json
 ```
@@ -29,6 +30,25 @@ cargo run --release -- candidate-lab mafmkm 3 --json
 
 `--verbose` 与 `--json` 不能同时使用。命令名、选项名、模式版本和 JSON
 字段保留英文；候选解释、操作提示与错误信息使用中文。
+
+## 课程式目标检查
+
+`--expect <文字>` 事先冻结一个目标，并报告它在本次可见候选中的精确
+名次。例如：
+
+```powershell
+cargo run --release -- candidate-lab mafmkm 3 --expect 麻烦猫猫
+cargo run --release -- candidate-lab mafkmm 3 --recovery --expect 麻烦猫猫
+```
+
+第一条会报告目标位于普通候选第 1 名、按键颠倒栏未检查；第二条会报告
+普通候选前 3 项未找到、目标位于按键颠倒候选第 1 名。
+
+检查只比较完全相同的目标文字，不推断同义表达；“前 3 项未找到”也只
+描述已经请求的可见深度，不等于整个候选空间不存在。`--json` 会输出
+`match: "exact_text"`、两个栏的名次和 `recovery_checked`，从而保留
+“未命中”与“根本未检查”的区别。目标只来自本次命令参数，不会保存或
+用于学习。
 
 ## 两个候选栏
 
@@ -72,9 +92,9 @@ cargo run --release -- candidate-lab mafmkm 3 --json
 
 ## 下一步与停止条件
 
-下一层可以增加事先冻结的 `--expect` 课程目标，报告目标在两个栏中的
-名次；再下一层才是本地候选窗或键盘交互。只有以下条件同时成立，动作
-投影才能升级为体验结论：
+下一层可以把多条事先冻结的 `--expect` 课程整理成独立公开用例；再下一层
+才是本地候选窗或键盘交互。只有以下条件同时成立，动作投影才能升级为
+体验结论：
 
 - 真实候选选择、翻页和切栏动作能够被可靠记录；
 - 完整码基线没有退化；
