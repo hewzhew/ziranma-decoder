@@ -3,9 +3,11 @@
 ## Scope
 
 This repository studies a local, privacy-first, explainable noisy-channel
-decoder for Ziranma double pinyin. Keep each change inside the milestone
-described in `docs/design.md`; do not silently expand the project into a full
-IME, GUI, Rime integration, Windows TSF service, or neural model.
+decoder for Ziranma double pinyin. Keep each change inside the milestones
+described in `docs/design.md`. A bounded Windows TSF alpha is now explicitly
+approved in `docs/tsf-alpha.md`; follow its phased install and rollback gates.
+Do not silently expand it into a production IME, broad GUI, Rime integration,
+or neural model.
 
 ## Engineering rules
 

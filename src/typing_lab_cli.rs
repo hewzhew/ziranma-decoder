@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use ziranma_decoder::{LexiconEntry, SentenceCandidate};
+use ziranma_decoder::{
+    CompositionEffect, CompositionInput, CompositionSession, LexiconEntry, SessionSelectionMemory,
+};
 
 pub const TYPING_LAB_USAGE: &str = "\
 连续输入实验台
@@ -25,14 +26,14 @@ Esc 返回或清空；输入为空时再按 Esc 退出。q 始终是普通双拼
 pub const DEFAULT_TYPING_LAB_LIMIT: usize = 5;
 pub const MAX_TYPING_LAB_LIMIT: usize = 10;
 pub const TYPING_LAB_CANDIDATE_POOL_DEPTH: usize = 200;
-const MAX_PHONETIC_KEYS: usize = 64;
 const MAX_COMMITTED_CHARACTERS: usize = 4096;
-const MAX_SESSION_SELECTIONS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TypingLabOptions {
     pub visible_limit: usize,
 }
+
+pub type TypingLabSelectionMemory = SessionSelectionMemory;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypingLabInput {
@@ -49,6 +50,24 @@ pub enum TypingLabInput {
     Invalid,
 }
 
+impl TypingLabInput {
+    fn into_composition(self) -> Option<CompositionInput> {
+        Some(match self {
+            Self::Letters(letters) => CompositionInput::Letters(letters),
+            Self::Confirm => CompositionInput::Confirm,
+            Self::Select(rank) => CompositionInput::Select(rank),
+            Self::Backspace => CompositionInput::Backspace,
+            Self::PreviousPage => CompositionInput::PreviousPage,
+            Self::NextPage => CompositionInput::NextPage,
+            Self::EnterTab => CompositionInput::EnterTab,
+            Self::EnterRecovery => CompositionInput::EnterRecovery,
+            Self::Escape => CompositionInput::Escape,
+            Self::Invalid => CompositionInput::Invalid,
+            Self::Quit => return None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypingLabEffect {
     Continue,
@@ -63,65 +82,7 @@ pub enum TypingLabEffect {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypingLabSession {
     committed: String,
-    phonetic: String,
-    shape_pinyin: Option<String>,
-    stroke_prefix: String,
-    recovery_mode: bool,
-    candidate_page_start: usize,
-    notice: Option<String>,
-}
-
-/// Bounded, memory-only recall of candidates explicitly selected in this run.
-///
-/// The remembered key strings and text are intentionally not exposed through
-/// `Debug`, serialization, or disk I/O. This is an interaction aid, not the
-/// persistent personal model described in `docs/personal-model.md`.
-#[derive(Default)]
-pub struct TypingLabSelectionMemory {
-    selections: VecDeque<(String, SentenceCandidate)>,
-}
-
-impl TypingLabSelectionMemory {
-    pub fn remember(&mut self, code: &str, candidate: &SentenceCandidate) {
-        if code.is_empty() || candidate.text.is_empty() {
-            return;
-        }
-        if let Some(index) = self
-            .selections
-            .iter()
-            .position(|(remembered_code, _)| remembered_code == code)
-        {
-            self.selections.remove(index);
-        }
-        self.selections
-            .push_front((code.to_owned(), candidate.clone()));
-        self.selections.truncate(MAX_SESSION_SELECTIONS);
-    }
-
-    pub fn promote(&self, code: &str, candidates: &mut Vec<SentenceCandidate>) -> bool {
-        let Some((_, preferred_candidate)) = self
-            .selections
-            .iter()
-            .find(|(remembered_code, _)| remembered_code == code)
-        else {
-            return false;
-        };
-        let Some(index) = candidates
-            .iter()
-            .position(|candidate| candidate.text == preferred_candidate.text)
-        else {
-            let original_len = candidates.len();
-            candidates.insert(0, preferred_candidate.clone());
-            candidates.truncate(original_len.max(1));
-            return true;
-        };
-        if index == 0 {
-            return true;
-        }
-        let candidate = candidates.remove(index);
-        candidates.insert(0, candidate);
-        true
-    }
+    composition: CompositionSession,
 }
 
 impl TypingLabSession {
@@ -130,31 +91,31 @@ impl TypingLabSession {
     }
 
     pub fn phonetic(&self) -> &str {
-        &self.phonetic
+        self.composition.phonetic()
     }
 
     pub fn tab_mode(&self) -> bool {
-        self.shape_pinyin.is_some()
+        self.composition.tab_mode()
     }
 
     pub fn recovery_mode(&self) -> bool {
-        self.recovery_mode
+        self.composition.recovery_mode()
     }
 
     pub fn shape_pinyin(&self) -> Option<&str> {
-        self.shape_pinyin.as_deref()
+        self.composition.shape_pinyin()
     }
 
     pub fn stroke_prefix(&self) -> &str {
-        &self.stroke_prefix
+        self.composition.stroke_prefix()
     }
 
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.composition.notice()
     }
 
     pub fn candidate_page_start(&self) -> usize {
-        self.candidate_page_start
+        self.composition.candidate_page_start()
     }
 
     pub fn visible_candidate_range(
@@ -162,12 +123,12 @@ impl TypingLabSession {
         candidate_count: usize,
         page_size: usize,
     ) -> Range<usize> {
-        let start = self.candidate_page_start.min(candidate_count);
-        start..start.saturating_add(page_size).min(candidate_count)
+        self.composition
+            .visible_candidate_range(candidate_count, page_size)
     }
 
     pub fn previous_candidate_page(&mut self, page_size: usize) {
-        self.candidate_page_start = self.candidate_page_start.saturating_sub(page_size);
+        self.composition.previous_candidate_page(page_size);
     }
 
     pub fn next_candidate_page(
@@ -176,34 +137,21 @@ impl TypingLabSession {
         page_size: usize,
         candidate_limit: usize,
     ) {
-        let next = self.candidate_page_start.saturating_add(page_size);
-        if next < candidate_count || next < candidate_limit {
-            self.candidate_page_start = next;
-        } else {
-            self.set_notice("已经是最后一页");
-        }
+        self.composition
+            .next_candidate_page(candidate_count, page_size, candidate_limit);
     }
 
     pub fn normalize_candidate_page(&mut self, candidate_count: usize, page_size: usize) {
-        if self.candidate_page_start == 0 || self.candidate_page_start < candidate_count {
-            return;
-        }
-        self.candidate_page_start = candidate_count
-            .checked_sub(1)
-            .map_or(0, |last| last / page_size * page_size);
-        self.set_notice("已经是最后一页");
+        self.composition
+            .normalize_candidate_page(candidate_count, page_size);
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = Some(notice.into());
+        self.composition.set_notice(notice);
     }
 
     pub fn enter_tab(&mut self, pinyin: impl Into<String>) {
-        self.recovery_mode = false;
-        self.shape_pinyin = Some(pinyin.into());
-        self.stroke_prefix.clear();
-        self.candidate_page_start = 0;
-        self.notice = None;
+        self.composition.enter_tab(pinyin);
     }
 
     pub fn commit(&mut self, text: &str) -> bool {
@@ -218,92 +166,25 @@ impl TypingLabSession {
             return false;
         }
         self.committed.push_str(text);
-        self.phonetic.clear();
-        self.candidate_page_start = 0;
-        self.recovery_mode = false;
-        self.leave_tab();
-        self.notice = None;
+        self.composition.finish_commit();
         true
     }
 
     pub fn apply(&mut self, input: TypingLabInput) -> TypingLabEffect {
-        self.notice = None;
-        match input {
-            TypingLabInput::Letters(letters) if self.tab_mode() => {
-                if letters
-                    .as_bytes()
-                    .iter()
-                    .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z'))
-                {
-                    self.stroke_prefix.push_str(&letters);
-                    self.candidate_page_start = 0;
-                } else {
-                    self.set_notice("笔画只用 h s p n z");
-                }
-            }
-            TypingLabInput::Letters(letters)
-                if letters.as_bytes().iter().all(u8::is_ascii_lowercase) =>
-            {
-                self.recovery_mode = false;
-                let available = MAX_PHONETIC_KEYS.saturating_sub(self.phonetic.len());
-                self.phonetic.extend(letters.chars().take(available));
-                self.candidate_page_start = 0;
-                if letters.len() > available {
-                    self.set_notice("本轮最多输入 64 个字母");
-                }
-            }
-            TypingLabInput::Letters(_) | TypingLabInput::Invalid => {
-                self.set_notice("没有这个操作");
-            }
-            TypingLabInput::Confirm if !self.phonetic.is_empty() => {
-                return TypingLabEffect::Confirm;
-            }
-            TypingLabInput::Confirm => {}
-            TypingLabInput::Select(rank) if !self.phonetic.is_empty() => {
-                return TypingLabEffect::Select(rank);
-            }
-            TypingLabInput::Select(_) => {}
-            TypingLabInput::Backspace if self.tab_mode() => {
-                if self.stroke_prefix.pop().is_none() {
-                    self.leave_tab();
-                }
-                self.candidate_page_start = 0;
-            }
-            TypingLabInput::Backspace => {
-                self.recovery_mode = false;
-                self.phonetic.pop();
-                self.candidate_page_start = 0;
-            }
-            TypingLabInput::PreviousPage if !self.phonetic.is_empty() => {
-                return TypingLabEffect::PreviousPage;
-            }
-            TypingLabInput::NextPage if !self.phonetic.is_empty() => {
-                return TypingLabEffect::NextPage;
-            }
-            TypingLabInput::PreviousPage | TypingLabInput::NextPage => {}
-            TypingLabInput::EnterTab if !self.phonetic.is_empty() && !self.tab_mode() => {
-                return TypingLabEffect::RequestTab;
-            }
-            TypingLabInput::EnterTab => {}
-            TypingLabInput::EnterRecovery if !self.phonetic.is_empty() && !self.tab_mode() => {
-                self.recovery_mode = true;
-                self.candidate_page_start = 0;
-            }
-            TypingLabInput::EnterRecovery => {}
-            TypingLabInput::Escape if self.tab_mode() => self.leave_tab(),
-            TypingLabInput::Escape if self.recovery_mode() => self.recovery_mode = false,
-            TypingLabInput::Escape if !self.phonetic.is_empty() => {
-                self.phonetic.clear();
-                self.candidate_page_start = 0;
-            }
-            TypingLabInput::Escape | TypingLabInput::Quit => return TypingLabEffect::Quit,
+        let exit_on_pass_through = matches!(input, TypingLabInput::Escape);
+        let Some(input) = input.into_composition() else {
+            return TypingLabEffect::Quit;
+        };
+        match self.composition.apply(input) {
+            CompositionEffect::Continue => TypingLabEffect::Continue,
+            CompositionEffect::Confirm => TypingLabEffect::Confirm,
+            CompositionEffect::Select(rank) => TypingLabEffect::Select(rank),
+            CompositionEffect::PreviousPage => TypingLabEffect::PreviousPage,
+            CompositionEffect::NextPage => TypingLabEffect::NextPage,
+            CompositionEffect::RequestTab => TypingLabEffect::RequestTab,
+            CompositionEffect::PassThrough if exit_on_pass_through => TypingLabEffect::Quit,
+            CompositionEffect::PassThrough => TypingLabEffect::Continue,
         }
-        TypingLabEffect::Continue
-    }
-
-    fn leave_tab(&mut self) {
-        self.shape_pinyin = None;
-        self.stroke_prefix.clear();
     }
 }
 

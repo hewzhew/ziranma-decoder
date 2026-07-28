@@ -17,6 +17,7 @@ mod abbreviation;
 mod candidate_lab;
 mod capsule_replay;
 mod codec;
+mod composition;
 mod continuous_capture;
 mod correction_episode;
 mod evaluation;
@@ -50,6 +51,9 @@ pub use capsule_replay::{
     RankingReplayComparisonStats, ReplayStrategyStats, WindowExclusionStats, effective_letter_code,
 };
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
+pub use composition::{
+    CompositionEffect, CompositionInput, CompositionSession, SessionSelectionMemory,
+};
 #[cfg(windows)]
 pub use continuous_capture::WindowsUserDataProtector;
 pub use continuous_capture::{
