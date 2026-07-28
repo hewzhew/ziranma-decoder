@@ -12,12 +12,13 @@ pub const CANDIDATE_LAB_USAGE: &str = "\
   cargo run --release -- candidate-lab <连续按键串> [每栏显示数，1～10] [选项]
 
 选项：
-  --expect <文字>  检查目标文字在当前显示候选中的名次
+  --expect <文字>  检查公开或合成目标在当前显示候选中的名次
   --recovery  显示可能的相邻按键颠倒候选
   --verbose   显示算法评分、纠错预算和语言模型细节
   --json      输出使用稳定英文字段名的机器可读 JSON
 
-`--verbose` 与 `--json` 不能同时使用。";
+`--verbose` 与 `--json` 不能同时使用。
+隐私：按键串、目标和候选会出现在命令行或输出中；当前只用于公开或合成材料。";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateLabOutputMode {
@@ -58,6 +59,9 @@ pub fn parse_candidate_lab_arguments(
                     .ok_or("candidate-lab 的 --expect 后面需要目标文字")?;
                 if value.starts_with('-') {
                     return Err("candidate-lab 的 --expect 后面需要目标文字".into());
+                }
+                if value.trim().is_empty() {
+                    return Err("candidate-lab 的 --expect 后面需要非空目标文字".into());
                 }
                 expected_text = Some(value.to_owned());
             }
@@ -133,7 +137,7 @@ fn render_candidate_lab_concise(
     writeln!(output, "候选实验台").expect("writing to String cannot fail");
     writeln!(
         output,
-        "输入：{}（{} 个字母）；每栏显示 {} 项",
+        "输入：{}（{} 个字母）；每栏最多显示 {} 项",
         report.observed,
         report.observed.as_str().len(),
         report.top_k
@@ -185,12 +189,12 @@ fn render_expectation(
         .flatten();
     let primary_result = match primary_rank {
         Some(rank) => format!("普通候选第 {rank} 名"),
-        None => format!("普通候选前 {} 项未找到", report.top_k),
+        None => missing_visible_result("普通候选", &report.primary),
     };
     let recovery_result = if show_recovery {
         match recovery_rank {
             Some(rank) => format!("按键颠倒候选第 {rank} 名"),
-            None => format!("按键颠倒候选前 {} 项未找到", report.top_k),
+            None => missing_visible_result("按键颠倒候选", &report.anchored_transposition_recovery),
         }
     } else {
         "按键颠倒栏未检查".to_owned()
@@ -199,6 +203,14 @@ fn render_expectation(
         .expect("writing to String cannot fail");
     writeln!(output, "口径：只做目标文字的精确比较，不推断同义表达。")
         .expect("writing to String cannot fail");
+}
+
+fn missing_visible_result(label: &str, rows: &[CandidateLabCandidate]) -> String {
+    if rows.is_empty() {
+        format!("{label}当前没有候选")
+    } else {
+        format!("{label}当前显示的 {} 项中未找到", rows.len())
+    }
 }
 
 fn matching_rank(rows: &[CandidateLabCandidate], expected_text: &str) -> Option<usize> {
@@ -294,7 +306,7 @@ fn render_candidate_lab_verbose(
     .expect("writing to String cannot fail");
     writeln!(
         output,
-        "输入：{}；字母键 {}；每栏显示 {} 个候选",
+        "输入：{}；字母键 {}；每栏最多显示 {} 个候选",
         report.observed,
         report.observed.as_str().len(),
         report.top_k
@@ -442,7 +454,7 @@ fn render_candidate_lab_json(
     expected_text: Option<&str>,
 ) -> String {
     let mut output = String::new();
-    output.push_str("{\"schema\":\"ziranma-candidate-lab-v1\",\"input\":");
+    output.push_str("{\"schema\":\"ziranma-candidate-lab-v1\",\"contains_text\":true,\"input\":");
     push_json_string(&mut output, report.observed.as_str());
     write!(
         output,
@@ -737,6 +749,16 @@ text\tpinyin\tfrequency
         ])
         .unwrap_err();
         assert!(missing.to_string().contains("需要目标文字"));
+
+        for empty in ["", "   "] {
+            let error = parse_candidate_lab_arguments(&[
+                "mafmkm".to_owned(),
+                "--expect".to_owned(),
+                empty.to_owned(),
+            ])
+            .unwrap_err();
+            assert!(error.to_string().contains("需要非空目标文字"));
+        }
     }
 
     #[test]
@@ -758,6 +780,7 @@ text\tpinyin\tfrequency
             &options("mafmkm", 3, false, CandidateLabOutputMode::Concise),
         );
         assert!(output.contains("1. 麻烦猫猫"));
+        assert!(output.contains("每栏最多显示 3 项"));
         assert!(output.contains("预计 7 次操作，比完整输入少 2 次"));
         assert!(output.contains("第 2 个音节使用简拼"));
         assert!(!output.contains("候选评分"));
@@ -796,11 +819,23 @@ text\tpinyin\tfrequency
         recovery_row.lane = CandidateLabLane::AnchoredTranspositionRecovery;
         let recovery_target = recovery_row.candidate.text.clone();
         recovery_report.anchored_transposition_recovery = vec![recovery_row];
+        assert_eq!(recovery_report.primary.len(), 2);
         let mut recovery_options = options("mafmkm", 3, true, CandidateLabOutputMode::Concise);
         recovery_options.expected_text = Some(recovery_target);
         let recovery = render_candidate_lab(&recovery_report, &recovery_options);
-        assert!(recovery.contains("普通候选前 3 项未找到；按键颠倒候选第 1 名"));
+        assert!(recovery.contains("普通候选当前显示的 2 项中未找到；按键颠倒候选第 1 名"));
         assert!(recovery.contains("只做目标文字的精确比较"));
+
+        recovery_options.expected_text = Some("不存在".to_owned());
+        let missing = render_candidate_lab(&recovery_report, &recovery_options);
+        assert!(
+            missing
+                .contains("普通候选当前显示的 2 项中未找到；按键颠倒候选当前显示的 1 项中未找到")
+        );
+
+        recovery_report.anchored_transposition_recovery.clear();
+        let empty_recovery = render_candidate_lab(&recovery_report, &recovery_options);
+        assert!(empty_recovery.contains("按键颠倒候选当前没有候选"));
     }
 
     #[test]
@@ -811,6 +846,7 @@ text\tpinyin\tfrequency
             &options("mafmkm", 1, false, CandidateLabOutputMode::Json),
         );
         assert!(output.starts_with("{\"schema\":\"ziranma-candidate-lab-v1\""));
+        assert!(output.contains("\"contains_text\":true"));
         assert!(output.contains("\"recovery_included\":false"));
         assert!(output.contains("\"expectation\":null"));
         assert!(output.contains("\"anchored_transposition_recovery\":[]"));
