@@ -29,13 +29,14 @@ mod windows_shape_keys;
 use benchmark::{LatencySummary, run_decoder_benchmark};
 use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
 use shape_course_cli::{
-    SHAPE_COURSE_USAGE, ShapeCourseProgress, parse_shape_course_arguments,
-    render_shape_course_screen, render_shape_course_summary,
+    SHAPE_COURSE_USAGE, ShapeCourseAttempt, ShapeCourseAttemptEffect, ShapeCourseProgress,
+    parse_shape_course_arguments, parse_shape_course_input, render_shape_course_screen,
+    render_shape_course_summary,
 };
 use shape_lab_cli::{
     SHAPE_LAB_USAGE, ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect,
-    parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
-    render_shape_lab_screen,
+    normalize_shape_lab_input, parse_shape_lab_arguments, parse_shape_lab_input,
+    render_shape_lab_details, render_shape_lab_screen,
 };
 #[cfg(windows)]
 use windows_shape_keys::WindowsShapeKeyReader;
@@ -1090,15 +1091,21 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let lab = ShapeLab::new(&imported.entries, &shapes);
+    let phonetic_codes = tasks
+        .iter()
+        .map(|task| {
+            encode_pinyin_phrase(&task.pinyin).map(|encoded| encoded.full_code.as_str().to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut input_source = ShapeLabInputSource::open();
     let mut progress = ShapeCourseProgress::default();
-    let mut session = ShapeLabSession::default();
     let mut task_index = 0usize;
+    let mut attempt = ShapeCourseAttempt::new(phonetic_codes[task_index].clone());
     loop {
         let task = &tasks[task_index];
         let snapshot = lab.snapshot(
             &task.pinyin,
-            session.active_prefix(),
+            attempt.active_prefix(),
             Some(task.character),
             10,
         )?;
@@ -1109,7 +1116,7 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 &snapshot,
                 task_index + 1,
                 tasks.len(),
-                &session,
+                &attempt,
                 input_source.direct_keys(),
             )
         );
@@ -1118,14 +1125,14 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         io::stdout().flush()?;
 
-        let Some(input) = input_source.read()? else {
+        let Some(input) = input_source.read_course()? else {
             break;
         };
-        progress.observe_input(&input, &session);
+        progress.observe_input(&input, &attempt);
         let mut advance = false;
-        match session.apply(input) {
-            ShapeLabSessionEffect::Continue => {}
-            ShapeLabSessionEffect::Select(rank) => {
+        match attempt.apply(input) {
+            ShapeCourseAttemptEffect::Continue => {}
+            ShapeCourseAttemptEffect::Select(rank) => {
                 match snapshot
                     .candidates
                     .iter()
@@ -1137,16 +1144,16 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     }
                     Some(_) => {
                         progress.wrong_selections += 1;
-                        session.set_notice("请选目标字");
+                        attempt.set_notice("请选目标字");
                     }
-                    None => session.set_notice("这个位置没有候选"),
+                    None => attempt.set_notice("这个位置没有候选"),
                 }
             }
-            ShapeLabSessionEffect::Skip => {
+            ShapeCourseAttemptEffect::Skip => {
                 progress.skipped += 1;
                 advance = true;
             }
-            ShapeLabSessionEffect::Quit => break,
+            ShapeCourseAttemptEffect::Quit => break,
         }
 
         if advance {
@@ -1154,7 +1161,7 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if task_index == tasks.len() {
                 break;
             }
-            session = ShapeLabSession::default();
+            attempt = ShapeCourseAttempt::new(phonetic_codes[task_index].clone());
         }
     }
 
@@ -1195,13 +1202,28 @@ impl ShapeLabInputSource {
     fn read(&mut self) -> io::Result<Option<ShapeLabInput>> {
         match self {
             #[cfg(windows)]
-            Self::Direct(reader) => reader.read().map(Some),
+            Self::Direct(reader) => reader.read().map(normalize_shape_lab_input).map(Some),
             Self::Line => {
                 let mut input = String::new();
                 if io::stdin().read_line(&mut input)? == 0 {
                     Ok(None)
                 } else {
                     Ok(Some(parse_shape_lab_input(&input)))
+                }
+            }
+        }
+    }
+
+    fn read_course(&mut self) -> io::Result<Option<ShapeLabInput>> {
+        match self {
+            #[cfg(windows)]
+            Self::Direct(reader) => reader.read().map(Some),
+            Self::Line => {
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input)? == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(parse_shape_course_input(&input)))
                 }
             }
         }

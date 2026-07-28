@@ -32,6 +32,7 @@ pub struct ShapeLabCliOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShapeLabInput {
+    Letters(String),
     EnterTab,
     Stroke(String),
     Select(usize),
@@ -78,9 +79,14 @@ impl ShapeLabSession {
         self.notice = Some(notice.into());
     }
 
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
     pub fn apply(&mut self, input: ShapeLabInput) -> ShapeLabSessionEffect {
         self.notice = None;
         match input {
+            ShapeLabInput::Letters(_) => self.set_notice("没有这个操作"),
             ShapeLabInput::EnterTab => self.tab_mode = true,
             ShapeLabInput::Stroke(strokes) if self.tab_mode => {
                 self.stroke_prefix.push_str(&strokes);
@@ -102,6 +108,26 @@ impl ShapeLabSession {
             ShapeLabInput::Invalid => self.set_notice("没有这个操作"),
         }
         ShapeLabSessionEffect::Continue
+    }
+}
+
+pub fn normalize_shape_lab_input(input: ShapeLabInput) -> ShapeLabInput {
+    let ShapeLabInput::Letters(letters) = input else {
+        return input;
+    };
+    match letters.as_str() {
+        "t" => ShapeLabInput::EnterTab,
+        "q" => ShapeLabInput::Quit,
+        value
+            if !value.is_empty()
+                && value
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z')) =>
+        {
+            ShapeLabInput::Stroke(value.to_owned())
+        }
+        _ => ShapeLabInput::Invalid,
     }
 }
 
@@ -373,8 +399,9 @@ fn rank_text(rank: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect, parse_shape_lab_arguments,
-        parse_shape_lab_input, render_shape_lab_details, render_shape_lab_screen,
+        ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect, normalize_shape_lab_input,
+        parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
+        render_shape_lab_screen,
     };
     use ziranma_decoder::{ShapeLabCandidate, ShapeLabSnapshot};
 
@@ -491,6 +518,14 @@ mod tests {
         assert_eq!(parse_shape_lab_input("\n"), ShapeLabInput::Skip);
         assert_eq!(parse_shape_lab_input("q\n"), ShapeLabInput::Quit);
         assert_eq!(parse_shape_lab_input("x\n"), ShapeLabInput::Invalid);
+        assert_eq!(
+            normalize_shape_lab_input(ShapeLabInput::Letters("n".to_owned())),
+            ShapeLabInput::Stroke("n".to_owned())
+        );
+        assert_eq!(
+            normalize_shape_lab_input(ShapeLabInput::Letters("q".to_owned())),
+            ShapeLabInput::Quit
+        );
     }
 
     #[test]

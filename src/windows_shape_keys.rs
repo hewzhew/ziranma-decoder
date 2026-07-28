@@ -17,12 +17,7 @@ const VK_0: u16 = 0x30;
 const VK_9: u16 = 0x39;
 const VK_NUMPAD0: u16 = 0x60;
 const VK_NUMPAD9: u16 = 0x69;
-const VK_H: u16 = 0x48;
-const VK_N: u16 = 0x4e;
-const VK_P: u16 = 0x50;
-const VK_Q: u16 = 0x51;
-const VK_S: u16 = 0x53;
-const VK_T: u16 = 0x54;
+const VK_A: u16 = 0x41;
 const VK_Z: u16 = 0x5a;
 
 pub struct WindowsShapeKeyReader {
@@ -66,12 +61,12 @@ impl WindowsShapeKeyReader {
                 let Some(input) = decode_key_event(&event) else {
                     continue;
                 };
-                let repeat = if matches!(input, ShapeLabInput::Stroke(_) | ShapeLabInput::Backspace)
-                {
-                    usize::from(event.wRepeatCount.max(1)).min(32)
-                } else {
-                    1
-                };
+                let repeat =
+                    if matches!(input, ShapeLabInput::Letters(_) | ShapeLabInput::Backspace) {
+                        usize::from(event.wRepeatCount.max(1)).min(32)
+                    } else {
+                        1
+                    };
                 self.pending.extend(std::iter::repeat_n(input, repeat));
             }
 
@@ -94,15 +89,12 @@ fn decode_key_event(event: &KEY_EVENT_RECORD) -> Option<ShapeLabInput> {
     let key = event.wVirtualKeyCode;
     match key {
         VK_BACK => Some(ShapeLabInput::Backspace),
-        VK_TAB | VK_T => Some(ShapeLabInput::EnterTab),
+        VK_TAB => Some(ShapeLabInput::EnterTab),
         VK_ESCAPE => Some(ShapeLabInput::LeaveTab),
         VK_RETURN => Some(ShapeLabInput::Skip),
-        VK_Q => Some(ShapeLabInput::Quit),
-        VK_H => Some(ShapeLabInput::Stroke("h".to_owned())),
-        VK_S => Some(ShapeLabInput::Stroke("s".to_owned())),
-        VK_P => Some(ShapeLabInput::Stroke("p".to_owned())),
-        VK_N => Some(ShapeLabInput::Stroke("n".to_owned())),
-        VK_Z => Some(ShapeLabInput::Stroke("z".to_owned())),
+        VK_A..=VK_Z => Some(ShapeLabInput::Letters(
+            char::from(b'a' + u8::try_from(key - VK_A).expect("A-Z offset fits u8")).to_string(),
+        )),
         VK_0..=VK_9 => Some(digit_selection(key - VK_0)),
         VK_NUMPAD0..=VK_NUMPAD9 => Some(digit_selection(key - VK_NUMPAD0)),
         _ => None,
@@ -122,7 +114,7 @@ mod tests {
     use windows::Win32::System::Console::{KEY_EVENT_RECORD, LEFT_CTRL_PRESSED};
     use windows_core::BOOL;
 
-    use super::{VK_BACK, VK_H, VK_RETURN, VK_TAB, decode_key_event};
+    use super::{VK_A, VK_BACK, VK_RETURN, VK_TAB, decode_key_event};
     use crate::shape_lab_cli::ShapeLabInput;
 
     fn pressed(key: u16) -> KEY_EVENT_RECORD {
@@ -141,8 +133,8 @@ mod tests {
             Some(ShapeLabInput::EnterTab)
         );
         assert_eq!(
-            decode_key_event(&pressed(VK_H)),
-            Some(ShapeLabInput::Stroke("h".to_owned()))
+            decode_key_event(&pressed(VK_A + u16::from(b'h' - b'a'))),
+            Some(ShapeLabInput::Letters("h".to_owned()))
         );
         assert_eq!(
             decode_key_event(&pressed(VK_BACK)),
@@ -164,11 +156,12 @@ mod tests {
 
     #[test]
     fn ignores_key_releases_and_control_shortcuts() {
-        let mut released = pressed(VK_H);
+        let h = VK_A + u16::from(b'h' - b'a');
+        let mut released = pressed(h);
         released.bKeyDown = BOOL(0);
         assert_eq!(decode_key_event(&released), None);
 
-        let mut control_h = pressed(VK_H);
+        let mut control_h = pressed(h);
         control_h.dwControlKeyState = LEFT_CTRL_PRESSED;
         assert_eq!(decode_key_event(&control_h), None);
     }
