@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
-    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport,
+    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport, analyze_candidate_lab,
     audit_abbreviation_codebook, audit_anchored_tail_failures, audit_continuous_composition,
     audit_public_protocol_context, audit_public_protocols, encode_pinyin_phrase,
     evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
@@ -17,8 +17,10 @@ use ziranma_decoder::{
 };
 
 mod benchmark;
+mod candidate_lab_cli;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
+use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
@@ -69,6 +71,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "sentence-unigram" => run_sentence(&arguments[1..], false),
         "public-sentence" => run_public_sentence(&arguments[1..]),
         "public-compose" => run_public_compose(&arguments[1..]),
+        "candidate-lab" => run_candidate_lab(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
         "public-compose-audit" => run_public_compose_audit(&arguments[1..]),
         "public-protocol-audit" => run_public_protocol_audit(&arguments[1..]),
@@ -824,6 +827,20 @@ fn run_public_compose(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_candidate_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
+        println!("{CANDIDATE_LAB_USAGE}");
+        return Ok(());
+    }
+
+    let options = parse_candidate_lab_arguments(arguments)?;
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let decoder = Decoder::new(imported.entries);
+    let report = analyze_candidate_lab(&decoder, &options.observed, options.top_k)?;
+    print!("{}", render_candidate_lab(&report, &options));
+    Ok(())
+}
+
 fn run_public_compose_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if !arguments.is_empty() {
         return Err("public-compose-evaluate 不接受额外参数".into());
@@ -1368,42 +1385,46 @@ fn print_sentence_candidate_list(candidates: &[ziranma_decoder::SentenceCandidat
             candidate.total_score,
             candidate.unresolved_key_count
         );
-        for (index, segment) in candidate.segments.iter().enumerate() {
-            if segment.candidate.source == CandidateSource::UnresolvedInput {
-                println!(
-                    "   片段 {}：{} -> {} [原样保留；未解析代价 {:.3}；不消耗纠错预算]",
-                    index + 1,
-                    segment.observed,
-                    segment.candidate.text,
-                    segment.candidate.score.unresolved_input_penalty
-                );
-                continue;
-            }
+        print_sentence_candidate_segments(candidate);
+    }
+}
+
+fn print_sentence_candidate_segments(candidate: &ziranma_decoder::SentenceCandidate) {
+    for (index, segment) in candidate.segments.iter().enumerate() {
+        if segment.candidate.source == CandidateSource::UnresolvedInput {
             println!(
-                "   词 {}：{} -> {} [{}；{}；{}]",
+                "   片段 {}：{} -> {} [原样保留；未解析代价 {:.3}；不消耗纠错预算]",
                 index + 1,
                 segment.observed,
                 segment.candidate.text,
-                segment.candidate.spelling.code,
-                segment.candidate.spelling.description(),
-                segment.candidate.correction.description()
+                segment.candidate.score.unresolved_input_penalty
             );
-            if let Some(bigram) = segment.language_score.bigram {
-                println!(
-                    "      语言分 {:.3} = unigram {:.3} 与 bigram {:.3} 插值；共现 {}/{}，α={:.1}",
-                    segment.language_score.interpolated_log_probability,
-                    segment.language_score.unigram_log_probability,
-                    bigram.log_probability,
-                    bigram.observed_count,
-                    bigram.predecessor_total,
-                    bigram.alpha
-                );
-            } else {
-                println!(
-                    "      语言分 {:.3}（首词或未启用 bigram，使用 unigram）",
-                    segment.language_score.interpolated_log_probability
-                );
-            }
+            continue;
+        }
+        println!(
+            "   词 {}：{} -> {} [{}；{}；{}]",
+            index + 1,
+            segment.observed,
+            segment.candidate.text,
+            segment.candidate.spelling.code,
+            segment.candidate.spelling.description(),
+            segment.candidate.correction.description()
+        );
+        if let Some(bigram) = segment.language_score.bigram {
+            println!(
+                "      语言分 {:.3} = unigram {:.3} 与 bigram {:.3} 插值；共现 {}/{}，α={:.1}",
+                segment.language_score.interpolated_log_probability,
+                segment.language_score.unigram_log_probability,
+                bigram.log_probability,
+                bigram.observed_count,
+                bigram.predecessor_total,
+                bigram.alpha
+            );
+        } else {
+            println!(
+                "      语言分 {:.3}（首词或未启用 bigram，使用 unigram）",
+                segment.language_score.interpolated_log_probability
+            );
         }
     }
 }
@@ -1479,6 +1500,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-decode <按键串> [Top-K]
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
+  cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--expect <文字>] [--recovery] [--verbose|--json]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
@@ -1504,6 +1526,9 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- sentence zrmurf
   cargo run -- public-sentence zrmurf
   cargo run -- public-compose mafkmm 3
+  cargo run -- candidate-lab mafmkm 3
+  cargo run -- candidate-lab mafmkm 3 --expect 麻烦猫猫
+  cargo run -- candidate-lab mafkmm 3 --recovery
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit

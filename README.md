@@ -95,6 +95,19 @@ cargo run -- public-sentence zrmurf 10
 # 连续尾部简写，并单独保留一次相邻颠倒恢复
 cargo run -- public-compose mafkmm 3
 
+# 使用固定公开词典的只读候选实验台：默认显示简洁中文
+cargo run --release -- candidate-lab mafmkm 3
+
+# 课程式检查：直接报告目标文字在当前显示候选中的名次
+cargo run --release -- candidate-lab mafmkm 3 --expect 麻烦猫猫
+
+# 只有明确请求时才显示按键颠倒候选
+cargo run --release -- candidate-lab mafkmm 3 --recovery --expect 麻烦猫猫
+
+# 研究细节与机器可读结果使用独立输出层
+cargo run --release -- candidate-lab mafmkm 3 --verbose
+cargo run --release -- candidate-lab mafmkm 3 --json
+
 # 固定公开 2～6 字双词短语的连续输入评测
 cargo run --release -- public-compose-evaluate
 
@@ -114,8 +127,33 @@ cargo run --release -- public-protocol-context-audit
 cargo run --release -- benchmark 3
 ```
 
-CLI 只读取编译进程序的公开演示数据或固定公开快照，不会把输入写入
-磁盘。
+CLI 程序自身只读取编译进程序的公开演示数据或固定公开快照，不会主动把
+输入持久化；命令行历史、终端回滚和重定向输出属于程序之外的明文边界。
+
+## 候选实验台
+
+`candidate-lab` 默认只显示适合直接阅读的中文：普通候选、预计操作数、
+相对完整输入省下的动作，以及每个词使用完整双拼还是简拼。容易干扰正常
+输入的按键颠倒候选默认隐藏，只有显式加入 `--recovery` 才会出现。
+
+`--expect <目标文字>` 增加一次课程式精确检查，直接报告目标在普通栏或
+已开启恢复栏中的名次。它只检查每栏当前实际显示的候选（最多 10 项）；
+没找到时不会声称整个候选空间都没有，恢复栏未开启时也会明确写“未检查”。
+
+当前 `candidate-lab` 只应用于公开、人工构造或合成材料：连续按键串和
+`--expect` 目标都会作为命令行参数进入 shell，输入、目标和候选也会原样
+出现在终端或 JSON 中。程序自身不会学习或持久化这些内容，但 PowerShell
+历史、终端回滚、重定向和自动化日志仍可能保存明文；在提供不经过命令行
+参数的私人入口前，不要用它输入私人聊天内容。
+
+算法评分、纠错预算与语言模型证据收进 `--verbose`；自动评测则使用
+`--json` 输出的稳定英文字段，并以 `contains_text: true` 明示其中含输入、
+候选及可选目标文字。`--verbose` 与 `--json` 互斥，三个层次不会再混进
+同一个终端界面。
+
+预计操作仍只是统一口径的投影，不估算翻页与视觉查找。普通候选仍可能
+包含自由混合简拼，也不等于最终输入协议。完整边界、首份实例和停止条件见
+[候选实验台：从程序指标到真实手感](docs/candidate-lab.md)。
 
 ## Tab 音形辅助原型
 
