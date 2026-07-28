@@ -322,6 +322,11 @@ train 训练现有 word bigram，`--public-character-context` 从同一批公开
 历史 token/type/repeated 证据量，其中 repeated 等于 token 减 type。
 没有历史重复词对时停止增加更长 n-gram，等待真实后续会话。
 
+任何持久化个人模型都必须晚于上述独立历史/评测门槛。拟议格式只保存
+DPAPI 加密的最终词频、可选有序词对、兼容指纹与来源去重证据，不保存
+原始事件、按键或聊天正文；记录器与模型写入继续分离。完整生命周期、
+原子轮换和回退边界见[加密个人模型设计](personal-model.md)。
+
 ## 大词典规模探针
 
 Rime `pinyin-simp` 固定快照包含 65,125 行。导入器不改写源文件，而是
