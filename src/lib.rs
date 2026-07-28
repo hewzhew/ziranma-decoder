@@ -42,7 +42,10 @@ mod tracker;
 mod tsf_alpha;
 
 #[cfg(windows)]
-pub use tsf_alpha::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
+pub use tsf_alpha::{
+    TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID, TsfCandidatePreflightError,
+    TsfCandidatePreflightReport, preflight_candidate_snapshot,
+};
 
 pub use abbreviation::{
     AbbreviationAuditError, AbbreviationCodebookAudit, ImmediateAmbiguityWitness,

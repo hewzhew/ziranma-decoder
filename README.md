@@ -187,8 +187,19 @@ cargo run --release --bin candidatectl -- build `
   --public
 ```
 
+候选包可以在不注册输入法的情况下经过真实 Windows TSF 合成 Context 预检：
+
+```powershell
+cargo run --release --bin candidatectl -- preflight `
+  --package .local/candidate-demo-v1
+```
+
+预检从包内确定性选择一个完整码首选，逐键验证预编辑，再用空格确认上屏；
+报告只显示版本、按键数、上屏字数和结果，不显示候选正文。
+
 显式指定的本地槽库支持 `status`、`adopt`、`stage`、`promote` 和 `rollback`。
-它只接受通过完整校验的公开明文包；槽位状态原子替换，包文件不就地改写：
+它只接受通过完整校验和 TSF 预检的公开明文包；槽位状态原子替换，包文件不
+就地改写。预检凭据绑定包的内容标识，缺失、损坏或包被改写都会阻止提升：
 
 ```powershell
 cargo run --release --bin candidatectl -- adopt `
@@ -198,7 +209,7 @@ cargo run --release --bin candidatectl -- status --root .local/candidate-slots
 ```
 
 这些槽位目前只管理开发数据，不会改变已加载的 TSF：默认类工厂仍使用编译进
-DLL 的公开演示包。外部 current 加载和候选版本合成宿主门禁尚未接通。
+DLL 的公开演示包。外部 current 加载尚未接通。
 
 发布 DLL 的架构、COM 导出、证书目录和固定 zh-CN 语言配置可以先用只读工具
 核对；它不提供注册或激活命令：

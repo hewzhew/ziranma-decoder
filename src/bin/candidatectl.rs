@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
@@ -15,16 +16,22 @@ use windows::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows::core::PCWSTR;
 
+#[cfg(windows)]
+use ziranma_core::preflight_candidate_snapshot;
 use ziranma_core::{
     CandidatePackageManifest, CandidateSlotState, CandidateSnapshot,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, candidate_payload_fingerprint,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, candidate_payload_fingerprint, parse_lexicon_tsv,
 };
 
 const PACKAGE_MANIFEST_FILE: &str = "manifest.zcm";
 const PACKAGE_PAYLOAD_FILE: &str = "lexicon.tsv";
 const PACKAGES_DIRECTORY: &str = "packages";
+const PREFLIGHTS_DIRECTORY: &str = "preflights";
 const SLOT_STATE_FILE: &str = "slots.zcs";
+const PREFLIGHT_RECEIPT_SCHEMA: &str = "ziranma-candidate-preflight-v1";
+const PREFLIGHT_HOST_SCHEMA: &str = "tsf-synthetic-context-v1";
+const MAX_PREFLIGHT_RECEIPT_BYTES: usize = 256;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -37,6 +44,9 @@ enum Options {
         source: PathBuf,
         output: PathBuf,
         revision: String,
+    },
+    Preflight {
+        package: PathBuf,
     },
     Status {
         root: PathBuf,
@@ -61,7 +71,13 @@ struct LoadedPackage {
     manifest_text: String,
     payload_text: String,
     manifest: CandidatePackageManifest,
-    snapshot: CandidateSnapshot,
+    snapshot: Arc<CandidateSnapshot>,
+}
+
+struct PreflightSummary {
+    revision: String,
+    input_keys: usize,
+    committed_characters: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             revision,
         } => build_public_package(&source, &output, &revision)?,
+        Options::Preflight { package } => preflight(&package)?,
         Options::Status { root } => status(&root)?,
         Options::Adopt { root, package } => adopt(&root, &package)?,
         Options::Stage { root, package } => stage(&root, &package)?,
@@ -101,6 +118,9 @@ fn parse_options(
     match command.as_str() {
         "inspect" => parse_inspect(arguments),
         "build" => parse_build(arguments),
+        "preflight" => Ok(Options::Preflight {
+            package: parse_package_only(arguments, "preflight")?,
+        }),
         "status" => Ok(Options::Status {
             root: parse_root_only(arguments, "status")?,
         }),
@@ -211,6 +231,20 @@ fn parse_root_and_package(
     ))
 }
 
+fn parse_package_only(
+    mut arguments: impl Iterator<Item = String>,
+    command: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut package = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            _ => return Err(format!("unknown {command} argument; value was suppressed").into()),
+        }
+    }
+    package.ok_or_else(|| format!("{command} requires exactly one --package path").into())
+}
+
 fn set_path(
     slot: &mut Option<PathBuf>,
     arguments: &mut impl Iterator<Item = String>,
@@ -242,6 +276,7 @@ fn print_usage() {
     eprintln!(
         "  build --source <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --public"
     );
+    eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!("  status --root <SLOT_DIR>");
     eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR>");
     eprintln!("  promote|rollback --root <SLOT_DIR>");
@@ -296,6 +331,12 @@ fn status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     render_slot_report(root, &state)
 }
 
+fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    let summary = preflight_loaded_package(&loaded)?;
+    Ok(render_preflight_report(&summary))
+}
+
 fn adopt(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_some() {
@@ -305,9 +346,15 @@ fn adopt(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Erro
     let revision = loaded.snapshot.revision().to_owned();
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
+    let installed = load_installed_package(root, &package_id)?;
+    preflight_loaded_package(&installed)?;
+    write_preflight_receipt(root, &package_id)?;
     state.adopt(&package_id)?;
     write_slot_state(root, &state)?;
-    Ok(render_change_report("当前候选包已建立", &revision))
+    Ok(render_preflight_change_report(
+        "当前候选包已建立",
+        &revision,
+    ))
 }
 
 fn stage(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -319,15 +366,27 @@ fn stage(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Erro
     let revision = loaded.snapshot.revision().to_owned();
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
+    let installed = load_installed_package(root, &package_id)?;
+    preflight_loaded_package(&installed)?;
+    write_preflight_receipt(root, &package_id)?;
     state.stage(&package_id)?;
     write_slot_state(root, &state)?;
-    Ok(render_change_report("待切换候选包已暂存", &revision))
+    Ok(render_preflight_change_report(
+        "待切换候选包已暂存",
+        &revision,
+    ))
 }
 
 fn promote(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     validate_installed_slot(root, state.current())?;
     let next = validate_installed_slot(root, state.candidate())?;
+    validate_preflight_receipt(
+        root,
+        state
+            .candidate()
+            .ok_or("required candidate slot is empty")?,
+    )?;
     let revision = next.snapshot.revision().to_owned();
     state.promote()?;
     write_slot_state(root, &state)?;
@@ -338,6 +397,10 @@ fn rollback(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     validate_installed_slot(root, state.current())?;
     let previous = validate_installed_slot(root, state.previous())?;
+    validate_preflight_receipt(
+        root,
+        state.previous().ok_or("required previous slot is empty")?,
+    )?;
     let revision = previous.snapshot.revision().to_owned();
     state.rollback()?;
     write_slot_state(root, &state)?;
@@ -374,6 +437,43 @@ fn render_build_report(snapshot: &CandidateSnapshot) -> String {
     )
 }
 
+fn render_preflight_report(summary: &PreflightSummary) -> String {
+    format!(
+        "TSF 候选预检\n版本：{}\n输入：{} 键\n上屏：{} 字\n结果：通过\n本次操作：不写文件\n",
+        summary.revision, summary.input_keys, summary.committed_characters
+    )
+}
+
+#[cfg(windows)]
+fn preflight_loaded_package(
+    loaded: &LoadedPackage,
+) -> Result<PreflightSummary, Box<dyn std::error::Error>> {
+    let entries = parse_lexicon_tsv(&loaded.payload_text)
+        .map_err(|_| "candidate package has no usable TSF preflight probe")?;
+    let probe = entries
+        .first()
+        .ok_or("candidate package has no usable TSF preflight probe")?;
+    let code = probe.code.as_str();
+    let expected = loaded
+        .snapshot
+        .candidate_text(code, 1)?
+        .ok_or("candidate package produced no TSF preflight candidate")?;
+    let report =
+        preflight_candidate_snapshot(Arc::clone(&loaded.snapshot), code, expected.as_str())?;
+    Ok(PreflightSummary {
+        revision: report.revision().to_owned(),
+        input_keys: report.input_keys(),
+        committed_characters: report.committed_characters(),
+    })
+}
+
+#[cfg(not(windows))]
+fn preflight_loaded_package(
+    _loaded: &LoadedPackage,
+) -> Result<PreflightSummary, Box<dyn std::error::Error>> {
+    Err("TSF candidate preflight requires Windows".into())
+}
+
 fn render_slot_report(
     root: &Path,
     state: &CandidateSlotState,
@@ -391,6 +491,10 @@ fn render_slot_report(
 
 fn render_change_report(action: &str, revision: &str) -> String {
     format!("{action}\n版本：{revision}\n")
+}
+
+fn render_preflight_change_report(action: &str, revision: &str) -> String {
+    format!("{action}\n版本：{revision}\nTSF 预检：通过\n")
 }
 
 fn slot_revision(
@@ -433,7 +537,7 @@ fn load_package_directory(package: &Path) -> Result<LoadedPackage, Box<dyn std::
         MAX_CANDIDATE_SNAPSHOT_BYTES,
     )?;
     let manifest = CandidatePackageManifest::parse(&manifest_text)?;
-    let snapshot = manifest.load_snapshot(&payload_text)?;
+    let snapshot = Arc::new(manifest.load_snapshot(&payload_text)?);
     Ok(LoadedPackage {
         manifest_text,
         payload_text,
@@ -458,6 +562,9 @@ fn load_installed_package(
     if loaded.snapshot.contains_private_text() {
         return Err("candidate slot unexpectedly contains plaintext private text".into());
     }
+    if package_storage_id(&loaded) != package_id {
+        return Err("installed candidate package no longer matches its storage identifier".into());
+    }
     Ok(loaded)
 }
 
@@ -465,9 +572,7 @@ fn install_package(
     root: &Path,
     loaded: &LoadedPackage,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let manifest_id = candidate_payload_fingerprint(loaded.manifest_text.as_bytes());
-    let payload_id = candidate_payload_fingerprint(loaded.payload_text.as_bytes());
-    let package_id = format!("pkg-{manifest_id:016x}-{payload_id:016x}");
+    let package_id = package_storage_id(loaded);
     let packages = root.join(PACKAGES_DIRECTORY);
     let destination = packages.join(&package_id);
 
@@ -504,6 +609,63 @@ fn install_package(
     Ok(package_id)
 }
 
+fn package_storage_id(loaded: &LoadedPackage) -> String {
+    let manifest_id = candidate_payload_fingerprint(loaded.manifest_text.as_bytes());
+    let payload_id = candidate_payload_fingerprint(loaded.payload_text.as_bytes());
+    format!("pkg-{manifest_id:016x}-{payload_id:016x}")
+}
+
+fn preflight_receipt_body(package_id: &str) -> String {
+    format!(
+        "schema={PREFLIGHT_RECEIPT_SCHEMA}\npackage={package_id}\nhost={PREFLIGHT_HOST_SCHEMA}\n"
+    )
+}
+
+fn preflight_receipt_path(root: &Path, package_id: &str) -> PathBuf {
+    root.join(PREFLIGHTS_DIRECTORY)
+        .join(format!("{package_id}.zpf"))
+}
+
+fn write_preflight_receipt(
+    root: &Path,
+    package_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = preflight_receipt_body(package_id);
+    let path = preflight_receipt_path(root, package_id);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let existing = read_explicit_text(
+                &path,
+                "candidate preflight receipt",
+                MAX_PREFLIGHT_RECEIPT_BYTES,
+            )?;
+            if existing != expected {
+                return Err("candidate preflight receipt does not match its package".into());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_new_synced(&path, expected.as_bytes())
+        }
+        Err(_) => Err("cannot inspect candidate preflight receipt".into()),
+    }
+}
+
+fn validate_preflight_receipt(
+    root: &Path,
+    package_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let receipt = read_explicit_text(
+        &preflight_receipt_path(root, package_id),
+        "candidate preflight receipt",
+        MAX_PREFLIGHT_RECEIPT_BYTES,
+    )?;
+    if receipt != preflight_receipt_body(package_id) {
+        return Err("candidate preflight receipt does not match its package".into());
+    }
+    Ok(())
+}
+
 fn prepare_slot_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     match fs::symlink_metadata(root) {
         Ok(_) => ensure_regular_directory(root, "candidate slot root")?,
@@ -520,6 +682,14 @@ fn prepare_slot_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
             fs::create_dir(&packages).map_err(|_| "cannot create candidate package store")?;
         }
         Err(_) => return Err("cannot inspect candidate package store".into()),
+    }
+    let preflights = root.join(PREFLIGHTS_DIRECTORY);
+    match fs::symlink_metadata(&preflights) {
+        Ok(_) => ensure_regular_directory(&preflights, "candidate preflight store")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&preflights).map_err(|_| "cannot create candidate preflight store")?;
+        }
+        Err(_) => return Err("cannot inspect candidate preflight store".into()),
     }
     Ok(())
 }
@@ -691,6 +861,18 @@ mod tests {
             }
         );
         assert!(parse_options(["build".to_owned()]).is_err());
+        assert_eq!(
+            parse_options([
+                "preflight".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+            ])
+            .unwrap(),
+            Options::Preflight {
+                package: PathBuf::from("package")
+            }
+        );
+        assert!(parse_options(["preflight".to_owned()]).is_err());
         assert!(
             parse_options([
                 "build".to_owned(),
@@ -720,6 +902,19 @@ mod tests {
         assert!(!report.contains("你好"));
         assert!(!report.contains("nihk"));
         assert!(!report.contains("592a4dbb4b33efa6"));
+
+        let preflight = render_preflight_report(&PreflightSummary {
+            revision: "tsf-public-demo-v1".to_owned(),
+            input_keys: 4,
+            committed_characters: 2,
+        });
+        assert_eq!(
+            preflight,
+            "TSF 候选预检\n版本：tsf-public-demo-v1\n输入：4 键\n上屏：2 字\n\
+             结果：通过\n本次操作：不写文件\n"
+        );
+        assert!(!preflight.contains("你好"));
+        assert!(!preflight.contains("nihk"));
     }
 
     #[test]
@@ -747,6 +942,14 @@ mod tests {
         assert!(!slots.exists());
 
         adopt(&slots, &package_a).unwrap();
+        let adopted_state = read_slot_state(&slots).unwrap();
+        let receipt = fs::read_to_string(preflight_receipt_path(
+            &slots,
+            adopted_state.current().unwrap(),
+        ))
+        .unwrap();
+        assert!(!receipt.contains("你好"));
+        assert!(!receipt.contains("nihk"));
         assert_eq!(
             status(&slots).unwrap(),
             "候选数据槽\n当前：public-a\n待切换：无\n可回退：无\n本次操作：只读\n"
@@ -766,6 +969,90 @@ mod tests {
             status(&slots).unwrap(),
             "候选数据槽\n当前：public-a\n待切换：无\n可回退：public-b\n本次操作：只读\n"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_preflight_receipt_blocks_promotion_without_changing_slots() {
+        let root = temporary_test_root();
+        let source = root.join("source.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let slots = root.join("slots");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, LEXICON).unwrap();
+        build_public_package(&source, &package_a, "receipt-a").unwrap();
+        build_public_package(&source, &package_b, "receipt-b").unwrap();
+        adopt(&slots, &package_a).unwrap();
+        stage(&slots, &package_b).unwrap();
+
+        let before = read_slot_state(&slots).unwrap();
+        let candidate = before.candidate().unwrap();
+        fs::remove_file(preflight_receipt_path(&slots, candidate)).unwrap();
+        assert!(promote(&slots).is_err());
+        assert_eq!(read_slot_state(&slots).unwrap(), before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_installed_package_cannot_reuse_an_old_preflight_receipt() {
+        let root = temporary_test_root();
+        let source = root.join("source.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let slots = root.join("slots");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, LEXICON).unwrap();
+        build_public_package(&source, &package_a, "immutable-a").unwrap();
+        build_public_package(&source, &package_b, "immutable-b").unwrap();
+        adopt(&slots, &package_a).unwrap();
+        stage(&slots, &package_b).unwrap();
+
+        let before = read_slot_state(&slots).unwrap();
+        let candidate = before.candidate().unwrap();
+        let changed_manifest =
+            CandidatePackageManifest::from_payload("changed-after-preflight", false, LEXICON)
+                .unwrap()
+                .render();
+        fs::write(
+            slots
+                .join(PACKAGES_DIRECTORY)
+                .join(candidate)
+                .join(PACKAGE_MANIFEST_FILE),
+            changed_manifest,
+        )
+        .unwrap();
+        assert!(promote(&slots).is_err());
+        assert_eq!(read_slot_state(&slots).unwrap(), before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_tsf_preflight_leaves_current_and_candidate_unchanged() {
+        let root = temporary_test_root();
+        let source_a = root.join("source-a.tsv");
+        let source_b = root.join("source-b.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let slots = root.join("slots");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source_a, LEXICON).unwrap();
+        fs::write(
+            &source_b,
+            format!("text\tpinyin\tfrequency\n{}\ta\t1\n", "测".repeat(257)),
+        )
+        .unwrap();
+        build_public_package(&source_a, &package_a, "preflight-good").unwrap();
+        build_public_package(&source_b, &package_b, "preflight-rejected").unwrap();
+        adopt(&slots, &package_a).unwrap();
+
+        let before = read_slot_state(&slots).unwrap();
+        let error = stage(&slots, &package_b).unwrap_err().to_string();
+        assert!(!error.contains('测'));
+        assert_eq!(read_slot_state(&slots).unwrap(), before);
 
         fs::remove_dir_all(root).unwrap();
     }

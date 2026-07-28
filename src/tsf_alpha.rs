@@ -5,7 +5,9 @@
 //! without adding an input profile to Windows.
 
 use std::cell::RefCell;
+use std::error::Error as StdError;
 use std::ffi::c_void;
+use std::fmt;
 use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,19 +21,22 @@ use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, LPARAM, S_FALSE,
     S_OK, WPARAM,
 };
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize, IClassFactory, IClassFactory_Impl,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_0, VK_9, VK_A, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_NEXT,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
 };
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
-    ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
-    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfSource, ITfTextInputProcessor_Impl,
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
-    ITfThreadMgrEventSink_Impl, TF_AE_NONE, TF_ANCHOR_END, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
-    TF_ES_ASYNC, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION, TF_SELECTION,
-    TF_SELECTIONSTYLE,
+    CLSID_TF_ThreadMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
+    ITfContextComposition, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl,
+    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange,
+    ITfSource, ITfTextInputProcessor_Impl, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
+    ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_AE_NONE, TF_ANCHOR_END,
+    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_IAS_NO_DEFAULT_COMPOSITION, TF_POPF_ALL, TF_SELECTION, TF_SELECTIONSTYLE, TF_TF_MOVESTART,
 };
 use windows::core::{
     Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -46,6 +51,7 @@ pub const TSF_ALPHA_LANGID: u16 = 0x0804;
 
 static ACTIVE_COM_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
+static SYNTHETIC_HOST_LOCK: Mutex<()> = Mutex::new(());
 
 // This deliberately small, manually constructed public fixture is only a
 // bridge between the COM lifecycle and the real decoder. Loading the complete
@@ -63,7 +69,7 @@ type CandidateProviderLoadResult =
     std::result::Result<Arc<dyn CandidateProvider>, CandidatePackageError>;
 
 struct DevelopmentCandidateProvider {
-    snapshot: CandidateSnapshot,
+    snapshot: Arc<CandidateSnapshot>,
 }
 
 impl CandidateProvider for DevelopmentCandidateProvider {
@@ -77,10 +83,393 @@ fn development_candidate_provider() -> CandidateProviderLoadResult {
     PROVIDER
         .get_or_init(|| {
             let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST)?;
-            let snapshot = manifest.load_snapshot(TSF_DEVELOPMENT_LEXICON)?;
+            let snapshot = Arc::new(manifest.load_snapshot(TSF_DEVELOPMENT_LEXICON)?);
             Ok(Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
         })
         .clone()
+}
+
+const MAX_TSF_PREFLIGHT_CODE_KEYS: usize = 64;
+const MAX_TSF_PREFLIGHT_TEXT_CHARACTERS: usize = 256;
+
+/// Redacted evidence from one real TSF synthetic-context candidate preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TsfCandidatePreflightReport {
+    revision: String,
+    input_keys: usize,
+    committed_characters: usize,
+}
+
+impl TsfCandidatePreflightReport {
+    /// Returns the immutable candidate data revision that was exercised.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Returns the number of lowercase letter keys routed through TSF.
+    pub fn input_keys(&self) -> usize {
+        self.input_keys
+    }
+
+    /// Returns the number of Unicode scalar values committed to the context.
+    pub fn committed_characters(&self) -> usize {
+        self.committed_characters
+    }
+}
+
+/// Sanitized failures from a candidate snapshot's TSF synthetic-host preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TsfCandidatePreflightError {
+    /// The probe code is empty, too long, or not lowercase ASCII.
+    InvalidProbeCode,
+    /// The expected commit is empty or exceeds the fixed bound.
+    InvalidExpectedText,
+    /// The snapshot does not rank the supplied expected text first.
+    CandidateMismatch,
+    /// Another synthetic-host operation is already using local COM state.
+    HostBusy,
+    /// The calling thread could not enter a compatible COM apartment.
+    ComInitialization,
+    /// The system TSF thread manager could not be created or activated.
+    ThreadManager,
+    /// The local class factory could not construct or activate its service.
+    ServiceActivation,
+    /// The synthetic document, context, or focus could not be prepared.
+    ContextSetup,
+    /// A probe key was rejected or its edit transaction failed.
+    KeyRouting,
+    /// The live preedit text differed from the supplied code.
+    PreeditMismatch,
+    /// The final context text differed from the expected candidate.
+    CommitMismatch,
+    /// TSF objects could not be cleanly released after the probe.
+    Cleanup,
+}
+
+impl fmt::Display for TsfCandidatePreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProbeCode => write!(formatter, "TSF 预检按键无效"),
+            Self::InvalidExpectedText => write!(formatter, "TSF 预检目标文字无效"),
+            Self::CandidateMismatch => write!(formatter, "候选快照与 TSF 预检目标不符"),
+            Self::HostBusy => write!(formatter, "TSF 合成宿主当前不可用"),
+            Self::ComInitialization => write!(formatter, "TSF 预检无法初始化 COM"),
+            Self::ThreadManager => write!(formatter, "TSF 预检无法建立线程管理器"),
+            Self::ServiceActivation => write!(formatter, "TSF 预检无法激活文本服务"),
+            Self::ContextSetup => write!(formatter, "TSF 预检无法建立合成输入框"),
+            Self::KeyRouting => write!(formatter, "TSF 预检按键事务失败"),
+            Self::PreeditMismatch => write!(formatter, "TSF 预检组合文字不符"),
+            Self::CommitMismatch => write!(formatter, "TSF 预检上屏文字不符"),
+            Self::Cleanup => write!(formatter, "TSF 预检清理失败"),
+        }
+    }
+}
+
+impl StdError for TsfCandidatePreflightError {}
+
+/// Routes one snapshot candidate through a real system TSF synthetic context.
+///
+/// The caller supplies the expected first candidate explicitly. Neither the
+/// probe code nor its candidate text is retained in the returned report.
+pub fn preflight_candidate_snapshot(
+    snapshot: Arc<CandidateSnapshot>,
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<TsfCandidatePreflightReport, TsfCandidatePreflightError> {
+    if probe_code.is_empty()
+        || probe_code.len() > MAX_TSF_PREFLIGHT_CODE_KEYS
+        || !probe_code.bytes().all(|byte| byte.is_ascii_lowercase())
+    {
+        return Err(TsfCandidatePreflightError::InvalidProbeCode);
+    }
+    let committed_characters = expected_text.chars().count();
+    if committed_characters == 0 || committed_characters > MAX_TSF_PREFLIGHT_TEXT_CHARACTERS {
+        return Err(TsfCandidatePreflightError::InvalidExpectedText);
+    }
+    if snapshot
+        .candidate_text(probe_code, 1)
+        .map_err(|_| TsfCandidatePreflightError::CandidateMismatch)?
+        .as_deref()
+        != Some(expected_text)
+    {
+        return Err(TsfCandidatePreflightError::CandidateMismatch);
+    }
+
+    let _host_guard = SYNTHETIC_HOST_LOCK
+        .lock()
+        .map_err(|_| TsfCandidatePreflightError::HostBusy)?;
+    if !can_unload_now() {
+        return Err(TsfCandidatePreflightError::HostBusy);
+    }
+    let revision = snapshot.revision().to_owned();
+    let result = run_candidate_preflight(snapshot, probe_code, expected_text);
+    if !can_unload_now() {
+        return Err(TsfCandidatePreflightError::Cleanup);
+    }
+    result?;
+    Ok(TsfCandidatePreflightReport {
+        revision,
+        input_keys: probe_code.len(),
+        committed_characters,
+    })
+}
+
+struct PreflightApartment;
+
+impl PreflightApartment {
+    fn enter() -> std::result::Result<Self, TsfCandidatePreflightError> {
+        // SAFETY: the preflight owns this calling thread until the matching
+        // guard is dropped and requests a single-threaded COM apartment.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .map_err(|_| TsfCandidatePreflightError::ComInitialization)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for PreflightApartment {
+    fn drop(&mut self) {
+        // SAFETY: balances the successful CoInitializeEx on this thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
+struct ThreadManagerActivation {
+    manager: ITfThreadMgr,
+    active: bool,
+}
+
+impl ThreadManagerActivation {
+    fn close(&mut self) -> Result<()> {
+        if self.active {
+            // SAFETY: balances the successful Activate on this apartment.
+            unsafe { self.manager.Deactivate() }?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ThreadManagerActivation {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+struct ServiceActivation {
+    service: ITfTextInputProcessorEx,
+    active: bool,
+}
+
+impl ServiceActivation {
+    fn close(&mut self) -> Result<()> {
+        if self.active {
+            // SAFETY: balances the successful process-local ActivateEx.
+            unsafe { self.service.Deactivate() }?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServiceActivation {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+struct DocumentActivation {
+    manager: ITfDocumentMgr,
+    pushed: bool,
+}
+
+impl DocumentActivation {
+    fn close(&mut self) -> Result<()> {
+        if self.pushed {
+            // SAFETY: removes every context pushed by this synthetic host.
+            unsafe { self.manager.Pop(TF_POPF_ALL) }?;
+            self.pushed = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DocumentActivation {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[implement(ITfEditSession)]
+struct PreflightContextTextReader {
+    context: ITfContext,
+    output: Arc<Mutex<Option<String>>>,
+}
+
+impl ITfEditSession_Impl for PreflightContextTextReader_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        // SAFETY: `ec` grants read access to this context for the callback.
+        let range = unsafe { self.context.GetStart(ec) }?;
+        // SAFETY: the end range belongs to the same context and cookie.
+        let end = unsafe { self.context.GetEnd(ec) }?;
+        // SAFETY: expands only this local range to cover the context.
+        unsafe { range.ShiftEndToRange(ec, &end, TF_ANCHOR_END) }?;
+
+        let mut utf16 = Vec::new();
+        loop {
+            let mut chunk = [0_u16; 64];
+            let mut fetched = 0;
+            // SAFETY: the writable chunk is valid for this synchronous read.
+            unsafe { range.GetText(ec, TF_TF_MOVESTART, &mut chunk, &mut fetched) }?;
+            let fetched = usize::try_from(fetched).map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            utf16.extend_from_slice(&chunk[..fetched]);
+            if fetched < chunk.len() {
+                break;
+            }
+        }
+        let text = String::from_utf16(&utf16).map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        *self
+            .output
+            .lock()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))? = Some(text);
+        Ok(())
+    }
+}
+
+fn read_preflight_context_text(context: &ITfContext, client_id: u32) -> Result<String> {
+    let output = Arc::new(Mutex::new(None));
+    let reader: ITfEditSession = PreflightContextTextReader {
+        context: context.clone(),
+        output: Arc::clone(&output),
+    }
+    .into();
+    let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READ.0);
+    // SAFETY: every interface is apartment-local and the callback is sync.
+    unsafe { context.RequestEditSession(client_id, &reader, flags) }?.ok()?;
+    output
+        .lock()
+        .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+        .take()
+        .ok_or_else(|| lifecycle_error(E_UNEXPECTED))
+}
+
+fn run_candidate_preflight(
+    snapshot: Arc<CandidateSnapshot>,
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<(), TsfCandidatePreflightError> {
+    let _apartment = PreflightApartment::enter()?;
+    let provider =
+        Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>;
+    let factory: IClassFactory =
+        TsfClassFactory::counted_with_options(Ok(provider), KeyAdviceMode::SyntheticHost).into();
+    // SAFETY: aggregation is disabled and the local factory implements this interface.
+    let service: ITfTextInputProcessorEx = unsafe { factory.CreateInstance(None::<&IUnknown>) }
+        .map_err(|_| TsfCandidatePreflightError::ServiceActivation)?;
+    let key_sink: ITfKeyEventSink = service
+        .cast()
+        .map_err(|_| TsfCandidatePreflightError::ServiceActivation)?;
+
+    // SAFETY: COM is initialized on this thread and this is the system TSF manager.
+    let thread_manager: ITfThreadMgr =
+        unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| TsfCandidatePreflightError::ThreadManager)?;
+    // SAFETY: balanced by ThreadManagerActivation below.
+    let client_id = unsafe { thread_manager.Activate() }
+        .map_err(|_| TsfCandidatePreflightError::ThreadManager)?;
+    let mut thread_activation = ThreadManagerActivation {
+        manager: thread_manager.clone(),
+        active: true,
+    };
+    // SAFETY: SyntheticHost skips foreground key advice but uses normal state.
+    unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+        .map_err(|_| TsfCandidatePreflightError::ServiceActivation)?;
+    let mut service_activation = ServiceActivation {
+        service: service.clone(),
+        active: true,
+    };
+
+    // SAFETY: all objects remain on this initialized apartment thread.
+    let document_manager = unsafe { thread_manager.CreateDocumentMgr() }
+        .map_err(|_| TsfCandidatePreflightError::ContextSetup)?;
+    let mut context = None;
+    let mut text_store_cookie = 0;
+    // SAFETY: output storage remains live and no external text store is used.
+    unsafe {
+        document_manager.CreateContext(
+            client_id,
+            0,
+            None::<&IUnknown>,
+            &mut context,
+            &mut text_store_cookie,
+        )
+    }
+    .map_err(|_| TsfCandidatePreflightError::ContextSetup)?;
+    let context = context.ok_or(TsfCandidatePreflightError::ContextSetup)?;
+    // SAFETY: context and manager belong to this apartment.
+    unsafe { document_manager.Push(&context) }
+        .map_err(|_| TsfCandidatePreflightError::ContextSetup)?;
+    let mut document_activation = DocumentActivation {
+        manager: document_manager.clone(),
+        pushed: true,
+    };
+    // SAFETY: focuses the synthetic document owned by this thread manager.
+    unsafe { thread_manager.SetFocus(&document_manager) }
+        .map_err(|_| TsfCandidatePreflightError::ContextSetup)?;
+
+    let lparam = LPARAM(0);
+    for byte in probe_code.bytes() {
+        let key = WPARAM(usize::from(VK_A.0 + u16::from(byte - b'a')));
+        // SAFETY: these virtual-key values contain no pointer data.
+        let tested = unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+            .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
+        // SAFETY: routes the same accepted key through the active service.
+        let handled = unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+            .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
+        if !tested.as_bool() || !handled.as_bool() {
+            return Err(TsfCandidatePreflightError::KeyRouting);
+        }
+    }
+    if read_preflight_context_text(&context, client_id)
+        .map_err(|_| TsfCandidatePreflightError::KeyRouting)?
+        != probe_code
+    {
+        return Err(TsfCandidatePreflightError::PreeditMismatch);
+    }
+
+    let space = WPARAM(usize::from(VK_SPACE.0));
+    // SAFETY: routes one ordinary confirmation key through the same context.
+    let tested = unsafe { key_sink.OnTestKeyDown(&context, space, lparam) }
+        .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
+    // SAFETY: commits the first candidate through the active service.
+    let handled = unsafe { key_sink.OnKeyDown(&context, space, lparam) }
+        .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
+    if !tested.as_bool() || !handled.as_bool() {
+        return Err(TsfCandidatePreflightError::KeyRouting);
+    }
+    if read_preflight_context_text(&context, client_id)
+        .map_err(|_| TsfCandidatePreflightError::KeyRouting)?
+        != expected_text
+    {
+        return Err(TsfCandidatePreflightError::CommitMismatch);
+    }
+
+    document_activation
+        .close()
+        .map_err(|_| TsfCandidatePreflightError::Cleanup)?;
+    service_activation
+        .close()
+        .map_err(|_| TsfCandidatePreflightError::Cleanup)?;
+    thread_activation
+        .close()
+        .map_err(|_| TsfCandidatePreflightError::Cleanup)?;
+    drop(context);
+    drop(document_manager);
+    drop(key_sink);
+    drop(service);
+    drop(factory);
+    drop(thread_manager);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,7 +646,7 @@ impl TsfClassFactory {
     fn counted_for_process_test() -> Self {
         Self::counted_with_options(
             development_candidate_provider(),
-            KeyAdviceMode::DisabledForProcessTest,
+            KeyAdviceMode::SyntheticHost,
         )
     }
 }
@@ -659,8 +1048,7 @@ struct ActivationState {
 #[derive(Clone, Copy)]
 enum KeyAdviceMode {
     Foreground,
-    #[cfg(test)]
-    DisabledForProcessTest,
+    SyntheticHost,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
@@ -691,7 +1079,7 @@ impl TsfTextService {
 
     #[cfg(test)]
     fn counted_for_process_test(candidate_provider: Option<Arc<dyn CandidateProvider>>) -> Self {
-        Self::counted_with_options(candidate_provider, KeyAdviceMode::DisabledForProcessTest)
+        Self::counted_with_options(candidate_provider, KeyAdviceMode::SyntheticHost)
     }
 }
 
@@ -705,8 +1093,7 @@ impl TsfTextService_Impl {
     fn observed_key_modifiers(&self) -> KeyModifiers {
         match self.key_advice_mode {
             KeyAdviceMode::Foreground => current_key_modifiers(),
-            #[cfg(test)]
-            KeyAdviceMode::DisabledForProcessTest => KeyModifiers::default(),
+            KeyAdviceMode::SyntheticHost => KeyModifiers::default(),
         }
     }
 
@@ -867,8 +1254,7 @@ impl TsfTextService_Impl {
                         unsafe { manager.AdviseKeyEventSink(client_id, &sink, true) }?;
                         Ok(Some(manager))
                     }
-                    #[cfg(test)]
-                    KeyAdviceMode::DisabledForProcessTest => Ok(None),
+                    KeyAdviceMode::SyntheticHost => Ok(None),
                 }
             })();
             let keystroke_manager = match key_setup {
@@ -1177,10 +1563,8 @@ mod tests {
     };
     use windows::core::ComObject;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK
+        SYNTHETIC_HOST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1329,7 +1713,7 @@ mod tests {
         assert_eq!(DllCanUnloadNow(), S_OK);
         let factory: IClassFactory = TsfClassFactory::counted_with_options(
             Err(CandidatePackageError::UnsupportedSchema),
-            KeyAdviceMode::DisabledForProcessTest,
+            KeyAdviceMode::SyntheticHost,
         )
         .into();
         // SAFETY: aggregation is disabled and the requested interface is
@@ -1351,6 +1735,27 @@ mod tests {
         assert_eq!(
             provider.candidate("zzzzzzzz", 1).as_deref(),
             Some("zzzzzzzz")
+        );
+    }
+
+    #[test]
+    fn public_preflight_api_commits_snapshot_candidate_without_retaining_text() {
+        let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST).unwrap();
+        let snapshot = Arc::new(manifest.load_snapshot(TSF_DEVELOPMENT_LEXICON).unwrap());
+        let report = preflight_candidate_snapshot(snapshot, "nihk", "你好").unwrap();
+        assert_eq!(report.revision(), "tsf-public-demo-v1");
+        assert_eq!(report.input_keys(), 4);
+        assert_eq!(report.committed_characters(), 2);
+        assert_eq!(
+            format!("{report:?}"),
+            "TsfCandidatePreflightReport { revision: \"tsf-public-demo-v1\", input_keys: 4, committed_characters: 2 }"
+        );
+
+        let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST).unwrap();
+        let snapshot = Arc::new(manifest.load_snapshot(TSF_DEVELOPMENT_LEXICON).unwrap());
+        assert_eq!(
+            preflight_candidate_snapshot(snapshot, "nihk", "您好").unwrap_err(),
+            TsfCandidatePreflightError::CandidateMismatch
         );
     }
 

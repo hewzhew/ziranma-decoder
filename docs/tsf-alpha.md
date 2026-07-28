@@ -144,6 +144,9 @@ COM/注册入口、证书目录，以及固定 zh-CN 语言配置是否已存在
 - 独立 `candidatectl` 已能确定性生成公开包并原子管理
   current/candidate/previous 数据槽，但默认类工厂尚未读取该槽位。提升数据槽
   不会改变已加载 DLL；接通以前也不把它称为输入法热更新。
+- `candidatectl preflight` 会用包内确定性探针创建真实系统 Thread Manager 与
+  合成 Context，经过同一个类工厂、预编辑和首选上屏。`adopt` / `stage` 只有在
+  该预检通过后才写内容绑定凭据；提升和回退会复核凭据与当前包内容。
 
 微软要求现代自定义 IME 使用 TSF，并说明输入法 DLL 会被加载进当前应用、
 受到该应用容器能力约束：
