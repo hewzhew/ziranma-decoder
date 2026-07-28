@@ -9,9 +9,9 @@ use std::ffi::c_void;
 use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::{CompositionEffect, CompositionInput, CompositionSession};
+use crate::{CompositionEffect, CompositionInput, CompositionSession, Decoder, parse_lexicon_tsv};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, LPARAM, S_FALSE,
     S_OK, WPARAM,
@@ -44,9 +44,46 @@ pub const TSF_ALPHA_LANGID: u16 = 0x0804;
 static ACTIVE_COM_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
 
+// This deliberately small, manually constructed public fixture is only a
+// bridge between the COM lifecycle and the real decoder. Loading the complete
+// Rime snapshot inside every host process is a separate data-layer decision.
+const TSF_DEVELOPMENT_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
+
 trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, one-based candidate without learning or I/O.
     fn candidate(&self, code: &str, rank: usize) -> Option<String>;
+}
+
+struct DevelopmentCandidateProvider {
+    decoder: Decoder,
+}
+
+impl CandidateProvider for DevelopmentCandidateProvider {
+    fn candidate(&self, code: &str, rank: usize) -> Option<String> {
+        if !(1..=10).contains(&rank) {
+            return None;
+        }
+        let candidates = self.decoder.decode_sentence(code, rank).ok()?;
+        let candidate = candidates.get(rank - 1)?;
+        if candidate.unresolved_key_count == 0 {
+            return Some(candidate.text.clone());
+        }
+        // The development lexicon is intentionally tiny. Confirming an
+        // unknown first candidate must preserve the user's raw composition
+        // instead of inserting the decoder's visible unresolved markers.
+        (rank == 1).then(|| code.to_owned())
+    }
+}
+
+fn development_candidate_provider() -> Arc<dyn CandidateProvider> {
+    static PROVIDER: OnceLock<Arc<dyn CandidateProvider>> = OnceLock::new();
+    Arc::clone(PROVIDER.get_or_init(|| {
+        let entries = parse_lexicon_tsv(TSF_DEVELOPMENT_LEXICON)
+            .expect("the checked-in TSF development lexicon must remain valid");
+        Arc::new(DevelopmentCandidateProvider {
+            decoder: Decoder::new(entries),
+        })
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,12 +235,33 @@ fn can_unload_now() -> bool {
 }
 
 #[implement(IClassFactory)]
-struct TsfClassFactory;
+struct TsfClassFactory {
+    candidate_provider: Arc<dyn CandidateProvider>,
+    key_advice_mode: KeyAdviceMode,
+}
 
 impl TsfClassFactory {
     fn counted() -> Self {
+        Self::counted_with_options(development_candidate_provider(), KeyAdviceMode::Foreground)
+    }
+
+    fn counted_with_options(
+        candidate_provider: Arc<dyn CandidateProvider>,
+        key_advice_mode: KeyAdviceMode,
+    ) -> Self {
         object_created();
-        Self
+        Self {
+            candidate_provider,
+            key_advice_mode,
+        }
+    }
+
+    #[cfg(test)]
+    fn counted_for_process_test() -> Self {
+        Self::counted_with_options(
+            development_candidate_provider(),
+            KeyAdviceMode::DisabledForProcessTest,
+        )
     }
 }
 
@@ -231,7 +289,11 @@ impl IClassFactory_Impl for TsfClassFactory_Impl {
             return Err(lifecycle_error(E_POINTER));
         }
 
-        let service: ITfTextInputProcessorEx = TsfTextService::counted().into();
+        let service: ITfTextInputProcessorEx = TsfTextService::counted_with_options(
+            Some(Arc::clone(&self.candidate_provider)),
+            self.key_advice_mode,
+        )
+        .into();
         // SAFETY: `riid` and `ppvobject` were validated above. QueryInterface
         // owns the returned reference on success; dropping `service` releases
         // only the constructor's reference.
@@ -611,10 +673,6 @@ struct TsfTextService {
 }
 
 impl TsfTextService {
-    fn counted() -> Self {
-        Self::counted_with_options(None, KeyAdviceMode::Foreground)
-    }
-
     fn counted_with_options(
         candidate_provider: Option<Arc<dyn CandidateProvider>>,
         key_advice_mode: KeyAdviceMode,
@@ -1265,6 +1323,18 @@ mod tests {
     }
 
     #[test]
+    fn development_provider_decodes_public_fixture_and_preserves_unknown_input() {
+        let provider = development_candidate_provider();
+        assert_eq!(provider.candidate("nihk", 1).as_deref(), Some("你好"));
+        assert_eq!(provider.candidate("nihk", 0), None);
+        assert_eq!(provider.candidate("nihk", 11), None);
+        assert_eq!(
+            provider.candidate("zzzzzzzz", 1).as_deref(),
+            Some("zzzzzzzz")
+        );
+    }
+
+    #[test]
     fn object_and_server_locks_control_the_unload_boundary() {
         let _guard = test_lock();
         assert_eq!(DllCanUnloadNow(), S_OK);
@@ -1328,6 +1398,98 @@ mod tests {
         unsafe { thread_manager.Deactivate() }.expect("thread manager should deactivate");
 
         drop(service);
+        drop(thread_manager);
+        assert_eq!(DllCanUnloadNow(), S_OK);
+    }
+
+    #[test]
+    fn process_test_factory_service_decodes_and_commits_public_candidate() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        assert_eq!(DllCanUnloadNow(), S_OK);
+
+        let factory: IClassFactory = TsfClassFactory::counted_for_process_test().into();
+        // SAFETY: aggregation is disabled and the factory implements the
+        // requested text-service interface.
+        let service: ITfTextInputProcessorEx = unsafe { factory.CreateInstance(None::<&IUnknown>) }
+            .expect("process-test factory should create the text service");
+        let key_sink: ITfKeyEventSink = service
+            .cast()
+            .expect("factory service should expose its key-event sink");
+
+        // SAFETY: COM is initialized on this test thread.
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        // SAFETY: balanced below on this apartment thread.
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        // SAFETY: this factory uses the explicit process-test advice mode.
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        // SAFETY: output pointers remain valid for the call and the synthetic
+        // context needs no external text store.
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        // SAFETY: all objects belong to this apartment thread.
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        for offset in [13_u16, 8, 7, 10] {
+            let key = WPARAM(usize::from(VK_A.0 + offset));
+            // SAFETY: virtual-key values contain no pointer data and every
+            // interface belongs to the current apartment.
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+        }
+        assert_eq!(read_context_text(&context, client_id), "nihk");
+
+        let space = WPARAM(usize::from(VK_SPACE.0));
+        // SAFETY: same apartment-local key routing as above.
+        assert!(
+            unsafe { key_sink.OnTestKeyDown(&context, space, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, space, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(read_context_text(&context, client_id), "你好");
+
+        // SAFETY: exact reverse of the apartment-local setup.
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(factory);
         drop(thread_manager);
         assert_eq!(DllCanUnloadNow(), S_OK);
     }
