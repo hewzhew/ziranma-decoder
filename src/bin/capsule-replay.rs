@@ -30,7 +30,7 @@ const MAX_CAPSULE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_SEGMENTS: u64 = 1_000_000;
 const CAPTURE_HEALTH_REPORT_SCHEMA_V1: &str = "ziranma-capture-health-report-v1";
 const CAPTURE_INTEGRITY_REPORT_SCHEMA_V1: &str = "ziranma-capture-integrity-report-v1";
-const REPLAY_DECISION_REPORT_SCHEMA_V2: &str = "ziranma-replay-decision-report-v2";
+const REPLAY_DECISION_REPORT_SCHEMA_V3: &str = "ziranma-replay-decision-report-v3";
 const REPLAY_DECISION_MIN_WINDOWS: u64 = 20;
 const CAPTURE_HEALTH_PRIVACY_NOTICE: &str = "--health-only prints CAPTURE_HEALTH and CAPTURE_INTEGRITY; both contain behavioral \
      metadata; legacy v1/.zic integrity is unavailable, never zero-filled.";
@@ -855,18 +855,27 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
 
     let mut lines = vec![
         format!(
-            "DECISION_REPORT schema={REPLAY_DECISION_REPORT_SCHEMA_V2} \
+            "DECISION_REPORT schema={REPLAY_DECISION_REPORT_SCHEMA_V3} \
              contains_text=false contains_behavioral_metadata=true writes=false network=false"
         ),
         "私人输入决策报告（不显示原文）".to_owned(),
         format!(
-            "样本：{} 个输入文件，{} 条事件；{} 次提交，{} 次提交后编辑。编辑不自动等于打错。",
+            "一句话结论：{}",
+            decision_headline(report, health, &strategies)
+        ),
+        format!(
+            "样本：{} 份输入，{} 条事件；{} 次提交，{} 次提交后编辑。编辑不自动等于打错。",
             report.capsules, report.events, report.commits, report.revisions
         ),
         format!(
-            "采集：{} 条记录按键完整，{} 条不完整；{} 条位置不确定；{} 次提交含组合内回删。\
+            "采集：按键完整 {}，不完整 {} 条；{} 条位置不确定；{} 次提交含组合内回删。\
              完整性证据可用 {} 段，旧格式或明文胶囊 {} 段。",
-            health.keys_complete_records,
+            format_ratio(
+                health.keys_complete_records,
+                health
+                    .keys_complete_records
+                    .saturating_add(health.keys_incomplete_records)
+            ),
             health.keys_incomplete_records,
             health.ambiguous_positions,
             health.commits_with_internal_edit_keys,
@@ -889,8 +898,9 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
         ),
         format!(
             "排除原因（每次提交只记首个不满足条件）：按键不完整 {}，按键解释失败 {}，\
-             没有字母码 {}，码串过长 {}，组合拼音无法编码 {}，规范码 Top-10 无法确认目标词界 {}，\
-             位置不确定 {}，不是纯追加 {}；合计 {}/{}。",
+             没有字母码 {}，码串过长 {}，非拼音或当前码表暂不适用 {}，\
+             规范码 Top-10 无法确认目标词界 {}，位置不确定 {}，不是纯追加 {}；\
+             合计 {} 次，占全部 {} 次提交的 {}，未进入窗口资格。",
             report.window_exclusions.incomplete_keys,
             report.window_exclusions.key_interpretation_failure,
             report.window_exclusions.missing_letter_code,
@@ -902,17 +912,22 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
             report.window_exclusions.ambiguous_position,
             report.window_exclusions.non_append_document_change,
             report.window_exclusions.total(),
-            report.window_ineligible_commits
+            report
+                .window_eligible_commits
+                .saturating_add(report.window_ineligible_commits),
+            format_percentage(
+                report.window_exclusions.total(),
+                report
+                    .window_eligible_commits
+                    .saturating_add(report.window_ineligible_commits)
+            )
         ),
         format!(
-            "完整码连打：{} 个窗口；Top-1 {}/{}，Top-5 {}/{}，Top-10 {}/{}；{}。",
+            "完整码连打：{} 个窗口；Top-1 {}，Top-5 {}，Top-10 {}；{}。",
             baseline.attempts,
-            baseline.hits_at_1,
-            baseline.attempts,
-            baseline.hits_at_5,
-            baseline.attempts,
-            baseline.hits_at_10,
-            baseline.attempts,
+            format_ratio(baseline.hits_at_1, baseline.attempts),
+            format_ratio(baseline.hits_at_5, baseline.attempts),
+            format_ratio(baseline.hits_at_10, baseline.attempts),
             render_action_projection(
                 report.continuous_window_recorded_logical_key_actions,
                 baseline.projected_actions_with_one_selection(),
@@ -953,20 +968,17 @@ fn render_strategy_decision(
         paired.comparisons == continuous_windows && strategy.attempts == continuous_windows;
     format!(
         "- {label}：比较 {} 个窗口，少按 {} 个字母、多按 {} 个字母；\
-         Top-1 {}/{}, Top-5 {}/{}, Top-10 {}/{}；相对完整码名次变差 {} 次，\
-         其中掉出 Top-10 {} 次、救回 {} 次；{}。判断：{}",
+         Top-1 {}，Top-5 {}，Top-10 {}；相对完整码名次变差 {}，\
+         其中掉出 Top-10 {}、救回 {}；{}。判断：{}",
         paired.comparisons,
         paired.input_keys_saved,
         paired.input_keys_added,
-        strategy.hits_at_1,
-        strategy.attempts,
-        strategy.hits_at_5,
-        strategy.attempts,
-        strategy.hits_at_10,
-        strategy.attempts,
-        paired.rank_worsened,
-        paired.dropped_from_top_10,
-        paired.recovered_into_top_10,
+        format_ratio(strategy.hits_at_1, strategy.attempts),
+        format_ratio(strategy.hits_at_5, strategy.attempts),
+        format_ratio(strategy.hits_at_10, strategy.attempts),
+        format_ratio(paired.rank_worsened, paired.comparisons),
+        format_ratio(paired.dropped_from_top_10, paired.comparisons),
+        format_ratio(paired.recovered_into_top_10, paired.comparisons),
         render_action_projection(
             recorded_actions,
             strategy.projected_actions_with_one_selection(),
@@ -982,15 +994,29 @@ fn render_action_projection(recorded: u64, projected: u64, comparable: bool) -> 
     }
     if projected <= recorded {
         format!(
-            "乐观操作投影 {projected} 次，比同窗口记录值少 {} 次",
-            recorded - projected
+            "乐观操作投影 {projected} 次，比同窗口记录值少 {} 次（占记录值 {}）",
+            recorded - projected,
+            format_percentage(recorded - projected, recorded)
         )
     } else {
         format!(
-            "乐观操作投影 {projected} 次，比同窗口记录值多 {} 次",
-            projected - recorded
+            "乐观操作投影 {projected} 次，比同窗口记录值多 {} 次（占记录值 {}）",
+            projected - recorded,
+            format_percentage(projected - recorded, recorded)
         )
     }
+}
+
+fn format_ratio(part: u64, total: u64) -> String {
+    format!("{part}/{total}（{}）", format_percentage(part, total))
+}
+
+fn format_percentage(part: u64, total: u64) -> String {
+    if total == 0 {
+        return "—".to_owned();
+    }
+    let tenths = ((part as u128) * 1_000 + (total as u128 / 2)) / total as u128;
+    format!("{}.{:01}%", tenths / 10, tenths % 10)
 }
 
 fn strategy_decision(paired: &PairedReplayStrategyStats) -> StrategyDecision {
@@ -1021,6 +1047,46 @@ fn strategy_decision_text(decision: StrategyDecision) -> &'static str {
         StrategyDecision::RankCost => "虽然省键但候选名次变差，先验证真实选词成本",
         StrategyDecision::ValidateNextSession => "可冻结为候选，交给下一份独立自然会话验证",
     }
+}
+
+fn decision_headline(
+    report: &CapsuleReplayReport,
+    health: &CaptureHealthReport,
+    strategies: &[(&str, &ReplayStrategyStats, &PairedReplayStrategyStats)],
+) -> &'static str {
+    if health.integrity_counters.counter_saturated {
+        return "采集计数已经饱和；先修采集层，本轮不调整输入协议。";
+    }
+    if report.continuous_windows == 0 {
+        return "还没有连续窗口；继续自然记录，本轮不调整输入协议。";
+    }
+    if report.continuous_windows < REPLAY_DECISION_MIN_WINDOWS {
+        return "样本还在自然积累；达到 20 个可比较窗口前不调整输入协议。";
+    }
+    if report.window_canonical_full.attempts < report.continuous_windows {
+        return "连续窗口的完整码回放口径尚未齐；先核对排除项。";
+    }
+    if report.window_canonical_full.hits_at_10 < report.window_canonical_full.attempts {
+        return "完整码基线尚未稳定；先改善词典覆盖或排序，暂不研究通用简写。";
+    }
+
+    let decisions = strategies
+        .iter()
+        .map(|(_, _, paired)| strategy_decision(paired))
+        .collect::<Vec<_>>();
+    if decisions.contains(&StrategyDecision::ValidateNextSession) {
+        return "完整码连续输入值得继续；仅把通过安全门的简写候选交给下一会话验证。";
+    }
+    if decisions.contains(&StrategyDecision::TopTenDrop) {
+        if report.window_canonical_full.hits_at_1 < report.window_canonical_full.attempts {
+            return "完整码连续输入值得继续；通用简写暂不采用；下一步改善完整码 Top-1 排序。";
+        }
+        return "完整码连续输入值得继续；通用简写暂不采用；下一步只研究更受限的触发条件。";
+    }
+    if decisions.contains(&StrategyDecision::RankCost) {
+        return "完整码连续输入值得继续；简写的候选名次成本尚未解决。";
+    }
+    "保留完整码连续输入主线；现有简写没有显示出足够净收益。"
 }
 
 fn overall_decision(
@@ -1868,9 +1934,9 @@ mod tests {
         CAPTURE_HEALTH_PRIVACY_NOTICE, CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES,
         Options, PUBLIC_RIME_LEXICON, PUBLIC_UD_TRAIN, PrivateInputLoader,
         RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard, StrategyDecision,
-        expand_session_selector, parse_options, read_explicit_capsules,
-        redact_private_analysis_error, render_decision_report, resolve_capsule_input,
-        resolve_protected_input, strategy_decision, visit_private_inputs,
+        decision_headline, expand_session_selector, format_percentage, parse_options,
+        read_explicit_capsules, redact_private_analysis_error, render_decision_report,
+        resolve_capsule_input, resolve_protected_input, strategy_decision, visit_private_inputs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2718,18 +2784,60 @@ mod tests {
 
         let rendered = render_decision_report(&report, &health);
 
-        assert_eq!(rendered.lines().count(), 13);
+        assert_eq!(rendered.lines().count(), 14);
         assert!(rendered.starts_with(
-            "DECISION_REPORT schema=ziranma-replay-decision-report-v2 contains_text=false"
+            "DECISION_REPORT schema=ziranma-replay-decision-report-v3 contains_text=false"
         ));
+        assert!(rendered.contains("一句话结论：样本还在自然积累"));
         assert!(rendered.contains("实际字母与规范码不同"));
         assert!(rendered.contains("编辑不自动等于打错"));
-        assert!(rendered.contains("组合拼音无法编码 1"));
-        assert!(rendered.contains("合计 1/1"));
+        assert!(rendered.contains("非拼音或当前码表暂不适用 1"));
+        assert!(rendered.contains("合计 1 次，占全部 3 次提交的 33.3%"));
+        assert!(rendered.contains("Top-1 1/1（100.0%）"));
         assert!(rendered.contains("样本还少，继续自然记录，暂不改变协议"));
         assert!(rendered.contains("至少 20 个可比较窗口后再决定"));
         assert!(!rendered.contains("猫"));
         assert!(!rendered.contains("mao"));
+    }
+
+    #[test]
+    fn decision_report_percentages_are_deterministic_and_zero_safe() {
+        assert_eq!(format_percentage(73, 119), "61.3%");
+        assert_eq!(format_percentage(117, 119), "98.3%");
+        assert_eq!(format_percentage(119, 119), "100.0%");
+        assert_eq!(format_percentage(0, 0), "—");
+        assert_eq!(format_percentage(u64::MAX, u64::MAX), "100.0%");
+    }
+
+    #[test]
+    fn decision_headline_prioritizes_full_code_ranking_after_shorthand_drops() {
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        report.continuous_windows = 119;
+        report.window_canonical_full = ReplayStrategyStats {
+            attempts: 119,
+            hits_at_1: 73,
+            hits_at_5: 117,
+            hits_at_10: 119,
+            ..ReplayStrategyStats::default()
+        };
+        let strategy = ReplayStrategyStats {
+            attempts: 119,
+            ..ReplayStrategyStats::default()
+        };
+        let paired = PairedReplayStrategyStats {
+            comparisons: 119,
+            input_keys_saved: 196,
+            baseline_visible_at_10: 119,
+            dropped_from_top_10: 21,
+            rank_worsened: 45,
+            ..PairedReplayStrategyStats::default()
+        };
+        let strategies = [("synthetic", &strategy, &paired)];
+
+        assert_eq!(
+            decision_headline(&report, &CaptureHealthReport::default(), &strategies),
+            "完整码连续输入值得继续；通用简写暂不采用；下一步改善完整码 Top-1 排序。"
+        );
     }
 
     #[test]

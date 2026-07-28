@@ -346,12 +346,6 @@ mod windows_controller {
         };
         let is_current = processes.iter().any(|process| process.pid == active.pid);
         let elapsed = unix_ms_now()?.saturating_sub(active.started_unix_ms);
-        let phase = human_phase(is_current, &active.phase);
-        let target = match active.target.as_str() {
-            "connected" => "Codex 输入框已连接",
-            "waiting" => "正在等待 Codex 输入框",
-            _ => "目标状态未知",
-        };
         let ownership = if is_current {
             "当前会话"
         } else {
@@ -361,9 +355,12 @@ mod windows_controller {
             "  会话详情：{ownership} {}（{}，{}）",
             active.session,
             human_session_kind(&active.kind),
-            format_duration(elapsed)
+            human_session_age(is_current, elapsed)
         );
-        println!("  会话状态：{phase}；{target}");
+        println!(
+            "  会话状态：{}",
+            human_session_status(is_current, &active.phase, &active.target)
+        );
         println!(
             "  已安全保存：{} 个加密分段，{} 个事件",
             active.saved_segments, active.saved_events
@@ -389,6 +386,27 @@ mod windows_controller {
             (_, "failed") => "记录器已报告内部错误并停止",
             _ => "未知",
         }
+    }
+
+    fn human_session_age(is_current: bool, elapsed_ms: u64) -> String {
+        if is_current {
+            format!("已运行{}", format_duration(elapsed_ms))
+        } else {
+            format!("开始于{}前", format_duration(elapsed_ms))
+        }
+    }
+
+    fn human_session_status(is_current: bool, phase: &str, target: &str) -> String {
+        let phase_text = human_phase(is_current, phase);
+        if !is_current || !matches!(phase, "running" | "paused") {
+            return phase_text.to_owned();
+        }
+        let target_text = match target {
+            "connected" => "Codex 输入框已连接",
+            "waiting" => "正在等待 Codex 输入框",
+            _ => "目标状态未知",
+        };
+        format!("{phase_text}；{target_text}")
     }
 
     fn print_machine_active(
@@ -1463,9 +1481,9 @@ mod windows_controller {
     mod tests {
         use super::{
             ACTIVE_SCHEMA, ActiveState, BUILD_SCHEMA, ControllerCommand, STATE_SCHEMA, SlotState,
-            field_value, field_value_optional, format_duration, human_phase, machine_process_line,
-            parse_active_state, parse_command, parse_key_value_lines, parse_state, sanitize_field,
-            validate_slot_name,
+            field_value, field_value_optional, format_duration, human_phase, human_session_age,
+            human_session_status, machine_process_line, parse_active_state, parse_command,
+            parse_key_value_lines, parse_state, sanitize_field, validate_slot_name,
         };
 
         fn arguments(values: &[&str]) -> Vec<String> {
@@ -1617,6 +1635,20 @@ mod windows_controller {
                 "进程已不在；没有正常退出回执（外部结束或不可观测中止）"
             );
             assert_eq!(human_phase(false, "failed"), "记录器已报告内部错误并停止");
+            assert_eq!(
+                human_session_status(true, "running", "waiting"),
+                "运行中；正在等待 Codex 输入框"
+            );
+            assert_eq!(
+                human_session_status(false, "stopped", "waiting"),
+                "已正常停止"
+            );
+            assert_eq!(
+                human_session_status(false, "running", "connected"),
+                "进程已不在；没有正常退出回执（外部结束或不可观测中止）"
+            );
+            assert_eq!(human_session_age(true, 12_345), "已运行12秒");
+            assert_eq!(human_session_age(false, 12_345), "开始于12秒前");
         }
 
         #[test]

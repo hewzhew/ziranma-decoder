@@ -142,6 +142,11 @@ CLI 的 selector 展开、载入或分析错误按所在阶段至多报告历史
 八类互斥，合计必须等于 `window_ineligible_commits`，不会把同一次自定义
 词输入同时包装成多个问题。
 
+其中 `composition_unencodable` 是机器诊断名，不自动等于采集失败或打错。
+面向人的 `--decision` 把它显示为“非拼音或当前码表暂不适用”：英文、
+符号、输入法特殊流程以及当前映射不能解释的组合都可能落入这一类，只有
+另有证据时才能继续细分。
+
 满足单条资格也不等于已经形成连续样本。没有与相邻合格提交连接起来的
 单条另记 `isolated_eligible_commits`；它与真正进入连续窗口的提交满足：
 
@@ -227,8 +232,9 @@ cargo run --release --bin capsule-replay -- `
 `--decision` 仍按显式 selector 流式读取、在内存解密并且不写文件。它把
 同一次读取中的采集健康、完整性可用性、非规范码观察、互斥排除原因、
 孤立合格提交、连续窗口限域动作、完整码 Top-K 和三条逐词简写的配对
-结果压成一份中文报告；首行固定声明
-`ziranma-replay-decision-report-v2`、`contains_text=false` 与
+结果压成一份中文报告。v3 先显示一句话结论，再显示采集完整率、Top-K、
+名次退化、Top-10 掉出和操作投影差值的计数与百分比；首行固定声明
+`ziranma-replay-decision-report-v3`、`contains_text=false` 与
 `contains_behavioral_metadata=true`。报告不会
 显示文字、拼音、按键串、路径或会话号。
 
