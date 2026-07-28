@@ -1008,16 +1008,24 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut screen = AlternateScreen::enter(input_source.direct_keys())?;
 
     loop {
-        let (candidates, ordinary_candidates) = if let Some(pinyin) = session.shape_pinyin() {
+        let (candidates, candidate_kind) = if let Some(pinyin) = session.shape_pinyin() {
             let candidates = shape_lab
                 .snapshot(pinyin, session.stroke_prefix(), None, MAX_SHAPE_LAB_VISIBLE)?
                 .candidates
                 .into_iter()
                 .map(|candidate| candidate.character.to_string())
                 .collect::<Vec<_>>();
-            (candidates, false)
+            (candidates, TypingLabCandidateKind::Other)
         } else if session.phonetic().is_empty() {
-            (Vec::new(), false)
+            (Vec::new(), TypingLabCandidateKind::Other)
+        } else if session.recovery_mode() {
+            let candidates = decoder
+                .decode_sentence_lanes(session.phonetic(), options.visible_limit)?
+                .anchored_transposition_recovery
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .collect::<Vec<_>>();
+            (candidates, TypingLabCandidateKind::Recovery)
         } else {
             phonetic_cache.activate_code(session.phonetic());
             poll_typing_lab_deep_decode(&mut deep_decode, &mut phonetic_cache, session.phonetic())?;
@@ -1035,7 +1043,7 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|candidate| candidate.text.clone())
                 .collect::<Vec<_>>();
-            (candidates, true)
+            (candidates, TypingLabCandidateKind::Ordinary)
         };
         session.normalize_candidate_page(candidates.len(), options.visible_limit);
         let visible_range =
@@ -1060,25 +1068,28 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let Some(input) = input_source.read()? else {
             break;
         };
+        let candidate_details = candidate_kind
+            .remembers_selection()
+            .then_some(phonetic_cache.candidates.as_slice());
         match session.apply(input) {
             TypingLabEffect::Continue => {}
             TypingLabEffect::Confirm => select_typing_candidate(
                 &mut session,
                 &mut selection_memory,
                 &candidates,
-                ordinary_candidates.then_some(phonetic_cache.candidates.as_slice()),
+                candidate_details,
                 1,
             ),
             TypingLabEffect::Select(rank) => select_typing_candidate(
                 &mut session,
                 &mut selection_memory,
                 &candidates,
-                ordinary_candidates.then_some(phonetic_cache.candidates.as_slice()),
+                candidate_details,
                 rank,
             ),
             TypingLabEffect::PreviousPage => session.previous_candidate_page(options.visible_limit),
             TypingLabEffect::NextPage => {
-                let candidate_limit = if ordinary_candidates {
+                let candidate_limit = if candidate_kind == TypingLabCandidateKind::Ordinary {
                     if phonetic_cache.depth >= TYPING_LAB_CANDIDATE_POOL_DEPTH {
                         candidates.len()
                     } else {
@@ -1087,7 +1098,9 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 } else {
                     candidates.len()
                 };
-                if ordinary_candidates && phonetic_cache.depth < TYPING_LAB_CANDIDATE_POOL_DEPTH {
+                if candidate_kind == TypingLabCandidateKind::Ordinary
+                    && phonetic_cache.depth < TYPING_LAB_CANDIDATE_POOL_DEPTH
+                {
                     start_typing_lab_deep_decode(
                         &mut deep_decode,
                         Arc::clone(&decoder),
@@ -1406,6 +1419,19 @@ enum TypingLabInputSource {
 
 struct AlternateScreen {
     active: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypingLabCandidateKind {
+    Other,
+    Ordinary,
+    Recovery,
+}
+
+impl TypingLabCandidateKind {
+    fn remembers_selection(self) -> bool {
+        self == Self::Ordinary
+    }
 }
 
 #[derive(Default)]
@@ -2281,6 +2307,13 @@ ziranma-decoder：自然码可解释容错解码实验
 #[cfg(test)]
 mod typing_lab_runtime_tests {
     use super::*;
+
+    #[test]
+    fn only_ordinary_candidates_enter_session_selection_memory() {
+        assert!(TypingLabCandidateKind::Ordinary.remembers_selection());
+        assert!(!TypingLabCandidateKind::Recovery.remembers_selection());
+        assert!(!TypingLabCandidateKind::Other.remembers_selection());
+    }
 
     #[test]
     fn phonetic_cache_keeps_its_high_water_mark_until_the_code_changes() {

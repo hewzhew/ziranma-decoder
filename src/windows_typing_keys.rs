@@ -4,7 +4,8 @@ use std::io;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
     GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
-    LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, ReadConsoleInputW, STD_INPUT_HANDLE,
+    LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, ReadConsoleInputW, SHIFT_PRESSED,
+    STD_INPUT_HANDLE,
 };
 
 use crate::typing_lab_cli::TypingLabInput;
@@ -97,6 +98,9 @@ fn decode_key_event(event: &KEY_EVENT_RECORD) -> Option<TypingLabInput> {
     }
 
     let key = event.wVirtualKeyCode;
+    if key == VK_TAB && event.dwControlKeyState & SHIFT_PRESSED != 0 {
+        return Some(TypingLabInput::EnterRecovery);
+    }
     match key {
         VK_BACK => Some(TypingLabInput::Backspace),
         VK_TAB => Some(TypingLabInput::EnterTab),
@@ -148,6 +152,12 @@ mod tests {
         assert_eq!(
             decode_key_event(&pressed(VK_TAB)),
             Some(TypingLabInput::EnterTab)
+        );
+        let mut shifted_tab = pressed(VK_TAB);
+        shifted_tab.dwControlKeyState = SHIFT_PRESSED;
+        assert_eq!(
+            decode_key_event(&shifted_tab),
+            Some(TypingLabInput::EnterRecovery)
         );
         assert_eq!(
             decode_key_event(&pressed(VK_SPACE)),

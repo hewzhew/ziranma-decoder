@@ -14,6 +14,7 @@ pub const TYPING_LAB_USAGE: &str = "\
 直接输入连续双拼；空格或 Enter 选择首项，数字选择候选，退格修改。
 减号向前翻页，加号（或等号）向后翻页；PageUp / PageDown 也可使用。
 本轮选过的同码候选会优先显示，退出后清空。
+Shift+Tab 打开独立的换序候选，用于查看相邻两键颠倒的结果；Esc 返回。
 完整单字码可以按 Tab 进入笔画辅助，再按 h 横、s 竖、p 撇、n 捺、z 折。
 Esc 返回或清空；输入为空时再按 Esc 退出。q 始终是普通双拼字母。
 重定向输入时也可使用 -、+、= 或 :prev、:next 等行命令。
@@ -42,6 +43,7 @@ pub enum TypingLabInput {
     PreviousPage,
     NextPage,
     EnterTab,
+    EnterRecovery,
     Escape,
     Quit,
     Invalid,
@@ -64,6 +66,7 @@ pub struct TypingLabSession {
     phonetic: String,
     shape_pinyin: Option<String>,
     stroke_prefix: String,
+    recovery_mode: bool,
     candidate_page_start: usize,
     notice: Option<String>,
 }
@@ -134,6 +137,10 @@ impl TypingLabSession {
         self.shape_pinyin.is_some()
     }
 
+    pub fn recovery_mode(&self) -> bool {
+        self.recovery_mode
+    }
+
     pub fn shape_pinyin(&self) -> Option<&str> {
         self.shape_pinyin.as_deref()
     }
@@ -192,6 +199,7 @@ impl TypingLabSession {
     }
 
     pub fn enter_tab(&mut self, pinyin: impl Into<String>) {
+        self.recovery_mode = false;
         self.shape_pinyin = Some(pinyin.into());
         self.stroke_prefix.clear();
         self.candidate_page_start = 0;
@@ -212,6 +220,7 @@ impl TypingLabSession {
         self.committed.push_str(text);
         self.phonetic.clear();
         self.candidate_page_start = 0;
+        self.recovery_mode = false;
         self.leave_tab();
         self.notice = None;
         true
@@ -235,6 +244,7 @@ impl TypingLabSession {
             TypingLabInput::Letters(letters)
                 if letters.as_bytes().iter().all(u8::is_ascii_lowercase) =>
             {
+                self.recovery_mode = false;
                 let available = MAX_PHONETIC_KEYS.saturating_sub(self.phonetic.len());
                 self.phonetic.extend(letters.chars().take(available));
                 self.candidate_page_start = 0;
@@ -260,6 +270,7 @@ impl TypingLabSession {
                 self.candidate_page_start = 0;
             }
             TypingLabInput::Backspace => {
+                self.recovery_mode = false;
                 self.phonetic.pop();
                 self.candidate_page_start = 0;
             }
@@ -274,7 +285,13 @@ impl TypingLabSession {
                 return TypingLabEffect::RequestTab;
             }
             TypingLabInput::EnterTab => {}
+            TypingLabInput::EnterRecovery if !self.phonetic.is_empty() && !self.tab_mode() => {
+                self.recovery_mode = true;
+                self.candidate_page_start = 0;
+            }
+            TypingLabInput::EnterRecovery => {}
             TypingLabInput::Escape if self.tab_mode() => self.leave_tab(),
+            TypingLabInput::Escape if self.recovery_mode() => self.recovery_mode = false,
             TypingLabInput::Escape if !self.phonetic.is_empty() => {
                 self.phonetic.clear();
                 self.candidate_page_start = 0;
@@ -325,6 +342,7 @@ pub fn parse_typing_lab_input(raw: &str) -> TypingLabInput {
     match input.as_str() {
         "" | ":space" | ":enter" => TypingLabInput::Confirm,
         ":tab" => TypingLabInput::EnterTab,
+        ":recover" | ":recovery" => TypingLabInput::EnterRecovery,
         "-" | ":prev" | ":pageup" => TypingLabInput::PreviousPage,
         "+" | "=" | ":next" | ":pagedown" => TypingLabInput::NextPage,
         ":back" | ":backspace" => TypingLabInput::Backspace,
@@ -374,6 +392,9 @@ pub fn render_typing_lab_screen(
             session.stroke_prefix()
         )
         .expect("writing to String cannot fail");
+    } else if session.recovery_mode() {
+        writeln!(output, "输入：{}　换序候选", session.phonetic())
+            .expect("writing to String cannot fail");
     } else {
         writeln!(output, "输入：{}", session.phonetic()).expect("writing to String cannot fail");
     }
@@ -418,16 +439,23 @@ pub fn render_typing_lab_screen(
             )
             .expect("writing to String cannot fail");
         }
+    } else if session.recovery_mode() {
+        if direct_keys {
+            writeln!(output, "空格首选　数字选择　Esc返回").expect("writing to String cannot fail");
+        } else {
+            writeln!(output, "空行首选　数字选择　:esc返回")
+                .expect("writing to String cannot fail");
+        }
     } else if direct_keys {
         writeln!(
             output,
-            "空格首选　数字选择　-前页　+后页　退格修改　Tab找字　Esc清空/退出"
+            "空格首选　数字选择　-前页　+后页　Shift+Tab换序　Tab找字　退格修改　Esc清空/退出"
         )
         .expect("writing to String cannot fail");
     } else {
         writeln!(
             output,
-            "空行首选　数字选择　-前页　+后页　:back退格　:tab找字　:esc清空　:quit退出"
+            "空行首选　数字选择　-前页　+后页　:recover换序　:tab找字　:back退格　:esc清空　:quit退出"
         )
         .expect("writing to String cannot fail");
     }
@@ -474,6 +502,10 @@ mod tests {
             TypingLabInput::Letters("t".to_owned())
         );
         assert_eq!(parse_typing_lab_input(":tab"), TypingLabInput::EnterTab);
+        assert_eq!(
+            parse_typing_lab_input(":recover"),
+            TypingLabInput::EnterRecovery
+        );
         assert_eq!(parse_typing_lab_input(":next"), TypingLabInput::NextPage);
         assert_eq!(parse_typing_lab_input("-"), TypingLabInput::PreviousPage);
         assert_eq!(parse_typing_lab_input("+"), TypingLabInput::NextPage);
@@ -520,6 +552,27 @@ mod tests {
         );
         assert!(session.phonetic().is_empty());
         assert_eq!(session.apply(TypingLabInput::Escape), TypingLabEffect::Quit);
+    }
+
+    #[test]
+    fn recovery_is_explicit_and_escape_returns_without_clearing_input() {
+        let mut session = TypingLabSession::default();
+        session.apply(TypingLabInput::Letters("mafkmm".to_owned()));
+        assert_eq!(
+            session.apply(TypingLabInput::EnterRecovery),
+            TypingLabEffect::Continue
+        );
+        assert!(session.recovery_mode());
+        assert_eq!(session.phonetic(), "mafkmm");
+
+        session.apply(TypingLabInput::Escape);
+        assert!(!session.recovery_mode());
+        assert_eq!(session.phonetic(), "mafkmm");
+
+        session.apply(TypingLabInput::EnterRecovery);
+        session.apply(TypingLabInput::Backspace);
+        assert!(!session.recovery_mode());
+        assert_eq!(session.phonetic(), "mafkm");
     }
 
     #[test]
