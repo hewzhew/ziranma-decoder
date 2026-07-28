@@ -6,14 +6,14 @@ use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel,
-    CharacterShapeIndex, Decoder, ProtocolContextLaneReport, ProtocolIndexStats,
-    ProtocolStrategyReport, ShapeLab, analyze_candidate_lab, audit_abbreviation_codebook,
-    audit_anchored_tail_failures, audit_continuous_composition, audit_public_protocol_context,
-    audit_public_protocols, audit_shape_refinement_course, encode_pinyin_phrase,
-    evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
-    evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
-    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
-    parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
+    CharacterShapeIndex, Decoder, MAX_SHAPE_LAB_VISIBLE, ProtocolContextLaneReport,
+    ProtocolIndexStats, ProtocolStrategyReport, SentenceCandidate, ShapeLab, analyze_candidate_lab,
+    audit_abbreviation_codebook, audit_anchored_tail_failures, audit_continuous_composition,
+    audit_public_protocol_context, audit_public_protocols, audit_shape_refinement_course,
+    encode_pinyin_phrase, evaluate_character_context_oracle, evaluate_context_oracle,
+    evaluate_continuous_composition, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
+    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+    parse_lexicon_tsv, parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
     select_public_bigram_training_sequences, select_public_calibration_cases,
     select_public_continuous_composition_cases, select_public_protocol_audit_cases,
     select_shape_course_tasks,
@@ -42,9 +42,9 @@ use shape_lab_cli::{
     render_shape_lab_details, render_shape_lab_screen,
 };
 use typing_lab_cli::{
-    TYPING_LAB_USAGE, TypingLabEffect, TypingLabInput, TypingLabSession,
-    find_single_character_pinyin, parse_typing_lab_arguments, parse_typing_lab_input,
-    render_typing_lab_screen,
+    TYPING_LAB_CANDIDATE_POOL_DEPTH, TYPING_LAB_USAGE, TypingLabEffect, TypingLabInput,
+    TypingLabSelectionMemory, TypingLabSession, find_single_character_pinyin,
+    parse_typing_lab_arguments, parse_typing_lab_input, render_typing_lab_screen,
 };
 #[cfg(windows)]
 use windows_shape_keys::WindowsShapeKeyReader;
@@ -997,29 +997,54 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let shape_lab = ShapeLab::new(&imported.entries, &shapes);
     let mut input_source = TypingLabInputSource::open();
     let mut session = TypingLabSession::default();
+    let mut selection_memory = TypingLabSelectionMemory::default();
+    let mut phonetic_cache = TypingLabPhoneticCache::default();
+    let mut screen = AlternateScreen::enter(input_source.direct_keys())?;
 
     loop {
-        let candidates = if let Some(pinyin) = session.shape_pinyin() {
-            shape_lab
-                .snapshot(pinyin, session.stroke_prefix(), None, options.visible_limit)?
+        let (candidates, ordinary_candidates) = if let Some(pinyin) = session.shape_pinyin() {
+            let candidates = shape_lab
+                .snapshot(pinyin, session.stroke_prefix(), None, MAX_SHAPE_LAB_VISIBLE)?
                 .candidates
                 .into_iter()
                 .map(|candidate| candidate.character.to_string())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (candidates, false)
         } else if session.phonetic().is_empty() {
-            Vec::new()
+            (Vec::new(), false)
         } else {
-            decoder
-                .decode_sentence(session.phonetic(), options.visible_limit)?
-                .into_iter()
-                .map(|candidate| candidate.text)
-                .collect::<Vec<_>>()
+            let depth = if session.candidate_page_start() == 0 {
+                options.visible_limit
+            } else {
+                TYPING_LAB_CANDIDATE_POOL_DEPTH
+            };
+            if phonetic_cache.code != session.phonetic() || phonetic_cache.depth != depth {
+                phonetic_cache.code = session.phonetic().to_owned();
+                phonetic_cache.depth = depth;
+                phonetic_cache.candidates = decoder.decode_sentence(session.phonetic(), depth)?;
+            }
+            selection_memory.promote(session.phonetic(), &mut phonetic_cache.candidates);
+            let candidates = phonetic_cache
+                .candidates
+                .iter()
+                .map(|candidate| candidate.text.clone())
+                .collect::<Vec<_>>();
+            (candidates, true)
         };
+        session.normalize_candidate_page(candidates.len(), options.visible_limit);
+        let visible_range =
+            session.visible_candidate_range(candidates.len(), options.visible_limit);
+        let visible_candidates = &candidates[visible_range];
 
-        clear_interactive_screen();
+        screen.clear()?;
         print!(
             "{}",
-            render_typing_lab_screen(&session, &candidates, input_source.direct_keys())
+            render_typing_lab_screen(
+                &session,
+                visible_candidates,
+                candidates.len(),
+                input_source.direct_keys(),
+            )
         );
         if !input_source.direct_keys() {
             print!("> ");
@@ -1031,9 +1056,23 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         };
         match session.apply(input) {
             TypingLabEffect::Continue => {}
-            TypingLabEffect::Confirm => select_typing_candidate(&mut session, &candidates, 1),
-            TypingLabEffect::Select(rank) => {
-                select_typing_candidate(&mut session, &candidates, rank)
+            TypingLabEffect::Confirm => select_typing_candidate(
+                &mut session,
+                &mut selection_memory,
+                &candidates,
+                ordinary_candidates.then_some(phonetic_cache.candidates.as_slice()),
+                1,
+            ),
+            TypingLabEffect::Select(rank) => select_typing_candidate(
+                &mut session,
+                &mut selection_memory,
+                &candidates,
+                ordinary_candidates.then_some(phonetic_cache.candidates.as_slice()),
+                rank,
+            ),
+            TypingLabEffect::PreviousPage => session.previous_candidate_page(options.visible_limit),
+            TypingLabEffect::NextPage => {
+                session.next_candidate_page(candidates.len(), options.visible_limit)
             }
             TypingLabEffect::RequestTab => {
                 if let Some(pinyin) =
@@ -1048,15 +1087,27 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    clear_interactive_screen();
+    screen.leave()?;
     if !session.committed().is_empty() {
         println!("{}", session.committed());
     }
     Ok(())
 }
 
-fn select_typing_candidate(session: &mut TypingLabSession, candidates: &[String], rank: usize) {
-    if let Some(candidate) = rank.checked_sub(1).and_then(|index| candidates.get(index)) {
+fn select_typing_candidate(
+    session: &mut TypingLabSession,
+    selection_memory: &mut TypingLabSelectionMemory,
+    candidates: &[String],
+    candidate_details: Option<&[SentenceCandidate]>,
+    rank: usize,
+) {
+    let candidate_index = rank
+        .checked_sub(1)
+        .and_then(|index| session.candidate_page_start().checked_add(index));
+    if let Some(candidate) = candidate_index.and_then(|index| candidates.get(index)) {
+        if let Some(detail) = candidate_index.and_then(|index| candidate_details?.get(index)) {
+            selection_memory.remember(session.phonetic(), detail);
+        }
         session.commit(candidate);
     } else {
         session.set_notice("这个位置没有候选");
@@ -1325,6 +1376,50 @@ enum TypingLabInputSource {
     #[cfg(windows)]
     Direct(WindowsTypingKeyReader),
     Line,
+}
+
+struct AlternateScreen {
+    active: bool,
+}
+
+#[derive(Default)]
+struct TypingLabPhoneticCache {
+    code: String,
+    depth: usize,
+    candidates: Vec<SentenceCandidate>,
+}
+
+impl AlternateScreen {
+    fn enter(active: bool) -> io::Result<Self> {
+        if active {
+            print!("\x1b[?1049h\x1b[?25l\x1b[H\x1b[J");
+            io::stdout().flush()?;
+        }
+        Ok(Self { active })
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        if self.active {
+            print!("\x1b[H\x1b[J");
+            io::stdout().flush()?;
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) -> io::Result<()> {
+        if self.active {
+            print!("\x1b[?25h\x1b[?1049l");
+            io::stdout().flush()?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AlternateScreen {
+    fn drop(&mut self) {
+        let _ = self.leave();
+    }
 }
 
 impl TypingLabInputSource {

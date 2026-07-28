@@ -14,6 +14,8 @@ const VK_TAB: u16 = 0x09;
 const VK_RETURN: u16 = 0x0d;
 const VK_ESCAPE: u16 = 0x1b;
 const VK_SPACE: u16 = 0x20;
+const VK_PRIOR: u16 = 0x21;
+const VK_NEXT: u16 = 0x22;
 const VK_0: u16 = 0x30;
 const VK_9: u16 = 0x39;
 const VK_A: u16 = 0x41;
@@ -64,7 +66,10 @@ impl WindowsTypingKeyReader {
                 };
                 let repeat = if matches!(
                     input,
-                    TypingLabInput::Letters(_) | TypingLabInput::Backspace
+                    TypingLabInput::Letters(_)
+                        | TypingLabInput::Backspace
+                        | TypingLabInput::PreviousPage
+                        | TypingLabInput::NextPage
                 ) {
                     usize::from(event.wRepeatCount.max(1)).min(32)
                 } else {
@@ -95,6 +100,8 @@ fn decode_key_event(event: &KEY_EVENT_RECORD) -> Option<TypingLabInput> {
         VK_TAB => Some(TypingLabInput::EnterTab),
         VK_RETURN | VK_SPACE => Some(TypingLabInput::Confirm),
         VK_ESCAPE => Some(TypingLabInput::Escape),
+        VK_PRIOR => Some(TypingLabInput::PreviousPage),
+        VK_NEXT => Some(TypingLabInput::NextPage),
         VK_A..=VK_Z => Some(TypingLabInput::Letters(
             char::from(b'a' + u8::try_from(key - VK_A).expect("A-Z offset fits u8")).to_string(),
         )),
@@ -117,7 +124,9 @@ mod tests {
     use windows::Win32::System::Console::{KEY_EVENT_RECORD, LEFT_CTRL_PRESSED};
     use windows_core::BOOL;
 
-    use super::{VK_A, VK_BACK, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, decode_key_event};
+    use super::{
+        VK_A, VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SPACE, VK_TAB, decode_key_event,
+    };
     use crate::typing_lab_cli::TypingLabInput;
 
     fn pressed(key: u16) -> KEY_EVENT_RECORD {
@@ -150,6 +159,14 @@ mod tests {
         assert_eq!(
             decode_key_event(&pressed(VK_BACK)),
             Some(TypingLabInput::Backspace)
+        );
+        assert_eq!(
+            decode_key_event(&pressed(VK_PRIOR)),
+            Some(TypingLabInput::PreviousPage)
+        );
+        assert_eq!(
+            decode_key_event(&pressed(VK_NEXT)),
+            Some(TypingLabInput::NextPage)
         );
         assert_eq!(
             decode_key_event(&pressed(VK_A + u16::from(b'q' - b'a'))),
