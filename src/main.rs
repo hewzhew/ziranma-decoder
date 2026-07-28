@@ -1036,7 +1036,7 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             session.visible_candidate_range(candidates.len(), options.visible_limit);
         let visible_candidates = &candidates[visible_range];
 
-        screen.clear()?;
+        screen.clear();
         print!(
             "{}",
             render_typing_lab_screen(
@@ -1398,12 +1398,10 @@ impl AlternateScreen {
         Ok(Self { active })
     }
 
-    fn clear(&mut self) -> io::Result<()> {
+    fn clear(&mut self) {
         if self.active {
             print!("\x1b[H\x1b[J");
-            io::stdout().flush()?;
         }
-        Ok(())
     }
 
     fn leave(&mut self) -> io::Result<()> {

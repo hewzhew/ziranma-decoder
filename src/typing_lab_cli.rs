@@ -12,10 +12,11 @@ pub const TYPING_LAB_USAGE: &str = "\
   cargo run --release -- typing-lab [--limit <1～10>]
 
 直接输入连续双拼；空格或 Enter 选择首项，数字选择候选，退格修改。
-PageUp / PageDown 翻页。本轮选过的同码候选会优先显示，退出后清空。
+减号向前翻页，加号（或等号）向后翻页；PageUp / PageDown 也可使用。
+本轮选过的同码候选会优先显示，退出后清空。
 完整单字码可以按 Tab 进入笔画辅助，再按 h 横、s 竖、p 撇、n 捺、z 折。
 Esc 返回或清空；输入为空时再按 Esc 退出。q 始终是普通双拼字母。
-重定向输入时使用 :prev、:next、:tab、:esc、:quit 等行命令，避免占用任何字母键。
+重定向输入时也可使用 -、+、= 或 :prev、:next 等行命令。
 
 实验台使用固定公开词典与笔画快照，不读取私人记录、不写文件。
 它只在内存中记住本轮显式选择；输入和候选仍可能进入终端捕获或录屏。";
@@ -321,9 +322,9 @@ pub fn parse_typing_lab_input(raw: &str) -> TypingLabInput {
     match input.as_str() {
         "" | ":space" | ":enter" => TypingLabInput::Confirm,
         ":tab" => TypingLabInput::EnterTab,
-        ":prev" | ":pageup" => TypingLabInput::PreviousPage,
-        ":next" | ":pagedown" => TypingLabInput::NextPage,
-        "-" | ":back" | ":backspace" => TypingLabInput::Backspace,
+        "-" | ":prev" | ":pageup" => TypingLabInput::PreviousPage,
+        "+" | "=" | ":next" | ":pagedown" => TypingLabInput::NextPage,
+        ":back" | ":backspace" => TypingLabInput::Backspace,
         ":esc" | ":escape" => TypingLabInput::Escape,
         ":quit" | ":exit" => TypingLabInput::Quit,
         value if value.len() == 1 && value.as_bytes()[0].is_ascii_digit() => {
@@ -404,26 +405,26 @@ pub fn render_typing_lab_screen(
         if direct_keys {
             writeln!(
                 output,
-                "h横　s竖　p撇　n捺　z折　数字选择　PgUp/PgDn翻页　退格撤回　Esc返回"
+                "h横　s竖　p撇　n捺　z折　数字选择　-前页　+后页　退格撤回　Esc返回"
             )
             .expect("writing to String cannot fail");
         } else {
             writeln!(
                 output,
-                "h横　s竖　p撇　n捺　z折　数字选择　:prev/:next翻页　-撤回　:esc返回"
+                "h横　s竖　p撇　n捺　z折　数字选择　-前页　+后页　:back撤回　:esc返回"
             )
             .expect("writing to String cannot fail");
         }
     } else if direct_keys {
         writeln!(
             output,
-            "空格首选　数字选择　PgUp/PgDn翻页　退格修改　Tab找字　Esc清空/退出"
+            "空格首选　数字选择　-前页　+后页　退格修改　Tab找字　Esc清空/退出"
         )
         .expect("writing to String cannot fail");
     } else {
         writeln!(
             output,
-            "空行首选　数字选择　:prev/:next翻页　-退格　:tab找字　:esc清空　:quit退出"
+            "空行首选　数字选择　-前页　+后页　:back退格　:tab找字　:esc清空　:quit退出"
         )
         .expect("writing to String cannot fail");
     }
@@ -471,6 +472,10 @@ mod tests {
         );
         assert_eq!(parse_typing_lab_input(":tab"), TypingLabInput::EnterTab);
         assert_eq!(parse_typing_lab_input(":next"), TypingLabInput::NextPage);
+        assert_eq!(parse_typing_lab_input("-"), TypingLabInput::PreviousPage);
+        assert_eq!(parse_typing_lab_input("+"), TypingLabInput::NextPage);
+        assert_eq!(parse_typing_lab_input("="), TypingLabInput::NextPage);
+        assert_eq!(parse_typing_lab_input(":back"), TypingLabInput::Backspace);
         assert_eq!(parse_typing_lab_input(""), TypingLabInput::Confirm);
     }
 
