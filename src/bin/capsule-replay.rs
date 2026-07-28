@@ -9,9 +9,10 @@ use ziranma_decoder::{
     BigramLanguageModel, CAPTURE_INTEGRITY_SCHEMA_V1, CapsuleReplayReport, CaptureIntegrityV1,
     CaptureSessionKind, CharacterBigramLanguageModel, CharacterShapeIndex,
     ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
-    PHRASE_TRIM_MAX_GAP_MS, PersonalCacheReplayState, PrivateShapeActionComparisonStats,
-    PrivateShapeReplayAudit, RawKey, SegmentCloseReason, TrackerOutput, parse_rime_lexicon,
-    parse_stroke_sequence_tsv, parse_ud_conllu, select_public_bigram_training_sequences,
+    PHRASE_TRIM_MAX_GAP_MS, PairedReplayStrategyStats, PersonalCacheReplayState,
+    PrivateShapeActionComparisonStats, PrivateShapeReplayAudit, RawKey, ReplayStrategyStats,
+    SegmentCloseReason, TrackerOutput, parse_rime_lexicon, parse_stroke_sequence_tsv,
+    parse_ud_conllu, select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
 use ziranma_decoder::{
@@ -29,6 +30,8 @@ const MAX_CAPSULE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_SEGMENTS: u64 = 1_000_000;
 const CAPTURE_HEALTH_REPORT_SCHEMA_V1: &str = "ziranma-capture-health-report-v1";
 const CAPTURE_INTEGRITY_REPORT_SCHEMA_V1: &str = "ziranma-capture-integrity-report-v1";
+const REPLAY_DECISION_REPORT_SCHEMA_V1: &str = "ziranma-replay-decision-report-v1";
+const REPLAY_DECISION_MIN_WINDOWS: u64 = 20;
 const CAPTURE_HEALTH_PRIVACY_NOTICE: &str = "--health-only prints CAPTURE_HEALTH and CAPTURE_INTEGRITY; both contain behavioral \
      metadata; legacy v1/.zic integrity is unavailable, never zero-filled.";
 
@@ -45,6 +48,7 @@ enum Options {
         inputs: Vec<InputSelector>,
         window_gap_ms: Option<u64>,
         compact: bool,
+        decision: bool,
         public_context: bool,
         public_character_context: bool,
         personal_cache: bool,
@@ -62,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inputs,
             window_gap_ms,
             compact,
+            decision,
             public_context,
             public_character_context,
             personal_cache,
@@ -122,7 +127,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let entries = imported.entries;
             let decoder = Decoder::new(entries.clone());
             let mut report = CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
-            if personal_cache || personal_pair_cache {
+            let mut decision_health = CaptureHealthReport::default();
+            if decision {
+                visit_private_loaded_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |loaded| {
+                        decision_health.observe_loaded(loaded);
+                        redact_private_analysis_error(
+                            report.observe_capsule(&decoder, &loaded.capsule),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+            } else if personal_cache || personal_pair_cache {
                 let mut state = PersonalCacheReplayState::new();
                 if !history_inputs.is_empty() {
                     let mut history_report =
@@ -242,7 +262,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )?;
             }
-            if compact {
+            if decision {
+                println!("{}", render_decision_report(&report, &decision_health));
+            } else if compact {
                 println!("{}", report.compact_terminal_report());
             } else {
                 println!("{}", report.terminal_line());
@@ -260,6 +282,7 @@ fn parse_options(
     let mut inputs = Vec::new();
     let mut window_gap_ms = None;
     let mut compact = false;
+    let mut decision = false;
     let mut public_context = false;
     let mut public_character_context = false;
     let mut personal_cache = false;
@@ -307,6 +330,12 @@ fn parse_options(
                 }
                 compact = true;
             }
+            "--decision" => {
+                if decision {
+                    return Err("--decision can be given only once".into());
+                }
+                decision = true;
+            }
             "--public-context" => {
                 if public_context {
                     return Err("--public-context can be given only once".into());
@@ -348,6 +377,7 @@ fn parse_options(
                     && inputs.is_empty()
                     && window_gap_ms.is_none()
                     && !compact
+                    && !decision
                     && !public_context
                     && !public_character_context
                     && !personal_cache
@@ -378,6 +408,9 @@ fn parse_options(
     }
     if personal_pair_cache && window_gap_ms.is_none() {
         return Err("--personal-pair-cache requires --window-gap-ms".into());
+    }
+    if decision && window_gap_ms.is_none() {
+        return Err("--decision requires --window-gap-ms".into());
     }
     if usize::from(public_context)
         + usize::from(public_character_context)
@@ -419,11 +452,27 @@ fn parse_options(
             "--shape-audit cannot be combined with history, window, or compact options".into(),
         );
     }
+    if decision
+        && (compact
+            || !history_inputs.is_empty()
+            || public_context
+            || public_character_context
+            || personal_cache
+            || personal_pair_cache
+            || shape_audit
+            || health_only)
+    {
+        return Err(
+            "--decision cannot be combined with compact, history, context, cache, shape, or health options"
+                .into(),
+        );
+    }
     Ok(Options::Inputs {
         history_inputs,
         inputs,
         window_gap_ms,
         compact,
+        decision,
         public_context,
         public_character_context,
         personal_cache,
@@ -440,6 +489,9 @@ fn print_usage() {
     );
     eprintln!(
         "Usage (health): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... --health-only"
+    );
+    eprintln!(
+        "Usage (decision): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         --window-gap-ms <POSITIVE_MS> --decision"
     );
     eprintln!(
         "Usage (replay): cargo run --bin capsule-replay -- \\\n         [--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION> ...] \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         [--window-gap-ms <POSITIVE_MS> \\\n          [--public-context|--public-character-context|--personal-cache|\
@@ -763,6 +815,230 @@ impl CaptureHealthReport {
             counters.counter_saturated,
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrategyDecision {
+    NoEvidence,
+    NeedMoreData,
+    BaselineBlocked,
+    NoSavings,
+    TopTenDrop,
+    RankCost,
+    ValidateNextSession,
+}
+
+fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthReport) -> String {
+    let noncanonical_observations = report
+        .composition_encodable_commits
+        .saturating_sub(report.observed_matches_canonical);
+    let baseline = &report.window_canonical_full;
+    let comparable_actions = baseline.attempts == report.continuous_windows
+        && report.continuous_windows_over_key_limit == 0;
+    let strategies = [
+        (
+            "逐词尾音节简写",
+            &report.window_word_tail_one_short,
+            &report.window_word_tail_one_short_vs_full,
+        ),
+        (
+            "保守词尾简写（单字词不缩）",
+            &report.window_word_tail_keep_singletons,
+            &report.window_word_tail_keep_singletons_vs_full,
+        ),
+        (
+            "逐词首音节完整、其余简写",
+            &report.window_word_head_anchored,
+            &report.window_word_head_anchored_vs_full,
+        ),
+    ];
+
+    let mut lines = vec![
+        format!(
+            "DECISION_REPORT schema={REPLAY_DECISION_REPORT_SCHEMA_V1} \
+             contains_text=false contains_behavioral_metadata=true writes=false network=false"
+        ),
+        "私人输入决策报告（不显示原文）".to_owned(),
+        format!(
+            "样本：{} 个输入文件，{} 条事件；{} 次提交，{} 次提交后编辑。编辑不自动等于打错。",
+            report.capsules, report.events, report.commits, report.revisions
+        ),
+        format!(
+            "采集：{} 条记录按键完整，{} 条不完整；{} 条位置不确定；{} 次提交含组合内回删。\
+             完整性证据可用 {} 段，旧格式或明文胶囊 {} 段。",
+            health.keys_complete_records,
+            health.keys_incomplete_records,
+            health.ambiguous_positions,
+            health.commits_with_internal_edit_keys,
+            health.integrity_available_segments,
+            health.legacy_inputs_without_integrity
+        ),
+        format!(
+            "码表：{} 次提交可从拼音反推规范自然码，其中 {} 次实际字母与规范码不同。\
+             这不等于错误；自定义短语、别名和找字流程都可能造成这种观察，反事实策略不会把它冒充规范码。",
+            report.composition_encodable_commits, noncanonical_observations
+        ),
+        format!(
+            "连续输入：{} 次提交可进入窗口，{} 次被排除，形成 {} 个可比较窗口；\
+             这些窗口记录到 {} 次限域操作。",
+            report.window_eligible_commits,
+            report.window_ineligible_commits,
+            report.continuous_windows,
+            report.continuous_window_recorded_logical_key_actions
+        ),
+        format!(
+            "完整码连打：{} 个窗口；Top-1 {}/{}，Top-5 {}/{}，Top-10 {}/{}；{}。",
+            baseline.attempts,
+            baseline.hits_at_1,
+            baseline.attempts,
+            baseline.hits_at_5,
+            baseline.attempts,
+            baseline.hits_at_10,
+            baseline.attempts,
+            render_action_projection(
+                report.continuous_window_recorded_logical_key_actions,
+                baseline.projected_actions_with_one_selection(),
+                comparable_actions
+            )
+        ),
+    ];
+
+    for (label, strategy, paired) in strategies {
+        lines.push(render_strategy_decision(
+            label,
+            report.continuous_window_recorded_logical_key_actions,
+            report.continuous_windows,
+            strategy,
+            paired,
+        ));
+    }
+    lines.push(format!(
+        "下一步：{}",
+        overall_decision(report, health, &strategies)
+    ));
+    lines.push(
+        "口径：记录值只涵盖成功配对的限域按键；操作投影只计算“字母键 + 整窗一次选择”，\
+         不估算看候选、翻页和掉出 Top-10 后的补救，因此它是乐观下界，不是已经实现的输入速度。"
+            .to_owned(),
+    );
+    lines.join("\n")
+}
+
+fn render_strategy_decision(
+    label: &str,
+    recorded_actions: u64,
+    continuous_windows: u64,
+    strategy: &ReplayStrategyStats,
+    paired: &PairedReplayStrategyStats,
+) -> String {
+    let comparable_actions =
+        paired.comparisons == continuous_windows && strategy.attempts == continuous_windows;
+    format!(
+        "- {label}：比较 {} 个窗口，少按 {} 个字母、多按 {} 个字母；\
+         Top-1 {}/{}, Top-5 {}/{}, Top-10 {}/{}；相对完整码名次变差 {} 次，\
+         其中掉出 Top-10 {} 次、救回 {} 次；{}。判断：{}",
+        paired.comparisons,
+        paired.input_keys_saved,
+        paired.input_keys_added,
+        strategy.hits_at_1,
+        strategy.attempts,
+        strategy.hits_at_5,
+        strategy.attempts,
+        strategy.hits_at_10,
+        strategy.attempts,
+        paired.rank_worsened,
+        paired.dropped_from_top_10,
+        paired.recovered_into_top_10,
+        render_action_projection(
+            recorded_actions,
+            strategy.projected_actions_with_one_selection(),
+            comparable_actions
+        ),
+        strategy_decision_text(strategy_decision(paired))
+    )
+}
+
+fn render_action_projection(recorded: u64, projected: u64, comparable: bool) -> String {
+    if !comparable {
+        return format!("乐观操作投影 {projected} 次（有超长或缺失窗口，不能和实际总数直接相减）");
+    }
+    if projected <= recorded {
+        format!(
+            "乐观操作投影 {projected} 次，比同窗口记录值少 {} 次",
+            recorded - projected
+        )
+    } else {
+        format!(
+            "乐观操作投影 {projected} 次，比同窗口记录值多 {} 次",
+            projected - recorded
+        )
+    }
+}
+
+fn strategy_decision(paired: &PairedReplayStrategyStats) -> StrategyDecision {
+    if paired.comparisons == 0 {
+        StrategyDecision::NoEvidence
+    } else if paired.comparisons < REPLAY_DECISION_MIN_WINDOWS {
+        StrategyDecision::NeedMoreData
+    } else if paired.baseline_visible_at_10 < paired.comparisons {
+        StrategyDecision::BaselineBlocked
+    } else if paired.input_keys_saved <= paired.input_keys_added {
+        StrategyDecision::NoSavings
+    } else if paired.dropped_from_top_10 > 0 {
+        StrategyDecision::TopTenDrop
+    } else if paired.rank_worsened > 0 {
+        StrategyDecision::RankCost
+    } else {
+        StrategyDecision::ValidateNextSession
+    }
+}
+
+fn strategy_decision_text(decision: StrategyDecision) -> &'static str {
+    match decision {
+        StrategyDecision::NoEvidence => "还没有可比较样本",
+        StrategyDecision::NeedMoreData => "样本还少，继续自然记录，暂不改变协议",
+        StrategyDecision::BaselineBlocked => "完整码基线本身仍有缺口，先修基线",
+        StrategyDecision::NoSavings => "没有形成净省键，停止把它当通用方案",
+        StrategyDecision::TopTenDrop => "出现 Top-10 掉出，暂不进入 V1",
+        StrategyDecision::RankCost => "虽然省键但候选名次变差，先验证真实选词成本",
+        StrategyDecision::ValidateNextSession => "可冻结为候选，交给下一份独立自然会话验证",
+    }
+}
+
+fn overall_decision(
+    report: &CapsuleReplayReport,
+    health: &CaptureHealthReport,
+    strategies: &[(&str, &ReplayStrategyStats, &PairedReplayStrategyStats)],
+) -> &'static str {
+    if health.integrity_counters.counter_saturated {
+        return "采集计数已经饱和，先修复采集层，不用这批数字调整解码器。";
+    }
+    if report.continuous_windows == 0 {
+        return "目前没有连续窗口；继续自然记录，不需要特地制造句子。";
+    }
+    if report.continuous_windows < REPLAY_DECISION_MIN_WINDOWS {
+        return "先继续自然记录；累计至少 20 个可比较窗口后再决定，本轮不修改输入协议。";
+    }
+    if report.window_canonical_full.attempts < report.continuous_windows {
+        return "存在超长或无法完整回放的窗口；先核对这些排除项，不把分母差异解释成候选质量。";
+    }
+    if report.window_canonical_full.hits_at_10 < report.window_canonical_full.attempts {
+        return "先改善完整码的词典覆盖或排序；基线稳以前，不用简写成绩掩盖问题。";
+    }
+    let decisions = strategies
+        .iter()
+        .map(|(_, _, paired)| strategy_decision(paired))
+        .collect::<Vec<_>>();
+    if decisions.contains(&StrategyDecision::ValidateNextSession) {
+        return "已有保守简写候选可以冻结；下一份独立自然会话只做验证，不在本轮数据上继续调参。";
+    }
+    if decisions.contains(&StrategyDecision::TopTenDrop) {
+        return "当前简写存在 Top-10 安全损失，暂不并入 V1；下一轮先研究排序或更受限的触发条件。";
+    }
+    if decisions.contains(&StrategyDecision::RankCost) {
+        return "省键已经出现，但候选名次成本没有解决；下一轮先测真实选词动作，不扩大简写范围。";
+    }
+    "现有策略没有显示出足够的净收益；保留完整码主线，停止为得到漂亮数字而放宽协议。"
 }
 
 fn is_navigation_key(key: &RawKey) -> bool {
@@ -1573,10 +1849,10 @@ mod tests {
     use super::{
         CAPTURE_HEALTH_PRIVACY_NOTICE, CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES,
         Options, PUBLIC_RIME_LEXICON, PUBLIC_UD_TRAIN, PrivateInputLoader,
-        RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard,
+        RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard, StrategyDecision,
         expand_session_selector, parse_options, read_explicit_capsules,
-        redact_private_analysis_error, resolve_capsule_input, resolve_protected_input,
-        visit_private_inputs,
+        redact_private_analysis_error, render_decision_report, resolve_capsule_input,
+        resolve_protected_input, strategy_decision, visit_private_inputs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1584,9 +1860,10 @@ mod tests {
     use ziranma_decoder::{
         BigramLanguageModel, CapsuleReplayReport, CaptureIntegrityCountersV1, CaptureIntegrityV1,
         CaptureSessionKind, CharacterBigramLanguageModel, CommitRecord, ContinuousSegmentMetadata,
-        Decoder, DeltaPositionEvidence, EventCapsuleV1, KeySequence, PersonalCacheReplayState,
-        RawKey, SegmentCloseReason, TextDelta, TimedTrackerOutput, TrackerOutput,
-        parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+        Decoder, DeltaPositionEvidence, EventCapsuleV1, KeySequence, PairedReplayStrategyStats,
+        PersonalCacheReplayState, RawKey, ReplayStrategyStats, SegmentCloseReason, TextDelta,
+        TimedTrackerOutput, TrackerOutput, parse_rime_lexicon, parse_ud_conllu,
+        select_public_bigram_training_sequences,
     };
     #[cfg(windows)]
     use ziranma_decoder::{
@@ -1978,6 +2255,7 @@ mod tests {
             inputs,
             window_gap_ms,
             compact,
+            decision,
             public_context,
             public_character_context,
             personal_cache,
@@ -1992,6 +2270,7 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(window_gap_ms, None);
         assert!(!compact);
+        assert!(!decision);
         assert!(!public_context);
         assert!(!public_character_context);
         assert!(!personal_cache);
@@ -2020,6 +2299,44 @@ mod tests {
                 "--session".to_owned(),
                 "1234-77".to_owned(),
                 "--health-only".to_owned(),
+                "--compact".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let decision = parse_options(vec![
+            "--session".to_owned(),
+            "1234-77".to_owned(),
+            "--window-gap-ms".to_owned(),
+            "15000".to_owned(),
+            "--decision".to_owned(),
+        ])
+        .unwrap();
+        let Options::Inputs {
+            decision,
+            window_gap_ms,
+            ..
+        } = decision
+        else {
+            panic!("expected inputs");
+        };
+        assert!(decision);
+        assert_eq!(window_gap_ms, Some(15_000));
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--decision".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "15000".to_owned(),
+                "--decision".to_owned(),
                 "--compact".to_owned(),
             ])
             .is_err()
@@ -2324,6 +2641,130 @@ mod tests {
                 "--compact".to_owned(),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn decision_report_is_short_redacted_and_conservative_with_small_samples() {
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        report.capsules = 1;
+        report.events = 4;
+        report.commits = 2;
+        report.revisions = 2;
+        report.composition_encodable_commits = 2;
+        report.observed_matches_canonical = 1;
+        report.word_boundaries_available_commits = 2;
+        report.window_eligible_commits = 2;
+        report.continuous_windows = 1;
+        report.continuous_window_commits = 2;
+        report.continuous_window_recorded_logical_key_actions = 10;
+        report.window_canonical_full = ReplayStrategyStats {
+            attempts: 1,
+            input_keys: 8,
+            hits_at_1: 1,
+            hits_at_5: 1,
+            hits_at_10: 1,
+            rank_histogram_at_10: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        report.window_word_tail_keep_singletons = ReplayStrategyStats {
+            attempts: 1,
+            input_keys: 6,
+            hits_at_1: 0,
+            hits_at_5: 1,
+            hits_at_10: 1,
+            rank_histogram_at_10: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        report.window_word_tail_keep_singletons_vs_full = PairedReplayStrategyStats {
+            comparisons: 1,
+            shortened_codes: 1,
+            baseline_input_keys: 8,
+            strategy_input_keys: 6,
+            input_keys_saved: 2,
+            baseline_visible_at_10: 1,
+            strategy_visible_at_10: 1,
+            rank_worsened: 1,
+            ..PairedReplayStrategyStats::default()
+        };
+        let health = CaptureHealthReport {
+            capsules: 1,
+            events: 4,
+            commits: 2,
+            revisions: 2,
+            keys_complete_records: 4,
+            commits_with_internal_edit_keys: 1,
+            legacy_inputs_without_integrity: 1,
+            ..CaptureHealthReport::default()
+        };
+
+        let rendered = render_decision_report(&report, &health);
+
+        assert_eq!(rendered.lines().count(), 12);
+        assert!(rendered.starts_with(
+            "DECISION_REPORT schema=ziranma-replay-decision-report-v1 contains_text=false"
+        ));
+        assert!(rendered.contains("实际字母与规范码不同"));
+        assert!(rendered.contains("编辑不自动等于打错"));
+        assert!(rendered.contains("样本还少，继续自然记录，暂不改变协议"));
+        assert!(rendered.contains("至少 20 个可比较窗口后再决定"));
+        assert!(!rendered.contains("猫"));
+        assert!(!rendered.contains("mao"));
+    }
+
+    #[test]
+    fn decision_gate_requires_enough_safe_net_saving_comparisons() {
+        let insufficient = PairedReplayStrategyStats {
+            comparisons: 19,
+            input_keys_saved: 19,
+            baseline_visible_at_10: 19,
+            ..PairedReplayStrategyStats::default()
+        };
+        assert_eq!(
+            strategy_decision(&insufficient),
+            StrategyDecision::NeedMoreData
+        );
+
+        let baseline_blocked = PairedReplayStrategyStats {
+            comparisons: 20,
+            input_keys_saved: 20,
+            baseline_visible_at_10: 19,
+            ..PairedReplayStrategyStats::default()
+        };
+        assert_eq!(
+            strategy_decision(&baseline_blocked),
+            StrategyDecision::BaselineBlocked
+        );
+
+        let top_ten_drop = PairedReplayStrategyStats {
+            comparisons: 20,
+            input_keys_saved: 20,
+            baseline_visible_at_10: 20,
+            dropped_from_top_10: 1,
+            rank_worsened: 1,
+            ..PairedReplayStrategyStats::default()
+        };
+        assert_eq!(
+            strategy_decision(&top_ten_drop),
+            StrategyDecision::TopTenDrop
+        );
+
+        let rank_cost = PairedReplayStrategyStats {
+            comparisons: 20,
+            input_keys_saved: 20,
+            baseline_visible_at_10: 20,
+            rank_worsened: 1,
+            ..PairedReplayStrategyStats::default()
+        };
+        assert_eq!(strategy_decision(&rank_cost), StrategyDecision::RankCost);
+
+        let safe = PairedReplayStrategyStats {
+            comparisons: 20,
+            input_keys_saved: 20,
+            baseline_visible_at_10: 20,
+            ..PairedReplayStrategyStats::default()
+        };
+        assert_eq!(
+            strategy_decision(&safe),
+            StrategyDecision::ValidateNextSession
         );
     }
 
