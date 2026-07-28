@@ -10,6 +10,7 @@ use std::fmt;
 use crate::{
     CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotDescriptor,
     CandidateSnapshotError, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
+    candidate_payload_fingerprint, parse_lexicon_tsv,
 };
 
 /// First immutable candidate-package manifest schema.
@@ -30,6 +31,38 @@ pub struct CandidatePackageManifest {
 }
 
 impl CandidatePackageManifest {
+    /// Builds deterministic metadata for one already-materialized payload.
+    ///
+    /// This function does not write the payload or infer whether its text is
+    /// private. The caller must supply that policy decision explicitly.
+    pub fn from_payload(
+        revision: &str,
+        contains_private_text: bool,
+        lexicon_tsv: &str,
+    ) -> Result<Self, CandidatePackageError> {
+        if !super::candidate_snapshot::valid_candidate_snapshot_revision(revision) {
+            return Err(CandidatePackageError::InvalidRevision);
+        }
+        let payload_bytes = lexicon_tsv.len();
+        if payload_bytes == 0 || payload_bytes > MAX_CANDIDATE_SNAPSHOT_BYTES {
+            return Err(CandidatePackageError::InvalidPayloadBytes);
+        }
+        let entry_count = parse_lexicon_tsv(lexicon_tsv)
+            .map_err(|_| CandidatePackageError::Snapshot(CandidateSnapshotError::Lexicon))?
+            .len();
+        if entry_count == 0 || entry_count > MAX_CANDIDATE_SNAPSHOT_ENTRIES {
+            return Err(CandidatePackageError::InvalidEntryCount);
+        }
+
+        Ok(Self {
+            revision: revision.to_owned(),
+            contains_private_text,
+            payload_bytes,
+            payload_fingerprint: candidate_payload_fingerprint(lexicon_tsv.as_bytes()),
+            entry_count,
+        })
+    }
+
     /// Parses the exact eight-line v1 manifest without accepting unknown data.
     pub fn parse(contents: &str) -> Result<Self, CandidatePackageError> {
         if contents.is_empty() || contents.len() > MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES {
@@ -99,6 +132,25 @@ impl CandidatePackageManifest {
             expected_entry_count: self.entry_count,
         })
         .map_err(CandidatePackageError::Snapshot)
+    }
+
+    /// Renders the canonical eight-line v1 manifest.
+    pub fn render(&self) -> String {
+        format!(
+            "schema={CANDIDATE_PACKAGE_SCHEMA_V1}\n\
+             snapshot_schema={CANDIDATE_SNAPSHOT_SCHEMA_V1}\n\
+             revision={}\n\
+             contains_private_text={}\n\
+             payload_format={CANDIDATE_PACKAGE_LEXICON_TSV_V1}\n\
+             payload_bytes={}\n\
+             payload_fingerprint_fnv1a64={:016x}\n\
+             entry_count={}\n",
+            self.revision,
+            self.contains_private_text,
+            self.payload_bytes,
+            self.payload_fingerprint,
+            self.entry_count
+        )
     }
 
     /// Returns the validated data revision.
@@ -227,6 +279,26 @@ mod tests {
         assert_eq!(snapshot.revision(), manifest.revision());
         assert_eq!(
             snapshot.candidate_text("nihk", 1).unwrap().as_deref(),
+            Some("你好")
+        );
+    }
+
+    #[test]
+    fn deterministic_builder_reproduces_the_fixed_public_manifest() {
+        let built =
+            CandidatePackageManifest::from_payload("tsf-public-demo-v1", false, LEXICON).unwrap();
+        assert_eq!(built.render(), MANIFEST);
+        assert_eq!(
+            CandidatePackageManifest::parse(&built.render()).unwrap(),
+            built
+        );
+        assert_eq!(
+            built
+                .load_snapshot(LEXICON)
+                .unwrap()
+                .candidate_text("nihk", 1)
+                .unwrap()
+                .as_deref(),
             Some("你好")
         );
     }

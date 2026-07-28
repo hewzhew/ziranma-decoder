@@ -8,8 +8,8 @@
 
 当前 TSF 开发类工厂先解析固定的候选包清单，再通过这个入口加载仓库内的
 50 词公开演示词典。每个进程只构造一次，随后由类工厂创建的文本服务共享
-同一个不可变快照。它仍不是日用词典，也没有从磁盘选择
-current/candidate/previous 的能力。
+同一个不可变快照。它仍不是日用词典；磁盘上的 current/candidate/previous
+开发槽已经可以独立管理，但默认类工厂尚未读取它们。
 
 ## 不可变候选包
 
@@ -42,6 +42,39 @@ cargo run --release --bin candidatectl -- inspect `
 文件路径、指纹值或任何候选文字。检查器不写文件、不学习、不修改 TSF 配置、
 不联网，也不会替操作者安排下一步。
 
+## 确定性生成
+
+`candidatectl build` 只接受显式 `--public`、一个普通 UTF-8 TSV 和一个尚不存在
+的输出目录。它先严格解析词典，再计算字节数、词条数和 FNV-1a 损坏检测值，
+写入原样载荷与规范清单，最后从新目录完整回读一次：
+
+```powershell
+cargo run --release --bin candidatectl -- build `
+  --source tests/fixtures/public/demo_lexicon.tsv `
+  --output .local/candidate-demo-v1 `
+  --revision tsf-public-demo-v1 `
+  --public
+```
+
+输出目录已存在时一律拒绝覆盖。载荷先写、清单后写，因此中途失败最多留下
+一个无法通过完整加载的不完整目录，不会冒充有效包。当前命令刻意不提供私人
+明文生成；私人候选必须另行设计 DPAPI 封装和授权边界。
+
+## 开发槽位
+
+`candidatectl` 的 `adopt`、`stage`、`promote`、`rollback` 和 `status` 接收显式
+`--root`。`adopt` / `stage` 还要求显式 `--package`，只从固定的
+`manifest.zcm` 与 `lexicon.tsv` 加载，不扫描相邻目录。
+
+槽库把验证后的公开包复制到内容寻址、只增不改的内部目录。四行
+`ziranma-candidate-slots-v1` 状态只保存 current/candidate/previous 三个内部
+标识；提升把旧 current 留作 previous，回退交换 current 与 previous。失败的
+状态转换不改变内存状态，磁盘指针通过同步临时文件原子替换。`status` 不创建
+目录，也不显示内部标识、文件路径、指纹或候选正文。
+
+槽库不删除废弃包，也不接受 `contains_private_text=true` 的明文包。当前提升和
+回退只改变开发数据指针：已加载 DLL 不读取这个指针，TSF 候选不会随之变化。
+
 ## 固定边界
 
 一个描述符包含：
@@ -73,19 +106,18 @@ FNV-1a 只用于发现损坏、拿错版本或构建材料漂移。它不是密�
 这些规则首先保证不吞字。它们不声称未知双拼已经被正确转换，也不把按键直通
 包装成候选质量。
 
-## 尚未实现的换代层
+## 尚未接通的宿主换代层
 
-包清单、载荷校验和只读检查器已经完成。下一阶段才实现包生成与槽位，而不是
-让 `CandidateSnapshot` 自己扫描目录：
+包清单、确定性公开生成、完整加载与三槽状态已经完成。接下来仍有三道门：
 
-1. 构建工具从固定公开来源生成清单与不可变载荷，并另行记录上游 SHA-256 和
-   解码兼容指纹；
-2. 开发控制器显式把包放入 current/candidate/previous 槽位；
+1. 固定外部公开来源时，另行记录上游 SHA-256、许可证与解码兼容指纹；当前
+   FNV-1a 只能发现普通损坏，不能认证来源；
+2. candidate 必须先通过独立合成宿主检查，随后才允许 TSF 使用已提升的 current；
 3. 新文本服务只在创建时取得一个 `Arc<CandidateSnapshot>`，活动组合期间绝不
-   偷换模型；
-4. candidate 先做独立合成宿主检查，再显式 promote；加载失败继续保留 current；
-5. 私人模型仍沿用独立的 DPAPI、因果评测和显式授权流程，不因为公开候选包
-   可换代就自动启用学习。
+   偷换模型；加载失败继续保留编译内开发包或交还宿主输入路径。
+
+私人模型仍沿用独立的 DPAPI、因果评测和显式授权流程，不因为公开候选包可
+换代就自动启用学习。
 
 是否把完整公开词典编译进 DLL、映射只读数据文件，或使用独立引擎进程，需要
 在真实宿主权限、启动延迟、内存重复量和升级可靠性都有测量后再决定。当前快照

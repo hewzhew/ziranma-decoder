@@ -177,6 +177,28 @@ cargo run --release --bin candidatectl -- inspect `
 ```
 
 检查器只读两个明确指定的普通文件，不扫描目录、不写文件、不学习、不联网。
+公开 TSV 也可以确定性生成一个全新的候选包目录；目标目录必须尚不存在：
+
+```powershell
+cargo run --release --bin candidatectl -- build `
+  --source tests/fixtures/public/demo_lexicon.tsv `
+  --output .local/candidate-demo-v1 `
+  --revision tsf-public-demo-v1 `
+  --public
+```
+
+显式指定的本地槽库支持 `status`、`adopt`、`stage`、`promote` 和 `rollback`。
+它只接受通过完整校验的公开明文包；槽位状态原子替换，包文件不就地改写：
+
+```powershell
+cargo run --release --bin candidatectl -- adopt `
+  --root .local/candidate-slots `
+  --package .local/candidate-demo-v1
+cargo run --release --bin candidatectl -- status --root .local/candidate-slots
+```
+
+这些槽位目前只管理开发数据，不会改变已加载的 TSF：默认类工厂仍使用编译进
+DLL 的公开演示包。外部 current 加载和候选版本合成宿主门禁尚未接通。
 
 发布 DLL 的架构、COM 导出、证书目录和固定 zh-CN 语言配置可以先用只读工具
 核对；它不提供注册或激活命令：
