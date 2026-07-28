@@ -22,6 +22,7 @@ mod correction_episode;
 mod evaluation;
 mod event_capsule;
 mod language_model;
+mod private_session;
 mod protocol_audit;
 mod public_corpus;
 mod session_summary;
@@ -85,6 +86,10 @@ pub use language_model::{
     BigramLanguageModel, BigramLanguageModelStats, BigramScore, CharacterBigramLanguageModel,
     CharacterBigramLanguageModelStats, CharacterLanguageModelError, CharacterSequenceScore,
     LanguageModelParseError,
+};
+pub use private_session::{
+    ProtectedSessionError, ProtectedSessionErrorKind, ProtectedSessionReader,
+    ProtectedSessionSegment,
 };
 pub use protocol_audit::{
     AnchoredTailFailureAuditReport, AnchoredTailFailureCase, ProtocolContextLaneReport,
