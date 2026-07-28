@@ -138,7 +138,7 @@ mod windows_controller {
                 for argument in args {
                     match argument.as_str() {
                         "--machine" => machine = true,
-                        other => return Err(format!("unknown status argument: {other}").into()),
+                        _ => return Err("unknown status argument; value was suppressed".into()),
                     }
                 }
                 ControllerCommand::Status { machine }
@@ -177,7 +177,7 @@ mod windows_controller {
                             validate_session_kind(&session_kind)?;
                         }
                         "--background" => background = true,
-                        other => return Err(format!("unknown run argument: {other}").into()),
+                        _ => return Err("unknown run argument; value was suppressed".into()),
                     }
                 }
                 ControllerCommand::Run {
@@ -186,10 +186,11 @@ mod windows_controller {
                 }
             }
             "--help" | "-h" | "help" => {
+                reject_extra(args)?;
                 print_usage();
                 return Ok(None);
             }
-            other => return Err(format!("unknown recorderctl command: {other}").into()),
+            _ => return Err("unknown recorderctl command; value was suppressed".into()),
         };
         Ok(Some(parsed))
     }
@@ -204,8 +205,8 @@ mod windows_controller {
     fn reject_extra(
         mut args: impl Iterator<Item = String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(extra) = args.next() {
-            return Err(format!("unexpected argument: {extra}").into());
+        if args.next().is_some() {
+            return Err("unexpected argument; value was suppressed".into());
         }
         Ok(())
     }
@@ -243,7 +244,8 @@ mod windows_controller {
         }
         println!(
             "RECORDERCTL_STATUS schema={} configured={} running={} healthy={} \
-             network=false reads_capture_data=false writes=false",
+             network=false reads_capture_data=false writes=false path_disclosed=false \
+             contains_behavioral_metadata=true",
             STATE_SCHEMA,
             state.is_some(),
             processes.len(),
@@ -261,18 +263,7 @@ mod windows_controller {
         print_machine_active(active.as_ref(), &processes)?;
         for process in processes {
             let role = managed_process_role(&process, state.as_ref(), &root).unwrap_or("unmanaged");
-            let path = process
-                .path
-                .as_deref()
-                .map(human_readable_path)
-                .unwrap_or_else(|| "unavailable".to_owned());
-            println!(
-                "RECORDERCTL_PROCESS pid={} role={} managed={} path=\"{}\"",
-                process.pid,
-                role,
-                role != "unmanaged",
-                sanitize_field(&path)
-            );
+            println!("{}", machine_process_line(process.pid, role));
         }
         Ok(())
     }
@@ -405,7 +396,10 @@ mod windows_controller {
         processes: &[RecorderProcess],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(active) = active else {
-            println!("RECORDERCTL_SESSION schema={ACTIVE_SCHEMA} state=unavailable");
+            println!(
+                "RECORDERCTL_SESSION schema={ACTIVE_SCHEMA} state=unavailable \
+                 path_disclosed=false contains_behavioral_metadata=true"
+            );
             return Ok(());
         };
         let ownership = if processes.iter().any(|process| process.pid == active.pid) {
@@ -416,7 +410,8 @@ mod windows_controller {
         println!(
             "RECORDERCTL_SESSION schema={} state={} pid={} session={} kind={} \
              producer_version={} capture_profile={} phase={} target={} elapsed_ms={} \
-             saved_segments={} saved_events={} last_flush_unix_ms={}",
+             saved_segments={} saved_events={} last_flush_unix_ms={} path_disclosed=false \
+             contains_behavioral_metadata=true",
             ACTIVE_SCHEMA,
             ownership,
             active.pid,
@@ -494,14 +489,24 @@ mod windows_controller {
         let metadata = read_build_metadata(&binary)?;
         println!(
             "RECORDERCTL_SLOT role={} state=ready producer_version={} capture_profile={} \
-             bytes={} file=\"{}\"",
+             bytes={} file=\"{}\" path_disclosed=false",
             role,
             sanitize_token(&metadata.producer_version),
             sanitize_token(&metadata.capture_profile),
             metadata.byte_len,
-            sanitize_field(&human_readable_path(&binary))
+            sanitize_field(file_name)
         );
         Ok(())
+    }
+
+    fn machine_process_line(pid: u32, role: &str) -> String {
+        format!(
+            "RECORDERCTL_PROCESS pid={} role={} managed={} path=\"redacted\" \
+             path_disclosed=false contains_behavioral_metadata=true",
+            pid,
+            sanitize_token(role),
+            role != "unmanaged"
+        )
     }
 
     fn adopt(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -976,18 +981,14 @@ mod windows_controller {
             current.push(component);
             match fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(format!(
-                        "refusing symlink in recorder runtime path: {}",
-                        human_readable_path(&current)
-                    )
-                    .into());
+                    return Err(
+                        "refusing symlink in recorder runtime path; location suppressed".into(),
+                    );
                 }
                 Ok(metadata) if !metadata.is_dir() => {
-                    return Err(format!(
-                        "recorder runtime component is not a directory: {}",
-                        human_readable_path(&current)
-                    )
-                    .into());
+                    return Err(
+                        "recorder runtime component is not a directory; location suppressed".into(),
+                    );
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1441,14 +1442,6 @@ mod windows_controller {
         String::from_utf16_lossy(&value[..length])
     }
 
-    fn human_readable_path(path: &Path) -> String {
-        let displayed = path.display().to_string();
-        displayed
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&displayed)
-            .to_owned()
-    }
-
     fn sanitize_field(value: &str) -> String {
         value.replace('"', "'").replace(['\r', '\n'], " ")
     }
@@ -1470,8 +1463,9 @@ mod windows_controller {
     mod tests {
         use super::{
             ACTIVE_SCHEMA, ActiveState, BUILD_SCHEMA, ControllerCommand, STATE_SCHEMA, SlotState,
-            field_value, field_value_optional, format_duration, human_phase, parse_active_state,
-            parse_command, parse_key_value_lines, parse_state, sanitize_field, validate_slot_name,
+            field_value, field_value_optional, format_duration, human_phase, machine_process_line,
+            parse_active_state, parse_command, parse_key_value_lines, parse_state, sanitize_field,
+            validate_slot_name,
         };
 
         fn arguments(values: &[&str]) -> Vec<String> {
@@ -1504,6 +1498,23 @@ mod windows_controller {
             assert!(parse_command(arguments(&[])).is_err());
             assert!(parse_command(arguments(&["run", "--session-kind", "invalid"])).is_err());
             assert!(parse_command(arguments(&["promote", "extra"])).is_err());
+            assert!(parse_command(arguments(&["--help"])).unwrap().is_none());
+            assert!(parse_command(arguments(&["--help", "extra"])).is_err());
+        }
+
+        #[test]
+        fn rejected_controller_arguments_never_echo_their_values() {
+            let marker = r"Z:\synthetic-private\PRIVATE_PATH_MARKER";
+            for values in [
+                vec![marker],
+                vec!["status", marker],
+                vec!["run", marker],
+                vec!["promote", marker],
+            ] {
+                let error = parse_command(arguments(&values)).unwrap_err().to_string();
+                assert!(error.contains("suppressed"));
+                assert!(!error.contains("PRIVATE_PATH_MARKER"));
+            }
         }
 
         #[test]
@@ -1559,6 +1570,13 @@ mod windows_controller {
             );
             assert!(field_value(line, "missing").is_err());
             assert_eq!(sanitize_field("a\"\r\nb"), "a'  b");
+
+            let process = machine_process_line(42, "current");
+            assert!(process.contains("pid=42"));
+            assert!(process.contains("path=\"redacted\""));
+            assert!(process.contains("path_disclosed=false"));
+            assert!(process.contains("contains_behavioral_metadata=true"));
+            assert!(!process.contains("Users"));
         }
 
         #[test]

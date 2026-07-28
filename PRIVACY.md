@@ -54,8 +54,25 @@ continuous Codex recorder:
 - targets only the Codex edit control;
 - writes under `data/private/continuous-capture/`;
 - protects segment payloads with Windows DPAPI for the current user;
-- reports redacted lifecycle and count metadata;
+- keeps v2 pipeline-integrity counters (input volume, callback failures,
+  baseline epochs, and coarse close reasons) inside the protected payload;
+- reports redacted lifecycle and, only in explicit health mode, aggregate
+  behavioral count metadata;
 - sends nothing over the network.
+
+Integrity counters do not contain text, key values, exact selection offsets,
+or per-key timing, but they can still reveal input volume, editing habits, and
+continuity patterns. They are behavioral metadata, not anonymous data. Legacy
+v1 segments have no such evidence; reports must mark it unavailable rather
+than treating it as zero. The recorder cannot persist a write failure inside
+the segment whose write failed, so it fails closed instead of claiming a zero
+failure count.
+
+The older `CAPTURE_HEALTH` aggregates, recorder lifecycle/control state, saved
+event counts, session identifiers, and flush times are behavioral metadata too.
+Redacted means that text, key values, personal paths, and recoverable model
+state are absent; it does not mean that the remaining report is anonymous or
+safe to publish without review.
 
 The manual event-capsule path can store plaintext only when both an explicit
 output path and the separate `--allow-private-plaintext` acknowledgement are

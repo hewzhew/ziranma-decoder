@@ -44,9 +44,9 @@ mod windows_recorder {
         IUIAutomationValuePattern, TextEditChangeType, TextEditChangeType_Composition,
         TextEditChangeType_CompositionFinalized, TextPatternRangeEndpoint_End,
         TextPatternRangeEndpoint_Start, TreeScope_Descendants, TreeScope_Element,
-        UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
-        UIA_NamePropertyId, UIA_Text_TextChangedEventId, UIA_TextEditPatternId, UIA_TextPatternId,
-        UIA_ValuePatternId,
+        UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_E_ELEMENTNOTAVAILABLE,
+        UIA_E_TIMEOUT, UIA_EditControlTypeId, UIA_NamePropertyId, UIA_Text_TextChangedEventId,
+        UIA_TextEditPatternId, UIA_TextPatternId, UIA_ValuePatternId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
@@ -63,9 +63,10 @@ mod windows_recorder {
     use windows::core::{BSTR, Interface, PCWSTR, Ref, Result as WindowsResult, implement};
 
     use ziranma_decoder::{
-        CODEX_CAPTURE_PROFILE_V1, CONTINUOUS_PRODUCER_VERSION, CaptureSessionKind,
-        LocalInputTracker, ProtectedSegmentWriter, ProtectedSegmentWriterConfig, RawKey,
-        SegmentWriteReceipt, TextSelection, WindowsUserDataProtector,
+        CODEX_CAPTURE_PROFILE_V2, CONTINUOUS_PRODUCER_VERSION, CaptureIntegrityCountersV1,
+        CaptureSessionKind, LocalInputTracker, ProtectedSegmentWriter,
+        ProtectedSegmentWriterConfig, RawKey, SegmentCloseReason, SegmentWriteReceipt,
+        TextSelection, WindowsUserDataProtector,
     };
 
     const TARGET_NAME: &str = "随心输入";
@@ -99,6 +100,21 @@ mod windows_recorder {
     enum DiscoveryStatus {
         Waiting,
         Ambiguous(usize),
+    }
+
+    #[derive(Debug)]
+    enum AttachAttemptError {
+        Retryable(&'static str),
+        Fatal(String),
+    }
+
+    impl std::fmt::Display for AttachAttemptError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Retryable(reason) => formatter.write_str(reason),
+                Self::Fatal(error) => formatter.write_str(error),
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -182,7 +198,7 @@ mod windows_recorder {
             format!(
                 "schema={CONTROL_STATE_SCHEMA}\npid={}\nsession={}\nkind={}\n\
                  producer_version={CONTINUOUS_PRODUCER_VERSION}\n\
-                 capture_profile={CODEX_CAPTURE_PROFILE_V1}\nstarted_unix_ms={}\nphase={}\n\
+                 capture_profile={CODEX_CAPTURE_PROFILE_V2}\nstarted_unix_ms={}\nphase={}\n\
                  target={}\nsaved_segments={}\nsaved_events={}\nlast_flush_unix_ms={}\n",
                 std::process::id(),
                 self.session_id,
@@ -222,7 +238,7 @@ mod windows_recorder {
             &mut self,
             receipt: &SegmentWriteReceipt,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            self.saved_segments = receipt.sequence.saturating_add(1);
+            self.saved_segments = self.saved_segments.max(receipt.sequence.saturating_add(1));
             self.saved_events = self.saved_events.saturating_add(receipt.events as u64);
             self.last_flush_unix_ms = Some(current_unix_ms()?);
             self.publish()
@@ -275,13 +291,16 @@ mod windows_recorder {
 
     struct RecorderState {
         tracker: LocalInputTracker,
+        pending_integrity: CaptureIntegrityCountersV1,
     }
 
     struct RecorderShared {
+        pipeline_gate: Mutex<()>,
         state: Mutex<RecorderState>,
         writer: Arc<Mutex<ProtectedSegmentWriter<WindowsUserDataProtector>>>,
         control_state: SharedControlState,
         paused: Arc<AtomicBool>,
+        accepting_events: AtomicBool,
         composition_active: AtomicBool,
         fatal_error: Arc<Mutex<Option<String>>>,
     }
@@ -297,85 +316,282 @@ mod windows_recorder {
             let mut tracker = LocalInputTracker::new(TARGET_NAME.to_owned(), initial_value);
             tracker.set_key_capture_enabled(true);
             Self {
-                state: Mutex::new(RecorderState { tracker }),
+                pipeline_gate: Mutex::new(()),
+                state: Mutex::new(RecorderState {
+                    tracker,
+                    pending_integrity: CaptureIntegrityCountersV1::default(),
+                }),
                 writer,
                 control_state,
                 paused,
+                accepting_events: AtomicBool::new(false),
                 composition_active: AtomicBool::new(false),
                 fatal_error,
             }
         }
 
         fn composition(&self, value: String) {
-            if self.paused.load(Ordering::Acquire) {
+            let _pipeline = match self.lock_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
+                }
+            };
+            if self.is_suspended() {
                 return;
             }
-            if let Ok(mut state) = self.state.lock() {
-                let starts_new_composition =
-                    !value.is_empty() && !state.tracker.has_active_composition();
-                if starts_new_composition && state.tracker.pending_keys_is_empty() {
-                    state.tracker.mark_pending_keys_incomplete();
+            let result = self
+                .state
+                .lock()
+                .map_err(|_| "recorder state lock was poisoned".to_owned())
+                .map(|mut state| {
+                    state.pending_integrity.observe_composition_callback();
+                    let starts_new_composition =
+                        !value.is_empty() && !state.tracker.has_active_composition();
+                    if starts_new_composition && state.tracker.pending_keys_is_empty() {
+                        state.tracker.mark_pending_keys_incomplete();
+                    }
+                    state.tracker.observe_composition(value);
+                    self.composition_active
+                        .store(state.tracker.has_active_composition(), Ordering::Release);
+                });
+            if let Err(error) = result {
+                self.fail_closed(error);
+            }
+        }
+
+        fn composition_read_error(&self) {
+            let _pipeline = match self.lock_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
                 }
-                state.tracker.observe_composition(value);
-                self.composition_active
-                    .store(state.tracker.has_active_composition(), Ordering::Release);
+            };
+            if self.is_suspended() {
+                return;
+            }
+            match self.state.lock() {
+                Ok(mut state) => state.pending_integrity.observe_composition_read_error(),
+                Err(_) => self.fail_closed("recorder state lock was poisoned".to_owned()),
+            }
+        }
+
+        fn composition_finalized(&self) {
+            let _pipeline = match self.lock_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
+                }
+            };
+            if self.is_suspended() {
+                return;
+            }
+            match self.state.lock() {
+                Ok(mut state) => state
+                    .pending_integrity
+                    .observe_composition_finalized_callback(),
+                Err(_) => self.fail_closed("recorder state lock was poisoned".to_owned()),
             }
         }
 
         fn key(&self, key: RawKey) {
-            if self.paused.load(Ordering::Acquire) {
-                return;
-            }
-            if let Ok(mut state) = self.state.lock() {
-                state.tracker.observe_key(key);
-            }
-        }
-
-        fn value(&self, value: String, selection: Option<TextSelection>) {
-            if self.paused.load(Ordering::Acquire) {
-                return;
-            }
-            let output = self.state.lock().ok().and_then(|mut state| {
-                let output = state.tracker.observe_value_with_selection(value, selection);
-                self.composition_active
-                    .store(state.tracker.has_active_composition(), Ordering::Release);
-                output
-            });
-            if let Some(output) = output {
-                let result = self
-                    .writer
-                    .lock()
-                    .map_err(|_| "protected writer lock was poisoned".to_owned())
-                    .and_then(|mut writer| {
-                        writer.observe(output).map_err(|error| error.to_string())
-                    });
-                match result {
-                    Ok(Some(receipt)) => {
-                        print_receipt(&receipt);
-                        if let Err(error) = record_control_receipt(&self.control_state, &receipt) {
-                            self.fail_closed(format!("control state publication failed: {error}"));
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => self.fail_closed(error),
+            let _pipeline = match self.lock_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
                 }
+            };
+            if self.is_suspended() {
+                return;
+            }
+            match self.state.lock() {
+                Ok(mut state) => {
+                    let reset = state.tracker.observe_key_with_buffer_status(key);
+                    state.pending_integrity.observe_key_action(reset);
+                }
+                Err(_) => self.fail_closed("recorder state lock was poisoned".to_owned()),
             }
         }
 
-        fn rebaseline(&self, value: String) {
-            if let Ok(mut state) = self.state.lock() {
-                let mut tracker = LocalInputTracker::new(TARGET_NAME.to_owned(), value);
-                tracker.set_key_capture_enabled(true);
-                state.tracker = tracker;
-                self.composition_active.store(false, Ordering::Release);
+        fn value(
+            &self,
+            value: String,
+            selection: Option<TextSelection>,
+            selection_read_failed: bool,
+        ) {
+            let _pipeline = match self.lock_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
+                }
+            };
+            if self.is_suspended() {
+                return;
+            }
+            let observed = self
+                .state
+                .lock()
+                .map_err(|_| "recorder state lock was poisoned".to_owned())
+                .map(|mut state| {
+                    let output = state.tracker.observe_value_with_selection(value, selection);
+                    state
+                        .pending_integrity
+                        .observe_value_callback(output.is_some());
+                    if selection_read_failed {
+                        state.pending_integrity.observe_selection_read_error();
+                    }
+                    self.composition_active
+                        .store(state.tracker.has_active_composition(), Ordering::Release);
+                    let integrity = std::mem::take(&mut state.pending_integrity);
+                    (integrity, output)
+                });
+            let (integrity, output) = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
+                }
+            };
+            let result = self
+                .writer
+                .lock()
+                .map_err(|_| "protected writer lock was poisoned".to_owned())
+                .and_then(|mut writer| {
+                    writer
+                        .observe_batch(integrity, output)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(Some(receipt)) => {
+                    print_receipt(&receipt);
+                    if let Err(error) = record_control_receipt(&self.control_state, &receipt) {
+                        self.fail_closed(format!("control state publication failed: {error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.fail_closed(error),
             }
         }
 
-        fn pause(&self) {
-            if let Ok(mut state) = self.state.lock() {
-                state.tracker.cancel_composition();
-                self.composition_active.store(false, Ordering::Release);
+        fn value_read_error(&self) {
+            let _pipeline = match self.lock_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
+                }
+            };
+            if self.is_suspended() {
+                return;
             }
+            match self.state.lock() {
+                Ok(mut state) => state.pending_integrity.observe_value_read_error(),
+                Err(_) => self.fail_closed("recorder state lock was poisoned".to_owned()),
+            }
+        }
+
+        fn rebaseline(&self, value: String) -> Result<(), String> {
+            let _pipeline = self.lock_pipeline()?;
+            self.rebaseline_under_pipeline(value, true)
+        }
+
+        fn activate(
+            &self,
+            read_baseline: impl FnOnce() -> Result<String, AttachAttemptError>,
+            install_key_session: impl FnOnce() -> Result<(), AttachAttemptError>,
+        ) -> Result<(), AttachAttemptError> {
+            let _pipeline = self.lock_pipeline().map_err(AttachAttemptError::Fatal)?;
+            let baseline = read_baseline()?;
+            self.rebaseline_under_pipeline(baseline, true)
+                .map_err(AttachAttemptError::Fatal)?;
+            install_key_session()?;
+            self.accepting_events.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn rebaseline_under_pipeline(
+            &self,
+            value: String,
+            setup_gap_is_possible: bool,
+        ) -> Result<(), String> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "recorder state lock was poisoned".to_owned())?;
+            let mut tracker = LocalInputTracker::new(TARGET_NAME.to_owned(), value);
+            tracker.set_key_capture_enabled(true);
+            if setup_gap_is_possible {
+                tracker.mark_pending_keys_incomplete();
+            }
+            state.tracker = tracker;
+            state.pending_integrity = CaptureIntegrityCountersV1::default();
+            self.composition_active.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn flush_integrity(&self) -> Result<(), String> {
+            let _pipeline = self.lock_pipeline()?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "recorder state lock was poisoned".to_owned())?;
+            if state.pending_integrity == CaptureIntegrityCountersV1::default() {
+                return Ok(());
+            }
+            self.writer
+                .lock()
+                .map_err(|_| "protected writer lock was poisoned".to_owned())?
+                .absorb_integrity(state.pending_integrity.clone())
+                .map_err(|error| error.to_string())?;
+            state.pending_integrity = CaptureIntegrityCountersV1::default();
+            Ok(())
+        }
+
+        fn pause(&self) -> Result<(), String> {
+            let _pipeline = self.lock_pipeline()?;
+            self.pause_under_pipeline()
+        }
+
+        fn pause_under_pipeline(&self) -> Result<(), String> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "recorder state lock was poisoned".to_owned())?;
+            let pending = state.tracker.pending_key_count();
+            state.pending_integrity.observe_boundary_discard(pending);
+            state.tracker.cancel_composition();
+            self.composition_active.store(false, Ordering::Release);
+            if state.pending_integrity == CaptureIntegrityCountersV1::default() {
+                return Ok(());
+            }
+            self.writer
+                .lock()
+                .map_err(|_| "protected writer lock was poisoned".to_owned())?
+                .absorb_integrity(state.pending_integrity.clone())
+                .map_err(|error| error.to_string())?;
+            state.pending_integrity = CaptureIntegrityCountersV1::default();
+            Ok(())
+        }
+
+        fn disconnect(&self) -> Result<(), String> {
+            self.accepting_events.store(false, Ordering::Release);
+            let _pipeline = self.lock_pipeline()?;
+            self.pause_under_pipeline()
+        }
+
+        fn is_suspended(&self) -> bool {
+            self.paused.load(Ordering::Acquire) || !self.accepting_events.load(Ordering::Acquire)
+        }
+
+        fn lock_pipeline(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+            self.pipeline_gate
+                .lock()
+                .map_err(|_| "recorder pipeline lock was poisoned".to_owned())
         }
 
         fn fail_closed(&self, error: String) {
@@ -400,11 +616,25 @@ mod windows_recorder {
             sender: Ref<IUIAutomationElement>,
             _eventid: windows::Win32::UI::Accessibility::UIA_EVENT_ID,
         ) -> WindowsResult<()> {
-            let sender = sender.ok()?;
-            if let Ok(value) = read_value(sender) {
-                let selection = read_selection(sender, &value).ok().flatten();
-                self.shared.value(value, selection);
-            }
+            let sender = match sender.ok() {
+                Ok(sender) => sender,
+                Err(_) => {
+                    self.shared.value_read_error();
+                    return Ok(());
+                }
+            };
+            let value = match read_value(sender) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.shared.value_read_error();
+                    return Ok(());
+                }
+            };
+            let (selection, selection_read_failed) = match read_selection(sender, &value) {
+                Ok(selection) => (selection, false),
+                Err(_) => (None, true),
+            };
+            self.shared.value(value, selection, selection_read_failed);
             Ok(())
         }
     }
@@ -423,9 +653,12 @@ mod windows_recorder {
             event_strings: *const SAFEARRAY,
         ) -> WindowsResult<()> {
             if change_type == TextEditChangeType_Composition {
-                self.shared
-                    .composition(read_event_strings(event_strings)?.join("|"));
+                match read_event_strings(event_strings) {
+                    Ok(strings) => self.shared.composition(strings.join("|")),
+                    Err(_) => self.shared.composition_read_error(),
+                }
             } else if change_type == TextEditChangeType_CompositionFinalized {
+                self.shared.composition_finalized();
                 // The ordinary Text_TextChanged event supplies the bounded
                 // before/after delta; keep the last composition until then.
             }
@@ -470,10 +703,13 @@ mod windows_recorder {
     }
 
     impl KeyHookContext {
-        fn set_session(&self, session: KeySession) {
-            if let Ok(mut slot) = self.session.lock() {
-                *slot = Some(session);
-            }
+        fn set_session(&self, session: KeySession) -> Result<(), String> {
+            let mut slot = self
+                .session
+                .lock()
+                .map_err(|_| "keyboard hook session lock was poisoned".to_owned())?;
+            *slot = Some(session);
+            Ok(())
         }
 
         fn clear_session(&self) {
@@ -557,7 +793,7 @@ mod windows_recorder {
                 "CODEX_RECORDER_METADATA producer_version={} capture_profile={} \
                  control_state_schema={} target=codex-only \
                  protection=windows-dpapi-current-user network=false",
-                CONTINUOUS_PRODUCER_VERSION, CODEX_CAPTURE_PROFILE_V1, CONTROL_STATE_SCHEMA
+                CONTINUOUS_PRODUCER_VERSION, CODEX_CAPTURE_PROFILE_V2, CONTROL_STATE_SCHEMA
             );
             return Ok(());
         }
@@ -584,151 +820,160 @@ mod windows_recorder {
                 audit.prose_mirror_class,
                 audit.codex_document_ancestor,
                 CONTINUOUS_PRODUCER_VERSION,
-                CODEX_CAPTURE_PROFILE_V1,
+                CODEX_CAPTURE_PROFILE_V2,
                 CONTROL_STATE_SCHEMA
             );
             return Ok(());
         }
 
-        let root = prepare_continuous_root()?;
-        let session_id = new_session_id()?;
-        let writer_config = ProtectedSegmentWriterConfig::new(
-            root,
-            session_id.clone(),
-            options.session_kind,
-            CONTINUOUS_PRODUCER_VERSION.to_owned(),
-            CODEX_CAPTURE_PROFILE_V1.to_owned(),
-            options.segment_events,
-            Duration::from_secs(options.flush_seconds),
-        )?;
-        let writer = Arc::new(Mutex::new(ProtectedSegmentWriter::new(
-            writer_config,
-            WindowsUserDataProtector,
-        )?));
-        let paused = Arc::new(AtomicBool::new(false));
-        let fatal_error = Arc::new(Mutex::new(None));
-        let control_state: SharedControlState = if options.control_state {
-            Some(Arc::new(Mutex::new(ControlStatePublisher::new(
+        let control_state_requested = options.control_state;
+        let capture_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let root = prepare_continuous_root()?;
+            let session_id = new_session_id()?;
+            let writer_config = ProtectedSegmentWriterConfig::new(
+                root,
                 session_id.clone(),
                 options.session_kind,
-            )?)))
-        } else {
-            None
-        };
-        let mut control_lifecycle = ControlLifecycleGuard::new(control_state.clone());
-        KEY_HOOK_CONTEXT
-            .set(KeyHookContext {
-                session: Mutex::new(None),
-                paused: Arc::clone(&paused),
-            })
-            .map_err(|_| "keyboard hook context was already initialized")?;
-
-        // SAFETY: callback has static ABI and is alive through the message loop.
-        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0)? };
-        // SAFETY: Registrations are process-owned and cleaned up below.
-        unsafe {
-            RegisterHotKey(
-                None,
-                PAUSE_HOTKEY_ID,
-                MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-                VK_F10.0 as u32,
+                CONTINUOUS_PRODUCER_VERSION.to_owned(),
+                CODEX_CAPTURE_PROFILE_V2.to_owned(),
+                options.segment_events,
+                Duration::from_secs(options.flush_seconds),
             )?;
-            RegisterHotKey(
-                None,
-                STOP_HOTKEY_ID,
-                MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-                VK_F12.0 as u32,
-            )?;
-        }
-        publish_control_state(&control_state)?;
+            let writer = Arc::new(Mutex::new(ProtectedSegmentWriter::new(
+                writer_config,
+                WindowsUserDataProtector,
+            )?));
+            let paused = Arc::new(AtomicBool::new(false));
+            let fatal_error = Arc::new(Mutex::new(None));
+            let control_state: SharedControlState = if options.control_state {
+                Some(Arc::new(Mutex::new(ControlStatePublisher::new(
+                    session_id.clone(),
+                    options.session_kind,
+                )?)))
+            } else {
+                None
+            };
+            let mut control_lifecycle = ControlLifecycleGuard::new(control_state.clone());
+            KEY_HOOK_CONTEXT
+                .set(KeyHookContext {
+                    session: Mutex::new(None),
+                    paused: Arc::clone(&paused),
+                })
+                .map_err(|_| "keyboard hook context was already initialized")?;
 
-        println!(
-            "CODEX_RECORDER_RUNNING session={} kind={} protection=windows-dpapi-current-user \
+            // SAFETY: callback has static ABI and is alive through the message loop.
+            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0)? };
+            // SAFETY: Registrations are process-owned and cleaned up below.
+            unsafe {
+                RegisterHotKey(
+                    None,
+                    PAUSE_HOTKEY_ID,
+                    MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+                    VK_F10.0 as u32,
+                )?;
+                RegisterHotKey(
+                    None,
+                    STOP_HOTKEY_ID,
+                    MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+                    VK_F12.0 as u32,
+                )?;
+            }
+            publish_control_state(&control_state)?;
+
+            println!(
+                "CODEX_RECORDER_RUNNING session={} kind={} protection=windows-dpapi-current-user \
              target=codex-only segment_events={} flush_seconds={} preview_text=false \
              producer_version={} capture_profile={} control_state={} network=false \
-             startup_installed=false",
-            session_id,
-            options.session_kind.as_str(),
-            options.segment_events,
-            options.flush_seconds,
-            CONTINUOUS_PRODUCER_VERSION,
-            CODEX_CAPTURE_PROFILE_V1,
-            options.control_state
-        );
-        println!("Ctrl+Shift+F10 pauses or resumes. Ctrl+Shift+F12 stops and flushes.");
-
-        let mut result = recorder_loop(
-            &automation,
-            &automation3,
-            &writer,
-            &control_state,
-            &paused,
-            &fatal_error,
-        );
-
-        if let Some(context) = KEY_HOOK_CONTEXT.get() {
-            context.clear_session();
-        }
-        // SAFETY: Each call matches a successful registration above.
-        unsafe {
-            let _ = UnregisterHotKey(None, PAUSE_HOTKEY_ID);
-            let _ = UnregisterHotKey(None, STOP_HOTKEY_ID);
-            let _ = UnhookWindowsHookEx(hook);
-        }
-        match flush_writer(&writer) {
-            Ok(Some(receipt)) => {
-                print_receipt(&receipt);
-                if let Err(error) = record_control_receipt(&control_state, &receipt) {
-                    keep_first_error(&mut result, error);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => keep_first_error(&mut result, error),
-        }
-        let written_counts = writer
-            .lock()
-            .map(|writer| (writer.written_segments(), writer.written_events()))
-            .map_err(|_| -> Box<dyn std::error::Error> {
-                "protected writer lock was poisoned".into()
-            });
-        match written_counts {
-            Ok((written_segments, written_events)) => {
-                println!(
-                    "CODEX_RECORDER_FEEDBACK session={} segments={} events={} \
-                     producer_version={} capture_profile={} contains_text=false \
-                     replay_selector=--session",
-                    session_id,
-                    written_segments,
-                    written_events,
-                    CONTINUOUS_PRODUCER_VERSION,
-                    CODEX_CAPTURE_PROFILE_V1
-                );
-                if written_segments > 0 {
-                    println!(
-                        "FEEDBACK_COMMAND cargo run --release --bin capsule-replay -- \
-                         --session {} --window-gap-ms 15000 --compact",
-                        session_id
-                    );
-                }
-            }
-            Err(error) => keep_first_error(&mut result, error),
-        }
-        let phase = if result.is_ok() {
-            ControlPhase::Stopped
-        } else {
-            ControlPhase::Failed
-        };
-        if let Err(error) = control_lifecycle.finish(phase) {
-            keep_first_error(&mut result, error);
-        }
-        if result.is_err() {
-            eprintln!(
-                "CODEX_RECORDER_FAILED kind=owned-error contains_text=false \
-                 control_state_attempted=true"
+             startup_installed=false contains_text=false contains_behavioral_metadata=true",
+                session_id,
+                options.session_kind.as_str(),
+                options.segment_events,
+                options.flush_seconds,
+                CONTINUOUS_PRODUCER_VERSION,
+                CODEX_CAPTURE_PROFILE_V2,
+                options.control_state
             );
+            println!("Ctrl+Shift+F10 pauses or resumes. Ctrl+Shift+F12 stops and flushes.");
+
+            let mut result = recorder_loop(
+                &automation,
+                &automation3,
+                &writer,
+                &control_state,
+                &paused,
+                &fatal_error,
+            );
+
+            if let Some(context) = KEY_HOOK_CONTEXT.get() {
+                context.clear_session();
+            }
+            // SAFETY: Each call matches a successful registration above.
+            unsafe {
+                let _ = UnregisterHotKey(None, PAUSE_HOTKEY_ID);
+                let _ = UnregisterHotKey(None, STOP_HOTKEY_ID);
+                let _ = UnhookWindowsHookEx(hook);
+            }
+            let final_close_reason = SegmentCloseReason::SessionEnd;
+            match flush_writer(&writer, final_close_reason) {
+                Ok(Some(receipt)) => {
+                    print_receipt(&receipt);
+                    if let Err(error) = record_control_receipt(&control_state, &receipt) {
+                        keep_first_error(&mut result, error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => keep_first_error(&mut result, error),
+            }
+            let written_counts = writer
+                .lock()
+                .map(|writer| (writer.written_segments(), writer.written_events()))
+                .map_err(|_| -> Box<dyn std::error::Error> {
+                    "protected writer lock was poisoned".into()
+                });
+            match written_counts {
+                Ok((written_segments, written_events)) => {
+                    println!(
+                        "CODEX_RECORDER_FEEDBACK session={} segments={} events={} \
+                     producer_version={} capture_profile={} contains_text=false \
+                     contains_behavioral_metadata=true replay_selector=--session",
+                        session_id,
+                        written_segments,
+                        written_events,
+                        CONTINUOUS_PRODUCER_VERSION,
+                        CODEX_CAPTURE_PROFILE_V2
+                    );
+                    if written_segments > 0 {
+                        println!(
+                            "FEEDBACK_COMMAND cargo run --release --bin capsule-replay -- \
+                         --session {} --window-gap-ms 15000 --compact",
+                            session_id
+                        );
+                    }
+                }
+                Err(error) => keep_first_error(&mut result, error),
+            }
+            let phase = if result.is_ok() {
+                ControlPhase::Stopped
+            } else {
+                ControlPhase::Failed
+            };
+            if let Err(error) = control_lifecycle.finish(phase) {
+                keep_first_error(&mut result, error);
+            }
+            result?;
+            println!(
+                "CODEX_RECORDER_STOPPED flushed=true contains_text=false \
+                 contains_behavioral_metadata=true"
+            );
+            Ok(())
+        })();
+        if capture_result.is_err() {
+            eprintln!(
+                "{}",
+                recorder_failure_terminal_line(control_state_requested)
+            );
+            return Err("continuous recorder failed; private details were suppressed".into());
         }
-        result?;
-        println!("CODEX_RECORDER_STOPPED flushed=true");
         Ok(())
     }
 
@@ -755,129 +1000,176 @@ mod windows_recorder {
         let mut last_status = None;
         let mut disconnected_at = None;
 
-        loop {
-            let mut stop = false;
-            let mut message = MSG::default();
-            // SAFETY: message is writable; PM_REMOVE drains this thread's queue.
-            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-                if message.message == WM_QUIT {
-                    stop = true;
-                    break;
-                }
-                if message.message == WM_HOTKEY {
-                    if message.wParam.0 == STOP_HOTKEY_ID as usize {
+        let loop_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            loop {
+                let mut stop = false;
+                let mut message = MSG::default();
+                // SAFETY: message is writable; PM_REMOVE drains this thread's queue.
+                while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    if message.message == WM_QUIT {
                         stop = true;
                         break;
                     }
-                    if message.wParam.0 == PAUSE_HOTKEY_ID as usize {
-                        toggle_pause(paused, attachment.as_ref(), writer, control_state)?;
-                    }
-                }
-                // SAFETY: Standard dispatch for messages not consumed above.
-                unsafe {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-            if stop {
-                if let Some(current) = attachment.take() {
-                    detach(automation, automation3, current);
-                }
-                break;
-            }
-
-            if let Some(error) = fatal_error.lock().ok().and_then(|value| value.clone()) {
-                if let Some(current) = attachment.take() {
-                    detach(automation, automation3, current);
-                }
-                return Err(
-                    format!("recording paused after a fail-closed storage error: {error}").into(),
-                );
-            }
-
-            if attachment.is_some()
-                && last_health.elapsed() >= TARGET_HEALTH_INTERVAL
-                && !attachment
-                    .as_ref()
-                    .is_some_and(|current| attachment_still_current(automation, current))
-            {
-                let current = attachment.take().expect("checked as present");
-                detach(automation, automation3, current);
-                if let Some(receipt) = flush_writer(writer)? {
-                    print_receipt(&receipt);
-                    record_control_receipt(control_state, &receipt)?;
-                }
-                set_control_target(control_state, ControlTarget::Waiting)?;
-                disconnected_at = Some(Instant::now());
-                last_status = None;
-                last_discovery = Instant::now() - TARGET_POLL_INTERVAL;
-            }
-            if last_health.elapsed() >= TARGET_HEALTH_INTERVAL {
-                last_health = Instant::now();
-                if let Some(receipt) = flush_writer_if_due(writer)? {
-                    print_receipt(&receipt);
-                    record_control_receipt(control_state, &receipt)?;
-                }
-            }
-
-            if attachment.is_none() && last_discovery.elapsed() >= TARGET_POLL_INTERVAL {
-                match choose_codex_target(automation)? {
-                    Ok(edit) => {
-                        let current = attach(
-                            automation,
-                            automation3,
-                            edit,
-                            Arc::clone(writer),
-                            control_state.clone(),
-                            Arc::clone(paused),
-                            Arc::clone(fatal_error),
-                        )?;
-                        if disconnected_at.take().is_some() {
-                            println!(
-                                "CODEX_TARGET_REBOUND pid={} continuity_boundary=flushed_if_nonempty \
-                                 key_pairing=automatic existing_text_saved=false",
-                                current.process_id
-                            );
-                        } else {
-                            println!(
-                                "CODEX_TARGET_CONNECTED pid={} key_pairing=automatic \
-                                 existing_text_saved=false",
-                                current.process_id
-                            );
+                    if message.message == WM_HOTKEY {
+                        if message.wParam.0 == STOP_HOTKEY_ID as usize {
+                            stop = true;
+                            break;
                         }
-                        attachment = Some(current);
-                        set_control_target(control_state, ControlTarget::Connected)?;
-                        last_status = None;
+                        if message.wParam.0 == PAUSE_HOTKEY_ID as usize {
+                            toggle_pause(paused, attachment.as_ref(), writer, control_state)?;
+                        }
                     }
-                    Err(status)
-                        if last_status != Some(status)
-                            && (status != DiscoveryStatus::Waiting
-                                || disconnected_at.is_none_or(|when| {
-                                    when.elapsed() >= RECONNECT_NOTICE_DELAY
-                                })) =>
+                    // SAFETY: Standard dispatch for messages not consumed above.
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                if stop {
+                    break;
+                }
+
+                if let Some(error) = fatal_error.lock().ok().and_then(|value| value.clone()) {
+                    return Err(format!(
+                        "recording paused after a fail-closed storage error: {error}"
+                    )
+                    .into());
+                }
+
+                if attachment.is_some()
+                    && last_health.elapsed() >= TARGET_HEALTH_INTERVAL
+                    && !attachment
+                        .as_ref()
+                        .is_some_and(|current| attachment_still_current(automation, current))
+                {
+                    let current = attachment.take().expect("checked as present");
+                    detach(automation, automation3, current)?;
+                    if let Some(receipt) = flush_writer(writer, SegmentCloseReason::Continuity)? {
+                        print_receipt(&receipt);
+                        record_control_receipt(control_state, &receipt)?;
+                    }
+                    set_control_target(control_state, ControlTarget::Waiting)?;
+                    disconnected_at = Some(Instant::now());
+                    last_status = None;
+                    last_discovery = Instant::now() - TARGET_POLL_INTERVAL;
+                }
+                if last_health.elapsed() >= TARGET_HEALTH_INTERVAL {
+                    last_health = Instant::now();
+                    if !paused.load(Ordering::Acquire)
+                        && let Some(current) = attachment.as_ref()
                     {
-                        match status {
-                            DiscoveryStatus::Waiting => {
-                                println!(
-                                    "CODEX_TARGET_WAITING continuity_boundary=flushed_if_nonempty \
-                                     app_restart_reconnect=true"
-                                )
-                            }
-                            DiscoveryStatus::Ambiguous(count) => eprintln!(
-                                "CODEX_TARGET_REFUSED candidates={count} \
-                                 reason=no_unique_focused_exact_codex_edit"
-                            ),
-                        }
-                        last_status = Some(status);
+                        current
+                            .shared
+                            .flush_integrity()
+                            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
                     }
-                    Err(_) => {}
+                    if let Some(receipt) = flush_writer_if_due(writer)? {
+                        print_receipt(&receipt);
+                        record_control_receipt(control_state, &receipt)?;
+                    }
                 }
-                last_discovery = Instant::now();
-            }
 
-            wait_for_message_or_poll();
+                if should_attempt_target_discovery(
+                    paused.load(Ordering::Acquire),
+                    attachment.is_some(),
+                ) && last_discovery.elapsed() >= TARGET_POLL_INTERVAL
+                {
+                    match choose_codex_target(automation)? {
+                        Ok(edit) => {
+                            let attach_result = attach(
+                                automation,
+                                automation3,
+                                edit,
+                                Arc::clone(writer),
+                                control_state.clone(),
+                                Arc::clone(paused),
+                                Arc::clone(fatal_error),
+                            );
+                            let current = match attach_result {
+                                Ok(current) => current,
+                                Err(AttachAttemptError::Retryable(reason)) => {
+                                    if let Some(receipt) =
+                                        flush_writer(writer, SegmentCloseReason::Continuity)?
+                                    {
+                                        print_receipt(&receipt);
+                                        record_control_receipt(control_state, &receipt)?;
+                                    }
+                                    set_control_target(control_state, ControlTarget::Waiting)?;
+                                    if last_status != Some(DiscoveryStatus::Waiting) {
+                                        println!(
+                                            "CODEX_TARGET_RETRYING reason={reason} \
+                                             continuity_boundary=flushed_if_nonempty \
+                                             contains_behavioral_metadata=true"
+                                        );
+                                    }
+                                    last_status = Some(DiscoveryStatus::Waiting);
+                                    last_discovery = Instant::now();
+                                    continue;
+                                }
+                                Err(AttachAttemptError::Fatal(error)) => {
+                                    return Err(error.into());
+                                }
+                            };
+                            if disconnected_at.take().is_some() {
+                                println!(
+                                    "CODEX_TARGET_REBOUND pid={} continuity_boundary=flushed_if_nonempty \
+                                     key_pairing=automatic existing_text_saved=false \
+                                     contains_behavioral_metadata=true",
+                                    current.process_id
+                                );
+                            } else {
+                                println!(
+                                    "CODEX_TARGET_CONNECTED pid={} key_pairing=automatic \
+                                     existing_text_saved=false contains_behavioral_metadata=true",
+                                    current.process_id
+                                );
+                            }
+                            attachment = Some(current);
+                            set_control_target(control_state, ControlTarget::Connected)?;
+                            last_status = None;
+                        }
+                        Err(status)
+                            if last_status != Some(status)
+                                && (status != DiscoveryStatus::Waiting
+                                    || disconnected_at.is_none_or(|when| {
+                                        when.elapsed() >= RECONNECT_NOTICE_DELAY
+                                    })) =>
+                        {
+                            match status {
+                                DiscoveryStatus::Waiting => {
+                                    println!(
+                                        "CODEX_TARGET_WAITING continuity_boundary=flushed_if_nonempty \
+                                         app_restart_reconnect=true contains_behavioral_metadata=true"
+                                    )
+                                }
+                                DiscoveryStatus::Ambiguous(count) => eprintln!(
+                                    "CODEX_TARGET_REFUSED candidates={count} \
+                                     reason=no_unique_focused_exact_codex_edit \
+                                     contains_behavioral_metadata=true"
+                                ),
+                            }
+                            last_status = Some(status);
+                        }
+                        Err(_) => {}
+                    }
+                    last_discovery = Instant::now();
+                }
+
+                wait_for_message_or_poll();
+            }
+            Ok(())
+        })();
+        let cleanup_result = attachment
+            .take()
+            .map_or(Ok(()), |current| detach(automation, automation3, current));
+        match (loop_result, cleanup_result) {
+            (Err(primary), Err(cleanup)) => {
+                Err(format!("{primary}; recorder attachment cleanup also failed: {cleanup}").into())
+            }
+            (Err(primary), _) => Err(primary),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Ok(()),
         }
-        Ok(())
     }
 
     fn wait_for_message_or_poll() {
@@ -895,6 +1187,10 @@ mod windows_recorder {
         if result == WAIT_FAILED {
             std::thread::sleep(Duration::from_millis(u64::from(MESSAGE_WAIT_TIMEOUT_MS)));
         }
+    }
+
+    fn should_attempt_target_discovery(paused: bool, attachment_present: bool) -> bool {
+        !paused && !attachment_present
     }
 
     fn attachment_still_current(automation: &IUIAutomation, attachment: &Attachment) -> bool {
@@ -948,11 +1244,21 @@ mod windows_recorder {
         control_state: SharedControlState,
         paused: Arc<AtomicBool>,
         fatal_error: Arc<Mutex<Option<String>>>,
-    ) -> Result<Attachment, Box<dyn std::error::Error>> {
-        validate_target(&edit)?;
-        let initial_value = read_value(&edit)?;
+    ) -> Result<Attachment, AttachAttemptError> {
+        validate_target(&edit)
+            .map_err(|_| AttachAttemptError::Retryable("target_changed_during_attach"))?;
+        let initial_value = read_value(&edit)
+            .map_err(|_| AttachAttemptError::Retryable("target_changed_during_attach"))?;
         // SAFETY: Read-only property on the already validated target.
-        let process_id = unsafe { edit.CurrentProcessId()? };
+        let process_id = unsafe { edit.CurrentProcessId() }
+            .map_err(|_| AttachAttemptError::Retryable("target_changed_during_attach"))?;
+        writer
+            .lock()
+            .map_err(|_| {
+                AttachAttemptError::Fatal("protected writer lock was poisoned".to_owned())
+            })?
+            .start_new_baseline_epoch()
+            .map_err(|error| AttachAttemptError::Fatal(error.to_string()))?;
         let shared = Arc::new(RecorderShared::new(
             initial_value,
             writer,
@@ -982,40 +1288,128 @@ mod windows_recorder {
         }
         .into();
 
-        // SAFETY: Handlers and target stay alive in Attachment until detach.
-        unsafe {
-            automation.AddAutomationEventHandler(
-                UIA_Text_TextChangedEventId,
+        let mut value_registered = false;
+        let mut composition_registered = false;
+        let mut focus_registered = false;
+        let registration_result = (|| -> WindowsResult<()> {
+            // SAFETY: Handlers and target stay alive until either rollback or
+            // the returned Attachment is detached.
+            unsafe {
+                automation.AddAutomationEventHandler(
+                    UIA_Text_TextChangedEventId,
+                    &edit,
+                    TreeScope_Element,
+                    None::<&IUIAutomationCacheRequest>,
+                    &value_handler,
+                )?;
+                value_registered = true;
+                automation3.AddTextEditTextChangedEventHandler(
+                    &edit,
+                    TreeScope_Element,
+                    TextEditChangeType_Composition,
+                    None::<&IUIAutomationCacheRequest>,
+                    &composition_handler,
+                )?;
+                composition_registered = true;
+                automation3.AddTextEditTextChangedEventHandler(
+                    &edit,
+                    TreeScope_Element,
+                    TextEditChangeType_CompositionFinalized,
+                    None::<&IUIAutomationCacheRequest>,
+                    &composition_handler,
+                )?;
+                automation.AddFocusChangedEventHandler(
+                    None::<&IUIAutomationCacheRequest>,
+                    &focus_handler,
+                )?;
+                focus_registered = true;
+            }
+            Ok(())
+        })();
+        if let Err(error) = registration_result {
+            let cleanup_result = shared.disconnect();
+            remove_registered_handlers(
+                automation,
+                automation3,
                 &edit,
-                TreeScope_Element,
-                None::<&IUIAutomationCacheRequest>,
                 &value_handler,
-            )?;
-            automation3.AddTextEditTextChangedEventHandler(
-                &edit,
-                TreeScope_Element,
-                TextEditChangeType_Composition,
-                None::<&IUIAutomationCacheRequest>,
                 &composition_handler,
-            )?;
-            automation3.AddTextEditTextChangedEventHandler(
-                &edit,
-                TreeScope_Element,
-                TextEditChangeType_CompositionFinalized,
-                None::<&IUIAutomationCacheRequest>,
-                &composition_handler,
-            )?;
-            automation
-                .AddFocusChangedEventHandler(None::<&IUIAutomationCacheRequest>, &focus_handler)?;
+                &focus_handler,
+                value_registered,
+                composition_registered,
+                focus_registered,
+            );
+            if let Err(cleanup) = cleanup_result {
+                return Err(AttachAttemptError::Fatal(format!(
+                    "UIA handler registration failed: {error}; recorder pipeline cleanup failed: {cleanup}"
+                )));
+            }
+            if retryable_uia_error_code(error.code().0 as u32) {
+                return Err(AttachAttemptError::Retryable(
+                    "target_changed_during_handler_registration",
+                ));
+            }
+            return Err(AttachAttemptError::Fatal(format!(
+                "UIA handler registration failed with HRESULT {:?}",
+                error.code()
+            )));
         }
-        KEY_HOOK_CONTEXT
-            .get()
-            .ok_or("keyboard hook context is unavailable")?
-            .set_session(KeySession {
-                process_id: process_id as u32,
-                target_active: Arc::clone(&target_active),
-                shared: Arc::clone(&shared),
-            });
+        let Some(key_context) = KEY_HOOK_CONTEXT.get() else {
+            let cleanup_result = shared.disconnect();
+            remove_registered_handlers(
+                automation,
+                automation3,
+                &edit,
+                &value_handler,
+                &composition_handler,
+                &focus_handler,
+                true,
+                true,
+                true,
+            );
+            cleanup_result.map_err(AttachAttemptError::Fatal)?;
+            return Err(AttachAttemptError::Fatal(
+                "keyboard hook context is unavailable".to_owned(),
+            ));
+        };
+        let key_session = KeySession {
+            process_id: process_id as u32,
+            target_active: Arc::clone(&target_active),
+            shared: Arc::clone(&shared),
+        };
+        let activation_result = shared.activate(
+            || {
+                read_value(&edit)
+                    .map_err(|_| AttachAttemptError::Retryable("target_changed_during_activation"))
+            },
+            || {
+                key_context
+                    .set_session(key_session)
+                    .map_err(AttachAttemptError::Fatal)
+            },
+        );
+        if let Err(error) = activation_result {
+            key_context.clear_session();
+            target_active.store(false, Ordering::Release);
+            let cleanup_result = shared.disconnect();
+            remove_registered_handlers(
+                automation,
+                automation3,
+                &edit,
+                &value_handler,
+                &composition_handler,
+                &focus_handler,
+                true,
+                true,
+                true,
+            );
+            if let Err(cleanup) = cleanup_result {
+                return Err(AttachAttemptError::Fatal(format!(
+                    "recorder activation failed: {error}; recorder pipeline cleanup failed: {cleanup}"
+                )));
+            }
+            return Err(error);
+        }
         Ok(Attachment {
             edit,
             process_id,
@@ -1027,26 +1421,64 @@ mod windows_recorder {
         })
     }
 
-    fn detach(automation: &IUIAutomation, automation3: &IUIAutomation3, attachment: Attachment) {
+    fn detach(
+        automation: &IUIAutomation,
+        automation3: &IUIAutomation3,
+        attachment: Attachment,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(context) = KEY_HOOK_CONTEXT.get() {
             context.clear_session();
         }
         attachment.target_active.store(false, Ordering::Release);
-        attachment.shared.pause();
-        // SAFETY: Each removal matches one registration from attach. Errors are
-        // expected when the provider process has already exited.
+        let disconnect_result = attachment.shared.disconnect();
+        remove_registered_handlers(
+            automation,
+            automation3,
+            &attachment.edit,
+            &attachment.value_handler,
+            &attachment.composition_handler,
+            &attachment.focus_handler,
+            true,
+            true,
+            true,
+        );
+        disconnect_result.map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remove_registered_handlers(
+        automation: &IUIAutomation,
+        automation3: &IUIAutomation3,
+        edit: &IUIAutomationElement,
+        value_handler: &IUIAutomationEventHandler,
+        composition_handler: &IUIAutomationTextEditTextChangedEventHandler,
+        focus_handler: &IUIAutomationFocusChangedEventHandler,
+        value_registered: bool,
+        composition_registered: bool,
+        focus_registered: bool,
+    ) {
+        // SAFETY: Each attempted removal corresponds to a completed
+        // registration. Provider-exit errors are expected during teardown.
         unsafe {
-            let _ = automation.RemoveFocusChangedEventHandler(&attachment.focus_handler);
-            let _ = automation.RemoveAutomationEventHandler(
-                UIA_Text_TextChangedEventId,
-                &attachment.edit,
-                &attachment.value_handler,
-            );
-            let _ = automation3.RemoveTextEditTextChangedEventHandler(
-                &attachment.edit,
-                &attachment.composition_handler,
-            );
+            if focus_registered {
+                let _ = automation.RemoveFocusChangedEventHandler(focus_handler);
+            }
+            if value_registered {
+                let _ = automation.RemoveAutomationEventHandler(
+                    UIA_Text_TextChangedEventId,
+                    edit,
+                    value_handler,
+                );
+            }
+            if composition_registered {
+                let _ =
+                    automation3.RemoveTextEditTextChangedEventHandler(edit, composition_handler);
+            }
         }
+    }
+
+    fn retryable_uia_error_code(code: u32) -> bool {
+        matches!(code, UIA_E_ELEMENTNOTAVAILABLE | UIA_E_TIMEOUT)
     }
 
     fn toggle_pause(
@@ -1057,32 +1489,46 @@ mod windows_recorder {
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !paused.swap(true, Ordering::AcqRel) {
             if let Some(attachment) = attachment {
-                attachment.shared.pause();
+                attachment
+                    .shared
+                    .pause()
+                    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             }
-            if let Some(receipt) = flush_writer(writer)? {
+            if let Some(receipt) = flush_writer(writer, SegmentCloseReason::Continuity)? {
                 print_receipt(&receipt);
                 record_control_receipt(control_state, &receipt)?;
             }
             set_control_paused(control_state, true)?;
-            println!("CODEX_RECORDER_PAUSED disk_flush=true");
+            println!("CODEX_RECORDER_PAUSED disk_flush=true contains_behavioral_metadata=true");
             return Ok(());
         }
 
         if let Some(attachment) = attachment {
             if !attachment.is_live() {
-                println!("CODEX_RECORDER_RESUME_WAITING target_connected=false");
+                println!(
+                    "CODEX_RECORDER_RESUME_WAITING target_connected=false \
+                     contains_behavioral_metadata=true"
+                );
                 paused.store(false, Ordering::Release);
                 set_control_paused(control_state, false)?;
                 set_control_target(control_state, ControlTarget::Waiting)?;
                 return Ok(());
             }
             let baseline = read_value(&attachment.edit)?;
-            attachment.shared.rebaseline(baseline);
+            writer
+                .lock()
+                .map_err(|_| "protected writer lock was poisoned")?
+                .start_new_baseline_epoch()?;
+            attachment
+                .shared
+                .rebaseline(baseline)
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         }
         paused.store(false, Ordering::Release);
         set_control_paused(control_state, false)?;
         println!(
-            "CODEX_RECORDER_RESUMED target_connected={} paused_text_saved=false",
+            "CODEX_RECORDER_RESUMED target_connected={} paused_text_saved=false \
+             contains_behavioral_metadata=true",
             attachment.is_some()
         );
         Ok(())
@@ -1090,11 +1536,12 @@ mod windows_recorder {
 
     fn flush_writer(
         writer: &Arc<Mutex<ProtectedSegmentWriter<WindowsUserDataProtector>>>,
+        reason: SegmentCloseReason,
     ) -> Result<Option<SegmentWriteReceipt>, Box<dyn std::error::Error>> {
         Ok(writer
             .lock()
             .map_err(|_| "protected writer lock was poisoned")?
-            .flush()?)
+            .flush_with_reason(reason)?)
     }
 
     fn flush_writer_if_due(
@@ -1171,24 +1618,25 @@ mod windows_recorder {
     }
 
     fn print_receipt(receipt: &SegmentWriteReceipt) {
-        println!(
-            "PROTECTED_SEGMENT_SAVED sequence={} events={} bytes={} protection={} \
-             contains_plaintext=false path=\"{}\"",
-            receipt.sequence,
-            receipt.events,
-            receipt.protected_bytes,
-            receipt.protection,
-            human_readable_path(&receipt.path)
-        );
+        println!("{}", receipt_terminal_line(receipt));
     }
 
-    fn human_readable_path(path: &Path) -> String {
-        let displayed = path.display().to_string();
-        displayed
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&displayed)
-            .replace('"', "'")
-            .replace(['\r', '\n'], " ")
+    fn receipt_terminal_line(receipt: &SegmentWriteReceipt) -> String {
+        format!(
+            "PROTECTED_SEGMENT_SAVED sequence={} events={} bytes={} protection={} \
+             contains_plaintext=false path_disclosed=false \
+             contains_behavioral_metadata=true",
+            receipt.sequence, receipt.events, receipt.protected_bytes, receipt.protection
+        )
+    }
+
+    fn recorder_failure_terminal_line(control_state_requested: bool) -> String {
+        format!(
+            "CODEX_RECORDER_FAILED kind=owned-error contains_text=false \
+             contains_behavioral_metadata=true control_state_requested={} \
+             error_details_suppressed=true",
+            control_state_requested
+        )
     }
 
     fn parse_options() -> Result<Option<Options>, Box<dyn std::error::Error>> {
@@ -1198,6 +1646,17 @@ mod windows_recorder {
     fn parse_options_from(
         arguments: impl IntoIterator<Item = String>,
     ) -> Result<Option<Options>, Box<dyn std::error::Error>> {
+        let arguments = arguments.into_iter().collect::<Vec<_>>();
+        if arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+        {
+            if arguments.len() == 1 {
+                print_usage();
+                return Ok(None);
+            }
+            return Err("--help must be used by itself".into());
+        }
         let mut run = false;
         let mut check_only = false;
         let mut metadata_only = false;
@@ -1231,11 +1690,7 @@ mod windows_recorder {
                         .ok_or("--flush-seconds requires a value")?
                         .parse()?;
                 }
-                "--help" | "-h" => {
-                    print_usage();
-                    return Ok(None);
-                }
-                other => return Err(format!("unknown argument: {other}").into()),
+                _ => return Err("unknown argument; value was suppressed".into()),
             }
         }
         if usize::from(run) + usize::from(check_only) + usize::from(metadata_only) != 1 {
@@ -1274,8 +1729,10 @@ mod windows_recorder {
     }
 
     fn print_usage() {
+        eprintln!("usage: codex-recorder --metadata");
+        eprintln!("       codex-recorder --check");
         eprintln!(
-            "usage: codex-recorder (--check|--metadata|--run) [--control-state] \
+            "       codex-recorder --run [--control-state] \
              [--session-kind daily|course|theme] \
              [--segment-events <1..={MAX_SEGMENT_EVENTS}>] \
              [--flush-seconds <{MIN_FLUSH_SECONDS}..={MAX_FLUSH_SECONDS}>]"
@@ -1286,8 +1743,8 @@ mod windows_recorder {
             "--control-state publishes redacted low-frequency lifecycle status under .local/recorder"
         );
         eprintln!(
-            "--run tracks only the exact Codex ProseMirror edit and writes current-user DPAPI \
-             segments under data/private/continuous-capture"
+            "--run tracks only the unique safe Codex edit; ProseMirror class is audit-only; \
+             protected segments stay under data/private/continuous-capture"
         );
         eprintln!("the recorder does not install itself at startup");
     }
@@ -1790,16 +2247,26 @@ mod windows_recorder {
     #[cfg(test)]
     mod tests {
         use super::{
-            CONTROL_STATE_SCHEMA, ControlLifecycleGuard, ControlPhase, ControlStatePublisher,
-            ControlTarget, DEFAULT_FLUSH_SECONDS, DEFAULT_SEGMENT_EVENTS, DiscoveryStatus,
-            TargetPolicyAudit, VK_SHIFT, human_readable_path, key_capture_allowed, map_key,
-            parse_options_from, unique_value_offset, write_control_state_atomic,
+            AttachAttemptError, CONTROL_STATE_SCHEMA, ControlLifecycleGuard, ControlPhase,
+            ControlStatePublisher, ControlTarget, DEFAULT_FLUSH_SECONDS, DEFAULT_SEGMENT_EVENTS,
+            DiscoveryStatus, RecorderShared, TargetPolicyAudit, VK_SHIFT, key_capture_allowed,
+            map_key, parse_options_from, receipt_terminal_line, recorder_failure_terminal_line,
+            retryable_uia_error_code, should_attempt_target_discovery, unique_value_offset,
+            write_control_state_atomic,
         };
         use std::fs;
-        use std::path::{Path, PathBuf};
-        use std::sync::{Arc, Mutex};
+        use std::path::PathBuf;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
         use std::time::{SystemTime, UNIX_EPOCH};
-        use ziranma_decoder::{CaptureSessionKind, RawKey};
+        use ziranma_decoder::{
+            CaptureSessionKind, ContinuousSegmentV2, DataProtector, ProtectedSegmentEnvelopeV1,
+            ProtectedSegmentWriter, ProtectedSegmentWriterConfig, RawKey, SegmentCloseReason,
+            SegmentWriteReceipt, WindowsUserDataProtector,
+        };
 
         fn arguments(values: &[&str]) -> Vec<String> {
             values.iter().map(|value| (*value).to_owned()).collect()
@@ -1824,6 +2291,13 @@ mod windows_recorder {
                 .unwrap()
                 .unwrap();
             assert!(controlled.control_state);
+            assert!(
+                parse_options_from(arguments(&["--help"]))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(parse_options_from(arguments(&["--run", "--help"])).is_err());
+            assert!(parse_options_from(arguments(&["--help", "--run"])).is_err());
         }
 
         #[test]
@@ -1848,6 +2322,16 @@ mod windows_recorder {
                 parse_options_from(arguments(&["--metadata", "--session-kind", "theme"])).is_err()
             );
             assert!(parse_options_from(arguments(&["--check", "--control-state"])).is_err());
+        }
+
+        #[test]
+        fn unknown_argument_is_suppressed_instead_of_echoed() {
+            let marker = r"Z:\synthetic-private\PRIVATE_PATH_MARKER";
+            let error = parse_options_from(arguments(&[marker]))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "unknown argument; value was suppressed");
+            assert!(!error.contains("PRIVATE_PATH_MARKER"));
         }
 
         #[test]
@@ -1889,6 +2373,219 @@ mod windows_recorder {
             write_control_state_atomic(&path, b"second").unwrap();
             assert_eq!(fs::read(&path).unwrap(), b"second");
             fs::remove_file(path).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+
+        #[test]
+        fn control_state_segment_count_never_moves_backward() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "ziranma-control-receipt-order-test-{}-{stamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("active-v1.txt");
+            let mut publisher = ControlStatePublisher {
+                path: path.clone(),
+                session_id: "1234-5678".to_owned(),
+                session_kind: CaptureSessionKind::Daily,
+                started_unix_ms: 1234,
+                phase: ControlPhase::Running,
+                target: ControlTarget::Connected,
+                saved_segments: 0,
+                saved_events: 0,
+                last_flush_unix_ms: None,
+            };
+            let receipt = |sequence, events| SegmentWriteReceipt {
+                path: PathBuf::from("redacted-test-segment.zcs"),
+                sequence,
+                events,
+                protected_bytes: 1,
+                protection: "test-protection",
+            };
+
+            publisher.record_receipt(&receipt(4, 3)).unwrap();
+            publisher.record_receipt(&receipt(2, 2)).unwrap();
+
+            assert_eq!(publisher.saved_segments, 5);
+            assert_eq!(publisher.saved_events, 5);
+            let serialized = fs::read_to_string(&path).unwrap();
+            assert!(serialized.contains("saved_segments=5\n"));
+            assert!(serialized.contains("saved_events=5\n"));
+            fs::remove_file(path).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+
+        #[test]
+        fn protected_segment_receipt_never_discloses_its_local_path() {
+            let receipt = SegmentWriteReceipt {
+                path: PathBuf::from("synthetic-private-marker/secret-segment.zcs"),
+                sequence: 4,
+                events: 3,
+                protected_bytes: 99,
+                protection: "test-protection",
+            };
+            let line = receipt_terminal_line(&receipt);
+            assert!(line.starts_with("PROTECTED_SEGMENT_SAVED sequence=4 events=3"));
+            assert!(line.contains("path_disclosed=false"));
+            assert!(!line.contains("private-marker"));
+            assert!(!line.contains("secret-segment"));
+        }
+
+        #[test]
+        fn recorder_failure_line_is_redacted_and_reports_control_state_truthfully() {
+            let direct = recorder_failure_terminal_line(false);
+            assert!(direct.contains("control_state_requested=false"));
+            assert!(direct.contains("error_details_suppressed=true"));
+            assert!(direct.contains("contains_behavioral_metadata=true"));
+            assert!(!direct.contains("Users"));
+            assert!(recorder_failure_terminal_line(true).contains("control_state_requested=true"));
+        }
+
+        #[test]
+        fn recorder_batches_pipeline_counters_with_the_synthetic_commit() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "ziranma-recorder-integrity-test-{}-{stamp}",
+                std::process::id()
+            ));
+            let config = ProtectedSegmentWriterConfig::new(
+                directory.clone(),
+                "synthetic-integrity".to_owned(),
+                CaptureSessionKind::Daily,
+                "0.1.0+continuous.7".to_owned(),
+                "codex-uia-v2".to_owned(),
+                1,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            let mut protected_writer =
+                ProtectedSegmentWriter::new(config, WindowsUserDataProtector).unwrap();
+            protected_writer.start_new_baseline_epoch().unwrap();
+            let writer = Arc::new(Mutex::new(protected_writer));
+            let paused = Arc::new(AtomicBool::new(false));
+            let fatal_error = Arc::new(Mutex::new(None));
+            let shared = RecorderShared::new(
+                String::new(),
+                Arc::clone(&writer),
+                None,
+                paused,
+                Arc::clone(&fatal_error),
+            );
+            shared.key(RawKey::Letter('x'));
+            shared.value("ignored-before-activation".to_owned(), None, false);
+            shared.activate(|| Ok(String::new()), || Ok(())).unwrap();
+
+            shared.key(RawKey::Letter('m'));
+            shared.composition("m".to_owned());
+            shared.value("m".to_owned(), None, false);
+            shared.key(RawKey::Letter('k'));
+            shared.composition("mao".to_owned());
+            shared.value("mao".to_owned(), None, true);
+            shared.composition_finalized();
+            shared.key(RawKey::Space);
+            shared.value("猫".to_owned(), None, false);
+
+            assert!(fatal_error.lock().unwrap().is_none());
+            assert_eq!(writer.lock().unwrap().written_events(), 1);
+            let path = fs::read_dir(&directory)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let bytes = fs::read(&path).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains('猫'));
+            let envelope = ProtectedSegmentEnvelopeV1::from_bytes(&bytes).unwrap();
+            let plaintext = WindowsUserDataProtector
+                .unprotect(envelope.protected())
+                .unwrap();
+            let segment = ContinuousSegmentV2::from_plaintext(&plaintext).unwrap();
+            let counters = &segment.integrity().counters;
+            assert_eq!(counters.key_actions_observed, 3);
+            assert_eq!(counters.composition_callbacks_observed, 2);
+            assert_eq!(counters.composition_finalized_callbacks_observed, 1);
+            assert_eq!(counters.value_callbacks_observed, 3);
+            assert_eq!(counters.value_callbacks_without_output, 2);
+            assert_eq!(counters.selection_read_errors, 1);
+            assert_eq!(counters.tracker_outputs_emitted, 1);
+            let ziranma_decoder::TrackerOutput::Commit(commit) =
+                &segment.capsule().events()[0].output
+            else {
+                panic!("synthetic input should produce one commit");
+            };
+            assert!(!commit.keys_complete);
+
+            fs::remove_file(path).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+
+        #[test]
+        fn callback_waiting_at_pause_boundary_cannot_enter_the_next_baseline() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "ziranma-recorder-pipeline-boundary-test-{}-{stamp}",
+                std::process::id()
+            ));
+            let config = ProtectedSegmentWriterConfig::new(
+                directory.clone(),
+                "synthetic-pipeline".to_owned(),
+                CaptureSessionKind::Daily,
+                "0.1.0+continuous.7".to_owned(),
+                "codex-uia-v2".to_owned(),
+                4,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            let mut protected_writer =
+                ProtectedSegmentWriter::new(config, WindowsUserDataProtector).unwrap();
+            protected_writer.start_new_baseline_epoch().unwrap();
+            let writer = Arc::new(Mutex::new(protected_writer));
+            let paused = Arc::new(AtomicBool::new(false));
+            let fatal_error = Arc::new(Mutex::new(None));
+            let shared = Arc::new(RecorderShared::new(
+                String::new(),
+                Arc::clone(&writer),
+                None,
+                Arc::clone(&paused),
+                Arc::clone(&fatal_error),
+            ));
+            shared.activate(|| Ok(String::new()), || Ok(())).unwrap();
+            let pipeline = shared.lock_pipeline().unwrap();
+            let rendezvous = Arc::new(std::sync::Barrier::new(2));
+            let worker_shared = Arc::clone(&shared);
+            let worker_rendezvous = Arc::clone(&rendezvous);
+            let worker = std::thread::spawn(move || {
+                worker_rendezvous.wait();
+                worker_shared.value("synthetic".to_owned(), None, false);
+            });
+
+            rendezvous.wait();
+            paused.store(true, Ordering::Release);
+            drop(pipeline);
+            worker.join().unwrap();
+            shared.pause().unwrap();
+
+            assert!(fatal_error.lock().unwrap().is_none());
+            let mut protected_writer = writer.lock().unwrap();
+            assert_eq!(protected_writer.pending_events(), 0);
+            assert!(
+                protected_writer
+                    .flush_with_reason(SegmentCloseReason::Continuity)
+                    .unwrap()
+                    .is_none()
+            );
+            drop(protected_writer);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
             fs::remove_dir(directory).unwrap();
         }
 
@@ -1969,11 +2666,29 @@ mod windows_recorder {
         }
 
         #[test]
-        fn windows_verbatim_prefix_is_hidden_from_human_receipts() {
-            assert_eq!(
-                human_readable_path(Path::new(r"\\?\C:\example\data\segment.zcs")),
-                r"C:\example\data\segment.zcs"
-            );
+        fn paused_waiting_state_never_opens_a_target_baseline() {
+            assert!(!should_attempt_target_discovery(true, false));
+            assert!(!should_attempt_target_discovery(true, true));
+            assert!(!should_attempt_target_discovery(false, true));
+            assert!(should_attempt_target_discovery(false, false));
+        }
+
+        #[test]
+        fn target_rebuild_during_attach_is_retryable_but_pipeline_failure_is_fatal() {
+            let rebuild = AttachAttemptError::Retryable("target_changed_during_activation");
+            assert!(matches!(&rebuild, AttachAttemptError::Retryable(_)));
+            assert_eq!(rebuild.to_string(), "target_changed_during_activation");
+
+            let pipeline = AttachAttemptError::Fatal("synthetic pipeline failure".to_owned());
+            assert!(matches!(pipeline, AttachAttemptError::Fatal(_)));
+        }
+
+        #[test]
+        fn only_documented_transient_uia_codes_retry_handler_registration() {
+            assert!(retryable_uia_error_code(0x8004_0201));
+            assert!(retryable_uia_error_code(0x8013_1505));
+            assert!(!retryable_uia_error_code(0x8004_0204));
+            assert!(!retryable_uia_error_code(0x8013_1509));
         }
     }
 }

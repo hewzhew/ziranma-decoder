@@ -30,8 +30,13 @@
 
 - `producer_version`：产生该段的记录器版本，例如
   `0.1.0+continuous.3`；
-- `capture_profile`：原子事件的采集语义；当前为 `codex-uia-v1`；
+- `capture_profile`：采集语义；历史段为 `codex-uia-v1`，完整性升级后的
+  新段为 `codex-uia-v2`；
 - 会话号、段序号、起止时间、`daily/course/theme` 类别和事件胶囊。
+
+v2 段还含加密的 `ziranma-codex-uia-integrity-v1` 管线计数。外层 DPAPI
+和原子 `ziranma-event-capsule-v1` 没有改变；回放按连续段 schema 分派，
+并把 v1 的完整性证据解释为 unavailable，而不是 0。
 
 这些字段和文字一起受到 DPAPI 保护。文件名只含会话号和段序号。
 
@@ -74,7 +79,9 @@ cargo run --release --bin capsule-replay -- `
   --health-only
 ```
 
-这个模式不构建词典或枚举候选，只报告事件形状，因此适合频繁中途检查。
+这个模式不构建词典或枚举候选。`CAPTURE_HEALTH` 报告事件形状；额外的
+`CAPTURE_INTEGRITY` 只聚合 v2 管线证据。两行都明确标记行为元数据，
+因而适合频繁中途检查，但仍不应把输出当作匿名数据随意公开。
 
 第一份会话只能用于描述问题、建立历史或提出假设，不能同时证明针对它的
 修改有效。

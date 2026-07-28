@@ -90,7 +90,12 @@ CLI 的 selector 展开、载入或分析错误按所在阶段至多报告历史
 
 持续会话中途可使用 `--session <ID> --health-only`。这个模式仍只展开显式
 会话的连续、可预测段名，但不载入词典或枚举候选，只输出事件数量、按键
-完整性、组合内编辑键、修订形状和位置歧义等脱敏健康计数。
+完整性、组合内编辑键、修订形状和位置歧义等脱敏健康计数。对于
+`ziranma-continuous-segment-v2`，它还输出独立的
+`CAPTURE_INTEGRITY` 聚合行；旧 v1 段和 `.zic` 只计入
+`legacy_inputs_without_integrity`，缺失不等于零。两行虽不含正文，仍以
+`contains_behavioral_metadata=true` 明示事件形状、输入量与连续性计数
+属于行为元数据；`report_schema` 与密文内的 `integrity_schema` 分开声明。
 
 `--window-gap-ms` 没有默认值；省略时只做逐提交回放。显式给出正数后，
 回放器还会把同一胶囊内的最大连续提交段视作一个离线窗口。相邻提交只有

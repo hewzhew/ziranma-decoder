@@ -6,15 +6,15 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ziranma_decoder::{
-    BigramLanguageModel, CapsuleReplayReport, CaptureSessionKind, CharacterBigramLanguageModel,
-    ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
-    PersonalCacheReplayState, RawKey, TrackerOutput, parse_rime_lexicon, parse_ud_conllu,
-    select_public_bigram_training_sequences,
+    BigramLanguageModel, CAPTURE_INTEGRITY_SCHEMA_V1, CapsuleReplayReport, CaptureIntegrityV1,
+    CaptureSessionKind, CharacterBigramLanguageModel, ContinuousSegmentMetadata, Decoder,
+    DeltaPositionEvidence, EventCapsuleV1, PersonalCacheReplayState, RawKey, SegmentCloseReason,
+    TrackerOutput, parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
 use ziranma_decoder::{
-    CODEX_CAPTURE_PROFILE_V1, ContinuousSegmentV1, DataProtector, ProtectedSegmentEnvelopeV1,
-    WindowsUserDataProtector,
+    CODEX_CAPTURE_PROFILE_V1, CODEX_CAPTURE_PROFILE_V2, DataProtector, DecodedContinuousSegment,
+    ProtectedSegmentEnvelopeV1, WindowsUserDataProtector,
 };
 
 const PUBLIC_RIME_LEXICON: &str =
@@ -23,6 +23,10 @@ const PUBLIC_UD_TRAIN: &str =
     include_str!("../../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu");
 const MAX_CAPSULE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_SEGMENTS: u64 = 1_000_000;
+const CAPTURE_HEALTH_REPORT_SCHEMA_V1: &str = "ziranma-capture-health-report-v1";
+const CAPTURE_INTEGRITY_REPORT_SCHEMA_V1: &str = "ziranma-capture-integrity-report-v1";
+const CAPTURE_HEALTH_PRIVACY_NOTICE: &str = "--health-only prints CAPTURE_HEALTH and CAPTURE_INTEGRITY; both contain behavioral \
+     metadata; legacy v1/.zic integrity is unavailable, never zero-filled.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputSelector {
@@ -76,17 +80,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SegmentMetadataGuard::new(personal_cache || personal_pair_cache);
             if health_only {
                 let mut health = CaptureHealthReport::default();
-                visit_private_inputs(
+                visit_private_loaded_inputs(
                     &mut loader,
                     &mut metadata_guard,
                     &inputs,
                     ReplayInputPhase::Evaluation,
-                    |capsule| {
-                        health.observe_capsule(capsule);
+                    |loaded| {
+                        health.observe_loaded(loaded);
                         Ok(())
                     },
                 )?;
                 println!("{}", health.terminal_line());
+                println!("{}", health.integrity_terminal_line());
                 return Ok(());
             }
             let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
@@ -390,8 +395,11 @@ fn parse_options(
 
 fn print_usage() {
     eprintln!(
-        "Usage: cargo run --bin capsule-replay -- \\\n         [--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION> ...] \\\n         [--input <FILE.zic|FILE.zcs>|--session <SESSION>] ... \\\n         [--window-gap-ms <POSITIVE_MS> \\\n          [--public-context|--public-character-context|--personal-cache|\
-           --personal-pair-cache]] [--compact] [--health-only]"
+        "Usage (health): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... --health-only"
+    );
+    eprintln!(
+        "Usage (replay): cargo run --bin capsule-replay -- \\\n         [--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION> ...] \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         [--window-gap-ms <POSITIVE_MS> \\\n          [--public-context|--public-character-context|--personal-cache|\
+           --personal-pair-cache]] [--compact]"
     );
     eprintln!(
         "Reads explicitly named private .zic capsules or current-user-protected .zcs segments, \
@@ -401,6 +409,11 @@ fn print_usage() {
         "--session expands only contiguous, predictably named segments for that explicit id; \
          it does not scan the private directory"
     );
+    eprintln!(
+        "History selectors require --window-gap-ms plus --personal-cache or \
+         --personal-pair-cache."
+    );
+    eprintln!("{CAPTURE_HEALTH_PRIVACY_NOTICE}");
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -420,6 +433,15 @@ struct CaptureHealthReport {
     revisions_with_navigation_keys: u64,
     revisions_with_selection_keys: u64,
     ambiguous_positions: u64,
+    integrity_available_segments: u64,
+    legacy_inputs_without_integrity: u64,
+    last_integrity_epoch_by_session: HashMap<String, u64>,
+    baseline_epochs_observed: u64,
+    close_capacity: u64,
+    close_timer: u64,
+    close_continuity: u64,
+    close_session_end: u64,
+    integrity_counters: ziranma_decoder::CaptureIntegrityCountersV1,
 }
 
 impl CaptureHealthReport {
@@ -498,6 +520,46 @@ impl CaptureHealthReport {
         }
     }
 
+    fn observe_loaded(&mut self, loaded: &LoadedPrivateInput) {
+        self.observe_capsule(&loaded.capsule);
+        let Some(integrity) = loaded.integrity.as_ref() else {
+            self.legacy_inputs_without_integrity =
+                self.legacy_inputs_without_integrity.saturating_add(1);
+            return;
+        };
+        self.integrity_available_segments = self.integrity_available_segments.saturating_add(1);
+        self.integrity_counters.accumulate(&integrity.counters);
+        match integrity.close_reason {
+            SegmentCloseReason::Capacity => {
+                self.close_capacity = self.close_capacity.saturating_add(1)
+            }
+            SegmentCloseReason::Timer => self.close_timer = self.close_timer.saturating_add(1),
+            SegmentCloseReason::Continuity => {
+                self.close_continuity = self.close_continuity.saturating_add(1)
+            }
+            SegmentCloseReason::SessionEnd => {
+                self.close_session_end = self.close_session_end.saturating_add(1)
+            }
+        }
+        if let Some(metadata) = loaded.metadata.as_ref() {
+            match self
+                .last_integrity_epoch_by_session
+                .get_mut(&metadata.session_id)
+            {
+                Some(previous) if *previous != integrity.baseline_epoch => {
+                    *previous = integrity.baseline_epoch;
+                    self.baseline_epochs_observed = self.baseline_epochs_observed.saturating_add(1);
+                }
+                Some(_) => {}
+                None => {
+                    self.last_integrity_epoch_by_session
+                        .insert(metadata.session_id.clone(), integrity.baseline_epoch);
+                    self.baseline_epochs_observed = self.baseline_epochs_observed.saturating_add(1);
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn from_capsules(capsules: &[EventCapsuleV1]) -> Self {
         let mut report = Self::default();
@@ -509,7 +571,9 @@ impl CaptureHealthReport {
 
     fn terminal_line(&self) -> String {
         format!(
-            "CAPTURE_HEALTH contains_text=false capsules={} events={} commits={} revisions={} \
+            "CAPTURE_HEALTH contains_text=false contains_behavioral_metadata=true \
+             report_schema={CAPTURE_HEALTH_REPORT_SCHEMA_V1} \
+             capsules={} events={} commits={} revisions={} \
              keys_complete_records={} keys_incomplete_records={} logical_key_actions={} \
              commits_with_internal_edit_keys={} revisions_delete_only={} \
              revisions_insert_only={} revisions_replace={} revisions_multi_character={} \
@@ -530,6 +594,42 @@ impl CaptureHealthReport {
             self.revisions_with_navigation_keys,
             self.revisions_with_selection_keys,
             self.ambiguous_positions
+        )
+    }
+
+    fn integrity_terminal_line(&self) -> String {
+        let counters = &self.integrity_counters;
+        format!(
+            "CAPTURE_INTEGRITY contains_text=false contains_behavioral_metadata=true \
+             report_schema={CAPTURE_INTEGRITY_REPORT_SCHEMA_V1} \
+             integrity_schema={CAPTURE_INTEGRITY_SCHEMA_V1} available_segments={} \
+             legacy_inputs_without_integrity={} baseline_epochs_observed={} \
+             close_capacity={} close_timer={} close_continuity={} close_session_end={} \
+             key_actions_observed={} composition_callbacks_observed={} \
+             composition_finalized_callbacks_observed={} value_callbacks_observed={} \
+             value_read_errors={} composition_read_errors={} selection_read_errors={} \
+             value_callbacks_without_output={} tracker_outputs_emitted={} \
+             key_actions_not_emitted_at_boundary={} key_buffer_resets={} \
+             counter_saturated={}",
+            self.integrity_available_segments,
+            self.legacy_inputs_without_integrity,
+            self.baseline_epochs_observed,
+            self.close_capacity,
+            self.close_timer,
+            self.close_continuity,
+            self.close_session_end,
+            counters.key_actions_observed,
+            counters.composition_callbacks_observed,
+            counters.composition_finalized_callbacks_observed,
+            counters.value_callbacks_observed,
+            counters.value_read_errors,
+            counters.composition_read_errors,
+            counters.selection_read_errors,
+            counters.value_callbacks_without_output,
+            counters.tracker_outputs_emitted,
+            counters.key_actions_not_emitted_at_boundary,
+            counters.key_buffer_resets,
+            counters.counter_saturated,
         )
     }
 }
@@ -747,6 +847,7 @@ impl std::error::Error for RedactedPrivateInputError {}
 struct LoadedPrivateInput {
     capsule: EventCapsuleV1,
     metadata: Option<ContinuousSegmentMetadata>,
+    integrity: Option<CaptureIntegrityV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -911,6 +1012,8 @@ struct SessionMetadataProgress {
     capture_profile: String,
     last_sequence: u64,
     last_ended_unix_ms: u64,
+    last_baseline_epoch: Option<u64>,
+    last_close_reason: Option<SegmentCloseReason>,
 }
 
 struct SegmentMetadataGuard {
@@ -930,12 +1033,25 @@ impl SegmentMetadataGuard {
         }
     }
 
+    #[cfg(test)]
     fn observe(
         &mut self,
         metadata: Option<&ContinuousSegmentMetadata>,
         phase: ReplayInputPhase,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.observe_with_integrity(metadata, None, phase)
+    }
+
+    fn observe_with_integrity(
+        &mut self,
+        metadata: Option<&ContinuousSegmentMetadata>,
+        integrity: Option<&CaptureIntegrityV1>,
+        phase: ReplayInputPhase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(metadata) = metadata else {
+            if integrity.is_some() {
+                return Err("integrity evidence requires protected segment metadata".into());
+            }
             return Ok(());
         };
         if phase == ReplayInputPhase::Evaluation && self.enforce_history_before_evaluation {
@@ -968,6 +1084,27 @@ impl SegmentMetadataGuard {
             if metadata.started_unix_ms < progress.last_ended_unix_ms {
                 return Err("protected session segment times move backwards".into());
             }
+            if progress.last_baseline_epoch.is_some() != integrity.is_some() {
+                return Err("protected session integrity availability changed".into());
+            }
+            if let Some(integrity) = integrity {
+                let previous_epoch = progress
+                    .last_baseline_epoch
+                    .expect("availability checked above");
+                if integrity.baseline_epoch < previous_epoch {
+                    return Err("protected session baseline epoch moved backwards".into());
+                }
+                if progress.last_close_reason == Some(SegmentCloseReason::SessionEnd) {
+                    return Err("protected session continued after session end".into());
+                }
+                if integrity.baseline_epoch == previous_epoch
+                    && progress.last_close_reason == Some(SegmentCloseReason::Continuity)
+                {
+                    return Err("protected session continued a closed baseline epoch".into());
+                }
+                progress.last_baseline_epoch = Some(integrity.baseline_epoch);
+                progress.last_close_reason = Some(integrity.close_reason);
+            }
             progress.last_sequence = metadata.sequence;
             progress.last_ended_unix_ms = metadata.ended_unix_ms;
         } else {
@@ -980,6 +1117,8 @@ impl SegmentMetadataGuard {
                     capture_profile: metadata.capture_profile.clone(),
                     last_sequence: metadata.sequence,
                     last_ended_unix_ms: metadata.ended_unix_ms,
+                    last_baseline_epoch: integrity.map(|value| value.baseline_epoch),
+                    last_close_reason: integrity.map(|value| value.close_reason),
                 },
             );
         }
@@ -1004,6 +1143,18 @@ fn visit_private_inputs(
     phase: ReplayInputPhase,
     mut visitor: impl FnMut(&EventCapsuleV1) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    visit_private_loaded_inputs(loader, metadata_guard, requested_inputs, phase, |loaded| {
+        visitor(&loaded.capsule)
+    })
+}
+
+fn visit_private_loaded_inputs(
+    loader: &mut PrivateInputLoader,
+    metadata_guard: &mut SegmentMetadataGuard,
+    requested_inputs: &[PathBuf],
+    phase: ReplayInputPhase,
+    mut visitor: impl FnMut(&LoadedPrivateInput) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     for (index, requested) in requested_inputs.iter().enumerate() {
         let loaded = loader
             .load_one(requested)
@@ -1012,8 +1163,12 @@ fn visit_private_inputs(
                 ordinal: index.saturating_add(1),
                 kind: error.kind,
             })?;
-        metadata_guard.observe(loaded.metadata.as_ref(), phase)?;
-        visitor(&loaded.capsule)?;
+        metadata_guard.observe_with_integrity(
+            loaded.metadata.as_ref(),
+            loaded.integrity.as_ref(),
+            phase,
+        )?;
+        visitor(&loaded)?;
     }
     Ok(())
 }
@@ -1055,6 +1210,7 @@ fn decode_private_input(
             Ok(LoadedPrivateInput {
                 capsule,
                 metadata: None,
+                integrity: None,
             })
         }
         PrivateInputFormat::ProtectedSegment => decode_protected_segment(encoded, target),
@@ -1088,7 +1244,7 @@ fn decode_protected_segment(
         )
         .into());
     }
-    let decoded = ContinuousSegmentV1::from_plaintext(&plaintext).map_err(|error| {
+    let decoded = DecodedContinuousSegment::from_plaintext(&plaintext).map_err(|error| {
         format!(
             "invalid unprotected continuous segment {}: {error}",
             target.display()
@@ -1096,18 +1252,23 @@ fn decode_protected_segment(
     });
     plaintext.fill(0);
     let segment = decoded?;
-    if segment.capture_profile() != CODEX_CAPTURE_PROFILE_V1 {
+    let (metadata, integrity, capsule) = segment.into_parts();
+    let expected_profile = if integrity.is_some() {
+        CODEX_CAPTURE_PROFILE_V2
+    } else {
+        CODEX_CAPTURE_PROFILE_V1
+    };
+    if metadata.capture_profile != expected_profile {
         return Err(format!(
             "unsupported protected segment capture profile {:?} in {}",
-            segment.capture_profile(),
+            metadata.capture_profile,
             target.display()
         )
         .into());
     }
     let expected_name = format!(
         "segment-{}-{:08}.zcs",
-        segment.session_id(),
-        segment.sequence()
+        metadata.session_id, metadata.sequence
     );
     if target.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
         return Err(format!(
@@ -1116,10 +1277,10 @@ fn decode_protected_segment(
         )
         .into());
     }
-    let (metadata, capsule) = segment.into_parts();
     Ok(LoadedPrivateInput {
         capsule,
         metadata: Some(metadata),
+        integrity,
     })
 }
 
@@ -1279,9 +1440,10 @@ fn resolve_capsule_input(
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES, Options, PUBLIC_RIME_LEXICON,
-        PUBLIC_UD_TRAIN, PrivateInputLoader, RedactedPrivateSelectorError, ReplayInputPhase,
-        SegmentMetadataGuard, expand_session_selector, parse_options, read_explicit_capsules,
+        CAPTURE_HEALTH_PRIVACY_NOTICE, CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES,
+        Options, PUBLIC_RIME_LEXICON, PUBLIC_UD_TRAIN, PrivateInputLoader,
+        RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard,
+        expand_session_selector, parse_options, read_explicit_capsules,
         redact_private_analysis_error, resolve_capsule_input, resolve_protected_input,
         visit_private_inputs,
     };
@@ -1289,19 +1451,26 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use ziranma_decoder::{
-        BigramLanguageModel, CapsuleReplayReport, CaptureSessionKind, CharacterBigramLanguageModel,
-        CommitRecord, ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
-        KeySequence, PersonalCacheReplayState, RawKey, TextDelta, TimedTrackerOutput,
-        TrackerOutput, parse_rime_lexicon, parse_ud_conllu,
-        select_public_bigram_training_sequences,
+        BigramLanguageModel, CapsuleReplayReport, CaptureIntegrityCountersV1, CaptureIntegrityV1,
+        CaptureSessionKind, CharacterBigramLanguageModel, CommitRecord, ContinuousSegmentMetadata,
+        Decoder, DeltaPositionEvidence, EventCapsuleV1, KeySequence, PersonalCacheReplayState,
+        RawKey, SegmentCloseReason, TextDelta, TimedTrackerOutput, TrackerOutput,
+        parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
     };
     #[cfg(windows)]
     use ziranma_decoder::{
-        CODEX_CAPTURE_PROFILE_V1, ContinuousSegmentV1, DataProtector, ProtectedSegmentEnvelopeV1,
-        WindowsUserDataProtector,
+        CODEX_CAPTURE_PROFILE_V1, CODEX_CAPTURE_PROFILE_V2, ContinuousSegmentV1,
+        ContinuousSegmentV2, DataProtector, ProtectedSegmentEnvelopeV1, WindowsUserDataProtector,
     };
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn health_help_discloses_behavioral_metadata_and_legacy_unavailability() {
+        assert!(CAPTURE_HEALTH_PRIVACY_NOTICE.contains("behavioral metadata"));
+        assert!(CAPTURE_HEALTH_PRIVACY_NOTICE.contains("unavailable"));
+        assert!(CAPTURE_HEALTH_PRIVACY_NOTICE.contains("never zero-filled"));
+    }
 
     struct TestWorkspace {
         manifest: PathBuf,
@@ -1413,6 +1582,20 @@ mod tests {
         .unwrap()
     }
 
+    fn integrity(epoch: u64, reason: SegmentCloseReason) -> CaptureIntegrityV1 {
+        CaptureIntegrityV1::new(
+            epoch,
+            reason,
+            CaptureIntegrityCountersV1 {
+                value_callbacks_observed: 1,
+                tracker_outputs_emitted: 1,
+                ..CaptureIntegrityCountersV1::default()
+            },
+            1,
+        )
+        .unwrap()
+    }
+
     #[cfg(windows)]
     #[test]
     fn explicitly_named_protected_segment_decrypts_without_plaintext_export() {
@@ -1445,6 +1628,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded, vec![expected]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_v2_segment_preserves_integrity_while_reusing_v1_events() {
+        let mut workspace = TestWorkspace::new();
+        let expected = capsule();
+        let metadata = ContinuousSegmentMetadata::new(
+            "test-v2".to_owned(),
+            0,
+            10,
+            20,
+            CaptureSessionKind::Daily,
+            "0.1.0+continuous.7".to_owned(),
+            CODEX_CAPTURE_PROFILE_V2.to_owned(),
+        )
+        .unwrap();
+        let counters = CaptureIntegrityCountersV1 {
+            key_actions_observed: 3,
+            value_callbacks_observed: 1,
+            tracker_outputs_emitted: 1,
+            ..CaptureIntegrityCountersV1::default()
+        };
+        let integrity =
+            CaptureIntegrityV1::new(1, SegmentCloseReason::SessionEnd, counters, 1).unwrap();
+        let segment =
+            ContinuousSegmentV2::new(metadata, integrity.clone(), expected.clone()).unwrap();
+        let protected = WindowsUserDataProtector
+            .protect(&segment.to_plaintext().unwrap())
+            .unwrap();
+        let bytes = ProtectedSegmentEnvelopeV1::new(protected)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        workspace.write_protected("segment-test-v2-00000000.zcs", &bytes);
+
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let loaded = loader
+            .load_one(&workspace.relative_protected("segment-test-v2-00000000.zcs"))
+            .unwrap();
+        assert_eq!(loaded.capsule, expected);
+        assert_eq!(loaded.integrity, Some(integrity));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_segment_schema_profile_mismatches_are_rejected_and_redacted() {
+        let mut workspace = TestWorkspace::new();
+        let marker = "PRIVATE_PROFILE_MARKER";
+
+        let v1_metadata = ContinuousSegmentMetadata::new(
+            "bad-v1".to_owned(),
+            0,
+            10,
+            20,
+            CaptureSessionKind::Daily,
+            "0.1.0".to_owned(),
+            CODEX_CAPTURE_PROFILE_V2.to_owned(),
+        )
+        .unwrap();
+        let v1 = ContinuousSegmentV1::new(v1_metadata, capsule_with_text(marker)).unwrap();
+        let v1_bytes = ProtectedSegmentEnvelopeV1::new(
+            WindowsUserDataProtector
+                .protect(&v1.to_plaintext().unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        workspace.write_protected("segment-bad-v1-00000000.zcs", &v1_bytes);
+
+        let v2_metadata = ContinuousSegmentMetadata::new(
+            "bad-v2".to_owned(),
+            0,
+            20,
+            30,
+            CaptureSessionKind::Daily,
+            "0.1.0".to_owned(),
+            CODEX_CAPTURE_PROFILE_V1.to_owned(),
+        )
+        .unwrap();
+        let v2 = ContinuousSegmentV2::new(
+            v2_metadata,
+            integrity(1, SegmentCloseReason::SessionEnd),
+            capsule_with_text(marker),
+        )
+        .unwrap();
+        let v2_bytes = ProtectedSegmentEnvelopeV1::new(
+            WindowsUserDataProtector
+                .protect(&v2.to_plaintext().unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        workspace.write_protected("segment-bad-v2-00000000.zcs", &v2_bytes);
+
+        for name in ["segment-bad-v1-00000000.zcs", "segment-bad-v2-00000000.zcs"] {
+            let mut loader = PrivateInputLoader::new(&workspace.manifest);
+            let mut guard = SegmentMetadataGuard::new(false);
+            let error = visit_private_inputs(
+                &mut loader,
+                &mut guard,
+                &[workspace.relative_protected(name)],
+                ReplayInputPhase::Evaluation,
+                |_| Ok(()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("decode-or-unprotect-failed"));
+            assert!(!error.contains(marker));
+            assert!(!error.contains(name));
+            assert!(!error.contains("codex-uia"));
+        }
     }
 
     #[cfg(windows)]
@@ -1876,8 +2173,76 @@ mod tests {
         assert_eq!(report.logical_key_actions, 3);
         let line = report.terminal_line();
         assert!(line.starts_with("CAPTURE_HEALTH contains_text=false"));
+        assert!(line.contains("contains_behavioral_metadata=true"));
+        assert!(line.contains("report_schema=ziranma-capture-health-report-v1"));
         assert!(!line.contains('猫'));
         assert!(!line.contains("mao"));
+    }
+
+    #[test]
+    fn integrity_health_is_aggregate_marks_legacy_as_unavailable_and_never_echoes_text() {
+        let counters = CaptureIntegrityCountersV1 {
+            key_actions_observed: 3,
+            composition_callbacks_observed: 2,
+            composition_finalized_callbacks_observed: 1,
+            value_callbacks_observed: 2,
+            value_read_errors: 0,
+            composition_read_errors: 0,
+            selection_read_errors: 1,
+            value_callbacks_without_output: 1,
+            tracker_outputs_emitted: 1,
+            key_actions_not_emitted_at_boundary: 0,
+            key_buffer_resets: 0,
+            counter_saturated: false,
+        };
+        let loaded = super::LoadedPrivateInput {
+            capsule: capsule(),
+            metadata: Some(
+                ContinuousSegmentMetadata::new(
+                    "synthetic-session".to_owned(),
+                    0,
+                    10,
+                    20,
+                    CaptureSessionKind::Daily,
+                    "0.1.0+continuous.7".to_owned(),
+                    "codex-uia-v2".to_owned(),
+                )
+                .unwrap(),
+            ),
+            integrity: Some(
+                CaptureIntegrityV1::new(1, SegmentCloseReason::Timer, counters, 1).unwrap(),
+            ),
+        };
+        let mut report = CaptureHealthReport::default();
+        report.observe_loaded(&loaded);
+        report.observe_loaded(&super::LoadedPrivateInput {
+            capsule: capsule(),
+            metadata: None,
+            integrity: None,
+        });
+        assert_eq!(
+            report.integrity_available_segments + report.legacy_inputs_without_integrity,
+            report.capsules
+        );
+        assert_eq!(
+            report.close_capacity
+                + report.close_timer
+                + report.close_continuity
+                + report.close_session_end,
+            report.integrity_available_segments
+        );
+        assert_eq!(report.integrity_counters.tracker_outputs_emitted, 1);
+        let line = report.integrity_terminal_line();
+        assert!(line.starts_with("CAPTURE_INTEGRITY contains_text=false"));
+        assert!(line.contains("report_schema=ziranma-capture-integrity-report-v1"));
+        assert!(line.contains("integrity_schema=ziranma-codex-uia-integrity-v1"));
+        assert!(line.contains("available_segments=1"));
+        assert!(line.contains("legacy_inputs_without_integrity=1"));
+        assert!(line.contains("baseline_epochs_observed=1"));
+        assert!(line.contains("close_timer=1"));
+        assert!(!line.contains('猫'));
+        assert!(!line.contains("mao"));
+        assert!(!line.contains("synthetic-session"));
     }
 
     #[test]
@@ -2374,6 +2739,76 @@ mod tests {
             reversed_evaluation_sessions
                 .observe(
                     Some(&segment_metadata("older", 0, 150, 180, "v1")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn protected_metadata_guard_keeps_v2_integrity_epochs_causal() {
+        let metadata = |sequence, start, end| {
+            let mut metadata = segment_metadata("integrity", sequence, start, end, "continuous.7");
+            metadata.capture_profile = "codex-uia-v2".to_owned();
+            metadata
+        };
+
+        let mut closed_epoch = SegmentMetadataGuard::new(false);
+        closed_epoch
+            .observe_with_integrity(
+                Some(&metadata(0, 10, 20)),
+                Some(&integrity(1, SegmentCloseReason::Timer)),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        closed_epoch
+            .observe_with_integrity(
+                Some(&metadata(1, 20, 30)),
+                Some(&integrity(1, SegmentCloseReason::Continuity)),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            closed_epoch
+                .observe_with_integrity(
+                    Some(&metadata(2, 30, 40)),
+                    Some(&integrity(1, SegmentCloseReason::Timer)),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut backwards_epoch = SegmentMetadataGuard::new(false);
+        backwards_epoch
+            .observe_with_integrity(
+                Some(&metadata(0, 10, 20)),
+                Some(&integrity(2, SegmentCloseReason::Timer)),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            backwards_epoch
+                .observe_with_integrity(
+                    Some(&metadata(1, 20, 30)),
+                    Some(&integrity(1, SegmentCloseReason::Timer)),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut ended = SegmentMetadataGuard::new(false);
+        ended
+            .observe_with_integrity(
+                Some(&metadata(0, 10, 20)),
+                Some(&integrity(1, SegmentCloseReason::SessionEnd)),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            ended
+                .observe_with_integrity(
+                    Some(&metadata(1, 20, 30)),
+                    Some(&integrity(2, SegmentCloseReason::Timer)),
                     ReplayInputPhase::Evaluation,
                 )
                 .is_err()
