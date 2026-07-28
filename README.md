@@ -589,7 +589,8 @@ cargo run --release --bin capsule-replay -- `
 
 短时探针之外，仓库现在提供一个独立的 `codex-recorder`，用于一次启动后
 持续积累 Codex 输入框的新差分。它不依赖固定 PID；Codex 退出、重启或
-重建输入元素时会解除旧绑定并等待唯一的精确目标重新出现。先做完全
+重建输入元素时会解除旧绑定并等待唯一的精确目标重新出现；若重建恰好
+发生在监听挂接窗口，已注册部分也会回滚并重试，不会结束整个会话。先做完全
 只读的目标体检：
 
 ```powershell
@@ -613,7 +614,8 @@ cargo build --release --bin recorderctl
 ```
 
 `status` 默认用中文显示“正在运行、当前版、待升级版、可回退版、下一步”；
-脚本需要稳定字段时使用 `status --machine`。两者都只读取
+本地脚本需要稳定字段时使用 `status --machine`；机器输出也不公开绝对
+路径，但其中的会话、时长和数量仍是行为元数据，不宜原样分享。两者都只读取
 `.local/recorder/` 中的版本指针并查询同名进程，不读取 `data/private/`、
 不初始化 UIA、不写盘。支持 `active-v1` 的记录器还会显示会话号、运行
 时长、连接/暂停状态、已安全保存的分段与事件数和最近刷新时间。这份状态
@@ -635,9 +637,11 @@ cargo build --release --bin recorderctl
 由 Windows 当前用户 DPAPI 保护，再原子发布到
 `data/private/continuous-capture/`；磁盘临时文件也已经加密。已有输入
 只作内存基线，不保存为事件。`Ctrl+Shift+F10` 暂停/恢复并在暂停时刷新，
-`Ctrl+Shift+F12` 停止并刷新。终端状态全程脱敏、不显示具体文字或按键。
+`Ctrl+Shift+F12` 停止并刷新。终端状态不显示具体文字、按键或本地路径，
+分段回执只声明 `path_disclosed=false`；但会话号、时间点和数量仍是行为
+元数据，不应当成匿名报告随意公开。
 发送消息或切换任务造成的短暂编辑框重建会合并成一条 `REBOUND`，不会
-把新框的既有草稿重复保存；路径回执也隐藏 Windows 内部的 `\\?\` 前缀。
+把新框的既有草稿重复保存。
 
 加密段可由原回放器逐个点名读取：
 
@@ -674,6 +678,13 @@ cargo run --release --bin capsule-replay -- `
   --health-only
 ```
 
+新版健康输出保留既有 `CAPTURE_HEALTH`，并另加一行
+`CAPTURE_INTEGRITY contains_text=false contains_behavioral_metadata=true`。
+两行都显式标记 `contains_behavioral_metadata=true`，因为即使没有正文，
+提交、修订、逻辑按键和连续性数量也会描述输入行为。
+它只聚合 `codex-uia-v2` 加密段里的低分辨率管线证据；旧 v1 段和明文
+胶囊单列为 `legacy_inputs_without_integrity`，不会把缺失字段冒充成 0。
+
 完整报告里的 `noncanonical_code_observations` 是中性观察，不会把用户
 自定义词码直接当作打错。
 
@@ -681,8 +692,11 @@ cargo run --release --bin capsule-replay -- `
 一次提交内复用相同码串，并复用逐提交阶段已经获得的窗口分词。两者都不
 持久化候选缓存，也不跨历史/评测边界学习。
 
-每个加密段还在密文内保存记录器版本与 `codex-uia-v1` 采集口径。根据旧
-报告做出的改动不能再用同一会话证明有效；旧会话用
+每个加密段还在密文内保存记录器版本与采集口径。新记录器写
+`ziranma-continuous-segment-v2` / `codex-uia-v2`，在不改变 v1 原子事件
+格式的前提下加入回调计数、读取失败、基线代数和粗粒度边界原因；新版
+回放器仍严格读取旧 `ziranma-continuous-segment-v1` / `codex-uia-v1`，
+不迁移或重写历史。根据旧报告做出的改动不能再用同一会话证明有效；旧会话用
 `--history-session` 学习，下一次独立会话才用 `--session` 评测。完整
 接受、回退和停止判据见
 [反馈驱动升级闭环](docs/feedback-upgrade-loop.md)。

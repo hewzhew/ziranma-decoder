@@ -46,10 +46,12 @@ pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_p
 #[cfg(windows)]
 pub use continuous_capture::WindowsUserDataProtector;
 pub use continuous_capture::{
-    CODEX_CAPTURE_PROFILE_V1, CONTINUOUS_PRODUCER_VERSION, CONTINUOUS_SEGMENT_SCHEMA_V1,
-    CaptureSessionKind, ContinuousCaptureError, ContinuousSegmentMetadata, ContinuousSegmentV1,
-    DataProtector, PROTECTED_SEGMENT_SCHEMA_V1, ProtectedSegmentEnvelopeV1, ProtectedSegmentWriter,
-    ProtectedSegmentWriterConfig, SegmentWriteReceipt,
+    CAPTURE_INTEGRITY_SCHEMA_V1, CODEX_CAPTURE_PROFILE_V1, CODEX_CAPTURE_PROFILE_V2,
+    CONTINUOUS_PRODUCER_VERSION, CONTINUOUS_SEGMENT_SCHEMA_V1, CONTINUOUS_SEGMENT_SCHEMA_V2,
+    CaptureIntegrityCountersV1, CaptureIntegrityV1, CaptureSessionKind, ContinuousCaptureError,
+    ContinuousSegmentMetadata, ContinuousSegmentV1, ContinuousSegmentV2, DataProtector,
+    DecodedContinuousSegment, PROTECTED_SEGMENT_SCHEMA_V1, ProtectedSegmentEnvelopeV1,
+    ProtectedSegmentWriter, ProtectedSegmentWriterConfig, SegmentCloseReason, SegmentWriteReceipt,
 };
 pub use correction_episode::{
     CorrectionCandidate, CorrectionCandidateDetector, CorrectionCandidateForm,

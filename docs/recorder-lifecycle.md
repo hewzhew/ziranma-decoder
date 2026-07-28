@@ -53,6 +53,36 @@
 临时不采集。换代使用 `Ctrl+Shift+F12`，因为它会解除监听、刷新和关闭
 进程。
 
+`codex-uia-v1` → `codex-uia-v2` 是一次真正的采集口径升级，因此必须按
+上述会话边界换代：先让含 v1/v2 双读能力的回放器通过测试，再 stage v2
+记录器；旧记录器继续写完自己的 v1 会话，`drain` 后才能 `promote` 并
+启动全新 v2 会话。历史 `.zcs` 不迁移、不重写。若 v2 真实会话异常，
+排空后可 `rollback` 到上一记录器；新版回放器仍能同时解释已经完成的
+v1 和 v2 段，但完整性报告会分开显示可用覆盖度。
+
+通过源码检查并选定会话边界后，v1 → v2 的完整 PowerShell 顺序如下。
+`stage` 和第一次 `status` 不会打断当前记录器；从 `drain` 开始才进入短暂
+维护窗口：
+
+```powershell
+Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
+cargo build --release --bin codex-recorder --bin recorderctl --bin capsule-replay
+.\target\release\recorderctl.exe stage .\target\release\codex-recorder.exe
+.\target\release\recorderctl.exe status
+
+# 只在准备结束旧会话时继续执行以下四行
+.\target\release\recorderctl.exe drain
+.\target\release\recorderctl.exe promote
+.\target\release\recorderctl.exe run --session-kind daily --background
+.\target\release\recorderctl.exe status
+```
+
+若 `drain` 没有报告正常刷新退出，就停在原地排查，不运行 `promote`。
+`promote` 报错时先运行 `status`，不要盲目 `rollback`：只有状态确认
+v2 已成为 current 且没有记录器进程，或新版在成功提升后启动失败，才用
+`recorderctl rollback` 恢复上一槽位，再启动新的回滚会话。任何失败都
+不应通过启动第二个监听器来掩盖。
+
 ## 已实现的 `recorderctl`
 
 控制器是仓库中的独立小程序，不是系统服务。先构建：
@@ -64,7 +94,8 @@ cargo build --release --bin recorderctl
 它提供以下显式操作：
 
 - `recorderctl status`：用中文报告当前、候选、上一良好版本、进程和下一步；
-- `recorderctl status --machine`：输出稳定的逐行机器字段；
+- `recorderctl status --machine`：输出稳定的逐行机器字段；槽位只显示
+  已验证的安全文件名，进程路径固定为 `redacted`；
 - `recorderctl adopt <codex-recorder.exe>`：仅用于第一次收编已知良好版；
 - `recorderctl stage <candidate.exe>`：复制为不可变候选并执行 `--check`；
 - `recorderctl promote`：仅在所有记录器退出后把 candidate 提升为 current；
@@ -100,7 +131,8 @@ cargo build --release --bin recorderctl
 `status` 默认把内部槽位翻译为“当前版本、待升级版本、可回退版本”，并
 根据是否正在运行及有无候选给出下一条安全操作；有 `active-v1` 时还显示
 当前会话、时长、连接、保存计数和刷新时间。`--machine` 保留原始
-schema/slot/session/process 字段，供脚本解析。两种模式在未配置时都不会创建目录；
+schema/slot/session/process 字段，供本地脚本解析，但不公开绝对路径；这些
+会话、时长和数量仍是行为元数据，不宜原样分享。两种模式在未配置时都不会创建目录；
 它们不初始化 UIA，不读取
 `data/private/`，也不写文件。`stage` 会在复制完成后对复制品运行只读
 `--check`，确认至少一个精确 Codex 目标、版本和采集口径，再更新 candidate

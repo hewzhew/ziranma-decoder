@@ -135,17 +135,30 @@ impl LocalInputTracker {
         self.pending_keys.is_empty()
     }
 
+    pub fn pending_key_count(&self) -> usize {
+        self.pending_keys.len()
+    }
+
     pub fn observe_key(&mut self, key: RawKey) {
+        let _ = self.observe_key_with_buffer_status(key);
+    }
+
+    /// Returns true when the bounded 128-key guard had to reset the prior
+    /// pending buffer before accepting this key.
+    pub fn observe_key_with_buffer_status(&mut self, key: RawKey) -> bool {
         const MAX_PENDING_KEYS: usize = 128;
         if self.pending_keys.is_empty() {
             self.pending_value_baseline = Some(self.current_value.clone());
         }
+        let mut reset = false;
         if self.pending_keys.len() == MAX_PENDING_KEYS {
             self.pending_keys.clear();
             self.pending_keys_complete = false;
             self.pending_value_baseline = Some(self.current_value.clone());
+            reset = true;
         }
         self.pending_keys.push(key);
+        reset
     }
 
     pub fn observe_composition(&mut self, composition: impl Into<String>) {
@@ -959,5 +972,16 @@ mod tests {
                 },
             }))
         );
+    }
+
+    #[test]
+    fn bounded_key_buffer_reports_only_the_actual_reset() {
+        let mut tracker = LocalInputTracker::new("随心输入", "");
+        for _ in 0..128 {
+            assert!(!tracker.observe_key_with_buffer_status(RawKey::Letter('a')));
+        }
+        assert_eq!(tracker.pending_key_count(), 128);
+        assert!(tracker.observe_key_with_buffer_status(RawKey::Letter('b')));
+        assert_eq!(tracker.pending_key_count(), 1);
     }
 }
