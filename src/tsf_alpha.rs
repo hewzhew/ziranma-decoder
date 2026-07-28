@@ -11,7 +11,10 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::{CompositionEffect, CompositionInput, CompositionSession, Decoder, parse_lexicon_tsv};
+use crate::{
+    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotDescriptor,
+    CandidateSnapshotError, CompositionEffect, CompositionInput, CompositionSession,
+};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, LPARAM, S_FALSE,
     S_OK, WPARAM,
@@ -48,42 +51,44 @@ static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
 // bridge between the COM lifecycle and the real decoder. Loading the complete
 // Rime snapshot inside every host process is a separate data-layer decision.
 const TSF_DEVELOPMENT_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
+const TSF_DEVELOPMENT_SNAPSHOT: CandidateSnapshotDescriptor<'static> =
+    CandidateSnapshotDescriptor {
+        schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+        revision: "tsf-public-demo-v1",
+        contains_private_text: false,
+        lexicon_tsv: TSF_DEVELOPMENT_LEXICON,
+        expected_payload_bytes: 1_132,
+        expected_payload_fingerprint: 0x592a_4dbb_4b33_efa6,
+        expected_entry_count: 50,
+    };
 
 trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, one-based candidate without learning or I/O.
     fn candidate(&self, code: &str, rank: usize) -> Option<String>;
 }
 
+type CandidateProviderLoadResult =
+    std::result::Result<Arc<dyn CandidateProvider>, CandidateSnapshotError>;
+
 struct DevelopmentCandidateProvider {
-    decoder: Decoder,
+    snapshot: CandidateSnapshot,
 }
 
 impl CandidateProvider for DevelopmentCandidateProvider {
     fn candidate(&self, code: &str, rank: usize) -> Option<String> {
-        if !(1..=10).contains(&rank) {
-            return None;
-        }
-        let candidates = self.decoder.decode_sentence(code, rank).ok()?;
-        let candidate = candidates.get(rank - 1)?;
-        if candidate.unresolved_key_count == 0 {
-            return Some(candidate.text.clone());
-        }
-        // The development lexicon is intentionally tiny. Confirming an
-        // unknown first candidate must preserve the user's raw composition
-        // instead of inserting the decoder's visible unresolved markers.
-        (rank == 1).then(|| code.to_owned())
+        self.snapshot.candidate_text(code, rank).ok().flatten()
     }
 }
 
-fn development_candidate_provider() -> Arc<dyn CandidateProvider> {
-    static PROVIDER: OnceLock<Arc<dyn CandidateProvider>> = OnceLock::new();
-    Arc::clone(PROVIDER.get_or_init(|| {
-        let entries = parse_lexicon_tsv(TSF_DEVELOPMENT_LEXICON)
-            .expect("the checked-in TSF development lexicon must remain valid");
-        Arc::new(DevelopmentCandidateProvider {
-            decoder: Decoder::new(entries),
+fn development_candidate_provider() -> CandidateProviderLoadResult {
+    static PROVIDER: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| {
+            CandidateSnapshot::load(TSF_DEVELOPMENT_SNAPSHOT).map(|snapshot| {
+                Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>
+            })
         })
-    }))
+        .clone()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,7 +241,7 @@ fn can_unload_now() -> bool {
 
 #[implement(IClassFactory)]
 struct TsfClassFactory {
-    candidate_provider: Arc<dyn CandidateProvider>,
+    candidate_provider: CandidateProviderLoadResult,
     key_advice_mode: KeyAdviceMode,
 }
 
@@ -246,7 +251,7 @@ impl TsfClassFactory {
     }
 
     fn counted_with_options(
-        candidate_provider: Arc<dyn CandidateProvider>,
+        candidate_provider: CandidateProviderLoadResult,
         key_advice_mode: KeyAdviceMode,
     ) -> Self {
         object_created();
@@ -289,8 +294,12 @@ impl IClassFactory_Impl for TsfClassFactory_Impl {
             return Err(lifecycle_error(E_POINTER));
         }
 
+        let candidate_provider = self
+            .candidate_provider
+            .as_ref()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
         let service: ITfTextInputProcessorEx = TsfTextService::counted_with_options(
-            Some(Arc::clone(&self.candidate_provider)),
+            Some(Arc::clone(candidate_provider)),
             self.key_advice_mode,
         )
         .into();
@@ -1323,8 +1332,27 @@ mod tests {
     }
 
     #[test]
+    fn class_factory_rejects_service_creation_when_snapshot_is_unavailable() {
+        let _guard = test_lock();
+        assert_eq!(DllCanUnloadNow(), S_OK);
+        let factory: IClassFactory = TsfClassFactory::counted_with_options(
+            Err(CandidateSnapshotError::UnsupportedSchema),
+            KeyAdviceMode::DisabledForProcessTest,
+        )
+        .into();
+        // SAFETY: aggregation is disabled and the requested interface is
+        // valid; the unavailable snapshot is the intended failure.
+        let result: Result<ITfTextInputProcessorEx> =
+            unsafe { factory.CreateInstance(None::<&IUnknown>) };
+        let error = result.expect_err("candidate snapshot failure must reject service creation");
+        assert_eq!(error.code(), E_UNEXPECTED);
+        drop(factory);
+        assert_eq!(DllCanUnloadNow(), S_OK);
+    }
+
+    #[test]
     fn development_provider_decodes_public_fixture_and_preserves_unknown_input() {
-        let provider = development_candidate_provider();
+        let provider = development_candidate_provider().unwrap();
         assert_eq!(provider.candidate("nihk", 1).as_deref(), Some("你好"));
         assert_eq!(provider.candidate("nihk", 0), None);
         assert_eq!(provider.candidate("nihk", 11), None);
@@ -1332,6 +1360,21 @@ mod tests {
             provider.candidate("zzzzzzzz", 1).as_deref(),
             Some("zzzzzzzz")
         );
+    }
+
+    #[test]
+    fn unavailable_snapshot_leaves_keys_unhandled() {
+        let _guard = test_lock();
+        assert_eq!(DllCanUnloadNow(), S_OK);
+        let service = ComObject::new(TsfTextService::counted_for_process_test(None));
+        assert!(
+            service
+                .plan_key(WPARAM(usize::from(VK_A.0)), KeyModifiers::default())
+                .unwrap()
+                .is_none()
+        );
+        drop(service);
+        assert_eq!(DllCanUnloadNow(), S_OK);
     }
 
     #[test]

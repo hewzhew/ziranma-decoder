@@ -15,6 +15,7 @@ use std::fmt;
 
 mod abbreviation;
 mod candidate_lab;
+mod candidate_snapshot;
 mod capsule_replay;
 mod codec;
 mod composition;
@@ -48,6 +49,11 @@ pub use abbreviation::{
 pub use candidate_lab::{
     CandidateLabCandidate, CandidateLabError, CandidateLabLane, CandidateLabReport,
     MAX_CANDIDATE_LAB_TOP_K, analyze_candidate_lab,
+};
+pub use candidate_snapshot::{
+    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotDescriptor,
+    CandidateSnapshotError, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
+    MAX_CANDIDATE_SNAPSHOT_RANK, candidate_payload_fingerprint,
 };
 pub use capsule_replay::{
     CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
