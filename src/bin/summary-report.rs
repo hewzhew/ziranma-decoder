@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ziranma_decoder::{AggregatedSessionSummary, SessionSummaryV1};
+use ziranma_core::{AggregatedSessionSummary, SessionSummaryV1};
 
 const MAX_SUMMARY_BYTES: u64 = 64 * 1024;
 
@@ -224,7 +224,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use ziranma_decoder::{AggregatedSessionSummary, SessionSummaryCounts, SessionSummaryV1};
+    use ziranma_core::{AggregatedSessionSummary, SessionSummaryCounts, SessionSummaryV1};
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 

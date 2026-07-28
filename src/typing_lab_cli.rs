@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use ziranma_decoder::{
+use ziranma_core::{
     CompositionEffect, CompositionInput, CompositionSession, LexiconEntry, SessionSelectionMemory,
 };
 
@@ -349,7 +349,7 @@ pub fn render_typing_lab_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ziranma_decoder::{KeySequence, LexiconEntry};
+    use ziranma_core::{KeySequence, LexiconEntry};
 
     fn entry(text: &str, pinyin: &str, code: &str, frequency: u64) -> LexiconEntry {
         LexiconEntry {
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn session_selection_memory_promotes_only_the_same_code() {
-        let decoder = ziranma_decoder::Decoder::new(vec![
+        let decoder = ziranma_core::Decoder::new(vec![
             entry("大", "da", "da", 20),
             entry("答", "da", "da", 10),
         ]);

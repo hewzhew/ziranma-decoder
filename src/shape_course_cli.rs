@@ -1,9 +1,7 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
-use ziranma_decoder::{
-    MAX_INTERACTIVE_SHAPE_COURSE_TASKS, ShapeCourseDifficulty, ShapeLabSnapshot,
-};
+use ziranma_core::{MAX_INTERACTIVE_SHAPE_COURSE_TASKS, ShapeCourseDifficulty, ShapeLabSnapshot};
 
 use crate::shape_lab_cli::{
     ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect, normalize_shape_lab_input,
@@ -351,7 +349,7 @@ mod tests {
         render_shape_course_summary,
     };
     use crate::shape_lab_cli::ShapeLabInput;
-    use ziranma_decoder::{ShapeCourseDifficulty, ShapeLabCandidate, ShapeLabSnapshot};
+    use ziranma_core::{ShapeCourseDifficulty, ShapeLabCandidate, ShapeLabSnapshot};
 
     fn snapshot(prefix: &str) -> ShapeLabSnapshot {
         ShapeLabSnapshot {

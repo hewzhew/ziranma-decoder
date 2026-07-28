@@ -35,6 +35,8 @@ mod shape_replay;
 mod single_character_pool;
 mod stroke_data;
 mod tracker;
+#[cfg(windows)]
+mod tsf_alpha;
 
 pub use abbreviation::{
     AbbreviationAuditError, AbbreviationCodebookAudit, ImmediateAmbiguityWitness,

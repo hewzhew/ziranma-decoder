@@ -62,7 +62,7 @@ mod windows_recorder {
     };
     use windows::core::{BSTR, Interface, PCWSTR, Ref, Result as WindowsResult, implement};
 
-    use ziranma_decoder::{
+    use ziranma_core::{
         CODEX_CAPTURE_PROFILE_V2, CONTINUOUS_PRODUCER_VERSION, CaptureIntegrityCountersV1,
         CaptureSessionKind, LocalInputTracker, ProtectedSegmentWriter,
         ProtectedSegmentWriterConfig, RawKey, SegmentCloseReason, SegmentWriteReceipt,
@@ -2262,7 +2262,7 @@ mod windows_recorder {
         };
         use std::time::Duration;
         use std::time::{SystemTime, UNIX_EPOCH};
-        use ziranma_decoder::{
+        use ziranma_core::{
             CaptureSessionKind, ContinuousSegmentV2, DataProtector, ProtectedSegmentEnvelopeV1,
             ProtectedSegmentWriter, ProtectedSegmentWriterConfig, RawKey, SegmentCloseReason,
             SegmentWriteReceipt, WindowsUserDataProtector,
@@ -2515,8 +2515,7 @@ mod windows_recorder {
             assert_eq!(counters.value_callbacks_without_output, 2);
             assert_eq!(counters.selection_read_errors, 1);
             assert_eq!(counters.tracker_outputs_emitted, 1);
-            let ziranma_decoder::TrackerOutput::Commit(commit) =
-                &segment.capsule().events()[0].output
+            let ziranma_core::TrackerOutput::Commit(commit) = &segment.capsule().events()[0].output
             else {
                 panic!("synthetic input should produce one commit");
             };

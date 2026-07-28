@@ -1,4 +1,4 @@
-use ziranma_decoder::{
+use ziranma_core::{
     BigramLanguageModel, CandidateSource, Correction, Decoder, LexiconParseError, parse_lexicon_tsv,
 };
 
@@ -199,7 +199,7 @@ fn parser_generates_canonical_codes_from_pinyin() {
 
 #[test]
 fn pinned_public_rime_snapshot_has_stable_import_accounting() {
-    let imported = ziranma_decoder::parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap();
+    let imported = ziranma_core::parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap();
 
     assert_eq!(imported.stats.source_rows, 65_125);
     assert_eq!(imported.stats.imported_entries, 65_116);

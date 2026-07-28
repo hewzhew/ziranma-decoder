@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ziranma_decoder::{
+use ziranma_core::{
     BigramLanguageModel, CAPTURE_INTEGRITY_SCHEMA_V1, CapsuleReplayReport, CaptureIntegrityV1,
     CaptureSessionKind, CharacterBigramLanguageModel, CharacterShapeIndex,
     ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1, LexiconEntry,
@@ -16,7 +16,7 @@ use ziranma_decoder::{
     select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
-use ziranma_decoder::{
+use ziranma_core::{
     CODEX_CAPTURE_PROFILE_V1, CODEX_CAPTURE_PROFILE_V2, DataProtector, DecodedContinuousSegment,
     ProtectedSegmentEnvelopeV1, WindowsUserDataProtector,
 };
@@ -576,7 +576,7 @@ fn print_usage() {
     eprintln!("{CAPTURE_HEALTH_PRIVACY_NOTICE}");
 }
 
-fn print_private_shape_report(report: &ziranma_decoder::PrivateShapeReplayReport) {
+fn print_private_shape_report(report: &ziranma_core::PrivateShapeReplayReport) {
     println!(
         "PRIVATE_SHAPE_REPLAY contains_text=false capsules={} events={} commits={} revisions={} keys_complete_commits={} candidate_order=public_rime_weight_proxy",
         report.capsules,
@@ -688,7 +688,7 @@ struct CaptureHealthReport {
     close_timer: u64,
     close_continuity: u64,
     close_session_end: u64,
-    integrity_counters: ziranma_decoder::CaptureIntegrityCountersV1,
+    integrity_counters: ziranma_core::CaptureIntegrityCountersV1,
 }
 
 impl CaptureHealthReport {
@@ -2046,7 +2046,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use ziranma_decoder::{
+    use ziranma_core::{
         BigramLanguageModel, CapsuleReplayReport, CaptureIntegrityCountersV1, CaptureIntegrityV1,
         CaptureSessionKind, CharacterBigramLanguageModel, CommitRecord, ContinuousSegmentMetadata,
         Decoder, DeltaPositionEvidence, EventCapsuleV1, KeySequence, PairedReplayStrategyStats,
@@ -2055,7 +2055,7 @@ mod tests {
         parse_ud_conllu, select_public_bigram_training_sequences,
     };
     #[cfg(windows)]
-    use ziranma_decoder::{
+    use ziranma_core::{
         CODEX_CAPTURE_PROFILE_V1, CODEX_CAPTURE_PROFILE_V2, ContinuousSegmentV1,
         ContinuousSegmentV2, DataProtector, ProtectedSegmentEnvelopeV1, WindowsUserDataProtector,
     };

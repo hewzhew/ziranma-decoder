@@ -3,12 +3,12 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use ziranma_decoder::{
+use ziranma_core::{
     DeltaPositionEvidence, ProtectedSessionSegment, RawKey, RevisionRecord, TextDelta,
     TimedTrackerOutput, TrackerOutput,
 };
 #[cfg(windows)]
-use ziranma_decoder::{ProtectedSessionReader, WindowsUserDataProtector};
+use ziranma_core::{ProtectedSessionReader, WindowsUserDataProtector};
 
 const DEFAULT_LIMIT: usize = 40;
 const MAX_LIMIT: usize = 500;
@@ -466,7 +466,7 @@ mod tests {
         DEFAULT_LIMIT, Options, format_compact_delta, format_compact_event, format_detailed_event,
         format_keys, format_private_text, format_review_header, parse_options,
     };
-    use ziranma_decoder::{
+    use ziranma_core::{
         CommitRecord, DeltaPositionEvidence, RawKey, RevisionRecord, TextDelta, TimedTrackerOutput,
         TrackerOutput,
     };

@@ -2,9 +2,9 @@
 
 ## 状态
 
-这是用户明确批准的新里程碑。当前只完成与宿主无关的 `CompositionSession`
-抽取；仓库尚未生成、注册或安装 TSF 输入法，也没有修改 Windows 默认输入
-方式。
+这是用户明确批准的新里程碑。当前已完成与宿主无关的 `CompositionSession`
+抽取，以及只供构建和测试的 TSF COM 生命周期探针。仓库尚未注册或安装 TSF
+输入法，也没有修改 Windows 默认输入方式。
 
 ## 目标
 
@@ -54,10 +54,17 @@ CompositionSession
 ### 1. TSF 生命周期探针
 
 - 创建最小 Windows `cdylib` 边界；
-- 实现激活、停用、焦点和按键接收；
-- 先用合成状态和单元测试验证 COM 引用计数与失败清理；
-- 形成完全成对的显式注册/注销命令；
+- 实现 COM 类工厂、激活、停用、服务器锁和安全卸载边界；
+- 用真实的系统 `ITfThreadMgr` 在测试进程内验证生命周期与失败清理；
+- 当前 DLL 只导出 `DllGetClassObject` 和 `DllCanUnloadNow`；刻意不提供
+  `DllRegisterServer` / `DllUnregisterServer`，因此不能被 `regsvr32` 注册；
+- 焦点和按键接收留给第 2 阶段；
 - 在用户再次确认安装前，只构建和检查，不注册。
+
+当前构建命令为 `cargo build --release --lib`，产物是
+`target/release/ziranma_core.dll`。它只生成未注册的 DLL；单元测试会在测试线程
+中创建并释放系统 TSF Thread Manager，不写注册表、不创建输入配置文件，也不
+改变 Windows 输入法列表。
 
 ### 2. 最小可输入闭环
 

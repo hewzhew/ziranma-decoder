@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
-use ziranma_decoder::{
+use ziranma_core::{
     CandidateLabCandidate, CandidateLabLane, CandidateLabReport, CandidateSource, Correction,
 };
 
@@ -400,7 +400,7 @@ fn render_verbose_lane(output: &mut String, label: &str, rows: &[CandidateLabCan
     }
 }
 
-fn render_verbose_segments(output: &mut String, candidate: &ziranma_decoder::SentenceCandidate) {
+fn render_verbose_segments(output: &mut String, candidate: &ziranma_core::SentenceCandidate) {
     for (index, segment) in candidate.segments.iter().enumerate() {
         if segment.candidate.source == CandidateSource::UnresolvedInput {
             writeln!(
@@ -686,7 +686,7 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ziranma_decoder::{Decoder, analyze_candidate_lab, parse_lexicon_tsv};
+    use ziranma_core::{Decoder, analyze_candidate_lab, parse_lexicon_tsv};
 
     const LEXICON: &str = "\
 text\tpinyin\tfrequency

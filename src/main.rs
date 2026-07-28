@@ -9,7 +9,7 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 
-use ziranma_decoder::{
+use ziranma_core::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel,
     CharacterShapeIndex, Decoder, KeySequenceError, MAX_SHAPE_LAB_VISIBLE,
     ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport, SentenceCandidate,
@@ -596,7 +596,7 @@ fn run_public_calibrate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn print_labeled_recall_report(label: &str, report: &ziranma_decoder::LabeledRecallReport) {
+fn print_labeled_recall_report(label: &str, report: &ziranma_core::LabeledRecallReport) {
     println!(
         "{label}：Top-1 {}/{}（{:.1}%），Top-5 {}/{}（{:.1}%），Top-10 {}/{}（{:.1}%）",
         report.hits_at_1,
@@ -611,7 +611,7 @@ fn print_labeled_recall_report(label: &str, report: &ziranma_decoder::LabeledRec
     );
 }
 
-fn print_context_oracle_report(label: &str, report: &ziranma_decoder::ContextOracleReport) {
+fn print_context_oracle_report(label: &str, report: &ziranma_core::ContextOracleReport) {
     println!(
         "{label}：原始相符 {}/{}；原始不符中预期路径胜 {}、平 {}、原 Top-1 胜 {}",
         report.unigram_top_1_matches_expected,
@@ -636,7 +636,7 @@ fn print_context_oracle_report(label: &str, report: &ziranma_decoder::ContextOra
 
 fn print_character_context_oracle_report(
     label: &str,
-    report: &ziranma_decoder::CharacterContextOracleReport,
+    report: &ziranma_core::CharacterContextOracleReport,
 ) {
     println!(
         "{label}：原始相符 {}/{}；原始不符中答案文本胜 {}、平 {}、原 Top-1 文本胜 {}",
@@ -691,7 +691,7 @@ fn print_character_context_oracle_report(
 
 fn print_labeled_rejection_report(
     label: &str,
-    report: &ziranma_decoder::LabeledRejectionShadowReport,
+    report: &ziranma_core::LabeledRejectionShadowReport,
 ) {
     println!(
         "{label}现行 Top-1：文本相符 {}/{}；不符 {}（其中完整覆盖 {}）",
@@ -850,7 +850,7 @@ fn print_latency(label: &str, summary: LatencySummary) {
     );
 }
 
-fn print_sentence_work(label: &str, stats: ziranma_decoder::SentenceSearchStats) {
+fn print_sentence_work(label: &str, stats: ziranma_core::SentenceSearchStats) {
     println!(
         "  {label}：trie 扫描 {}；路径访问 {}（精确预扫 {} 路径/{} 词条）/子树剪枝 {}；对齐状态 {} 实查 + {} 复用；终点路径/展开词条 {} -> {}（跳过 {}）；lattice 边 {} -> {} -> {}；排名转移 {} -> {}；路径组合 {}",
         stats.segment_trie_scans,
@@ -2013,7 +2013,7 @@ fn format_audit_rank(rank: Option<usize>, audit_depth: usize) -> String {
     rank.map_or_else(|| format!(">{audit_depth}"), |rank| rank.to_string())
 }
 
-fn print_composition_recall(label: &str, report: ziranma_decoder::CompositionRecallReport) {
+fn print_composition_recall(label: &str, report: ziranma_core::CompositionRecallReport) {
     println!(
         "{label:<18} {:>3}/{:<3} {:>6.1}%  {:>3}/{:<3} {:>6.1}%  {:>3}/{:<3} {:>6.1}%  {:>3}/{:<3} {:>6.1}%",
         report.hits_at_1,
@@ -2031,7 +2031,7 @@ fn print_composition_recall(label: &str, report: ziranma_decoder::CompositionRec
     );
 }
 
-fn print_composition_visibility(label: &str, report: ziranma_decoder::CompositionRecallReport) {
+fn print_composition_visibility(label: &str, report: ziranma_core::CompositionRecallReport) {
     println!(
         "{label}可见性：{} 条直接首选；{} 条在第 2～10；{} 条在 Top-10 外",
         report.hits_at_1,
@@ -2100,7 +2100,7 @@ fn demo_sentence_decoder(use_bigram: bool) -> Result<Decoder, Box<dyn Error>> {
 fn print_sentence_candidates(
     observed: &str,
     use_bigram: bool,
-    candidates: &[ziranma_decoder::SentenceCandidate],
+    candidates: &[ziranma_core::SentenceCandidate],
 ) {
     println!(
         "整串输入：{observed}（{}）",
@@ -2118,7 +2118,7 @@ fn print_sentence_candidates(
     print_sentence_candidate_list(candidates);
 }
 
-fn print_sentence_candidate_list(candidates: &[ziranma_decoder::SentenceCandidate]) {
+fn print_sentence_candidate_list(candidates: &[ziranma_core::SentenceCandidate]) {
     if candidates.is_empty() {
         println!("  （没有候选）");
         return;
@@ -2136,7 +2136,7 @@ fn print_sentence_candidate_list(candidates: &[ziranma_decoder::SentenceCandidat
     }
 }
 
-fn print_sentence_candidate_segments(candidate: &ziranma_decoder::SentenceCandidate) {
+fn print_sentence_candidate_segments(candidate: &ziranma_core::SentenceCandidate) {
     for (index, segment) in candidate.segments.iter().enumerate() {
         if segment.candidate.source == CandidateSource::UnresolvedInput {
             println!(

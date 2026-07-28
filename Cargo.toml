@@ -8,6 +8,10 @@ repository = "https://github.com/hewzhew/ziranma-decoder"
 publish = false
 default-run = "ziranma-decoder"
 
+[lib]
+name = "ziranma_core"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
@@ -23,6 +27,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.62.2"

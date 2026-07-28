@@ -56,7 +56,7 @@ mod windows_probe {
     };
     use windows::core::{BSTR, Interface, Ref, Result as WindowsResult, implement};
 
-    use ziranma_decoder::{
+    use ziranma_core::{
         CommitRecord, CorrectionCandidate, CorrectionCandidateDetector, EVENT_CAPSULE_SCHEMA_V1,
         EventCapsuleError, EventCapsuleRecorder, EventCapsuleV1, LocalInputTracker, RawKey,
         RevisionRecord, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryV1,
@@ -1541,7 +1541,7 @@ mod windows_probe {
         use std::fs;
         use std::path::Path;
         use std::sync::atomic::{AtomicU64, Ordering};
-        use ziranma_decoder::{
+        use ziranma_core::{
             CommitRecord, CorrectionCandidate, CorrectionCandidateForm, CorrectionCandidateKind,
             DeltaPositionEvidence, RawKey, RevisionRecord, SessionSummaryCounts, SessionSummaryV1,
             TextDelta, TrackerOutput,

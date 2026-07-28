@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ziranma_decoder::{Decoder, PinyinEncodeError, SentenceSearchStats, encode_pinyin_phrase};
+use ziranma_core::{Decoder, PinyinEncodeError, SentenceSearchStats, encode_pinyin_phrase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LatencySummary {
@@ -190,7 +190,7 @@ fn fully_abbreviated_sentence(words: &[&str]) -> Result<String, PinyinEncodeErro
     Ok(observed)
 }
 
-fn update_checksum(checksum: usize, candidates: &[ziranma_decoder::Candidate]) -> usize {
+fn update_checksum(checksum: usize, candidates: &[ziranma_core::Candidate]) -> usize {
     candidates.iter().fold(checksum, |checksum, candidate| {
         checksum
             .wrapping_mul(31)

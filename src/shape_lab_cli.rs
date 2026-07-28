@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
-use ziranma_decoder::ShapeLabSnapshot;
+use ziranma_core::ShapeLabSnapshot;
 
 pub const SHAPE_LAB_USAGE: &str = "\
 Tab 笔画实验台
@@ -403,7 +403,7 @@ mod tests {
         parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
         render_shape_lab_screen,
     };
-    use ziranma_decoder::{ShapeLabCandidate, ShapeLabSnapshot};
+    use ziranma_core::{ShapeLabCandidate, ShapeLabSnapshot};
 
     #[test]
     fn parses_one_shot_options_in_any_order() {
