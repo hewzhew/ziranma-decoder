@@ -3,8 +3,9 @@
 ## 状态
 
 这是用户明确批准的新里程碑。当前已完成与宿主无关的 `CompositionSession`
-抽取，以及只供构建和测试的 TSF COM 生命周期探针。仓库尚未注册或安装 TSF
-输入法，也没有修改 Windows 默认输入方式。
+抽取、TSF COM 生命周期探针，以及只在测试进程中工作的按键与同步编辑事务
+探针。仓库尚未注册或安装 TSF 输入法，也没有修改 Windows 默认输入方式；
+编辑事务目前不修改 `ITfRange`，因此还不能在真实编辑框显示或提交文字。
 
 ## 目标
 
@@ -58,7 +59,14 @@ CompositionSession
 - 用真实的系统 `ITfThreadMgr` 在测试进程内验证生命周期与失败清理；
 - 当前 DLL 只导出 `DllGetClassObject` 和 `DllCanUnloadNow`；刻意不提供
   `DllRegisterServer` / `DllUnregisterServer`，因此不能被 `regsvr32` 注册；
-- 焦点和按键接收留给第 2 阶段；
+- 文本服务已实现 `ITfKeyEventSink`，正式激活路径会申请前台按键接收，并在
+  停用时成对释放；
+- 未注册测试进程拿到的是应用 client id，Windows 会拒绝用它冒充前台文本
+  服务。测试因此只绕过“前台订阅”这一项，直接调用同一个按键接收器；
+- 测试按键仍经过真实的 Thread Manager、Document Manager、Context 与同步
+  `RequestEditSession`。事务只记录有界的“更新/取消/提交”结构，不保存原文；
+- 默认类工厂没有候选源，任何按键都会交还宿主。测试候选源只能由仓库内测试
+  显式注入；
 - 在用户再次确认安装前，只构建和检查，不注册。
 
 当前构建命令为 `cargo build --release --lib`，产物是
@@ -68,9 +76,10 @@ CompositionSession
 
 ### 2. 最小可输入闭环
 
-- `a`～`z` 更新组合串；
-- Backspace 修改，Esc 取消；
-- Space / Enter 与数字选择候选；
+- `a`～`z`、Backspace、Esc、Space / Enter 与数字键的路由和事务计划已有
+  进程内覆盖；
+- 下一步用 `ITfInsertAtSelection`、`ITfContextComposition` 和 `ITfRange` 真正
+  创建、更新、取消与提交组合；
 - 提交、焦点丢失和输入法切换都正确结束组合；
 - 未激活或没有组合时，普通按键交还宿主。
 
@@ -107,6 +116,8 @@ CompositionSession
 
 - <https://learn.microsoft.com/zh-cn/windows/apps/develop/input/input-method-editor-requirements>
 - <https://learn.microsoft.com/en-us/windows/win32/tsf/text-service-registration>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfkeystrokemgr-advisekeyeventsink>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession>
 
 Weasel 与 PIME/libIME2 只用于研究成熟项目如何分离 Windows 前端、UI 与引擎；
 不复制其实现。引入或链接第三方代码前必须单独审查其许可证与更新边界。
