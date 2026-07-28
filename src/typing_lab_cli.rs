@@ -163,11 +163,14 @@ impl TypingLabSession {
         self.candidate_page_start = self.candidate_page_start.saturating_sub(page_size);
     }
 
-    pub fn next_candidate_page(&mut self, candidate_count: usize, page_size: usize) {
+    pub fn next_candidate_page(
+        &mut self,
+        candidate_count: usize,
+        page_size: usize,
+        candidate_limit: usize,
+    ) {
         let next = self.candidate_page_start.saturating_add(page_size);
-        if next < candidate_count
-            || (self.candidate_page_start == 0 && candidate_count <= page_size)
-        {
+        if next < candidate_count || next < candidate_limit {
             self.candidate_page_start = next;
         } else {
             self.set_notice("已经是最后一页");
@@ -527,7 +530,7 @@ mod tests {
             session.apply(TypingLabInput::NextPage),
             TypingLabEffect::NextPage
         );
-        session.next_candidate_page(17, 5);
+        session.next_candidate_page(17, 5, 17);
         assert_eq!(session.visible_candidate_range(17, 5), 5..10);
         session.previous_candidate_page(5);
         assert_eq!(session.visible_candidate_range(17, 5), 0..5);
@@ -535,7 +538,7 @@ mod tests {
 
         let mut lazy_session = TypingLabSession::default();
         lazy_session.apply(TypingLabInput::Letters("da".to_owned()));
-        lazy_session.next_candidate_page(5, 5);
+        lazy_session.next_candidate_page(5, 5, 200);
         assert_eq!(lazy_session.visible_candidate_range(200, 5), 5..10);
         lazy_session.normalize_candidate_page(5, 5);
         assert_eq!(lazy_session.visible_candidate_range(5, 5), 0..5);

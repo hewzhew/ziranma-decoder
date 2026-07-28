@@ -2,21 +2,26 @@ use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write as _};
 use std::process::ExitCode;
+use std::sync::{
+    Arc,
+    mpsc::{self, TryRecvError},
+};
+use std::thread;
 use std::time::Instant;
 
 use ziranma_decoder::{
     BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel,
-    CharacterShapeIndex, Decoder, MAX_SHAPE_LAB_VISIBLE, ProtocolContextLaneReport,
-    ProtocolIndexStats, ProtocolStrategyReport, SentenceCandidate, ShapeLab, analyze_candidate_lab,
-    audit_abbreviation_codebook, audit_anchored_tail_failures, audit_continuous_composition,
-    audit_public_protocol_context, audit_public_protocols, audit_shape_refinement_course,
-    encode_pinyin_phrase, evaluate_character_context_oracle, evaluate_context_oracle,
-    evaluate_continuous_composition, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
-    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
-    parse_lexicon_tsv, parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
-    select_public_bigram_training_sequences, select_public_calibration_cases,
-    select_public_continuous_composition_cases, select_public_protocol_audit_cases,
-    select_shape_course_tasks,
+    CharacterShapeIndex, Decoder, KeySequenceError, MAX_SHAPE_LAB_VISIBLE,
+    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport, SentenceCandidate,
+    ShapeLab, analyze_candidate_lab, audit_abbreviation_codebook, audit_anchored_tail_failures,
+    audit_continuous_composition, audit_public_protocol_context, audit_public_protocols,
+    audit_shape_refinement_course, encode_pinyin_phrase, evaluate_character_context_oracle,
+    evaluate_context_oracle, evaluate_continuous_composition, evaluate_labeled_recall,
+    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
+    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
+    parse_stroke_sequence_tsv, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases, select_public_continuous_composition_cases,
+    select_public_protocol_audit_cases, select_shape_course_tasks,
 };
 
 mod benchmark;
@@ -993,12 +998,13 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
     let strokes = parse_stroke_sequence_tsv(PUBLIC_STROKE_DATA)?;
     let shapes = CharacterShapeIndex::new(strokes.into_shapes())?;
-    let decoder = Decoder::new(imported.entries.clone());
+    let decoder = Arc::new(Decoder::new(imported.entries.clone()));
     let shape_lab = ShapeLab::new(&imported.entries, &shapes);
     let mut input_source = TypingLabInputSource::open();
     let mut session = TypingLabSession::default();
     let mut selection_memory = TypingLabSelectionMemory::default();
     let mut phonetic_cache = TypingLabPhoneticCache::default();
+    let mut deep_decode = None::<TypingLabDeepDecode>;
     let mut screen = AlternateScreen::enter(input_source.direct_keys())?;
 
     loop {
@@ -1013,15 +1019,15 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         } else if session.phonetic().is_empty() {
             (Vec::new(), false)
         } else {
-            let depth = if session.candidate_page_start() == 0 {
-                options.visible_limit
-            } else {
-                TYPING_LAB_CANDIDATE_POOL_DEPTH
-            };
-            if phonetic_cache.code != session.phonetic() || phonetic_cache.depth != depth {
-                phonetic_cache.code = session.phonetic().to_owned();
-                phonetic_cache.depth = depth;
-                phonetic_cache.candidates = decoder.decode_sentence(session.phonetic(), depth)?;
+            phonetic_cache.activate_code(session.phonetic());
+            poll_typing_lab_deep_decode(&mut deep_decode, &mut phonetic_cache, session.phonetic())?;
+            let required_depth = session
+                .candidate_page_start()
+                .saturating_add(options.visible_limit)
+                .min(TYPING_LAB_CANDIDATE_POOL_DEPTH);
+            if phonetic_cache.depth < required_depth {
+                let candidates = decoder.decode_sentence(session.phonetic(), required_depth)?;
+                phonetic_cache.replace(required_depth, candidates);
             }
             selection_memory.promote(session.phonetic(), &mut phonetic_cache.candidates);
             let candidates = phonetic_cache
@@ -1072,7 +1078,27 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             ),
             TypingLabEffect::PreviousPage => session.previous_candidate_page(options.visible_limit),
             TypingLabEffect::NextPage => {
-                session.next_candidate_page(candidates.len(), options.visible_limit)
+                let candidate_limit = if ordinary_candidates {
+                    if phonetic_cache.depth >= TYPING_LAB_CANDIDATE_POOL_DEPTH {
+                        candidates.len()
+                    } else {
+                        TYPING_LAB_CANDIDATE_POOL_DEPTH
+                    }
+                } else {
+                    candidates.len()
+                };
+                if ordinary_candidates && phonetic_cache.depth < TYPING_LAB_CANDIDATE_POOL_DEPTH {
+                    start_typing_lab_deep_decode(
+                        &mut deep_decode,
+                        Arc::clone(&decoder),
+                        session.phonetic(),
+                    )?;
+                }
+                session.next_candidate_page(
+                    candidates.len(),
+                    options.visible_limit,
+                    candidate_limit,
+                )
             }
             TypingLabEffect::RequestTab => {
                 if let Some(pinyin) =
@@ -1387,6 +1413,77 @@ struct TypingLabPhoneticCache {
     code: String,
     depth: usize,
     candidates: Vec<SentenceCandidate>,
+}
+
+struct TypingLabDeepDecode {
+    code: String,
+    receiver: mpsc::Receiver<Result<Vec<SentenceCandidate>, KeySequenceError>>,
+}
+
+impl TypingLabPhoneticCache {
+    fn activate_code(&mut self, code: &str) {
+        if self.code == code {
+            return;
+        }
+        self.code.clear();
+        self.code.push_str(code);
+        self.depth = 0;
+        self.candidates.clear();
+    }
+
+    fn replace(&mut self, depth: usize, candidates: Vec<SentenceCandidate>) {
+        if depth < self.depth {
+            return;
+        }
+        self.depth = depth;
+        self.candidates = candidates;
+    }
+}
+
+fn start_typing_lab_deep_decode(
+    job: &mut Option<TypingLabDeepDecode>,
+    decoder: Arc<Decoder>,
+    code: &str,
+) -> io::Result<()> {
+    if job.is_some() {
+        return Ok(());
+    }
+    let code = code.to_owned();
+    let worker_code = code.clone();
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("typing-lab-deep-decode".to_owned())
+        .spawn(move || {
+            let result = decoder.decode_sentence(&worker_code, TYPING_LAB_CANDIDATE_POOL_DEPTH);
+            let _ = sender.send(result);
+        })?;
+    *job = Some(TypingLabDeepDecode { code, receiver });
+    Ok(())
+}
+
+fn poll_typing_lab_deep_decode(
+    job: &mut Option<TypingLabDeepDecode>,
+    cache: &mut TypingLabPhoneticCache,
+    code: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(active) = job.as_ref() else {
+        return Ok(());
+    };
+    let matches_current_code = active.code == code;
+    let result = match active.receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return Ok(()),
+        Err(TryRecvError::Disconnected) => {
+            *job = None;
+            return Err(io::Error::other("后台候选计算意外停止").into());
+        }
+    };
+    *job = None;
+    let candidates = result?;
+    if matches_current_code {
+        cache.replace(TYPING_LAB_CANDIDATE_POOL_DEPTH, candidates);
+    }
+    Ok(())
 }
 
 impl AlternateScreen {
@@ -2179,4 +2276,63 @@ ziranma-decoder：自然码可解释容错解码实验
 
 程序只读取仓库内的公开演示词典，不会保存输入。"
     );
+}
+
+#[cfg(test)]
+mod typing_lab_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn phonetic_cache_keeps_its_high_water_mark_until_the_code_changes() {
+        let mut cache = TypingLabPhoneticCache::default();
+        cache.activate_code("da");
+        cache.replace(200, Vec::new());
+        cache.replace(5, Vec::new());
+        assert_eq!(cache.depth, 200);
+
+        cache.activate_code("da");
+        assert_eq!(cache.depth, 200);
+        cache.activate_code("ni");
+        assert_eq!(cache.depth, 0);
+        assert!(cache.candidates.is_empty());
+    }
+
+    #[test]
+    fn completed_deep_decode_upgrades_the_matching_cache() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok::<Vec<SentenceCandidate>, KeySequenceError>(Vec::new()))
+            .unwrap();
+        let mut job = Some(TypingLabDeepDecode {
+            code: "da".to_owned(),
+            receiver,
+        });
+        let mut cache = TypingLabPhoneticCache::default();
+        cache.activate_code("da");
+        cache.replace(10, Vec::new());
+
+        poll_typing_lab_deep_decode(&mut job, &mut cache, "da").unwrap();
+        assert!(job.is_none());
+        assert_eq!(cache.depth, TYPING_LAB_CANDIDATE_POOL_DEPTH);
+    }
+
+    #[test]
+    fn completed_stale_decode_is_discarded_and_releases_the_worker_slot() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok::<Vec<SentenceCandidate>, KeySequenceError>(Vec::new()))
+            .unwrap();
+        let mut job = Some(TypingLabDeepDecode {
+            code: "da".to_owned(),
+            receiver,
+        });
+        let mut cache = TypingLabPhoneticCache::default();
+        cache.activate_code("ni");
+        cache.replace(5, Vec::new());
+
+        poll_typing_lab_deep_decode(&mut job, &mut cache, "ni").unwrap();
+        assert!(job.is_none());
+        assert_eq!(cache.depth, 5);
+        assert_eq!(cache.code, "ni");
+    }
 }
