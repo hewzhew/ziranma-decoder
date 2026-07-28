@@ -23,8 +23,11 @@ mod benchmark;
 mod candidate_lab_cli;
 mod shape_course_cli;
 mod shape_lab_cli;
+mod typing_lab_cli;
 #[cfg(windows)]
 mod windows_shape_keys;
+#[cfg(windows)]
+mod windows_typing_keys;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
 use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
@@ -38,8 +41,15 @@ use shape_lab_cli::{
     normalize_shape_lab_input, parse_shape_lab_arguments, parse_shape_lab_input,
     render_shape_lab_details, render_shape_lab_screen,
 };
+use typing_lab_cli::{
+    TYPING_LAB_USAGE, TypingLabEffect, TypingLabInput, TypingLabSession,
+    find_single_character_pinyin, parse_typing_lab_arguments, parse_typing_lab_input,
+    render_typing_lab_screen,
+};
 #[cfg(windows)]
 use windows_shape_keys::WindowsShapeKeyReader;
+#[cfg(windows)]
+use windows_typing_keys::WindowsTypingKeyReader;
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
@@ -93,6 +103,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "public-sentence" => run_public_sentence(&arguments[1..]),
         "public-compose" => run_public_compose(&arguments[1..]),
         "candidate-lab" => run_candidate_lab(&arguments[1..]),
+        "typing-lab" => run_typing_lab(&arguments[1..]),
         "shape-lab" => run_shape_lab(&arguments[1..]),
         "shape-course" => run_shape_course(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
@@ -972,6 +983,86 @@ fn run_candidate_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
+        println!("{TYPING_LAB_USAGE}");
+        return Ok(());
+    }
+
+    let options = parse_typing_lab_arguments(arguments)?;
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let strokes = parse_stroke_sequence_tsv(PUBLIC_STROKE_DATA)?;
+    let shapes = CharacterShapeIndex::new(strokes.into_shapes())?;
+    let decoder = Decoder::new(imported.entries.clone());
+    let shape_lab = ShapeLab::new(&imported.entries, &shapes);
+    let mut input_source = TypingLabInputSource::open();
+    let mut session = TypingLabSession::default();
+
+    loop {
+        let candidates = if let Some(pinyin) = session.shape_pinyin() {
+            shape_lab
+                .snapshot(pinyin, session.stroke_prefix(), None, options.visible_limit)?
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.character.to_string())
+                .collect::<Vec<_>>()
+        } else if session.phonetic().is_empty() {
+            Vec::new()
+        } else {
+            decoder
+                .decode_sentence(session.phonetic(), options.visible_limit)?
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .collect::<Vec<_>>()
+        };
+
+        clear_interactive_screen();
+        print!(
+            "{}",
+            render_typing_lab_screen(&session, &candidates, input_source.direct_keys())
+        );
+        if !input_source.direct_keys() {
+            print!("> ");
+        }
+        io::stdout().flush()?;
+
+        let Some(input) = input_source.read()? else {
+            break;
+        };
+        match session.apply(input) {
+            TypingLabEffect::Continue => {}
+            TypingLabEffect::Confirm => select_typing_candidate(&mut session, &candidates, 1),
+            TypingLabEffect::Select(rank) => {
+                select_typing_candidate(&mut session, &candidates, rank)
+            }
+            TypingLabEffect::RequestTab => {
+                if let Some(pinyin) =
+                    find_single_character_pinyin(&imported.entries, session.phonetic())
+                {
+                    session.enter_tab(pinyin);
+                } else {
+                    session.set_notice("Tab 只用于完整单字码");
+                }
+            }
+            TypingLabEffect::Quit => break,
+        }
+    }
+
+    clear_interactive_screen();
+    if !session.committed().is_empty() {
+        println!("{}", session.committed());
+    }
+    Ok(())
+}
+
+fn select_typing_candidate(session: &mut TypingLabSession, candidates: &[String], rank: usize) {
+    if let Some(candidate) = rank.checked_sub(1).and_then(|index| candidates.get(index)) {
+        session.commit(candidate);
+    } else {
+        session.set_notice("这个位置没有候选");
+    }
+}
+
 fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
         println!("{SHAPE_LAB_USAGE}");
@@ -1029,7 +1120,7 @@ fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             options.expected_character,
             options.visible_limit,
         )?;
-        clear_shape_lab_screen();
+        clear_interactive_screen();
         print!(
             "{}",
             render_shape_lab_screen(
@@ -1057,7 +1148,7 @@ fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     .find(|candidate| candidate.filtered_rank == rank)
                     .map(|candidate| candidate.character)
                 {
-                    clear_shape_lab_screen();
+                    clear_interactive_screen();
                     println!("{character}");
                     break;
                 }
@@ -1109,7 +1200,7 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             Some(task.character),
             10,
         )?;
-        clear_shape_lab_screen();
+        clear_interactive_screen();
         print!(
             "{}",
             render_shape_course_screen(
@@ -1165,7 +1256,7 @@ fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    clear_shape_lab_screen();
+    clear_interactive_screen();
     print!("{}", render_shape_course_summary(&progress, tasks.len()));
     Ok(())
 }
@@ -1230,7 +1321,52 @@ impl ShapeLabInputSource {
     }
 }
 
-fn clear_shape_lab_screen() {
+enum TypingLabInputSource {
+    #[cfg(windows)]
+    Direct(WindowsTypingKeyReader),
+    Line,
+}
+
+impl TypingLabInputSource {
+    fn open() -> Self {
+        #[cfg(windows)]
+        if io::stdin().is_terminal()
+            && io::stdout().is_terminal()
+            && let Ok(reader) = WindowsTypingKeyReader::open()
+        {
+            return Self::Direct(reader);
+        }
+        Self::Line
+    }
+
+    fn direct_keys(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self, Self::Direct(_))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn read(&mut self) -> io::Result<Option<TypingLabInput>> {
+        match self {
+            #[cfg(windows)]
+            Self::Direct(reader) => reader.read().map(Some),
+            Self::Line => {
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input)? == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(parse_typing_lab_input(&input)))
+                }
+            }
+        }
+    }
+}
+
+fn clear_interactive_screen() {
     if io::stdout().is_terminal() {
         print!("\x1b[2J\x1b[H");
     }
@@ -1896,6 +2032,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--expect <文字>] [--recovery] [--verbose|--json]
+  cargo run --release -- typing-lab [--limit <1～10>]
   cargo run --release -- shape-lab <公开单字拼音> [--expect <单字>] [--prefix <hspnz...>] [--limit <1～10>] [--details]
   cargo run --release -- shape-course [--count <1～50>] [--level <easy|medium|hard|mixed>]
   cargo run --release -- public-compose-evaluate
@@ -1927,6 +2064,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- candidate-lab mafmkm 3
   cargo run -- candidate-lab mafmkm 3 --expect 麻烦猫猫
   cargo run -- candidate-lab mafkmm 3 --recovery
+  cargo run --release -- typing-lab
   cargo run --release -- shape-lab shi --expect 事
   cargo run --release -- shape-lab da --expect 龘 --prefix n
   cargo run --release -- shape-lab da --expect 龘 --prefix n --details

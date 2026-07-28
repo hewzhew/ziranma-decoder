@@ -108,6 +108,9 @@ cargo run --release -- candidate-lab mafkmm 3 --recovery --expect 麻烦猫猫
 cargo run --release -- candidate-lab mafmkm 3 --verbose
 cargo run --release -- candidate-lab mafmkm 3 --json
 
+# 端到端逐键实验：连续双拼、候选选择、退格与 Tab 单字辅助
+cargo run --release -- typing-lab
+
 # 固定公开 2～6 字双词短语的连续输入评测
 cargo run --release -- public-compose-evaluate
 
@@ -139,6 +142,18 @@ cargo run --release -- benchmark 3
 
 CLI 程序自身只读取编译进程序的公开演示数据或固定公开快照，不会主动把
 输入持久化；命令行历史、终端回滚和重定向输出属于程序之外的明文边界。
+
+## 连续输入实验台
+
+`typing-lab` 是静态候选报告与未来系统输入法之间的最小交互层。Windows
+终端中可以直接输入连续双拼，空格或 Enter 选首项，数字选择其他候选，
+退格修改；完整单字码上按 Tab 后，使用 `h/s/p/n/z` 继续过滤同码字。`q`
+和 `t` 始终是普通双拼字母，退出使用空输入下的 Esc，不占用编码键。
+
+普通候选直接调用现有连续句子解码器，Tab 直接调用现有冻结单字池；实验台
+不复制一套算法，也不读取私人记录、学习输入或写文件。当前尚无候选翻页、
+光标移动、标点、系统输入框上屏和个人排序。完整按键、重定向回退与停止
+边界见[端到端连续输入实验台](docs/typing-lab.md)。
 
 ## 候选实验台
 
