@@ -21,13 +21,18 @@ use ziranma_decoder::{
 mod benchmark;
 mod candidate_lab_cli;
 mod shape_lab_cli;
+#[cfg(windows)]
+mod windows_shape_keys;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
 use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
 use shape_lab_cli::{
-    SHAPE_LAB_USAGE, ShapeLabInput, parse_shape_lab_arguments, parse_shape_lab_input,
-    render_shape_lab_details, render_shape_lab_screen,
+    SHAPE_LAB_USAGE, ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect,
+    parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
+    render_shape_lab_screen,
 };
+#[cfg(windows)]
+use windows_shape_keys::WindowsShapeKeyReader;
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
@@ -1000,43 +1005,44 @@ fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             options.expected_character,
             options.visible_limit,
         )?;
-        print!("{}", render_shape_lab_screen(&snapshot, true, false, None));
+        print!(
+            "{}",
+            render_shape_lab_screen(&snapshot, true, false, None, false)
+        );
         return Ok(());
     }
 
-    let stdin = io::stdin();
-    let mut tab_mode = false;
-    let mut prefix = String::new();
-    let mut notice = None::<String>;
+    let mut input_source = ShapeLabInputSource::open();
+    let mut session = ShapeLabSession::default();
     loop {
-        let active_prefix = if tab_mode { prefix.as_str() } else { "" };
         let snapshot = lab.snapshot(
             &options.pinyin,
-            active_prefix,
+            session.active_prefix(),
             options.expected_character,
             options.visible_limit,
         )?;
         clear_shape_lab_screen();
         print!(
             "{}",
-            render_shape_lab_screen(&snapshot, tab_mode, true, notice.as_deref())
+            render_shape_lab_screen(
+                &snapshot,
+                session.tab_mode(),
+                true,
+                session.notice(),
+                input_source.direct_keys(),
+            )
         );
-        print!("> ");
+        if !input_source.direct_keys() {
+            print!("> ");
+        }
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
+        let Some(input) = input_source.read()? else {
             break;
-        }
-        notice = None;
-        match parse_shape_lab_input(&input) {
-            ShapeLabInput::Noop => {}
-            ShapeLabInput::EnterTab => tab_mode = true,
-            ShapeLabInput::Stroke(strokes) if tab_mode => prefix.push_str(&strokes),
-            ShapeLabInput::Stroke(_) => {
-                notice = Some("先输入 t 进入笔画辅助".to_owned());
-            }
-            ShapeLabInput::Select(rank) => {
+        };
+        match session.apply(input) {
+            ShapeLabSessionEffect::Continue => {}
+            ShapeLabSessionEffect::Select(rank) => {
                 if let Some(character) = snapshot
                     .candidates
                     .iter()
@@ -1047,23 +1053,57 @@ fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     println!("{character}");
                     break;
                 }
-                notice = Some("这个位置没有候选".to_owned());
+                session.set_notice("这个位置没有候选");
             }
-            ShapeLabInput::Backspace if tab_mode => {
-                if prefix.pop().is_none() {
-                    tab_mode = false;
-                }
-            }
-            ShapeLabInput::Backspace => {}
-            ShapeLabInput::LeaveTab => {
-                tab_mode = false;
-                prefix.clear();
-            }
-            ShapeLabInput::Quit => break,
-            ShapeLabInput::Invalid => notice = Some("没有这个操作".to_owned()),
+            ShapeLabSessionEffect::Quit => break,
         }
     }
     Ok(())
+}
+
+enum ShapeLabInputSource {
+    #[cfg(windows)]
+    Direct(WindowsShapeKeyReader),
+    Line,
+}
+
+impl ShapeLabInputSource {
+    fn open() -> Self {
+        #[cfg(windows)]
+        if io::stdin().is_terminal()
+            && io::stdout().is_terminal()
+            && let Ok(reader) = WindowsShapeKeyReader::open()
+        {
+            return Self::Direct(reader);
+        }
+        Self::Line
+    }
+
+    fn direct_keys(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self, Self::Direct(_))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn read(&mut self) -> io::Result<Option<ShapeLabInput>> {
+        match self {
+            #[cfg(windows)]
+            Self::Direct(reader) => reader.read().map(Some),
+            Self::Line => {
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input)? == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(parse_shape_lab_input(&input)))
+                }
+            }
+        }
+    }
 }
 
 fn clear_shape_lab_screen() {

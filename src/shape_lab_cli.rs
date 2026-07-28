@@ -15,8 +15,9 @@ Tab 笔画实验台
   --limit <1～10>      最多显示多少个候选（默认 10）
   --details            显示排序、动作投影和公开笔画码后退出
 
-会话中输入 t 进入 Tab 辅助；再逐笔输入 h 横、s 竖、p 撇、n 捺、z 折。
-数字选择候选，- 撤回一笔，esc 返回普通候选，q 退出。
+Windows 交互终端中直接按 Tab 进入辅助；再逐笔按 h 横、s 竖、p 撇、n 捺、z 折。
+数字选择候选，退格撤回一笔，Esc 返回普通候选，q 退出；全程不需要 Enter。
+重定向或不支持逐键读取时，会回退为行命令：t、hspnz、数字、-、esc、q。
 隐私：拼音、目标和候选会显示在终端；请只使用公开或合成材料。
 口径：固定公开词典与笔画快照；只过滤、不重排；不学习、不写文件。";
 
@@ -39,6 +40,68 @@ pub enum ShapeLabInput {
     LeaveTab,
     Quit,
     Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShapeLabSessionEffect {
+    Continue,
+    Select(usize),
+    Quit,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShapeLabSession {
+    tab_mode: bool,
+    stroke_prefix: String,
+    notice: Option<String>,
+}
+
+impl ShapeLabSession {
+    pub fn tab_mode(&self) -> bool {
+        self.tab_mode
+    }
+
+    pub fn active_prefix(&self) -> &str {
+        if self.tab_mode {
+            &self.stroke_prefix
+        } else {
+            ""
+        }
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    pub fn apply(&mut self, input: ShapeLabInput) -> ShapeLabSessionEffect {
+        self.notice = None;
+        match input {
+            ShapeLabInput::Noop => {}
+            ShapeLabInput::EnterTab => self.tab_mode = true,
+            ShapeLabInput::Stroke(strokes) if self.tab_mode => {
+                self.stroke_prefix.push_str(&strokes);
+            }
+            ShapeLabInput::Stroke(_) => self.set_notice("先按 Tab 进入笔画辅助"),
+            ShapeLabInput::Select(rank) => return ShapeLabSessionEffect::Select(rank),
+            ShapeLabInput::Backspace if self.tab_mode => {
+                if self.stroke_prefix.pop().is_none() {
+                    self.tab_mode = false;
+                }
+            }
+            ShapeLabInput::Backspace => {}
+            ShapeLabInput::LeaveTab => {
+                self.tab_mode = false;
+                self.stroke_prefix.clear();
+            }
+            ShapeLabInput::Quit => return ShapeLabSessionEffect::Quit,
+            ShapeLabInput::Invalid => self.set_notice("没有这个操作"),
+        }
+        ShapeLabSessionEffect::Continue
+    }
 }
 
 pub fn parse_shape_lab_arguments(
@@ -150,6 +213,7 @@ pub fn render_shape_lab_screen(
     tab_mode: bool,
     show_controls: bool,
     notice: Option<&str>,
+    direct_keys: bool,
 ) -> String {
     let mut output = String::new();
     if let Some(expected) = snapshot.expected_character {
@@ -181,14 +245,23 @@ pub fn render_shape_lab_screen(
 
     if show_controls {
         writeln!(output).expect("writing to String cannot fail");
-        if tab_mode {
+        if tab_mode && direct_keys {
             writeln!(
                 output,
-                "h横　s竖　p撇　n捺　z折　　数字选择　-撤回　esc返回　q退出"
+                "h横　s竖　p撇　n捺　z折　　数字选择　退格撤回　Esc返回　q退出"
             )
             .expect("writing to String cannot fail");
+        } else if tab_mode {
+            writeln!(
+                output,
+                "h横　s竖　p撇　n捺　z折　　数字选择　-撤回　esc返回　q退出（每次按 Enter）"
+            )
+            .expect("writing to String cannot fail");
+        } else if direct_keys {
+            writeln!(output, "数字选择　Tab进入笔画辅助　q退出")
+                .expect("writing to String cannot fail");
         } else {
-            writeln!(output, "数字选择　t进入笔画辅助　q退出")
+            writeln!(output, "数字选择　t进入笔画辅助　q退出（每次按 Enter）")
                 .expect("writing to String cannot fail");
         }
     }
@@ -299,8 +372,8 @@ fn rank_text(rank: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShapeLabInput, parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
-        render_shape_lab_screen,
+        ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect, parse_shape_lab_arguments,
+        parse_shape_lab_input, render_shape_lab_details, render_shape_lab_screen,
     };
     use ziranma_decoder::{ShapeLabCandidate, ShapeLabSnapshot};
 
@@ -394,7 +467,7 @@ mod tests {
             projected_actions_one_selection: 5,
         };
 
-        let rendered = render_shape_lab_screen(&snapshot, true, true, None);
+        let rendered = render_shape_lab_screen(&snapshot, true, true, None, true);
         assert!(rendered.contains("目标：事（shi）"));
         assert!(rendered.contains("双拼：ui　Tab　n"));
         assert!(rendered.contains("1 事"));
@@ -416,5 +489,55 @@ mod tests {
         assert_eq!(parse_shape_lab_input("esc\n"), ShapeLabInput::LeaveTab);
         assert_eq!(parse_shape_lab_input("q\n"), ShapeLabInput::Quit);
         assert_eq!(parse_shape_lab_input("x\n"), ShapeLabInput::Invalid);
+    }
+
+    #[test]
+    fn session_scenario_enters_filters_rewinds_and_leaves_tab() {
+        let mut session = ShapeLabSession::default();
+        assert_eq!(
+            session.apply(ShapeLabInput::EnterTab),
+            ShapeLabSessionEffect::Continue
+        );
+        assert!(session.tab_mode());
+        session.apply(ShapeLabInput::Stroke("nh".to_owned()));
+        assert_eq!(session.active_prefix(), "nh");
+
+        session.apply(ShapeLabInput::Backspace);
+        assert_eq!(session.active_prefix(), "n");
+        session.apply(ShapeLabInput::LeaveTab);
+        assert!(!session.tab_mode());
+        assert_eq!(session.active_prefix(), "");
+
+        session.apply(ShapeLabInput::EnterTab);
+        assert_eq!(session.active_prefix(), "");
+    }
+
+    #[test]
+    fn session_scenario_keeps_selection_and_quit_as_effects() {
+        let mut session = ShapeLabSession::default();
+        assert_eq!(
+            session.apply(ShapeLabInput::Select(3)),
+            ShapeLabSessionEffect::Select(3)
+        );
+        assert_eq!(
+            session.apply(ShapeLabInput::Quit),
+            ShapeLabSessionEffect::Quit
+        );
+    }
+
+    #[test]
+    fn session_scenario_exits_empty_tab_with_backspace() {
+        let mut session = ShapeLabSession::default();
+        session.apply(ShapeLabInput::EnterTab);
+        session.apply(ShapeLabInput::Backspace);
+        assert!(!session.tab_mode());
+    }
+
+    #[test]
+    fn session_scenario_rejects_strokes_before_tab() {
+        let mut session = ShapeLabSession::default();
+        session.apply(ShapeLabInput::Stroke("n".to_owned()));
+        assert_eq!(session.active_prefix(), "");
+        assert_eq!(session.notice(), Some("先按 Tab 进入笔画辅助"));
     }
 }
