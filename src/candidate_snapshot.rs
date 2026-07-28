@@ -56,7 +56,7 @@ impl CandidateSnapshot {
         if descriptor.schema != CANDIDATE_SNAPSHOT_SCHEMA_V1 {
             return Err(CandidateSnapshotError::UnsupportedSchema);
         }
-        if !valid_revision(descriptor.revision) {
+        if !valid_candidate_snapshot_revision(descriptor.revision) {
             return Err(CandidateSnapshotError::InvalidRevision);
         }
 
@@ -249,7 +249,7 @@ pub const fn candidate_payload_fingerprint(bytes: &[u8]) -> u64 {
     fingerprint
 }
 
-fn valid_revision(revision: &str) -> bool {
+pub(crate) fn valid_candidate_snapshot_revision(revision: &str) -> bool {
     !revision.is_empty()
         && revision.len() <= MAX_CANDIDATE_SNAPSHOT_REVISION_BYTES
         && revision

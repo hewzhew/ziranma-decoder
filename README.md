@@ -168,6 +168,16 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 [只读候选快照](docs/candidate-snapshots.md)构造；快照损坏时不会创建文本服务，
 宿主保留原输入路径。任何本机注册仍需要用户再次明确确认。
 
+固定候选包的清单与载荷可以在不加载 TSF、不显示候选正文的情况下单独检查：
+
+```powershell
+cargo run --release --bin candidatectl -- inspect `
+  --manifest tests/fixtures/public/demo_candidate_manifest.zcm `
+  --payload tests/fixtures/public/demo_lexicon.tsv
+```
+
+检查器只读两个明确指定的普通文件，不扫描目录、不写文件、不学习、不联网。
+
 发布 DLL 的架构、COM 导出、证书目录和固定 zh-CN 语言配置可以先用只读工具
 核对；它不提供注册或激活命令：
 
@@ -540,7 +550,7 @@ lattice 完成后，排序状态只包含输入位置、全局错误预算和前
 - 足以改善大词典排序的密集公开上下文模型或个人词频；
 - 从真实打字中估计错误概率；
 - 神经网络、在线服务或遥测；
-- 可注册的 Windows TSF 输入法、可换代日用候选数据层或候选窗口；
+- 可注册的 Windows TSF 输入法、带版本槽位的日用候选数据层或候选窗口；
 - 自动上屏或静默修改。
 
 底层性能阶段至此封口。独立公开评测已经证明：直接把“完整词典覆盖”

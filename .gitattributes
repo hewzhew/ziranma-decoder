@@ -2,6 +2,7 @@
 Cargo.toml text eol=lf
 LICENSE text eol=lf
 tests/fixtures/public/demo_lexicon.tsv text eol=lf
+tests/fixtures/public/demo_candidate_manifest.zcm text eol=lf
 
 data/public/rime-pinyin-simp/* -text
 data/public/ud-chinese-gsdsimp/* -text

@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
-    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotDescriptor,
-    CandidateSnapshotError, CompositionEffect, CompositionInput, CompositionSession,
+    CandidatePackageError, CandidatePackageManifest, CandidateSnapshot, CompositionEffect,
+    CompositionInput, CompositionSession,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, LPARAM, S_FALSE,
@@ -51,16 +51,8 @@ static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
 // bridge between the COM lifecycle and the real decoder. Loading the complete
 // Rime snapshot inside every host process is a separate data-layer decision.
 const TSF_DEVELOPMENT_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
-const TSF_DEVELOPMENT_SNAPSHOT: CandidateSnapshotDescriptor<'static> =
-    CandidateSnapshotDescriptor {
-        schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
-        revision: "tsf-public-demo-v1",
-        contains_private_text: false,
-        lexicon_tsv: TSF_DEVELOPMENT_LEXICON,
-        expected_payload_bytes: 1_132,
-        expected_payload_fingerprint: 0x592a_4dbb_4b33_efa6,
-        expected_entry_count: 50,
-    };
+const TSF_DEVELOPMENT_MANIFEST: &str =
+    include_str!("../tests/fixtures/public/demo_candidate_manifest.zcm");
 
 trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, one-based candidate without learning or I/O.
@@ -68,7 +60,7 @@ trait CandidateProvider: Send + Sync {
 }
 
 type CandidateProviderLoadResult =
-    std::result::Result<Arc<dyn CandidateProvider>, CandidateSnapshotError>;
+    std::result::Result<Arc<dyn CandidateProvider>, CandidatePackageError>;
 
 struct DevelopmentCandidateProvider {
     snapshot: CandidateSnapshot,
@@ -84,9 +76,9 @@ fn development_candidate_provider() -> CandidateProviderLoadResult {
     static PROVIDER: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
     PROVIDER
         .get_or_init(|| {
-            CandidateSnapshot::load(TSF_DEVELOPMENT_SNAPSHOT).map(|snapshot| {
-                Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>
-            })
+            let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST)?;
+            let snapshot = manifest.load_snapshot(TSF_DEVELOPMENT_LEXICON)?;
+            Ok(Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
         })
         .clone()
 }
@@ -1336,7 +1328,7 @@ mod tests {
         let _guard = test_lock();
         assert_eq!(DllCanUnloadNow(), S_OK);
         let factory: IClassFactory = TsfClassFactory::counted_with_options(
-            Err(CandidateSnapshotError::UnsupportedSchema),
+            Err(CandidatePackageError::UnsupportedSchema),
             KeyAdviceMode::DisabledForProcessTest,
         )
         .into();

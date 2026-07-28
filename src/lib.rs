@@ -15,6 +15,7 @@ use std::fmt;
 
 mod abbreviation;
 mod candidate_lab;
+mod candidate_package;
 mod candidate_snapshot;
 mod capsule_replay;
 mod codec;
@@ -49,6 +50,10 @@ pub use abbreviation::{
 pub use candidate_lab::{
     CandidateLabCandidate, CandidateLabError, CandidateLabLane, CandidateLabReport,
     MAX_CANDIDATE_LAB_TOP_K, analyze_candidate_lab,
+};
+pub use candidate_package::{
+    CANDIDATE_PACKAGE_LEXICON_TSV_V1, CANDIDATE_PACKAGE_SCHEMA_V1, CandidatePackageError,
+    CandidatePackageManifest, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
 };
 pub use candidate_snapshot::{
     CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotDescriptor,

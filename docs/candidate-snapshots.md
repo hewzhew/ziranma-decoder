@@ -6,9 +6,41 @@
 描述符，快照完成校验后才建立现有 `Decoder` 索引。它不寻找文件、不解密、
 不学习、不写磁盘，也不联网。
 
-当前 TSF 开发类工厂通过这个入口加载仓库内的 50 词公开演示词典。每个进程
-只构造一次，随后由类工厂创建的文本服务共享同一个不可变快照。它仍不是日用
-词典，也没有从磁盘选择 current/candidate/previous 的能力。
+当前 TSF 开发类工厂先解析固定的候选包清单，再通过这个入口加载仓库内的
+50 词公开演示词典。每个进程只构造一次，随后由类工厂创建的文本服务共享
+同一个不可变快照。它仍不是日用词典，也没有从磁盘选择
+current/candidate/previous 的能力。
+
+## 不可变候选包
+
+`ziranma-candidate-package-v1` 清单固定为八行、LF 结尾，不接受未知字段、调换
+顺序或非规范数字：
+
+```text
+schema=ziranma-candidate-package-v1
+snapshot_schema=ziranma-candidate-snapshot-v1
+revision=<版本>
+contains_private_text=<true|false>
+payload_format=ziranma-lexicon-tsv-v1
+payload_bytes=<字节数>
+payload_fingerprint_fnv1a64=<16 位小写十六进制>
+entry_count=<词条数>
+```
+
+清单不含候选正文，载荷单独保存为 UTF-8 TSV。核心库只接收调用者已经明确
+提供的两段内存，不解析路径。`candidatectl inspect` 才负责只读打开用户点名的
+两个普通文件；它拒绝符号链接、空文件、非 UTF-8 和超过固定上限的文件，不
+扫描相邻目录，也不尝试猜测配对文件。
+
+```powershell
+cargo run --release --bin candidatectl -- inspect `
+  --manifest tests/fixtures/public/demo_candidate_manifest.zcm `
+  --payload tests/fixtures/public/demo_lexicon.tsv
+```
+
+报告只显示版本、公开/私人标记、词条数、载荷字节数和“校验通过”，不显示
+文件路径、指纹值或任何候选文字。检查器不写文件、不学习、不修改 TSF 配置、
+不联网，也不会替操作者安排下一步。
 
 ## 固定边界
 
@@ -43,10 +75,11 @@ FNV-1a 只用于发现损坏、拿错版本或构建材料漂移。它不是密�
 
 ## 尚未实现的换代层
 
-下一阶段才实现快照来源与槽位，而不是让 `CandidateSnapshot` 自己扫描目录：
+包清单、载荷校验和只读检查器已经完成。下一阶段才实现包生成与槽位，而不是
+让 `CandidateSnapshot` 自己扫描目录：
 
-1. 构建工具从固定公开来源生成一个不可变候选包，并记录 schema、revision、
-   SHA-256、词条数和解码兼容指纹；
+1. 构建工具从固定公开来源生成清单与不可变载荷，并另行记录上游 SHA-256 和
+   解码兼容指纹；
 2. 开发控制器显式把包放入 current/candidate/previous 槽位；
 3. 新文本服务只在创建时取得一个 `Arc<CandidateSnapshot>`，活动组合期间绝不
    偷换模型；

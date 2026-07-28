@@ -1,0 +1,8 @@
+schema=ziranma-candidate-package-v1
+snapshot_schema=ziranma-candidate-snapshot-v1
+revision=tsf-public-demo-v1
+contains_private_text=false
+payload_format=ziranma-lexicon-tsv-v1
+payload_bytes=1132
+payload_fingerprint_fnv1a64=592a4dbb4b33efa6
+entry_count=50
