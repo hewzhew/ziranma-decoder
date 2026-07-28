@@ -25,6 +25,7 @@ mod language_model;
 mod protocol_audit;
 mod public_corpus;
 mod session_summary;
+mod shape_course;
 mod shape_evaluation;
 mod shape_lab;
 mod shape_refinement;
@@ -102,6 +103,10 @@ pub use public_corpus::{
 pub use session_summary::{
     AggregatedSessionSummary, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryError,
     SessionSummaryV1,
+};
+pub use shape_course::{
+    MAX_INTERACTIVE_SHAPE_COURSE_TASKS, ShapeCourseDifficulty, ShapeCourseTask,
+    select_shape_course_tasks,
 };
 pub use shape_evaluation::{
     SHAPE_COURSE_MAX_PREFIX_KEYS, SHAPE_COURSE_VISIBLE_LIMIT, ShapeCourseAuditReport,

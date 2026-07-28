@@ -147,6 +147,9 @@ cargo run --release --bin capsule-replay -- `
 # Windows 交互终端：直接按 Tab、笔画键和数字；每键立即生效
 cargo run --release -- shape-lab shi --expect 事
 
+# 连续十题：一画、两画、三画按固定顺序交替
+cargo run --release -- shape-course --count 10 --level mixed
+
 # 一次性复现某个前缀
 cargo run --release -- shape-lab da --expect 龘 --prefix n --limit 10
 
@@ -169,6 +172,11 @@ Windows 交互终端使用控制台事件逐键读取：直接按 `Tab` 进入�
 全局热键，也不改动控制台模式；状态转换另有平台无关的顺序测试。重定向、
 管道或不支持控制台事件的平台自动使用行命令回退，此时以 `t` 代替 Tab、
 以 `-` 代替退格，并在每个命令后按 Enter。
+
+连续课程从公开首屏外目标中按结构难度选题：目标在全部已接受笔顺下最少
+一画可见为 `easy`，两画为 `medium`，三画为 `hard`；`mixed` 固定交替。
+题序由固定快照和稳定散列决定，并由回归测试冻结。选中目标即清空前缀进入
+下一题，Enter 只跳过当前题，`q` 结束；最终动作账不含逐题文字，也不落盘。
 
 这里刻意不接私人胶囊、不学习输入、不写文件，也不注册系统级 Tab 热键。
 详细模式中的动作数只是“完整双拼字母 + 可选 Tab + 笔画键 + 一次选择”的统一投影；

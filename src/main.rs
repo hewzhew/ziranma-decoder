@@ -16,16 +16,22 @@ use ziranma_decoder::{
     parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
     select_public_bigram_training_sequences, select_public_calibration_cases,
     select_public_continuous_composition_cases, select_public_protocol_audit_cases,
+    select_shape_course_tasks,
 };
 
 mod benchmark;
 mod candidate_lab_cli;
+mod shape_course_cli;
 mod shape_lab_cli;
 #[cfg(windows)]
 mod windows_shape_keys;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
 use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
+use shape_course_cli::{
+    SHAPE_COURSE_USAGE, ShapeCourseProgress, parse_shape_course_arguments,
+    render_shape_course_screen, render_shape_course_summary,
+};
 use shape_lab_cli::{
     SHAPE_LAB_USAGE, ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect,
     parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
@@ -87,6 +93,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "public-compose" => run_public_compose(&arguments[1..]),
         "candidate-lab" => run_candidate_lab(&arguments[1..]),
         "shape-lab" => run_shape_lab(&arguments[1..]),
+        "shape-course" => run_shape_course(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
         "public-compose-audit" => run_public_compose_audit(&arguments[1..]),
         "public-protocol-audit" => run_public_protocol_audit(&arguments[1..]),
@@ -1055,9 +1062,104 @@ fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 }
                 session.set_notice("这个位置没有候选");
             }
+            ShapeLabSessionEffect::Skip => {}
             ShapeLabSessionEffect::Quit => break,
         }
     }
+    Ok(())
+}
+
+fn run_shape_course(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
+        println!("{SHAPE_COURSE_USAGE}");
+        return Ok(());
+    }
+
+    let options = parse_shape_course_arguments(arguments)?;
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let strokes = parse_stroke_sequence_tsv(PUBLIC_STROKE_DATA)?;
+    let shapes = CharacterShapeIndex::new(strokes.into_shapes())?;
+    let tasks = select_shape_course_tasks(
+        &imported.entries,
+        &shapes,
+        options.difficulty,
+        options.count,
+    );
+    if tasks.is_empty() {
+        return Err("固定公开快照中没有符合这个课程级别的题目".into());
+    }
+
+    let lab = ShapeLab::new(&imported.entries, &shapes);
+    let mut input_source = ShapeLabInputSource::open();
+    let mut progress = ShapeCourseProgress::default();
+    let mut session = ShapeLabSession::default();
+    let mut task_index = 0usize;
+    loop {
+        let task = &tasks[task_index];
+        let snapshot = lab.snapshot(
+            &task.pinyin,
+            session.active_prefix(),
+            Some(task.character),
+            10,
+        )?;
+        clear_shape_lab_screen();
+        print!(
+            "{}",
+            render_shape_course_screen(
+                &snapshot,
+                task_index + 1,
+                tasks.len(),
+                &session,
+                input_source.direct_keys(),
+            )
+        );
+        if !input_source.direct_keys() {
+            print!("> ");
+        }
+        io::stdout().flush()?;
+
+        let Some(input) = input_source.read()? else {
+            break;
+        };
+        progress.observe_input(&input, &session);
+        let mut advance = false;
+        match session.apply(input) {
+            ShapeLabSessionEffect::Continue => {}
+            ShapeLabSessionEffect::Select(rank) => {
+                match snapshot
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.filtered_rank == rank)
+                {
+                    Some(candidate) if candidate.character == task.character => {
+                        progress.correct += 1;
+                        advance = true;
+                    }
+                    Some(_) => {
+                        progress.wrong_selections += 1;
+                        session.set_notice("请选目标字");
+                    }
+                    None => session.set_notice("这个位置没有候选"),
+                }
+            }
+            ShapeLabSessionEffect::Skip => {
+                progress.skipped += 1;
+                advance = true;
+            }
+            ShapeLabSessionEffect::Quit => break,
+        }
+
+        if advance {
+            task_index += 1;
+            if task_index == tasks.len() {
+                break;
+            }
+            session = ShapeLabSession::default();
+        }
+    }
+
+    clear_shape_lab_screen();
+    print!("{}", render_shape_course_summary(&progress, tasks.len()));
     Ok(())
 }
 
@@ -1773,6 +1875,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--expect <文字>] [--recovery] [--verbose|--json]
   cargo run --release -- shape-lab <公开单字拼音> [--expect <单字>] [--prefix <hspnz...>] [--limit <1～10>] [--details]
+  cargo run --release -- shape-course [--count <1～50>] [--level <easy|medium|hard|mixed>]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
@@ -1805,6 +1908,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run --release -- shape-lab shi --expect 事
   cargo run --release -- shape-lab da --expect 龘 --prefix n
   cargo run --release -- shape-lab da --expect 龘 --prefix n --details
+  cargo run --release -- shape-course --count 10 --level mixed
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit

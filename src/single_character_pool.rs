@@ -10,6 +10,12 @@ pub(crate) struct RankedCharacter {
     pinyin: String,
 }
 
+impl RankedCharacter {
+    pub(crate) fn pinyin(&self) -> &str {
+        &self.pinyin
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SingleCharacterPoolIndex {
     source_entries: usize,

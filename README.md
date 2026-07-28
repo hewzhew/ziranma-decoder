@@ -130,6 +130,9 @@ cargo run --release -- public-shape-audit
 cargo run --release -- shape-lab shi --expect 事
 cargo run --release -- shape-lab da --expect 龘 --prefix n
 
+# 连续公开课程：默认混合一画、两画、三画题；Enter 跳过，q 结束
+cargo run --release -- shape-course --count 10 --level mixed
+
 # release 模式固定工作负载、预热后重复采样
 cargo run --release -- benchmark 3
 ```
@@ -168,6 +171,12 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 只输出选中的字，不替使用者总结手感。若输入或输出被重定向，程序自动回退
 为行命令 `t`、`hspnz`、数字、`-`、`esc`、`q`。`--prefix` 可直接查看一个
 公开前缀。
+
+`shape-course` 把同一冻结协议串成一次连续会话，不必每题重新运行命令。
+`easy`、`medium`、`hard` 分别选择在全部公开替代笔顺下最少一、二、三画
+进入首屏的目标，`mixed` 按三个级别轮流出题。选中目标后直接进入下一题，
+不输出赞美或替使用者判断是否省力；Enter 跳过，`q` 随时结束。结束页只给
+进度、Tab、笔画、退格与误选计数，不保存文件，也不读取私人记录。
 
 候选池大小、原排名、动作投影与完整公开笔画码不属于体验界面，只有显式
 加入 `--details` 才会输出并立即退出。筛选仍只删除不匹配项、不重排；

@@ -190,7 +190,7 @@ pub fn audit_shape_refinement_course(
     report
 }
 
-fn stable_stroke_filter(
+pub(crate) fn stable_stroke_filter(
     pool: &[RankedCharacter],
     target_index: usize,
     prefix: &str,

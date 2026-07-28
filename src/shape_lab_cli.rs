@@ -32,12 +32,12 @@ pub struct ShapeLabCliOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShapeLabInput {
-    Noop,
     EnterTab,
     Stroke(String),
     Select(usize),
     Backspace,
     LeaveTab,
+    Skip,
     Quit,
     Invalid,
 }
@@ -46,6 +46,7 @@ pub enum ShapeLabInput {
 pub enum ShapeLabSessionEffect {
     Continue,
     Select(usize),
+    Skip,
     Quit,
 }
 
@@ -80,7 +81,6 @@ impl ShapeLabSession {
     pub fn apply(&mut self, input: ShapeLabInput) -> ShapeLabSessionEffect {
         self.notice = None;
         match input {
-            ShapeLabInput::Noop => {}
             ShapeLabInput::EnterTab => self.tab_mode = true,
             ShapeLabInput::Stroke(strokes) if self.tab_mode => {
                 self.stroke_prefix.push_str(&strokes);
@@ -97,6 +97,7 @@ impl ShapeLabSession {
                 self.tab_mode = false;
                 self.stroke_prefix.clear();
             }
+            ShapeLabInput::Skip => return ShapeLabSessionEffect::Skip,
             ShapeLabInput::Quit => return ShapeLabSessionEffect::Quit,
             ShapeLabInput::Invalid => self.set_notice("没有这个操作"),
         }
@@ -186,7 +187,7 @@ pub fn parse_shape_lab_input(raw: &str) -> ShapeLabInput {
     }
     let input = without_newline.trim().to_ascii_lowercase();
     match input.as_str() {
-        "" => ShapeLabInput::Noop,
+        "" | "skip" | "next" => ShapeLabInput::Skip,
         "t" | "tab" => ShapeLabInput::EnterTab,
         "-" | "back" | "backspace" => ShapeLabInput::Backspace,
         "esc" | "escape" => ShapeLabInput::LeaveTab,
@@ -487,6 +488,7 @@ mod tests {
         assert_eq!(parse_shape_lab_input("0\n"), ShapeLabInput::Select(10));
         assert_eq!(parse_shape_lab_input("-\n"), ShapeLabInput::Backspace);
         assert_eq!(parse_shape_lab_input("esc\n"), ShapeLabInput::LeaveTab);
+        assert_eq!(parse_shape_lab_input("\n"), ShapeLabInput::Skip);
         assert_eq!(parse_shape_lab_input("q\n"), ShapeLabInput::Quit);
         assert_eq!(parse_shape_lab_input("x\n"), ShapeLabInput::Invalid);
     }
@@ -518,6 +520,10 @@ mod tests {
         assert_eq!(
             session.apply(ShapeLabInput::Select(3)),
             ShapeLabSessionEffect::Select(3)
+        );
+        assert_eq!(
+            session.apply(ShapeLabInput::Skip),
+            ShapeLabSessionEffect::Skip
         );
         assert_eq!(
             session.apply(ShapeLabInput::Quit),

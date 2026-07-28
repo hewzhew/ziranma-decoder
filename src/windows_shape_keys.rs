@@ -12,6 +12,7 @@ use crate::shape_lab_cli::ShapeLabInput;
 const VK_BACK: u16 = 0x08;
 const VK_TAB: u16 = 0x09;
 const VK_ESCAPE: u16 = 0x1b;
+const VK_RETURN: u16 = 0x0d;
 const VK_0: u16 = 0x30;
 const VK_9: u16 = 0x39;
 const VK_NUMPAD0: u16 = 0x60;
@@ -95,6 +96,7 @@ fn decode_key_event(event: &KEY_EVENT_RECORD) -> Option<ShapeLabInput> {
         VK_BACK => Some(ShapeLabInput::Backspace),
         VK_TAB | VK_T => Some(ShapeLabInput::EnterTab),
         VK_ESCAPE => Some(ShapeLabInput::LeaveTab),
+        VK_RETURN => Some(ShapeLabInput::Skip),
         VK_Q => Some(ShapeLabInput::Quit),
         VK_H => Some(ShapeLabInput::Stroke("h".to_owned())),
         VK_S => Some(ShapeLabInput::Stroke("s".to_owned())),
@@ -120,7 +122,7 @@ mod tests {
     use windows::Win32::System::Console::{KEY_EVENT_RECORD, LEFT_CTRL_PRESSED};
     use windows_core::BOOL;
 
-    use super::{VK_BACK, VK_H, VK_TAB, decode_key_event};
+    use super::{VK_BACK, VK_H, VK_RETURN, VK_TAB, decode_key_event};
     use crate::shape_lab_cli::ShapeLabInput;
 
     fn pressed(key: u16) -> KEY_EVENT_RECORD {
@@ -145,6 +147,10 @@ mod tests {
         assert_eq!(
             decode_key_event(&pressed(VK_BACK)),
             Some(ShapeLabInput::Backspace)
+        );
+        assert_eq!(
+            decode_key_event(&pressed(VK_RETURN)),
+            Some(ShapeLabInput::Skip)
         );
         assert_eq!(
             decode_key_event(&pressed(b'3'.into())),
