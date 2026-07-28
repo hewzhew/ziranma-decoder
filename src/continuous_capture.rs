@@ -160,6 +160,21 @@ impl ContinuousSegmentV1 {
         self.capsule
     }
 
+    pub fn into_parts(self) -> (ContinuousSegmentMetadata, EventCapsuleV1) {
+        (
+            ContinuousSegmentMetadata {
+                session_id: self.session_id,
+                sequence: self.sequence,
+                started_unix_ms: self.started_unix_ms,
+                ended_unix_ms: self.ended_unix_ms,
+                session_kind: self.session_kind,
+                producer_version: self.producer_version,
+                capture_profile: self.capture_profile,
+            },
+            self.capsule,
+        )
+    }
+
     pub fn to_plaintext(&self) -> Result<Vec<u8>, ContinuousCaptureError> {
         let capsule = self.capsule.to_text()?;
         let header = format!(
@@ -817,6 +832,15 @@ mod tests {
         );
         assert_eq!(segment.producer_version(), "0.1.0");
         assert_eq!(segment.capture_profile(), "synthetic-v1");
+        let (metadata, capsule) = segment.clone().into_parts();
+        assert_eq!(metadata.session_id, segment.session_id());
+        assert_eq!(metadata.sequence, segment.sequence());
+        assert_eq!(metadata.started_unix_ms, segment.started_unix_ms());
+        assert_eq!(metadata.ended_unix_ms, segment.ended_unix_ms());
+        assert_eq!(metadata.session_kind, segment.session_kind());
+        assert_eq!(metadata.producer_version, segment.producer_version());
+        assert_eq!(metadata.capture_profile, segment.capture_profile());
+        assert_eq!(capsule, *segment.capsule());
 
         let mut truncated = plaintext;
         truncated.pop();

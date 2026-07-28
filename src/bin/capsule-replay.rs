@@ -1,14 +1,15 @@
 //! Explicit, read-only replay of private event capsules against public data.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ziranma_decoder::{
-    BigramLanguageModel, CapsuleReplayReport, CharacterBigramLanguageModel, Decoder,
-    DeltaPositionEvidence, EventCapsuleV1, PersonalCacheReplayState, RawKey, TrackerOutput,
-    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    BigramLanguageModel, CapsuleReplayReport, CaptureSessionKind, CharacterBigramLanguageModel,
+    ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
+    PersonalCacheReplayState, RawKey, TrackerOutput, parse_rime_lexicon, parse_ud_conllu,
+    select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
 use ziranma_decoder::{
@@ -59,18 +60,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             health_only,
         } => {
             let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let history_inputs = expand_input_selectors(manifest_dir, &history_inputs)?;
-            let inputs = expand_input_selectors(manifest_dir, &inputs)?;
-            let history_count = history_inputs.len();
-            let mut requested_inputs = history_inputs;
-            requested_inputs.extend(inputs);
-            let mut history_capsules = read_explicit_capsules(manifest_dir, &requested_inputs)?;
-            let capsules = history_capsules.split_off(history_count);
+            let history_inputs =
+                expand_input_selectors(manifest_dir, &history_inputs).map_err(|_| {
+                    RedactedPrivateSelectorError {
+                        phase: ReplayInputPhase::History,
+                    }
+                })?;
+            let inputs = expand_input_selectors(manifest_dir, &inputs).map_err(|_| {
+                RedactedPrivateSelectorError {
+                    phase: ReplayInputPhase::Evaluation,
+                }
+            })?;
+            let mut loader = PrivateInputLoader::new(manifest_dir);
+            let mut metadata_guard =
+                SegmentMetadataGuard::new(personal_cache || personal_pair_cache);
             if health_only {
-                println!(
-                    "{}",
-                    CaptureHealthReport::from_capsules(&capsules).terminal_line()
-                );
+                let mut health = CaptureHealthReport::default();
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |capsule| {
+                        health.observe_capsule(capsule);
+                        Ok(())
+                    },
+                )?;
+                println!("{}", health.terminal_line());
                 return Ok(());
             }
             let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
@@ -79,32 +95,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut report = CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
             if personal_cache || personal_pair_cache {
                 let mut state = PersonalCacheReplayState::new();
-                if !history_capsules.is_empty() {
+                if !history_inputs.is_empty() {
                     let mut history_report =
                         CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
-                    for capsule in &history_capsules {
-                        if personal_pair_cache {
-                            history_report.observe_capsule_with_personal_pair_cache(
-                                &decoder, &mut state, capsule,
-                            )?;
-                        } else {
-                            history_report.observe_capsule_with_personal_cache(
-                                &decoder, &mut state, capsule,
-                            )?;
-                        }
-                    }
+                    visit_private_inputs(
+                        &mut loader,
+                        &mut metadata_guard,
+                        &history_inputs,
+                        ReplayInputPhase::History,
+                        |capsule| {
+                            if personal_pair_cache {
+                                redact_private_analysis_error(
+                                    history_report.observe_capsule_with_personal_pair_cache(
+                                        &decoder, &mut state, capsule,
+                                    ),
+                                )?;
+                            } else {
+                                redact_private_analysis_error(
+                                    history_report.observe_capsule_with_personal_cache(
+                                        &decoder, &mut state, capsule,
+                                    ),
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )?;
                     report.record_personal_cache_history(&history_report, &state);
                 }
-                for capsule in &capsules {
-                    if personal_pair_cache {
-                        report.observe_capsule_with_personal_pair_cache(
-                            &decoder, &mut state, capsule,
-                        )?;
-                    } else {
-                        report
-                            .observe_capsule_with_personal_cache(&decoder, &mut state, capsule)?;
-                    }
-                }
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |capsule| {
+                        if personal_pair_cache {
+                            redact_private_analysis_error(
+                                report.observe_capsule_with_personal_pair_cache(
+                                    &decoder, &mut state, capsule,
+                                ),
+                            )?;
+                        } else {
+                            redact_private_analysis_error(
+                                report.observe_capsule_with_personal_cache(
+                                    &decoder, &mut state, capsule,
+                                ),
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             } else if public_context || public_character_context {
                 let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
                 let training = select_public_bigram_training_sequences(&train_corpus, &entries);
@@ -120,14 +159,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         0.0
                     };
-                    for capsule in &capsules {
-                        report.observe_capsule_with_public_context(
-                            &decoder,
-                            &language_model,
-                            log_frequency_total,
-                            capsule,
-                        )?;
-                    }
+                    visit_private_inputs(
+                        &mut loader,
+                        &mut metadata_guard,
+                        &inputs,
+                        ReplayInputPhase::Evaluation,
+                        |capsule| {
+                            redact_private_analysis_error(
+                                report.observe_capsule_with_public_context(
+                                    &decoder,
+                                    &language_model,
+                                    log_frequency_total,
+                                    capsule,
+                                ),
+                            )?;
+                            Ok(())
+                        },
+                    )?;
                 } else {
                     let text_sequences = training
                         .sequences
@@ -136,18 +184,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect::<Vec<_>>();
                     let language_model =
                         CharacterBigramLanguageModel::from_text_sequences(&text_sequences)?;
-                    for capsule in &capsules {
-                        report.observe_capsule_with_public_character_context(
-                            &decoder,
-                            &language_model,
-                            capsule,
-                        )?;
-                    }
+                    visit_private_inputs(
+                        &mut loader,
+                        &mut metadata_guard,
+                        &inputs,
+                        ReplayInputPhase::Evaluation,
+                        |capsule| {
+                            redact_private_analysis_error(
+                                report.observe_capsule_with_public_character_context(
+                                    &decoder,
+                                    &language_model,
+                                    capsule,
+                                ),
+                            )?;
+                            Ok(())
+                        },
+                    )?;
                 }
             } else {
-                for capsule in &capsules {
-                    report.observe_capsule(&decoder, capsule)?;
-                }
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |capsule| {
+                        redact_private_analysis_error(report.observe_capsule(&decoder, capsule))?;
+                        Ok(())
+                    },
+                )?;
             }
             if compact {
                 println!("{}", report.compact_terminal_report());
@@ -258,7 +322,7 @@ fn parse_options(
                 return Ok(Options::Help);
             }
             "--help" | "-h" => return Err("--help must be used by itself".into()),
-            _ => return Err(format!("unknown argument: {argument}").into()),
+            _ => return Err("unknown argument; value was suppressed".into()),
         }
     }
     if inputs.is_empty() {
@@ -359,85 +423,86 @@ struct CaptureHealthReport {
 }
 
 impl CaptureHealthReport {
-    fn from_capsules(capsules: &[EventCapsuleV1]) -> Self {
-        let mut report = Self {
-            capsules: u64::try_from(capsules.len()).unwrap_or(u64::MAX),
-            ..Self::default()
-        };
-        for capsule in capsules {
-            for event in capsule.events() {
-                report.events = report.events.saturating_add(1);
-                let (keys, keys_complete, position) = match &event.output {
-                    TrackerOutput::Commit(commit) => {
-                        report.commits = report.commits.saturating_add(1);
-                        if commit
-                            .keys
-                            .iter()
-                            .any(|key| matches!(key, RawKey::Backspace | RawKey::Delete))
-                        {
-                            report.commits_with_internal_edit_keys =
-                                report.commits_with_internal_edit_keys.saturating_add(1);
-                        }
-                        (
-                            commit.keys.as_slice(),
-                            commit.keys_complete,
-                            commit.document_change.position_evidence,
-                        )
+    fn observe_capsule(&mut self, capsule: &EventCapsuleV1) {
+        self.capsules = self.capsules.saturating_add(1);
+        for event in capsule.events() {
+            self.events = self.events.saturating_add(1);
+            let (keys, keys_complete, position) = match &event.output {
+                TrackerOutput::Commit(commit) => {
+                    self.commits = self.commits.saturating_add(1);
+                    if commit
+                        .keys
+                        .iter()
+                        .any(|key| matches!(key, RawKey::Backspace | RawKey::Delete))
+                    {
+                        self.commits_with_internal_edit_keys =
+                            self.commits_with_internal_edit_keys.saturating_add(1);
                     }
-                    TrackerOutput::Revision(revision) => {
-                        report.revisions = report.revisions.saturating_add(1);
-                        match (
-                            revision.change.deleted.is_empty(),
-                            revision.change.inserted.is_empty(),
-                        ) {
-                            (false, true) => {
-                                report.revisions_delete_only =
-                                    report.revisions_delete_only.saturating_add(1);
-                            }
-                            (true, false) => {
-                                report.revisions_insert_only =
-                                    report.revisions_insert_only.saturating_add(1);
-                            }
-                            (false, false) => {
-                                report.revisions_replace =
-                                    report.revisions_replace.saturating_add(1);
-                            }
-                            (true, true) => {}
+                    (
+                        commit.keys.as_slice(),
+                        commit.keys_complete,
+                        commit.document_change.position_evidence,
+                    )
+                }
+                TrackerOutput::Revision(revision) => {
+                    self.revisions = self.revisions.saturating_add(1);
+                    match (
+                        revision.change.deleted.is_empty(),
+                        revision.change.inserted.is_empty(),
+                    ) {
+                        (false, true) => {
+                            self.revisions_delete_only =
+                                self.revisions_delete_only.saturating_add(1);
                         }
-                        if revision.change.deleted.chars().count() > 1
-                            || revision.change.inserted.chars().count() > 1
-                        {
-                            report.revisions_multi_character =
-                                report.revisions_multi_character.saturating_add(1);
+                        (true, false) => {
+                            self.revisions_insert_only =
+                                self.revisions_insert_only.saturating_add(1);
                         }
-                        if revision.keys.iter().any(is_navigation_key) {
-                            report.revisions_with_navigation_keys =
-                                report.revisions_with_navigation_keys.saturating_add(1);
+                        (false, false) => {
+                            self.revisions_replace = self.revisions_replace.saturating_add(1);
                         }
-                        if revision.keys.iter().any(is_selection_key) {
-                            report.revisions_with_selection_keys =
-                                report.revisions_with_selection_keys.saturating_add(1);
-                        }
-                        (
-                            revision.keys.as_slice(),
-                            revision.keys_complete,
-                            revision.change.position_evidence,
-                        )
+                        (true, true) => {}
                     }
-                };
-                report.logical_key_actions = report
-                    .logical_key_actions
-                    .saturating_add(u64::try_from(keys.len()).unwrap_or(u64::MAX));
-                if keys_complete {
-                    report.keys_complete_records = report.keys_complete_records.saturating_add(1);
-                } else {
-                    report.keys_incomplete_records =
-                        report.keys_incomplete_records.saturating_add(1);
+                    if revision.change.deleted.chars().count() > 1
+                        || revision.change.inserted.chars().count() > 1
+                    {
+                        self.revisions_multi_character =
+                            self.revisions_multi_character.saturating_add(1);
+                    }
+                    if revision.keys.iter().any(is_navigation_key) {
+                        self.revisions_with_navigation_keys =
+                            self.revisions_with_navigation_keys.saturating_add(1);
+                    }
+                    if revision.keys.iter().any(is_selection_key) {
+                        self.revisions_with_selection_keys =
+                            self.revisions_with_selection_keys.saturating_add(1);
+                    }
+                    (
+                        revision.keys.as_slice(),
+                        revision.keys_complete,
+                        revision.change.position_evidence,
+                    )
                 }
-                if position == DeltaPositionEvidence::Ambiguous {
-                    report.ambiguous_positions = report.ambiguous_positions.saturating_add(1);
-                }
+            };
+            self.logical_key_actions = self
+                .logical_key_actions
+                .saturating_add(u64::try_from(keys.len()).unwrap_or(u64::MAX));
+            if keys_complete {
+                self.keys_complete_records = self.keys_complete_records.saturating_add(1);
+            } else {
+                self.keys_incomplete_records = self.keys_incomplete_records.saturating_add(1);
             }
+            if position == DeltaPositionEvidence::Ambiguous {
+                self.ambiguous_positions = self.ambiguous_positions.saturating_add(1);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn from_capsules(capsules: &[EventCapsuleV1]) -> Self {
+        let mut report = Self::default();
+        for capsule in capsules {
+            report.observe_capsule(capsule);
         }
         report
     }
@@ -532,7 +597,7 @@ fn expand_session_selector(
         // Windows, fs::canonicalize may add a `\\?\` verbatim prefix. Passing
         // that spelling into the later fixed-directory check would make the
         // same directory compare unequal to its ordinary `D:\...` spelling.
-        // read_explicit_capsules still canonicalizes and verifies every file
+        // PrivateInputLoader still canonicalizes and verifies every file
         // immediately before opening it.
         let path = root.join(format!("segment-{session_id}-{sequence:08}.zcs"));
         match fs::symlink_metadata(&path) {
@@ -588,113 +653,381 @@ enum PrivateInputFormat {
     ProtectedSegment,
 }
 
-fn read_explicit_capsules(
-    manifest_dir: &Path,
-    requested_inputs: &[PathBuf],
-) -> Result<Vec<EventCapsuleV1>, Box<dyn std::error::Error>> {
-    let capsule_root = manifest_dir.join("data/private/event-capsules");
-    let protected_root = manifest_dir.join("data/private/continuous-capture");
-    let mut canonical_capsule_root = None;
-    let mut canonical_protected_root = None;
-    let mut seen = HashSet::new();
-    let mut capsules = Vec::with_capacity(requested_inputs.len());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayInputPhase {
+    History,
+    Evaluation,
+}
 
-    for requested in requested_inputs {
-        let (target, format) =
-            resolve_private_input(manifest_dir, &capsule_root, &protected_root, requested)?;
+impl ReplayInputPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::History => "history",
+            Self::Evaluation => "evaluation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RedactedPrivateSelectorError {
+    phase: ReplayInputPhase,
+}
+
+impl std::fmt::Display for RedactedPrivateSelectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "private {} selector could not be expanded; details were suppressed",
+            self.phase.as_str()
+        )
+    }
+}
+
+impl std::fmt::Debug for RedactedPrivateSelectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for RedactedPrivateSelectorError {}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RedactedPrivateAnalysisError;
+
+impl std::fmt::Display for RedactedPrivateAnalysisError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "private replay analysis failed; input details were suppressed"
+        )
+    }
+}
+
+impl std::fmt::Debug for RedactedPrivateAnalysisError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for RedactedPrivateAnalysisError {}
+
+fn redact_private_analysis_error<T, E>(
+    result: Result<T, E>,
+) -> Result<T, RedactedPrivateAnalysisError> {
+    result.map_err(|_| RedactedPrivateAnalysisError)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RedactedPrivateInputError {
+    phase: ReplayInputPhase,
+    ordinal: usize,
+    kind: PrivateInputLoadKind,
+}
+
+impl std::fmt::Display for RedactedPrivateInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "private {} input #{} could not be loaded: {}; path and content were suppressed",
+            self.phase.as_str(),
+            self.ordinal,
+            self.kind.as_str()
+        )
+    }
+}
+
+impl std::fmt::Debug for RedactedPrivateInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for RedactedPrivateInputError {}
+
+struct LoadedPrivateInput {
+    capsule: EventCapsuleV1,
+    metadata: Option<ContinuousSegmentMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateInputLoadKind {
+    PathPolicy,
+    UnsafeFile,
+    Duplicate,
+    Read,
+    TooLarge,
+    DecodeOrUnprotect,
+}
+
+impl PrivateInputLoadKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PathPolicy => "path-policy",
+            Self::UnsafeFile => "unsafe-file",
+            Self::Duplicate => "duplicate",
+            Self::Read => "read-failed",
+            Self::TooLarge => "too-large",
+            Self::DecodeOrUnprotect => "decode-or-unprotect-failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrivateInputLoadError {
+    kind: PrivateInputLoadKind,
+}
+
+impl PrivateInputLoadError {
+    fn new(kind: PrivateInputLoadKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl std::fmt::Display for PrivateInputLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "private input load failed: {}",
+            self.kind.as_str()
+        )
+    }
+}
+
+impl std::error::Error for PrivateInputLoadError {}
+
+struct PrivateInputLoader {
+    manifest_dir: PathBuf,
+    capsule_root: PathBuf,
+    protected_root: PathBuf,
+    canonical_capsule_root: Option<PathBuf>,
+    canonical_protected_root: Option<PathBuf>,
+    seen: HashSet<PathBuf>,
+}
+
+impl PrivateInputLoader {
+    fn new(manifest_dir: &Path) -> Self {
+        Self {
+            manifest_dir: manifest_dir.to_path_buf(),
+            capsule_root: manifest_dir.join("data/private/event-capsules"),
+            protected_root: manifest_dir.join("data/private/continuous-capture"),
+            canonical_capsule_root: None,
+            canonical_protected_root: None,
+            seen: HashSet::new(),
+        }
+    }
+
+    fn load_one(&mut self, requested: &Path) -> Result<LoadedPrivateInput, PrivateInputLoadError> {
+        let (target, format) = resolve_private_input(
+            &self.manifest_dir,
+            &self.capsule_root,
+            &self.protected_root,
+            requested,
+        )
+        .map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::PathPolicy))?;
         let canonical_root = match format {
             PrivateInputFormat::PlainCapsule => {
-                if canonical_capsule_root.is_none() {
-                    canonical_capsule_root =
-                        Some(validate_capsule_root(manifest_dir, &capsule_root)?);
+                if self.canonical_capsule_root.is_none() {
+                    self.canonical_capsule_root = Some(
+                        validate_capsule_root(&self.manifest_dir, &self.capsule_root).map_err(
+                            |_| PrivateInputLoadError::new(PrivateInputLoadKind::UnsafeFile),
+                        )?,
+                    );
                 }
-                canonical_capsule_root.as_ref().expect("initialized above")
-            }
-            PrivateInputFormat::ProtectedSegment => {
-                if canonical_protected_root.is_none() {
-                    canonical_protected_root = Some(validate_private_root(
-                        manifest_dir,
-                        &protected_root,
-                        &["data", "private", "continuous-capture"],
-                        "protected segment",
-                    )?);
-                }
-                canonical_protected_root
+                self.canonical_capsule_root
                     .as_ref()
                     .expect("initialized above")
+                    .clone()
+            }
+            PrivateInputFormat::ProtectedSegment => {
+                if self.canonical_protected_root.is_none() {
+                    self.canonical_protected_root = Some(
+                        validate_private_root(
+                            &self.manifest_dir,
+                            &self.protected_root,
+                            &["data", "private", "continuous-capture"],
+                            "protected segment",
+                        )
+                        .map_err(|_| {
+                            PrivateInputLoadError::new(PrivateInputLoadKind::UnsafeFile)
+                        })?,
+                    );
+                }
+                self.canonical_protected_root
+                    .as_ref()
+                    .expect("initialized above")
+                    .clone()
             }
         };
-        let metadata = fs::symlink_metadata(&target).map_err(|error| {
-            format!(
-                "cannot inspect explicitly named private input {}: {error}",
-                target.display()
-            )
-        })?;
+        let metadata = fs::symlink_metadata(&target)
+            .map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::Read))?;
         if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "private input cannot be a symbolic link: {}",
-                target.display()
-            )
-            .into());
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::UnsafeFile));
         }
         if !metadata.is_file() {
-            return Err(
-                format!("private input must be a regular file: {}", target.display()).into(),
-            );
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::UnsafeFile));
         }
 
-        let canonical_target = fs::canonicalize(&target)?;
+        let canonical_target = fs::canonicalize(&target)
+            .map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::Read))?;
         if canonical_target.parent() != Some(canonical_root.as_path()) {
-            return Err(format!(
-                "private input resolves outside its fixed private directory: {}",
-                target.display()
-            )
-            .into());
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::UnsafeFile));
         }
-        if !seen.insert(canonical_target.clone()) {
-            return Err(format!(
-                "duplicate capsule input is not allowed: {}",
-                target.display()
-            )
-            .into());
+        if !self.seen.insert(canonical_target.clone()) {
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::Duplicate));
         }
 
-        let mut file = File::open(&canonical_target)?;
-        let opened_metadata = file.metadata()?;
+        let mut file = File::open(&canonical_target)
+            .map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::Read))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::Read))?;
         if !opened_metadata.is_file() {
-            return Err(format!(
-                "private input changed before it could be read: {}",
-                target.display()
-            )
-            .into());
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::UnsafeFile));
         }
         if opened_metadata.len() > MAX_CAPSULE_FILE_BYTES {
-            return Err(format!(
-                "private input exceeds the {MAX_CAPSULE_FILE_BYTES}-byte limit: {}",
-                target.display()
-            )
-            .into());
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::TooLarge));
         }
         let mut encoded = Vec::new();
         file.by_ref()
             .take(MAX_CAPSULE_FILE_BYTES + 1)
             .read_to_end(&mut encoded)
-            .map_err(|error| {
-                format!(
-                    "cannot read explicitly named private input {}: {error}",
-                    target.display()
-                )
-            })?;
+            .map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::Read))?;
         if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_CAPSULE_FILE_BYTES {
-            return Err(format!(
-                "private input exceeds the {MAX_CAPSULE_FILE_BYTES}-byte limit: {}",
-                target.display()
-            )
-            .into());
+            return Err(PrivateInputLoadError::new(PrivateInputLoadKind::TooLarge));
         }
-        let capsule = decode_private_input(format, &encoded, &target)?;
-        capsules.push(capsule);
+        let decoded = decode_private_input(format, &encoded, &target);
+        if format == PrivateInputFormat::PlainCapsule {
+            encoded.fill(0);
+        }
+        decoded.map_err(|_| PrivateInputLoadError::new(PrivateInputLoadKind::DecodeOrUnprotect))
     }
+}
+
+#[derive(Debug)]
+struct SessionMetadataProgress {
+    phase: ReplayInputPhase,
+    session_kind: CaptureSessionKind,
+    producer_version: String,
+    capture_profile: String,
+    last_sequence: u64,
+    last_ended_unix_ms: u64,
+}
+
+struct SegmentMetadataGuard {
+    sessions: HashMap<String, SessionMetadataProgress>,
+    latest_history_end_unix_ms: Option<u64>,
+    latest_evaluation_end_unix_ms: Option<u64>,
+    enforce_history_before_evaluation: bool,
+}
+
+impl SegmentMetadataGuard {
+    fn new(enforce_history_before_evaluation: bool) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            latest_history_end_unix_ms: None,
+            latest_evaluation_end_unix_ms: None,
+            enforce_history_before_evaluation,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        metadata: Option<&ContinuousSegmentMetadata>,
+        phase: ReplayInputPhase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+        if phase == ReplayInputPhase::Evaluation && self.enforce_history_before_evaluation {
+            if self
+                .latest_history_end_unix_ms
+                .is_some_and(|history_end| metadata.started_unix_ms < history_end)
+            {
+                return Err("protected evaluation segment predates protected history".into());
+            }
+            if self
+                .latest_evaluation_end_unix_ms
+                .is_some_and(|evaluation_end| metadata.started_unix_ms < evaluation_end)
+            {
+                return Err("protected evaluation segments move backwards globally".into());
+            }
+        }
+        if let Some(progress) = self.sessions.get_mut(&metadata.session_id) {
+            if progress.phase != phase {
+                return Err("one protected session cannot cross history/evaluation phases".into());
+            }
+            if progress.session_kind != metadata.session_kind
+                || progress.producer_version != metadata.producer_version
+                || progress.capture_profile != metadata.capture_profile
+            {
+                return Err("protected session metadata changed between segments".into());
+            }
+            if metadata.sequence <= progress.last_sequence {
+                return Err("protected session segments are not in increasing order".into());
+            }
+            if metadata.started_unix_ms < progress.last_ended_unix_ms {
+                return Err("protected session segment times move backwards".into());
+            }
+            progress.last_sequence = metadata.sequence;
+            progress.last_ended_unix_ms = metadata.ended_unix_ms;
+        } else {
+            self.sessions.insert(
+                metadata.session_id.clone(),
+                SessionMetadataProgress {
+                    phase,
+                    session_kind: metadata.session_kind,
+                    producer_version: metadata.producer_version.clone(),
+                    capture_profile: metadata.capture_profile.clone(),
+                    last_sequence: metadata.sequence,
+                    last_ended_unix_ms: metadata.ended_unix_ms,
+                },
+            );
+        }
+        if phase == ReplayInputPhase::History {
+            self.latest_history_end_unix_ms = Some(
+                self.latest_history_end_unix_ms
+                    .map_or(metadata.ended_unix_ms, |latest| {
+                        latest.max(metadata.ended_unix_ms)
+                    }),
+            );
+        } else if self.enforce_history_before_evaluation {
+            self.latest_evaluation_end_unix_ms = Some(metadata.ended_unix_ms);
+        }
+        Ok(())
+    }
+}
+
+fn visit_private_inputs(
+    loader: &mut PrivateInputLoader,
+    metadata_guard: &mut SegmentMetadataGuard,
+    requested_inputs: &[PathBuf],
+    phase: ReplayInputPhase,
+    mut visitor: impl FnMut(&EventCapsuleV1) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (index, requested) in requested_inputs.iter().enumerate() {
+        let loaded = loader
+            .load_one(requested)
+            .map_err(|error| RedactedPrivateInputError {
+                phase,
+                ordinal: index.saturating_add(1),
+                kind: error.kind,
+            })?;
+        metadata_guard.observe(loaded.metadata.as_ref(), phase)?;
+        visitor(&loaded.capsule)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_explicit_capsules(
+    manifest_dir: &Path,
+    requested_inputs: &[PathBuf],
+) -> Result<Vec<EventCapsuleV1>, Box<dyn std::error::Error>> {
+    let mut loader = PrivateInputLoader::new(manifest_dir);
+    let capsules = requested_inputs
+        .iter()
+        .map(|requested| loader.load_one(requested).map(|loaded| loaded.capsule))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(capsules)
 }
 
@@ -702,7 +1035,7 @@ fn decode_private_input(
     format: PrivateInputFormat,
     encoded: &[u8],
     target: &Path,
-) -> Result<EventCapsuleV1, Box<dyn std::error::Error>> {
+) -> Result<LoadedPrivateInput, Box<dyn std::error::Error>> {
     match format {
         PrivateInputFormat::PlainCapsule => {
             let text = std::str::from_utf8(encoded).map_err(|error| {
@@ -711,14 +1044,18 @@ fn decode_private_input(
                     target.display()
                 )
             })?;
-            EventCapsuleV1::from_text(text)
+            let capsule = EventCapsuleV1::from_text(text)
                 .map_err(|error| {
                     format!(
                         "invalid private event capsule {}: {error}",
                         target.display()
                     )
                 })
-                .map_err(Into::into)
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            Ok(LoadedPrivateInput {
+                capsule,
+                metadata: None,
+            })
         }
         PrivateInputFormat::ProtectedSegment => decode_protected_segment(encoded, target),
     }
@@ -728,7 +1065,7 @@ fn decode_private_input(
 fn decode_protected_segment(
     encoded: &[u8],
     target: &Path,
-) -> Result<EventCapsuleV1, Box<dyn std::error::Error>> {
+) -> Result<LoadedPrivateInput, Box<dyn std::error::Error>> {
     let envelope = ProtectedSegmentEnvelopeV1::from_bytes(encoded).map_err(|error| {
         format!(
             "invalid protected segment envelope {}: {error}",
@@ -744,6 +1081,7 @@ fn decode_protected_segment(
             )
         })?;
     if plaintext.len() > MAX_CAPSULE_FILE_BYTES as usize {
+        plaintext.fill(0);
         return Err(format!(
             "unprotected segment exceeds the {MAX_CAPSULE_FILE_BYTES}-byte limit: {}",
             target.display()
@@ -778,14 +1116,18 @@ fn decode_protected_segment(
         )
         .into());
     }
-    Ok(segment.into_capsule())
+    let (metadata, capsule) = segment.into_parts();
+    Ok(LoadedPrivateInput {
+        capsule,
+        metadata: Some(metadata),
+    })
 }
 
 #[cfg(not(windows))]
 fn decode_protected_segment(
     _encoded: &[u8],
     target: &Path,
-) -> Result<EventCapsuleV1, Box<dyn std::error::Error>> {
+) -> Result<LoadedPrivateInput, Box<dyn std::error::Error>> {
     Err(format!(
         "protected segment requires the same Windows user account that created it: {}",
         target.display()
@@ -937,21 +1279,26 @@ fn resolve_capsule_input(
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES, Options,
-        expand_session_selector, parse_options, read_explicit_capsules, resolve_capsule_input,
-        resolve_protected_input,
+        CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES, Options, PUBLIC_RIME_LEXICON,
+        PUBLIC_UD_TRAIN, PrivateInputLoader, RedactedPrivateSelectorError, ReplayInputPhase,
+        SegmentMetadataGuard, expand_session_selector, parse_options, read_explicit_capsules,
+        redact_private_analysis_error, resolve_capsule_input, resolve_protected_input,
+        visit_private_inputs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use ziranma_decoder::{
+        BigramLanguageModel, CapsuleReplayReport, CaptureSessionKind, CharacterBigramLanguageModel,
+        CommitRecord, ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
+        KeySequence, PersonalCacheReplayState, RawKey, TextDelta, TimedTrackerOutput,
+        TrackerOutput, parse_rime_lexicon, parse_ud_conllu,
+        select_public_bigram_training_sequences,
+    };
     #[cfg(windows)]
     use ziranma_decoder::{
-        CODEX_CAPTURE_PROFILE_V1, CaptureSessionKind, ContinuousSegmentMetadata,
-        ContinuousSegmentV1, DataProtector, ProtectedSegmentEnvelopeV1, WindowsUserDataProtector,
-    };
-    use ziranma_decoder::{
-        CommitRecord, DeltaPositionEvidence, EventCapsuleV1, RawKey, TextDelta, TimedTrackerOutput,
-        TrackerOutput,
+        CODEX_CAPTURE_PROFILE_V1, ContinuousSegmentV1, DataProtector, ProtectedSegmentEnvelopeV1,
+        WindowsUserDataProtector,
     };
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1020,6 +1367,10 @@ mod tests {
     }
 
     fn capsule() -> EventCapsuleV1 {
+        capsule_with_text("猫")
+    }
+
+    fn capsule_with_text(text: &str) -> EventCapsuleV1 {
         EventCapsuleV1::new(vec![TimedTrackerOutput {
             elapsed_ms: 100,
             output: TrackerOutput::Commit(CommitRecord {
@@ -1029,17 +1380,36 @@ mod tests {
                 change: TextDelta {
                     start: 0,
                     deleted: "mao".to_owned(),
-                    inserted: "猫".to_owned(),
+                    inserted: text.to_owned(),
                     position_evidence: DeltaPositionEvidence::UniqueText,
                 },
                 document_change: TextDelta {
                     start: 0,
                     deleted: String::new(),
-                    inserted: "猫".to_owned(),
+                    inserted: text.to_owned(),
                     position_evidence: DeltaPositionEvidence::UniqueText,
                 },
             }),
         }])
+        .unwrap()
+    }
+
+    fn segment_metadata(
+        session_id: &str,
+        sequence: u64,
+        started_unix_ms: u64,
+        ended_unix_ms: u64,
+        producer_version: &str,
+    ) -> ContinuousSegmentMetadata {
+        ContinuousSegmentMetadata::new(
+            session_id.to_owned(),
+            sequence,
+            started_unix_ms,
+            ended_unix_ms,
+            CaptureSessionKind::Daily,
+            producer_version.to_owned(),
+            "codex-uia-v1".to_owned(),
+        )
         .unwrap()
     }
 
@@ -1077,6 +1447,55 @@ mod tests {
         assert_eq!(loaded, vec![expected]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn streaming_loader_accepts_mixed_plain_and_protected_inputs_in_order() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("plain.zic", &capsule_with_text("甲").to_text().unwrap());
+        let metadata = ContinuousSegmentMetadata::new(
+            "mixed-1".to_owned(),
+            0,
+            10,
+            20,
+            CaptureSessionKind::Daily,
+            "0.1.0".to_owned(),
+            CODEX_CAPTURE_PROFILE_V1.to_owned(),
+        )
+        .unwrap();
+        let segment = ContinuousSegmentV1::new(metadata, capsule_with_text("乙")).unwrap();
+        let protected = WindowsUserDataProtector
+            .protect(&segment.to_plaintext().unwrap())
+            .unwrap();
+        let bytes = ProtectedSegmentEnvelopeV1::new(protected)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        workspace.write_protected("segment-mixed-1-00000000.zcs", &bytes);
+        let inputs = vec![
+            workspace.relative("plain.zic"),
+            workspace.relative_protected("segment-mixed-1-00000000.zcs"),
+        ];
+
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(false);
+        let mut inserted = Vec::new();
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &inputs,
+            ReplayInputPhase::Evaluation,
+            |capsule| {
+                let TrackerOutput::Commit(commit) = &capsule.events()[0].output else {
+                    panic!("synthetic capsule must contain a commit");
+                };
+                inserted.push(commit.document_change.inserted.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(inserted, vec!["甲", "乙"]);
+    }
+
     #[test]
     fn protected_input_is_restricted_to_the_fixed_private_directory() {
         let manifest = Path::new(r"D:\repo");
@@ -1107,6 +1526,14 @@ mod tests {
     #[test]
     fn cli_requires_repeated_explicit_inputs() {
         assert!(parse_options(Vec::<String>::new()).is_err());
+        let marker = "PRIVATE_PATH_MARKER";
+        let unknown = match parse_options(vec![marker.to_owned()]) {
+            Err(error) => error,
+            Ok(_) => panic!("a positional private value must not be accepted"),
+        };
+        assert!(!unknown.to_string().contains(marker));
+        assert!(!format!("{unknown:?}").contains(marker));
+        assert!(unknown.to_string().contains("value was suppressed"));
         assert!(matches!(
             parse_options(vec!["--help".to_owned()]).unwrap(),
             Options::Help
@@ -1454,6 +1881,542 @@ mod tests {
     }
 
     #[test]
+    fn private_analysis_errors_never_echo_the_rejected_key_sequence() {
+        let marker = "PRIVATE_KEY_MARKER";
+        let source = KeySequence::new(marker).unwrap_err();
+        let error = redact_private_analysis_error::<(), _>(Err(source)).unwrap_err();
+        let redacted = error.to_string();
+        assert!(!redacted.contains(marker));
+        assert_eq!(
+            redacted,
+            "private replay analysis failed; input details were suppressed"
+        );
+        assert_eq!(format!("{error:?}"), redacted);
+    }
+
+    #[test]
+    fn selector_errors_use_redacted_debug_output_for_main_termination() {
+        for phase in [ReplayInputPhase::History, ReplayInputPhase::Evaluation] {
+            let error = RedactedPrivateSelectorError { phase };
+            let display = error.to_string();
+            assert_eq!(format!("{error:?}"), display);
+            assert!(!display.contains("session-id-or-path"));
+        }
+    }
+
+    #[test]
+    fn streaming_health_report_matches_collected_capsules() {
+        let capsules = vec![capsule(), capsule()];
+        let collected = CaptureHealthReport::from_capsules(&capsules);
+        let mut streamed = CaptureHealthReport::default();
+        for capsule in &capsules {
+            streamed.observe_capsule(capsule);
+        }
+        assert_eq!(streamed, collected);
+        assert_eq!(streamed.terminal_line(), collected.terminal_line());
+    }
+
+    #[test]
+    fn streaming_baseline_report_matches_collected_loading() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("first.zic", &capsule().to_text().unwrap());
+        workspace.write("second.zic", &capsule().to_text().unwrap());
+        let inputs = vec![
+            workspace.relative("first.zic"),
+            workspace.relative("second.zic"),
+        ];
+        let collected_capsules = read_explicit_capsules(&workspace.manifest, &inputs).unwrap();
+        let entries = parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap().entries;
+        let decoder = Decoder::new(entries);
+
+        let mut collected = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        for capsule in &collected_capsules {
+            collected.observe_capsule(&decoder, capsule).unwrap();
+        }
+
+        let mut streamed = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(false);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &inputs,
+            ReplayInputPhase::Evaluation,
+            |capsule| {
+                streamed.observe_capsule(&decoder, capsule)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(streamed, collected);
+        assert_eq!(streamed.terminal_line(), collected.terminal_line());
+        assert_eq!(
+            streamed.compact_terminal_report(),
+            collected.compact_terminal_report()
+        );
+    }
+
+    #[test]
+    fn streaming_public_context_reports_match_collected_loading() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("first.zic", &capsule().to_text().unwrap());
+        workspace.write("second.zic", &capsule().to_text().unwrap());
+        let inputs = vec![
+            workspace.relative("first.zic"),
+            workspace.relative("second.zic"),
+        ];
+        let collected_capsules = read_explicit_capsules(&workspace.manifest, &inputs).unwrap();
+        let entries = parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap().entries;
+        let decoder = Decoder::new(entries.clone());
+        let corpus = parse_ud_conllu(PUBLIC_UD_TRAIN).unwrap();
+        let training = select_public_bigram_training_sequences(&corpus, &entries);
+        let word_model =
+            BigramLanguageModel::from_token_sequences(&training.sequences, &entries).unwrap();
+        let frequency_total = entries
+            .iter()
+            .map(|entry| entry.frequency as f64)
+            .sum::<f64>();
+        let log_frequency_total = frequency_total.ln();
+
+        let mut collected_word = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        for capsule in &collected_capsules {
+            collected_word
+                .observe_capsule_with_public_context(
+                    &decoder,
+                    &word_model,
+                    log_frequency_total,
+                    capsule,
+                )
+                .unwrap();
+        }
+        let mut streamed_word = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(false);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &inputs,
+            ReplayInputPhase::Evaluation,
+            |capsule| {
+                streamed_word.observe_capsule_with_public_context(
+                    &decoder,
+                    &word_model,
+                    log_frequency_total,
+                    capsule,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed_word, collected_word);
+
+        let text_sequences = training
+            .sequences
+            .iter()
+            .map(|sequence| sequence.concat())
+            .collect::<Vec<_>>();
+        let character_model =
+            CharacterBigramLanguageModel::from_text_sequences(&text_sequences).unwrap();
+        let mut collected_character =
+            CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        for capsule in &collected_capsules {
+            collected_character
+                .observe_capsule_with_public_character_context(&decoder, &character_model, capsule)
+                .unwrap();
+        }
+        let mut streamed_character =
+            CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(false);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &inputs,
+            ReplayInputPhase::Evaluation,
+            |capsule| {
+                streamed_character.observe_capsule_with_public_character_context(
+                    &decoder,
+                    &character_model,
+                    capsule,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed_character, collected_character);
+    }
+
+    #[test]
+    fn streaming_personal_history_and_evaluation_share_only_the_cache_state() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("history.zic", &capsule().to_text().unwrap());
+        workspace.write("evaluation.zic", &capsule().to_text().unwrap());
+        let history_inputs = vec![workspace.relative("history.zic")];
+        let evaluation_inputs = vec![workspace.relative("evaluation.zic")];
+        let history_capsules =
+            read_explicit_capsules(&workspace.manifest, &history_inputs).unwrap();
+        let evaluation_capsules =
+            read_explicit_capsules(&workspace.manifest, &evaluation_inputs).unwrap();
+        let entries = parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap().entries;
+        let decoder = Decoder::new(entries);
+
+        let mut collected_state = PersonalCacheReplayState::new();
+        let mut collected_history =
+            CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        collected_history
+            .observe_capsule_with_personal_pair_cache(
+                &decoder,
+                &mut collected_state,
+                &history_capsules[0],
+            )
+            .unwrap();
+        let mut collected = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        collected.record_personal_cache_history(&collected_history, &collected_state);
+        collected
+            .observe_capsule_with_personal_pair_cache(
+                &decoder,
+                &mut collected_state,
+                &evaluation_capsules[0],
+            )
+            .unwrap();
+
+        let mut streamed_state = PersonalCacheReplayState::new();
+        let mut streamed_history =
+            CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut streamed = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(true);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &history_inputs,
+            ReplayInputPhase::History,
+            |capsule| {
+                streamed_history.observe_capsule_with_personal_pair_cache(
+                    &decoder,
+                    &mut streamed_state,
+                    capsule,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        streamed.record_personal_cache_history(&streamed_history, &streamed_state);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &evaluation_inputs,
+            ReplayInputPhase::Evaluation,
+            |capsule| {
+                streamed.observe_capsule_with_personal_pair_cache(
+                    &decoder,
+                    &mut streamed_state,
+                    capsule,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(streamed, collected);
+    }
+
+    #[test]
+    fn streaming_word_cache_matches_multiple_online_evaluation_capsules() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("history.zic", &capsule().to_text().unwrap());
+        workspace.write("evaluation-1.zic", &capsule().to_text().unwrap());
+        workspace.write("evaluation-2.zic", &capsule().to_text().unwrap());
+        let history_inputs = vec![workspace.relative("history.zic")];
+        let evaluation_inputs = vec![
+            workspace.relative("evaluation-1.zic"),
+            workspace.relative("evaluation-2.zic"),
+        ];
+        let history_capsules =
+            read_explicit_capsules(&workspace.manifest, &history_inputs).unwrap();
+        let evaluation_capsules =
+            read_explicit_capsules(&workspace.manifest, &evaluation_inputs).unwrap();
+        let entries = parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap().entries;
+        let decoder = Decoder::new(entries);
+
+        let mut collected_state = PersonalCacheReplayState::new();
+        let mut collected_history =
+            CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        collected_history
+            .observe_capsule_with_personal_cache(
+                &decoder,
+                &mut collected_state,
+                &history_capsules[0],
+            )
+            .unwrap();
+        let mut collected = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        collected.record_personal_cache_history(&collected_history, &collected_state);
+        for capsule in &evaluation_capsules {
+            collected
+                .observe_capsule_with_personal_cache(&decoder, &mut collected_state, capsule)
+                .unwrap();
+        }
+
+        let mut streamed_state = PersonalCacheReplayState::new();
+        let mut streamed_history =
+            CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut streamed = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(true);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &history_inputs,
+            ReplayInputPhase::History,
+            |capsule| {
+                streamed_history.observe_capsule_with_personal_cache(
+                    &decoder,
+                    &mut streamed_state,
+                    capsule,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        streamed.record_personal_cache_history(&streamed_history, &streamed_state);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &evaluation_inputs,
+            ReplayInputPhase::Evaluation,
+            |capsule| {
+                streamed.observe_capsule_with_personal_cache(
+                    &decoder,
+                    &mut streamed_state,
+                    capsule,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(streamed, collected);
+    }
+
+    #[test]
+    fn streaming_loader_rejects_a_duplicate_across_history_and_evaluation() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("same.zic", &capsule().to_text().unwrap());
+        let input = vec![workspace.relative("same.zic")];
+        let mut loader = PrivateInputLoader::new(&workspace.manifest);
+        let mut guard = SegmentMetadataGuard::new(true);
+        visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &input,
+            ReplayInputPhase::History,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let error = visit_private_inputs(
+            &mut loader,
+            &mut guard,
+            &input,
+            ReplayInputPhase::Evaluation,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let debug = format!("{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "private evaluation input #1 could not be loaded: duplicate; path and content were suppressed"
+        );
+        assert_eq!(debug, error.to_string());
+        assert!(!error.to_string().contains("same.zic"));
+    }
+
+    #[test]
+    fn protected_metadata_guard_rejects_reordering_and_future_leakage() {
+        let mut ordered = SegmentMetadataGuard::new(true);
+        ordered
+            .observe(
+                Some(&segment_metadata("history", 0, 10, 20, "old")),
+                ReplayInputPhase::History,
+            )
+            .unwrap();
+        ordered
+            .observe(
+                Some(&segment_metadata("history", 1, 20, 30, "old")),
+                ReplayInputPhase::History,
+            )
+            .unwrap();
+        ordered
+            .observe(
+                Some(&segment_metadata("evaluation", 0, 31, 40, "new")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+
+        let mut backwards_sequence = SegmentMetadataGuard::new(false);
+        backwards_sequence
+            .observe(
+                Some(&segment_metadata("same", 1, 10, 20, "v1")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            backwards_sequence
+                .observe(
+                    Some(&segment_metadata("same", 0, 20, 30, "v1")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut changed_version = SegmentMetadataGuard::new(false);
+        changed_version
+            .observe(
+                Some(&segment_metadata("same", 0, 10, 20, "v1")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            changed_version
+                .observe(
+                    Some(&segment_metadata("same", 1, 20, 30, "v2")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut changed_profile = SegmentMetadataGuard::new(false);
+        changed_profile
+            .observe(
+                Some(&segment_metadata("same", 0, 10, 20, "v1")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        let mut profile_mismatch = segment_metadata("same", 1, 20, 30, "v1");
+        profile_mismatch.capture_profile = "other-profile".to_owned();
+        assert!(
+            changed_profile
+                .observe(Some(&profile_mismatch), ReplayInputPhase::Evaluation)
+                .is_err()
+        );
+
+        let mut changed_kind = SegmentMetadataGuard::new(false);
+        changed_kind
+            .observe(
+                Some(&segment_metadata("same", 0, 10, 20, "v1")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        let mut kind_mismatch = segment_metadata("same", 1, 20, 30, "v1");
+        kind_mismatch.session_kind = CaptureSessionKind::Theme;
+        assert!(
+            changed_kind
+                .observe(Some(&kind_mismatch), ReplayInputPhase::Evaluation)
+                .is_err()
+        );
+
+        let mut leaked_future = SegmentMetadataGuard::new(true);
+        leaked_future
+            .observe(
+                Some(&segment_metadata("history", 0, 100, 200, "old")),
+                ReplayInputPhase::History,
+            )
+            .unwrap();
+        assert!(
+            leaked_future
+                .observe(
+                    Some(&segment_metadata("evaluation", 0, 150, 250, "new")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut crossed_phase = SegmentMetadataGuard::new(true);
+        crossed_phase
+            .observe(
+                Some(&segment_metadata("same", 0, 10, 20, "v1")),
+                ReplayInputPhase::History,
+            )
+            .unwrap();
+        assert!(
+            crossed_phase
+                .observe(
+                    Some(&segment_metadata("same", 1, 20, 30, "v1")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut backwards_time = SegmentMetadataGuard::new(false);
+        backwards_time
+            .observe(
+                Some(&segment_metadata("same", 0, 10, 20, "v1")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            backwards_time
+                .observe(
+                    Some(&segment_metadata("same", 1, 19, 30, "v1")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+
+        let mut reversed_evaluation_sessions = SegmentMetadataGuard::new(true);
+        reversed_evaluation_sessions
+            .observe(
+                Some(&segment_metadata("newer", 0, 200, 300, "v2")),
+                ReplayInputPhase::Evaluation,
+            )
+            .unwrap();
+        assert!(
+            reversed_evaluation_sessions
+                .observe(
+                    Some(&segment_metadata("older", 0, 150, 180, "v1")),
+                    ReplayInputPhase::Evaluation,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_late_invalid_input_returns_no_completed_report() {
+        let mut workspace = TestWorkspace::new();
+        workspace.write("first.zic", &capsule().to_text().unwrap());
+        workspace.write("broken.zic", "PRIVATE_MARKER");
+        let inputs = vec![
+            workspace.relative("first.zic"),
+            workspace.relative("broken.zic"),
+        ];
+        let entries = parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap().entries;
+        let decoder = Decoder::new(entries);
+        let completed_report = (|| -> Result<String, Box<dyn std::error::Error>> {
+            let mut report = CapsuleReplayReport::with_window_gap_limit(Some(15_000))?;
+            let mut loader = PrivateInputLoader::new(&workspace.manifest);
+            let mut guard = SegmentMetadataGuard::new(false);
+            visit_private_inputs(
+                &mut loader,
+                &mut guard,
+                &inputs,
+                ReplayInputPhase::Evaluation,
+                |capsule| {
+                    report.observe_capsule(&decoder, capsule)?;
+                    Ok(())
+                },
+            )?;
+            Ok(report.terminal_line())
+        })();
+        let error = completed_report.unwrap_err().to_string();
+        assert!(!error.contains("PRIVATE_MARKER"));
+        assert!(!error.contains("broken.zic"));
+        assert_eq!(
+            error,
+            "private evaluation input #2 could not be loaded: decode-or-unprotect-failed; path and content were suppressed"
+        );
+    }
+
+    #[test]
     fn session_selector_expands_only_contiguous_predictable_names() {
         let mut workspace = TestWorkspace::new();
         workspace.write_protected("segment-1234-77-00000000.zcs", b"zero");
@@ -1531,6 +2494,6 @@ mod tests {
         let oversized_error =
             read_explicit_capsules(&workspace.manifest, &[workspace.relative("oversized.zic")])
                 .unwrap_err();
-        assert!(oversized_error.to_string().contains("exceeds"));
+        assert!(oversized_error.to_string().contains("too-large"));
     }
 }
