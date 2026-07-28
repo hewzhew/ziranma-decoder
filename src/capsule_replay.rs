@@ -16,7 +16,7 @@ use crate::{
 
 pub const MAX_REPLAY_CODE_KEYS: usize = 64;
 const REPLAY_TOP_K: usize = 10;
-const PUBLIC_CONTEXT_POOL_DEPTH: usize = 50;
+pub const PUBLIC_CONTEXT_REPLAY_POOL_DEPTH: usize = 50;
 const PERSONAL_CACHE_POOL_DEPTH: usize = 50;
 const PERSONAL_CACHE_MAX_PROMOTION: usize = 3;
 
@@ -540,6 +540,82 @@ impl PairedReplayStrategyStats {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RankingReplayComparisonStats {
+    pub comparisons: u64,
+    pub baseline_visible_at_10: u64,
+    pub reranked_visible_at_10: u64,
+    pub gained_top_1: u64,
+    pub lost_top_1: u64,
+    pub rank_improved: u64,
+    pub rank_same: u64,
+    pub rank_worsened: u64,
+    pub both_outside_top_10: u64,
+    pub dropped_from_top_10: u64,
+    pub recovered_into_top_10: u64,
+}
+
+impl RankingReplayComparisonStats {
+    fn observe(&mut self, baseline_rank: Option<usize>, reranked_rank: Option<usize>) {
+        self.comparisons = self.comparisons.saturating_add(1);
+        if baseline_rank.is_some() {
+            self.baseline_visible_at_10 = self.baseline_visible_at_10.saturating_add(1);
+        }
+        if reranked_rank.is_some() {
+            self.reranked_visible_at_10 = self.reranked_visible_at_10.saturating_add(1);
+        }
+        if baseline_rank != Some(1) && reranked_rank == Some(1) {
+            self.gained_top_1 = self.gained_top_1.saturating_add(1);
+        }
+        if baseline_rank == Some(1) && reranked_rank != Some(1) {
+            self.lost_top_1 = self.lost_top_1.saturating_add(1);
+        }
+        match (baseline_rank, reranked_rank) {
+            (Some(baseline), Some(reranked)) if reranked < baseline => {
+                self.rank_improved = self.rank_improved.saturating_add(1);
+            }
+            (Some(baseline), Some(reranked)) if reranked == baseline => {
+                self.rank_same = self.rank_same.saturating_add(1);
+            }
+            (Some(_), Some(_)) => {
+                self.rank_worsened = self.rank_worsened.saturating_add(1);
+            }
+            (Some(_), None) => {
+                self.rank_worsened = self.rank_worsened.saturating_add(1);
+                self.dropped_from_top_10 = self.dropped_from_top_10.saturating_add(1);
+            }
+            (None, Some(_)) => {
+                self.rank_improved = self.rank_improved.saturating_add(1);
+                self.recovered_into_top_10 = self.recovered_into_top_10.saturating_add(1);
+            }
+            (None, None) => {
+                self.both_outside_top_10 = self.both_outside_top_10.saturating_add(1);
+            }
+        }
+    }
+
+    fn terminal_fields(&self, name: &str) -> String {
+        format!(
+            "{name}_comparisons={} {name}_baseline_visible_at_10={} \
+             {name}_reranked_visible_at_10={} {name}_gained_top_1={} \
+             {name}_lost_top_1={} {name}_rank_improved={} {name}_rank_same={} \
+             {name}_rank_worsened={} {name}_both_outside_top_10={} \
+             {name}_dropped_from_top_10={} {name}_recovered_into_top_10={}",
+            self.comparisons,
+            self.baseline_visible_at_10,
+            self.reranked_visible_at_10,
+            self.gained_top_1,
+            self.lost_top_1,
+            self.rank_improved,
+            self.rank_same,
+            self.rank_worsened,
+            self.both_outside_top_10,
+            self.dropped_from_top_10,
+            self.recovered_into_top_10
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContextReplayComparisonStats {
     pub windows: u64,
     pub baselines_both_visible_at_10: u64,
@@ -767,6 +843,7 @@ pub struct CapsuleReplayReport {
     pub window_word_head_anchored_vs_full: PairedReplayStrategyStats,
     pub public_context_windows: u64,
     pub public_context_window_canonical_full: ReplayStrategyStats,
+    pub public_context_canonical_full_vs_unigram: RankingReplayComparisonStats,
     pub public_context_window_word_tail_one_short: ReplayStrategyStats,
     pub public_context_window_word_tail_keep_singletons: ReplayStrategyStats,
     pub public_context_window_word_head_anchored: ReplayStrategyStats,
@@ -1592,6 +1669,8 @@ impl CapsuleReplayReport {
                 &target,
                 &mut self.public_context_window_canonical_full,
             )?;
+            self.public_context_canonical_full_vs_unigram
+                .observe(baseline_rank, context_baseline_rank);
             if let Some(code) = &word_tail_code {
                 let context_strategy_rank = observe_strategy_with_frozen_context(
                     decoder,
@@ -1680,7 +1759,7 @@ impl CapsuleReplayReport {
              continuous_window_commits={} \
              continuous_window_recorded_logical_key_actions={} \
              continuous_windows_over_key_limit={} {} {} {} {} {} {} {} {} \
-             public_context_windows={} {} {} {} {} {} {} {} {} {} {} \
+             public_context_windows={} {} {} {} {} {} {} {} {} {} {} {} \
              personal_cache_kind={} personal_cache_history_capsules={} \
              personal_cache_history_events={} \
              personal_cache_history_learning_commits={} \
@@ -1761,6 +1840,8 @@ impl CapsuleReplayReport {
             self.public_context_windows,
             self.public_context_window_canonical_full
                 .terminal_fields("public_context_window_canonical_full"),
+            self.public_context_canonical_full_vs_unigram
+                .terminal_fields("public_context_canonical_full_vs_unigram"),
             self.public_context_window_word_tail_one_short
                 .terminal_fields("public_context_window_word_tail_one_short"),
             self.public_context_window_word_tail_keep_singletons
@@ -1904,7 +1985,7 @@ impl CapsuleReplayReport {
                 self.continuous_window_recorded_logical_key_actions,
                 self.continuous_windows_over_key_limit,
                 self.public_context_windows,
-                PUBLIC_CONTEXT_POOL_DEPTH,
+                PUBLIC_CONTEXT_REPLAY_POOL_DEPTH,
                 display_personal_cache_kind(self.personal_cache_kind),
                 self.personal_cache_history_capsules,
                 self.personal_cache_history_events,
@@ -1994,6 +2075,10 @@ impl CapsuleReplayReport {
                         context_kind.compact_scope(),
                         "canonical_full",
                         &self.public_context_window_canonical_full,
+                    ),
+                    compact_ranking_comparison_line(
+                        context_kind.compact_context_label(),
+                        &self.public_context_canonical_full_vs_unigram,
                     ),
                     compact_context_comparison_line(
                         context_kind.compact_context_label(),
@@ -2345,7 +2430,7 @@ fn observe_strategy_with_frozen_context(
     if code.len() > MAX_REPLAY_CODE_KEYS {
         return Ok(None);
     }
-    let pool = decoder.decode_sentence(code, PUBLIC_CONTEXT_POOL_DEPTH)?;
+    let pool = decoder.decode_sentence(code, PUBLIC_CONTEXT_REPLAY_POOL_DEPTH)?;
     let mut scored = pool
         .into_iter()
         .enumerate()
@@ -2534,6 +2619,29 @@ fn compact_context_comparison_line(
         effect.unigram_baseline_only_visible_at_10,
         effect.context_baseline_only_visible_at_10,
         effect.neither_baseline_visible_at_10
+    )
+}
+
+fn compact_ranking_comparison_line(
+    context_label: &str,
+    comparison: &RankingReplayComparisonStats,
+) -> String {
+    format!(
+        "RANKING_COMPARE context={context_label} comparisons={} gained_top_1={} \
+         lost_top_1={} improved={} same={} worsened={} both_outside_top_10={} \
+         dropped_from_top_10={} recovered_into_top_10={} \
+         baseline_visible_at_10={} reranked_visible_at_10={}",
+        comparison.comparisons,
+        comparison.gained_top_1,
+        comparison.lost_top_1,
+        comparison.rank_improved,
+        comparison.rank_same,
+        comparison.rank_worsened,
+        comparison.both_outside_top_10,
+        comparison.dropped_from_top_10,
+        comparison.recovered_into_top_10,
+        comparison.baseline_visible_at_10,
+        comparison.reranked_visible_at_10
     )
 }
 
@@ -2780,8 +2888,9 @@ fn shortened_code(
 mod tests {
     use super::{
         CapsuleReplayReport, ContextReplayComparisonStats, PairedReplayStrategyStats,
-        PersonalCacheKind, PersonalCacheReplayError, PersonalCacheReplayState, ReplayStrategyStats,
-        effective_letter_code, observe_strategy_with_personal_cache,
+        PersonalCacheKind, PersonalCacheReplayError, PersonalCacheReplayState,
+        RankingReplayComparisonStats, ReplayStrategyStats, effective_letter_code,
+        observe_strategy_with_personal_cache,
     };
     use crate::{
         CommitRecord, DeltaPositionEvidence, EventCapsuleV1, RawKey, TextDelta, TimedTrackerOutput,
@@ -2889,6 +2998,37 @@ text\tpinyin\tfrequency
         assert_eq!(stats.input_keys_added, 0);
         assert_eq!(stats.baseline_visible_at_10, 4);
         assert_eq!(stats.strategy_visible_at_10, 4);
+        assert_eq!(stats.rank_improved, 2);
+        assert_eq!(stats.rank_same, 1);
+        assert_eq!(stats.rank_worsened, 2);
+        assert_eq!(stats.both_outside_top_10, 1);
+        assert_eq!(stats.dropped_from_top_10, 1);
+        assert_eq!(stats.recovered_into_top_10, 1);
+        assert_eq!(
+            stats.rank_improved + stats.rank_same + stats.rank_worsened + stats.both_outside_top_10,
+            stats.comparisons
+        );
+    }
+
+    #[test]
+    fn ranking_comparison_separates_top_one_changes_and_partitions_all_windows() {
+        let mut stats = RankingReplayComparisonStats::default();
+        for (baseline, reranked) in [
+            (Some(1), Some(2)),
+            (Some(2), Some(1)),
+            (Some(2), Some(2)),
+            (Some(3), None),
+            (None, Some(3)),
+            (None, None),
+        ] {
+            stats.observe(baseline, reranked);
+        }
+
+        assert_eq!(stats.comparisons, 6);
+        assert_eq!(stats.baseline_visible_at_10, 4);
+        assert_eq!(stats.reranked_visible_at_10, 4);
+        assert_eq!(stats.gained_top_1, 1);
+        assert_eq!(stats.lost_top_1, 1);
         assert_eq!(stats.rank_improved, 2);
         assert_eq!(stats.rank_same, 1);
         assert_eq!(stats.rank_worsened, 2);
@@ -3274,6 +3414,10 @@ text\tpinyin\tfrequency
         assert_eq!(report.public_context_windows, 1);
         assert_eq!(report.public_context_window_canonical_full.attempts, 1);
         assert_eq!(
+            report.public_context_canonical_full_vs_unigram.comparisons,
+            1
+        );
+        assert_eq!(
             report
                 .word_tail_keep_singletons_context_effect
                 .baselines_both_visible_at_10,
@@ -3287,9 +3431,10 @@ text\tpinyin\tfrequency
         );
 
         let compact = report.compact_terminal_report();
-        assert_eq!(compact.lines().count(), 8);
+        assert_eq!(compact.lines().count(), 9);
         assert!(compact.contains("scope=window_unigram name=canonical_full"));
         assert!(compact.contains("scope=window_public_word_bigram name=canonical_full"));
+        assert!(compact.contains("RANKING_COMPARE context=public_word_bigram comparisons=1"));
         assert!(
             compact.contains(
                 "CONTEXT_COMPARE context=public_word_bigram name=word_tail_keep_singletons"
@@ -3320,13 +3465,18 @@ text\tpinyin\tfrequency
         assert_eq!(report.continuous_windows, 1);
         assert_eq!(report.public_context_windows, 1);
         assert_eq!(report.public_context_window_canonical_full.attempts, 1);
+        assert_eq!(
+            report.public_context_canonical_full_vs_unigram.comparisons,
+            1
+        );
 
         let terminal = report.terminal_line();
         assert!(terminal.contains("public_context_kind=character_bigram"));
         let compact = report.compact_terminal_report();
-        assert_eq!(compact.lines().count(), 8);
+        assert_eq!(compact.lines().count(), 9);
         assert!(compact.contains("scope=window_unigram name=canonical_full"));
         assert!(compact.contains("scope=window_public_character_bigram name=canonical_full"));
+        assert!(compact.contains("RANKING_COMPARE context=public_character_bigram comparisons=1"));
         assert!(compact.contains(
             "CONTEXT_COMPARE context=public_character_bigram \
                  name=word_tail_keep_singletons"

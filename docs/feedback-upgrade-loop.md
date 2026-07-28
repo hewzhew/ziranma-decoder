@@ -90,6 +90,22 @@ cargo run --release --bin capsule-replay -- `
 结论由使用者结合实验设计和独立会话证据在报告之外形成。旧的
 `--decision` 仍可作为兼容别名使用。
 
+若问题只聚焦于完整码候选的公开排序，而不想分别运行两次单模型诊断，
+可以在一份已经结束的会话上运行：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --session <ID> `
+  --window-gap-ms 15000 `
+  --ranking-report
+```
+
+它只流式读取一次点名会话，并在相同连续窗口、相同冻结 Top-50 候选池上
+并列比较现行频率排序、公开 train-only 词 bigram 和字 bigram。输出只报
+Top-K 与相对现行排序的 Top-1 得失、名次改善/持平/变差、Top-10 掉出/
+救回，不学习私人正文、不写文件，也不产生升级建议。为了保持配对口径，
+它不能与普通摘要、紧凑输出、个人缓存或历史学习混用。
+
 若只想在记录过程中看采集是否健康，可运行：
 
 ```powershell

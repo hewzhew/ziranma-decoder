@@ -588,6 +588,13 @@ cargo run --release --bin capsule-replay -- `
   --public-character-context `
   --compact
 
+# 成对排序摘要：一次流式读取，同窗比较现行频率、公开词 bigram 与字 bigram
+# 只输出脱敏计数，不写文件，也不替研究者给出采用或停止建议
+cargo run --release --bin capsule-replay -- `
+  --session <SESSION_ID> `
+  --window-gap-ms 15000 `
+  --ranking-report
+
 # 因果个人词缓存：预测后学习，文档重叠编辑可撤销，纯内存、不导出
 cargo run --release --bin capsule-replay -- `
   --input data/private/event-capsules/manual-001.zic `
@@ -715,6 +722,17 @@ cargo run --release --bin capsule-replay -- `
 字段和段边界语义保持不变；个人缓存模式仍会按设计保留历史词/词对状态，
 但不会保留所有原始事件。段边界仍是胶囊边界，不会因“流式”而偷偷连接
 跨轮换点的窗口。
+
+需要直接比较三条公开排序基线时，可把上例的 `--compact` 换成
+`--ranking-report`。它在同一次私人输入流式遍历中，针对完全相同的合格
+连续窗口并列统计现行词频排序、公开 train-only 词 bigram 和公开
+train-only 字 bigram。两条公开模型都只重排现行排序生成的固定 Top-50
+候选池，不从私人输入学习，也不扩大召回池。输出包含各自 Top-1/5/10，
+以及相对现行排序的 Top-1 得失、名次改善/持平/变差和 Top-10 掉出/救回；
+不显示正文、拼音、按键串、路径或会话号，不写文件，也不输出研究建议。
+该模式首行声明 `private_input_passes=1`、`ranking_lanes=3` 和固定候选池
+深度；它与 `--report`、`--compact`、单模型上下文开关、个人缓存、历史
+学习、形码审计及健康模式互斥。
 
 记录过程中只想快速检查数量和采集完整性时，可跳过候选解码：
 

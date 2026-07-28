@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use ziranma_decoder::{
     BigramLanguageModel, CAPTURE_INTEGRITY_SCHEMA_V1, CapsuleReplayReport, CaptureIntegrityV1,
     CaptureSessionKind, CharacterBigramLanguageModel, CharacterShapeIndex,
-    ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
-    PHRASE_TRIM_MAX_GAP_MS, PairedReplayStrategyStats, PersonalCacheReplayState,
-    PrivateShapeActionComparisonStats, PrivateShapeReplayAudit, RawKey, ReplayStrategyStats,
-    SegmentCloseReason, TrackerOutput, parse_rime_lexicon, parse_stroke_sequence_tsv,
-    parse_ud_conllu, select_public_bigram_training_sequences,
+    ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1, LexiconEntry,
+    PHRASE_TRIM_MAX_GAP_MS, PUBLIC_CONTEXT_REPLAY_POOL_DEPTH, PairedReplayStrategyStats,
+    PersonalCacheReplayState, PrivateShapeActionComparisonStats, PrivateShapeReplayAudit,
+    RankingReplayComparisonStats, RawKey, ReplayStrategyStats, SegmentCloseReason, TrackerOutput,
+    parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
+    select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
 use ziranma_decoder::{
@@ -31,6 +32,7 @@ const MAX_SESSION_SEGMENTS: u64 = 1_000_000;
 const CAPTURE_HEALTH_REPORT_SCHEMA_V1: &str = "ziranma-capture-health-report-v1";
 const CAPTURE_INTEGRITY_REPORT_SCHEMA_V1: &str = "ziranma-capture-integrity-report-v1";
 const HUMAN_REPLAY_REPORT_SCHEMA_V1: &str = "ziranma-replay-human-report-v1";
+const RANKING_COMPARISON_REPORT_SCHEMA_V1: &str = "ziranma-ranking-comparison-report-v1";
 const CAPTURE_HEALTH_PRIVACY_NOTICE: &str = "--health-only prints CAPTURE_HEALTH and CAPTURE_INTEGRITY; both contain behavioral \
      metadata; legacy v1/.zic integrity is unavailable, never zero-filled.";
 
@@ -48,6 +50,7 @@ enum Options {
         window_gap_ms: Option<u64>,
         compact: bool,
         human_report: bool,
+        ranking_report: bool,
         public_context: bool,
         public_character_context: bool,
         personal_cache: bool,
@@ -66,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window_gap_ms,
             compact,
             human_report,
+            ranking_report,
             public_context,
             public_character_context,
             personal_cache,
@@ -125,6 +129,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
             let entries = imported.entries;
             let decoder = Decoder::new(entries.clone());
+            if ranking_report {
+                let models = build_public_ranking_models(&entries)?;
+                let mut word_report = CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
+                let mut character_report =
+                    CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
+                let mut health = CaptureHealthReport::default();
+                visit_private_loaded_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |loaded| {
+                        health.observe_loaded(loaded);
+                        redact_private_analysis_error(
+                            word_report.observe_capsule_with_public_context(
+                                &decoder,
+                                &models.word,
+                                models.log_frequency_total,
+                                &loaded.capsule,
+                            ),
+                        )?;
+                        redact_private_analysis_error(
+                            character_report.observe_capsule_with_public_character_context(
+                                &decoder,
+                                &models.character,
+                                &loaded.capsule,
+                            ),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                ensure_ranking_reports_comparable(&word_report, &character_report)?;
+                println!(
+                    "{}",
+                    render_ranking_comparison_report(&word_report, &character_report, &health)
+                );
+                return Ok(());
+            }
             let mut report = CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
             let mut report_health = CaptureHealthReport::default();
             if human_report {
@@ -193,20 +235,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )?;
             } else if public_context || public_character_context {
-                let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
-                let training = select_public_bigram_training_sequences(&train_corpus, &entries);
+                let training = load_public_ranking_training(&entries)?;
                 if public_context {
                     let language_model =
                         BigramLanguageModel::from_token_sequences(&training.sequences, &entries)?;
-                    let frequency_total = entries
-                        .iter()
-                        .map(|entry| entry.frequency as f64)
-                        .sum::<f64>();
-                    let log_frequency_total = if frequency_total > 0.0 {
-                        frequency_total.ln()
-                    } else {
-                        0.0
-                    };
                     visit_private_inputs(
                         &mut loader,
                         &mut metadata_guard,
@@ -217,7 +249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 report.observe_capsule_with_public_context(
                                     &decoder,
                                     &language_model,
-                                    log_frequency_total,
+                                    training.log_frequency_total,
                                     capsule,
                                 ),
                             )?;
@@ -282,6 +314,7 @@ fn parse_options(
     let mut window_gap_ms = None;
     let mut compact = false;
     let mut human_report = false;
+    let mut ranking_report = false;
     let mut public_context = false;
     let mut public_character_context = false;
     let mut personal_cache = false;
@@ -335,6 +368,12 @@ fn parse_options(
                 }
                 human_report = true;
             }
+            "--ranking-report" => {
+                if ranking_report {
+                    return Err("--ranking-report can be given only once".into());
+                }
+                ranking_report = true;
+            }
             "--public-context" => {
                 if public_context {
                     return Err("--public-context can be given only once".into());
@@ -377,6 +416,7 @@ fn parse_options(
                     && window_gap_ms.is_none()
                     && !compact
                     && !human_report
+                    && !ranking_report
                     && !public_context
                     && !public_character_context
                     && !personal_cache
@@ -410,6 +450,9 @@ fn parse_options(
     }
     if human_report && window_gap_ms.is_none() {
         return Err("--report requires --window-gap-ms".into());
+    }
+    if ranking_report && window_gap_ms.is_none() {
+        return Err("--ranking-report requires --window-gap-ms".into());
     }
     if usize::from(public_context)
         + usize::from(public_character_context)
@@ -459,10 +502,27 @@ fn parse_options(
             || personal_cache
             || personal_pair_cache
             || shape_audit
-            || health_only)
+            || health_only
+            || ranking_report)
     {
         return Err(
             "--report cannot be combined with compact, history, context, cache, shape, or health options"
+                .into(),
+        );
+    }
+    if ranking_report
+        && (compact
+            || human_report
+            || !history_inputs.is_empty()
+            || public_context
+            || public_character_context
+            || personal_cache
+            || personal_pair_cache
+            || shape_audit
+            || health_only)
+    {
+        return Err(
+            "--ranking-report cannot be combined with other report, compact, history, context, cache, shape, or health options"
                 .into(),
         );
     }
@@ -472,6 +532,7 @@ fn parse_options(
         window_gap_ms,
         compact,
         human_report,
+        ranking_report,
         public_context,
         public_character_context,
         personal_cache,
@@ -493,6 +554,9 @@ fn print_usage() {
         "Usage (human report): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         --window-gap-ms <POSITIVE_MS> --report"
     );
     eprintln!("Legacy alias: --decision is accepted as --report.");
+    eprintln!(
+        "Usage (ranking comparison): cargo run --bin capsule-replay -- \\\n+         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n+         --window-gap-ms <POSITIVE_MS> --ranking-report"
+    );
     eprintln!(
         "Usage (replay): cargo run --bin capsule-replay -- \\\n         [--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION> ...] \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         [--window-gap-ms <POSITIVE_MS> \\\n          [--public-context|--public-character-context|--personal-cache|\
            --personal-pair-cache]] [--compact]"
@@ -815,6 +879,171 @@ impl CaptureHealthReport {
             counters.counter_saturated,
         )
     }
+}
+
+struct PublicRankingModels {
+    word: BigramLanguageModel,
+    character: CharacterBigramLanguageModel,
+    log_frequency_total: f64,
+}
+
+struct PublicRankingTraining {
+    sequences: Vec<Vec<String>>,
+    log_frequency_total: f64,
+}
+
+fn load_public_ranking_training(
+    entries: &[LexiconEntry],
+) -> Result<PublicRankingTraining, Box<dyn std::error::Error>> {
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let training = select_public_bigram_training_sequences(&train_corpus, entries);
+    let frequency_total = entries
+        .iter()
+        .map(|entry| entry.frequency as f64)
+        .sum::<f64>();
+    let log_frequency_total = if frequency_total > 0.0 {
+        frequency_total.ln()
+    } else {
+        0.0
+    };
+    Ok(PublicRankingTraining {
+        sequences: training.sequences,
+        log_frequency_total,
+    })
+}
+
+fn build_public_ranking_models(
+    entries: &[LexiconEntry],
+) -> Result<PublicRankingModels, Box<dyn std::error::Error>> {
+    let training = load_public_ranking_training(entries)?;
+    let word = BigramLanguageModel::from_token_sequences(&training.sequences, entries)?;
+    let text_sequences = training
+        .sequences
+        .iter()
+        .map(|sequence| sequence.concat())
+        .collect::<Vec<_>>();
+    let character = CharacterBigramLanguageModel::from_text_sequences(&text_sequences)?;
+    Ok(PublicRankingModels {
+        word,
+        character,
+        log_frequency_total: training.log_frequency_total,
+    })
+}
+
+fn ensure_ranking_reports_comparable(
+    word: &CapsuleReplayReport,
+    character: &CapsuleReplayReport,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let comparable = word.capsules == character.capsules
+        && word.events == character.events
+        && word.commits == character.commits
+        && word.revisions == character.revisions
+        && word.recorded_logical_key_actions == character.recorded_logical_key_actions
+        && word.window_eligible_commits == character.window_eligible_commits
+        && word.window_ineligible_commits == character.window_ineligible_commits
+        && word.window_exclusions == character.window_exclusions
+        && word.isolated_eligible_commits == character.isolated_eligible_commits
+        && word.continuous_windows == character.continuous_windows
+        && word.continuous_window_commits == character.continuous_window_commits
+        && word.continuous_window_recorded_logical_key_actions
+            == character.continuous_window_recorded_logical_key_actions
+        && word.continuous_windows_over_key_limit == character.continuous_windows_over_key_limit
+        && word.window_canonical_full == character.window_canonical_full
+        && word.public_context_windows == character.public_context_windows;
+    if comparable {
+        Ok(())
+    } else {
+        Err("ranking comparison lanes diverged; private values were suppressed".into())
+    }
+}
+
+fn render_ranking_comparison_report(
+    word: &CapsuleReplayReport,
+    character: &CapsuleReplayReport,
+    health: &CaptureHealthReport,
+) -> String {
+    let baseline = &word.window_canonical_full;
+    let lines = vec![
+        format!(
+            "RANKING_COMPARISON_REPORT schema={RANKING_COMPARISON_REPORT_SCHEMA_V1} \
+             contains_text=false contains_behavioral_metadata=true writes=false network=false \
+             private_input_passes=1 ranking_lanes=3 public_context_pool_depth={PUBLIC_CONTEXT_REPLAY_POOL_DEPTH}"
+        ),
+        "公开排序成对摘要（不显示原文）".to_owned(),
+        "范围：同一批窗口比较当前词频、公开词 bigram 与公开字符 bigram；只陈列成对观察，不安排后续研究。"
+            .to_owned(),
+        format!(
+            "样本：{} 份输入，{} 条事件；{} 次提交，{} 次提交后编辑。",
+            word.capsules, word.events, word.commits, word.revisions
+        ),
+        format!(
+            "采集：按键完整 {}，不完整 {} 条；完整性证据可用 {} 段，旧格式或明文胶囊 {} 段。",
+            format_ratio(
+                health.keys_complete_records,
+                health
+                    .keys_complete_records
+                    .saturating_add(health.keys_incomplete_records)
+            ),
+            health.keys_incomplete_records,
+            health.integrity_available_segments,
+            health.legacy_inputs_without_integrity
+        ),
+        format!(
+            "连续窗口：{} 个；{} 次提交进入窗口，{} 次合格提交保持孤立；{} 个窗口因码串过长未参与排序。",
+            word.continuous_windows,
+            word.continuous_window_commits,
+            word.isolated_eligible_commits,
+            word.continuous_windows_over_key_limit
+        ),
+        format!(
+            "候选口径：三条泳道使用同一解码器；公开上下文只重排每个窗口冻结的 Top-{PUBLIC_CONTEXT_REPLAY_POOL_DEPTH} 候选。可比较窗口：词模型 {}，字符模型 {}。",
+            word.public_context_canonical_full_vs_unigram.comparisons,
+            character
+                .public_context_canonical_full_vs_unigram
+                .comparisons
+        ),
+        format!(
+            "当前词频：Top-1 {}，Top-5 {}，Top-10 {}。",
+            format_ratio(baseline.hits_at_1, baseline.attempts),
+            format_ratio(baseline.hits_at_5, baseline.attempts),
+            format_ratio(baseline.hits_at_10, baseline.attempts)
+        ),
+        render_ranking_comparison_lane(
+            "公开词 bigram",
+            &word.public_context_window_canonical_full,
+            &word.public_context_canonical_full_vs_unigram,
+        ),
+        render_ranking_comparison_lane(
+            "公开字符 bigram",
+            &character.public_context_window_canonical_full,
+            &character.public_context_canonical_full_vs_unigram,
+        ),
+        "口径：改善、持平和变差按目标的 Top-10 名次成对计算；两边都在 Top-10 外单列。Top-1 获得/失去与 Top-10 救回/掉出分别计数。"
+            .to_owned(),
+    ];
+    lines.join("\n")
+}
+
+fn render_ranking_comparison_lane(
+    label: &str,
+    stats: &ReplayStrategyStats,
+    comparison: &RankingReplayComparisonStats,
+) -> String {
+    format!(
+        "- {label}：Top-1 {}，Top-5 {}，Top-10 {}；相对当前词频，Top-1 获得 {}、失去 {}；\
+         名次改善 {}、持平 {}、变差 {}、两边均在 Top-10 外 {}；Top-10 掉出 {}、救回 {}。",
+        format_ratio(stats.hits_at_1, stats.attempts),
+        format_ratio(stats.hits_at_5, stats.attempts),
+        format_ratio(stats.hits_at_10, stats.attempts),
+        format_ratio(comparison.gained_top_1, comparison.comparisons),
+        format_ratio(comparison.lost_top_1, comparison.comparisons),
+        format_ratio(comparison.rank_improved, comparison.comparisons),
+        format_ratio(comparison.rank_same, comparison.comparisons),
+        format_ratio(comparison.rank_worsened, comparison.comparisons),
+        format_ratio(comparison.both_outside_top_10, comparison.comparisons),
+        format_ratio(comparison.dropped_from_top_10, comparison.comparisons),
+        format_ratio(comparison.recovered_into_top_10, comparison.comparisons)
+    )
 }
 
 fn render_human_report(report: &CapsuleReplayReport, health: &CaptureHealthReport) -> String {
@@ -1809,9 +2038,10 @@ mod tests {
         CAPTURE_HEALTH_PRIVACY_NOTICE, CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES,
         Options, PUBLIC_RIME_LEXICON, PUBLIC_UD_TRAIN, PrivateInputLoader,
         RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard,
-        expand_session_selector, format_percentage, parse_options, read_explicit_capsules,
-        redact_private_analysis_error, render_human_report, resolve_capsule_input,
-        resolve_protected_input, visit_private_inputs,
+        ensure_ranking_reports_comparable, expand_session_selector, format_percentage,
+        parse_options, read_explicit_capsules, redact_private_analysis_error, render_human_report,
+        render_ranking_comparison_report, resolve_capsule_input, resolve_protected_input,
+        visit_private_inputs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1820,9 +2050,9 @@ mod tests {
         BigramLanguageModel, CapsuleReplayReport, CaptureIntegrityCountersV1, CaptureIntegrityV1,
         CaptureSessionKind, CharacterBigramLanguageModel, CommitRecord, ContinuousSegmentMetadata,
         Decoder, DeltaPositionEvidence, EventCapsuleV1, KeySequence, PairedReplayStrategyStats,
-        PersonalCacheReplayState, RawKey, ReplayStrategyStats, SegmentCloseReason, TextDelta,
-        TimedTrackerOutput, TrackerOutput, parse_rime_lexicon, parse_ud_conllu,
-        select_public_bigram_training_sequences,
+        PersonalCacheReplayState, RankingReplayComparisonStats, RawKey, ReplayStrategyStats,
+        SegmentCloseReason, TextDelta, TimedTrackerOutput, TrackerOutput, parse_rime_lexicon,
+        parse_ud_conllu, select_public_bigram_training_sequences,
     };
     #[cfg(windows)]
     use ziranma_decoder::{
@@ -2215,6 +2445,7 @@ mod tests {
             window_gap_ms,
             compact,
             human_report,
+            ranking_report,
             public_context,
             public_character_context,
             personal_cache,
@@ -2230,6 +2461,7 @@ mod tests {
         assert_eq!(window_gap_ms, None);
         assert!(!compact);
         assert!(!human_report);
+        assert!(!ranking_report);
         assert!(!public_context);
         assert!(!public_character_context);
         assert!(!personal_cache);
@@ -2319,6 +2551,38 @@ mod tests {
                 "--window-gap-ms".to_owned(),
                 "15000".to_owned(),
                 "--report".to_owned(),
+                "--compact".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let ranking = parse_options(vec![
+            "--session".to_owned(),
+            "1234-77".to_owned(),
+            "--window-gap-ms".to_owned(),
+            "15000".to_owned(),
+            "--ranking-report".to_owned(),
+        ])
+        .unwrap();
+        let Options::Inputs { ranking_report, .. } = ranking else {
+            panic!("expected inputs");
+        };
+        assert!(ranking_report);
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--ranking-report".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "15000".to_owned(),
+                "--ranking-report".to_owned(),
                 "--compact".to_owned(),
             ])
             .is_err()
@@ -2708,6 +2972,87 @@ mod tests {
         assert_eq!(format_percentage(119, 119), "100.0%");
         assert_eq!(format_percentage(0, 0), "—");
         assert_eq!(format_percentage(u64::MAX, u64::MAX), "100.0%");
+    }
+
+    #[test]
+    fn ranking_report_is_paired_redacted_and_contains_no_research_plan() {
+        let mut word = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
+        word.capsules = 1;
+        word.events = 4;
+        word.commits = 4;
+        word.continuous_windows = 2;
+        word.continuous_window_commits = 4;
+        word.public_context_windows = 2;
+        word.window_canonical_full = ReplayStrategyStats {
+            attempts: 2,
+            hits_at_1: 1,
+            hits_at_5: 2,
+            hits_at_10: 2,
+            ..ReplayStrategyStats::default()
+        };
+        word.public_context_window_canonical_full = ReplayStrategyStats {
+            attempts: 2,
+            hits_at_1: 2,
+            hits_at_5: 2,
+            hits_at_10: 2,
+            ..ReplayStrategyStats::default()
+        };
+        word.public_context_canonical_full_vs_unigram = RankingReplayComparisonStats {
+            comparisons: 2,
+            baseline_visible_at_10: 2,
+            reranked_visible_at_10: 2,
+            gained_top_1: 1,
+            rank_improved: 1,
+            rank_same: 1,
+            ..RankingReplayComparisonStats::default()
+        };
+        let mut character = word.clone();
+        character.public_context_window_canonical_full = ReplayStrategyStats {
+            attempts: 2,
+            hits_at_1: 0,
+            hits_at_5: 1,
+            hits_at_10: 1,
+            ..ReplayStrategyStats::default()
+        };
+        character.public_context_canonical_full_vs_unigram = RankingReplayComparisonStats {
+            comparisons: 2,
+            baseline_visible_at_10: 2,
+            reranked_visible_at_10: 1,
+            lost_top_1: 1,
+            rank_worsened: 2,
+            dropped_from_top_10: 1,
+            ..RankingReplayComparisonStats::default()
+        };
+        let health = CaptureHealthReport {
+            keys_complete_records: 4,
+            integrity_available_segments: 1,
+            ..CaptureHealthReport::default()
+        };
+
+        ensure_ranking_reports_comparable(&word, &character).unwrap();
+        let rendered = render_ranking_comparison_report(&word, &character, &health);
+
+        assert_eq!(rendered.lines().count(), 11);
+        assert!(rendered.starts_with(
+            "RANKING_COMPARISON_REPORT schema=ziranma-ranking-comparison-report-v1 contains_text=false"
+        ));
+        assert!(rendered.contains("private_input_passes=1 ranking_lanes=3"));
+        assert!(rendered.contains("当前词频：Top-1 1/2（50.0%）"));
+        assert!(rendered.contains("公开词 bigram：Top-1 2/2（100.0%）"));
+        assert!(rendered.contains("Top-1 获得 1/2（50.0%）、失去 0/2（0.0%）"));
+        assert!(rendered.contains("公开字符 bigram：Top-1 0/2（0.0%）"));
+        assert!(rendered.contains("Top-10 掉出 1/2（50.0%）、救回 0/2（0.0%）"));
+        assert!(!rendered.contains("下一步"));
+        assert!(!rendered.contains("建议"));
+        assert!(!rendered.contains("采用"));
+        assert!(!rendered.contains("猫"));
+        assert!(!rendered.contains("mao"));
+
+        let mut divergent = character;
+        divergent.window_canonical_full.hits_at_1 = 0;
+        let error = ensure_ranking_reports_comparable(&word, &divergent).unwrap_err();
+        assert!(!error.to_string().contains("猫"));
+        assert!(!format!("{error:?}").contains("猫"));
     }
 
     #[test]
