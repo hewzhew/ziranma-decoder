@@ -30,8 +30,7 @@ const MAX_CAPSULE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_SEGMENTS: u64 = 1_000_000;
 const CAPTURE_HEALTH_REPORT_SCHEMA_V1: &str = "ziranma-capture-health-report-v1";
 const CAPTURE_INTEGRITY_REPORT_SCHEMA_V1: &str = "ziranma-capture-integrity-report-v1";
-const REPLAY_DECISION_REPORT_SCHEMA_V3: &str = "ziranma-replay-decision-report-v3";
-const REPLAY_DECISION_MIN_WINDOWS: u64 = 20;
+const HUMAN_REPLAY_REPORT_SCHEMA_V1: &str = "ziranma-replay-human-report-v1";
 const CAPTURE_HEALTH_PRIVACY_NOTICE: &str = "--health-only prints CAPTURE_HEALTH and CAPTURE_INTEGRITY; both contain behavioral \
      metadata; legacy v1/.zic integrity is unavailable, never zero-filled.";
 
@@ -48,7 +47,7 @@ enum Options {
         inputs: Vec<InputSelector>,
         window_gap_ms: Option<u64>,
         compact: bool,
-        decision: bool,
+        human_report: bool,
         public_context: bool,
         public_character_context: bool,
         personal_cache: bool,
@@ -66,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inputs,
             window_gap_ms,
             compact,
-            decision,
+            human_report,
             public_context,
             public_character_context,
             personal_cache,
@@ -127,15 +126,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let entries = imported.entries;
             let decoder = Decoder::new(entries.clone());
             let mut report = CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
-            let mut decision_health = CaptureHealthReport::default();
-            if decision {
+            let mut report_health = CaptureHealthReport::default();
+            if human_report {
                 visit_private_loaded_inputs(
                     &mut loader,
                     &mut metadata_guard,
                     &inputs,
                     ReplayInputPhase::Evaluation,
                     |loaded| {
-                        decision_health.observe_loaded(loaded);
+                        report_health.observe_loaded(loaded);
                         redact_private_analysis_error(
                             report.observe_capsule(&decoder, &loaded.capsule),
                         )?;
@@ -262,8 +261,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )?;
             }
-            if decision {
-                println!("{}", render_decision_report(&report, &decision_health));
+            if human_report {
+                println!("{}", render_human_report(&report, &report_health));
             } else if compact {
                 println!("{}", report.compact_terminal_report());
             } else {
@@ -282,7 +281,7 @@ fn parse_options(
     let mut inputs = Vec::new();
     let mut window_gap_ms = None;
     let mut compact = false;
-    let mut decision = false;
+    let mut human_report = false;
     let mut public_context = false;
     let mut public_character_context = false;
     let mut personal_cache = false;
@@ -330,11 +329,11 @@ fn parse_options(
                 }
                 compact = true;
             }
-            "--decision" => {
-                if decision {
-                    return Err("--decision can be given only once".into());
+            "--report" | "--decision" => {
+                if human_report {
+                    return Err("human report mode can be selected only once".into());
                 }
-                decision = true;
+                human_report = true;
             }
             "--public-context" => {
                 if public_context {
@@ -377,7 +376,7 @@ fn parse_options(
                     && inputs.is_empty()
                     && window_gap_ms.is_none()
                     && !compact
-                    && !decision
+                    && !human_report
                     && !public_context
                     && !public_character_context
                     && !personal_cache
@@ -409,8 +408,8 @@ fn parse_options(
     if personal_pair_cache && window_gap_ms.is_none() {
         return Err("--personal-pair-cache requires --window-gap-ms".into());
     }
-    if decision && window_gap_ms.is_none() {
-        return Err("--decision requires --window-gap-ms".into());
+    if human_report && window_gap_ms.is_none() {
+        return Err("--report requires --window-gap-ms".into());
     }
     if usize::from(public_context)
         + usize::from(public_character_context)
@@ -452,7 +451,7 @@ fn parse_options(
             "--shape-audit cannot be combined with history, window, or compact options".into(),
         );
     }
-    if decision
+    if human_report
         && (compact
             || !history_inputs.is_empty()
             || public_context
@@ -463,7 +462,7 @@ fn parse_options(
             || health_only)
     {
         return Err(
-            "--decision cannot be combined with compact, history, context, cache, shape, or health options"
+            "--report cannot be combined with compact, history, context, cache, shape, or health options"
                 .into(),
         );
     }
@@ -472,7 +471,7 @@ fn parse_options(
         inputs,
         window_gap_ms,
         compact,
-        decision,
+        human_report,
         public_context,
         public_character_context,
         personal_cache,
@@ -491,8 +490,9 @@ fn print_usage() {
         "Usage (health): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... --health-only"
     );
     eprintln!(
-        "Usage (decision): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         --window-gap-ms <POSITIVE_MS> --decision"
+        "Usage (human report): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         --window-gap-ms <POSITIVE_MS> --report"
     );
+    eprintln!("Legacy alias: --decision is accepted as --report.");
     eprintln!(
         "Usage (replay): cargo run --bin capsule-replay -- \\\n         [--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION> ...] \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... \\\n         [--window-gap-ms <POSITIVE_MS> \\\n          [--public-context|--public-character-context|--personal-cache|\
            --personal-pair-cache]] [--compact]"
@@ -817,18 +817,7 @@ impl CaptureHealthReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StrategyDecision {
-    NoEvidence,
-    NeedMoreData,
-    BaselineBlocked,
-    NoSavings,
-    TopTenDrop,
-    RankCost,
-    ValidateNextSession,
-}
-
-fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthReport) -> String {
+fn render_human_report(report: &CapsuleReplayReport, health: &CaptureHealthReport) -> String {
     let noncanonical_observations = report
         .composition_encodable_commits
         .saturating_sub(report.observed_matches_canonical);
@@ -855,14 +844,11 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
 
     let mut lines = vec![
         format!(
-            "DECISION_REPORT schema={REPLAY_DECISION_REPORT_SCHEMA_V3} \
+            "REPLAY_HUMAN_REPORT schema={HUMAN_REPLAY_REPORT_SCHEMA_V1} \
              contains_text=false contains_behavioral_metadata=true writes=false network=false"
         ),
-        "私人输入决策报告（不显示原文）".to_owned(),
-        format!(
-            "一句话结论：{}",
-            decision_headline(report, health, &strategies)
-        ),
+        "私人输入回放摘要（不显示原文）".to_owned(),
+        "范围：只陈列观察值与反事实比较；不决定输入协议、版本或后续研究安排。".to_owned(),
         format!(
             "样本：{} 份输入，{} 条事件；{} 次提交，{} 次提交后编辑。编辑不自动等于打错。",
             report.capsules, report.events, report.commits, report.revisions
@@ -937,7 +923,7 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
     ];
 
     for (label, strategy, paired) in strategies {
-        lines.push(render_strategy_decision(
+        lines.push(render_strategy_report(
             label,
             report.continuous_window_recorded_logical_key_actions,
             report.continuous_windows,
@@ -945,10 +931,6 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
             paired,
         ));
     }
-    lines.push(format!(
-        "下一步：{}",
-        overall_decision(report, health, &strategies)
-    ));
     lines.push(
         "口径：记录值只涵盖成功配对的限域按键；操作投影只计算“字母键 + 整窗一次选择”，\
          不估算看候选、翻页和掉出 Top-10 后的补救，因此它是乐观下界，不是已经实现的输入速度。"
@@ -957,7 +939,7 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
     lines.join("\n")
 }
 
-fn render_strategy_decision(
+fn render_strategy_report(
     label: &str,
     recorded_actions: u64,
     continuous_windows: u64,
@@ -969,7 +951,7 @@ fn render_strategy_decision(
     format!(
         "- {label}：比较 {} 个窗口，少按 {} 个字母、多按 {} 个字母；\
          Top-1 {}，Top-5 {}，Top-10 {}；相对完整码名次变差 {}，\
-         其中掉出 Top-10 {}、救回 {}；{}。判断：{}",
+         其中掉出 Top-10 {}、救回 {}；{}。",
         paired.comparisons,
         paired.input_keys_saved,
         paired.input_keys_added,
@@ -983,8 +965,7 @@ fn render_strategy_decision(
             recorded_actions,
             strategy.projected_actions_with_one_selection(),
             comparable_actions
-        ),
-        strategy_decision_text(strategy_decision(paired))
+        )
     )
 }
 
@@ -1017,112 +998,6 @@ fn format_percentage(part: u64, total: u64) -> String {
     }
     let tenths = ((part as u128) * 1_000 + (total as u128 / 2)) / total as u128;
     format!("{}.{:01}%", tenths / 10, tenths % 10)
-}
-
-fn strategy_decision(paired: &PairedReplayStrategyStats) -> StrategyDecision {
-    if paired.comparisons == 0 {
-        StrategyDecision::NoEvidence
-    } else if paired.comparisons < REPLAY_DECISION_MIN_WINDOWS {
-        StrategyDecision::NeedMoreData
-    } else if paired.baseline_visible_at_10 < paired.comparisons {
-        StrategyDecision::BaselineBlocked
-    } else if paired.input_keys_saved <= paired.input_keys_added {
-        StrategyDecision::NoSavings
-    } else if paired.dropped_from_top_10 > 0 {
-        StrategyDecision::TopTenDrop
-    } else if paired.rank_worsened > 0 {
-        StrategyDecision::RankCost
-    } else {
-        StrategyDecision::ValidateNextSession
-    }
-}
-
-fn strategy_decision_text(decision: StrategyDecision) -> &'static str {
-    match decision {
-        StrategyDecision::NoEvidence => "还没有可比较样本",
-        StrategyDecision::NeedMoreData => "样本还少，继续自然记录，暂不改变协议",
-        StrategyDecision::BaselineBlocked => "完整码基线本身仍有缺口，先修基线",
-        StrategyDecision::NoSavings => "没有形成净省键，停止把它当通用方案",
-        StrategyDecision::TopTenDrop => "出现 Top-10 掉出，暂不进入 V1",
-        StrategyDecision::RankCost => "虽然省键但候选名次变差，先验证真实选词成本",
-        StrategyDecision::ValidateNextSession => "可冻结为候选，交给下一份独立自然会话验证",
-    }
-}
-
-fn decision_headline(
-    report: &CapsuleReplayReport,
-    health: &CaptureHealthReport,
-    strategies: &[(&str, &ReplayStrategyStats, &PairedReplayStrategyStats)],
-) -> &'static str {
-    if health.integrity_counters.counter_saturated {
-        return "采集计数已经饱和；先修采集层，本轮不调整输入协议。";
-    }
-    if report.continuous_windows == 0 {
-        return "还没有连续窗口；继续自然记录，本轮不调整输入协议。";
-    }
-    if report.continuous_windows < REPLAY_DECISION_MIN_WINDOWS {
-        return "样本还在自然积累；达到 20 个可比较窗口前不调整输入协议。";
-    }
-    if report.window_canonical_full.attempts < report.continuous_windows {
-        return "连续窗口的完整码回放口径尚未齐；先核对排除项。";
-    }
-    if report.window_canonical_full.hits_at_10 < report.window_canonical_full.attempts {
-        return "完整码基线尚未稳定；先改善词典覆盖或排序，暂不研究通用简写。";
-    }
-
-    let decisions = strategies
-        .iter()
-        .map(|(_, _, paired)| strategy_decision(paired))
-        .collect::<Vec<_>>();
-    if decisions.contains(&StrategyDecision::ValidateNextSession) {
-        return "完整码连续输入值得继续；仅把通过安全门的简写候选交给下一会话验证。";
-    }
-    if decisions.contains(&StrategyDecision::TopTenDrop) {
-        if report.window_canonical_full.hits_at_1 < report.window_canonical_full.attempts {
-            return "完整码连续输入值得继续；通用简写暂不采用；下一步改善完整码 Top-1 排序。";
-        }
-        return "完整码连续输入值得继续；通用简写暂不采用；下一步只研究更受限的触发条件。";
-    }
-    if decisions.contains(&StrategyDecision::RankCost) {
-        return "完整码连续输入值得继续；简写的候选名次成本尚未解决。";
-    }
-    "保留完整码连续输入主线；现有简写没有显示出足够净收益。"
-}
-
-fn overall_decision(
-    report: &CapsuleReplayReport,
-    health: &CaptureHealthReport,
-    strategies: &[(&str, &ReplayStrategyStats, &PairedReplayStrategyStats)],
-) -> &'static str {
-    if health.integrity_counters.counter_saturated {
-        return "采集计数已经饱和，先修复采集层，不用这批数字调整解码器。";
-    }
-    if report.continuous_windows == 0 {
-        return "目前没有连续窗口；继续自然记录，不需要特地制造句子。";
-    }
-    if report.continuous_windows < REPLAY_DECISION_MIN_WINDOWS {
-        return "先继续自然记录；累计至少 20 个可比较窗口后再决定，本轮不修改输入协议。";
-    }
-    if report.window_canonical_full.attempts < report.continuous_windows {
-        return "存在超长或无法完整回放的窗口；先核对这些排除项，不把分母差异解释成候选质量。";
-    }
-    if report.window_canonical_full.hits_at_10 < report.window_canonical_full.attempts {
-        return "先改善完整码的词典覆盖或排序；基线稳以前，不用简写成绩掩盖问题。";
-    }
-    let decisions = strategies
-        .iter()
-        .map(|(_, _, paired)| strategy_decision(paired))
-        .collect::<Vec<_>>();
-    if decisions.contains(&StrategyDecision::ValidateNextSession) {
-        return "已有保守简写候选可以冻结；下一份独立自然会话只做验证，不在本轮数据上继续调参。";
-    }
-    if decisions.contains(&StrategyDecision::TopTenDrop) {
-        return "当前简写存在 Top-10 安全损失，暂不并入 V1；下一轮先研究排序或更受限的触发条件。";
-    }
-    if decisions.contains(&StrategyDecision::RankCost) {
-        return "省键已经出现，但候选名次成本没有解决；下一轮先测真实选词动作，不扩大简写范围。";
-    }
-    "现有策略没有显示出足够的净收益；保留完整码主线，停止为得到漂亮数字而放宽协议。"
 }
 
 fn is_navigation_key(key: &RawKey) -> bool {
@@ -1933,10 +1808,10 @@ mod tests {
     use super::{
         CAPTURE_HEALTH_PRIVACY_NOTICE, CaptureHealthReport, InputSelector, MAX_CAPSULE_FILE_BYTES,
         Options, PUBLIC_RIME_LEXICON, PUBLIC_UD_TRAIN, PrivateInputLoader,
-        RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard, StrategyDecision,
-        decision_headline, expand_session_selector, format_percentage, parse_options,
-        read_explicit_capsules, redact_private_analysis_error, render_decision_report,
-        resolve_capsule_input, resolve_protected_input, strategy_decision, visit_private_inputs,
+        RedactedPrivateSelectorError, ReplayInputPhase, SegmentMetadataGuard,
+        expand_session_selector, format_percentage, parse_options, read_explicit_capsules,
+        redact_private_analysis_error, render_human_report, resolve_capsule_input,
+        resolve_protected_input, visit_private_inputs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2339,7 +2214,7 @@ mod tests {
             inputs,
             window_gap_ms,
             compact,
-            decision,
+            human_report,
             public_context,
             public_character_context,
             personal_cache,
@@ -2354,7 +2229,7 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(window_gap_ms, None);
         assert!(!compact);
-        assert!(!decision);
+        assert!(!human_report);
         assert!(!public_context);
         assert!(!public_character_context);
         assert!(!personal_cache);
@@ -2388,7 +2263,25 @@ mod tests {
             .is_err()
         );
 
-        let decision = parse_options(vec![
+        let report = parse_options(vec![
+            "--session".to_owned(),
+            "1234-77".to_owned(),
+            "--window-gap-ms".to_owned(),
+            "15000".to_owned(),
+            "--report".to_owned(),
+        ])
+        .unwrap();
+        let Options::Inputs {
+            human_report,
+            window_gap_ms,
+            ..
+        } = report
+        else {
+            panic!("expected inputs");
+        };
+        assert!(human_report);
+        assert_eq!(window_gap_ms, Some(15_000));
+        let legacy_report = parse_options(vec![
             "--session".to_owned(),
             "1234-77".to_owned(),
             "--window-gap-ms".to_owned(),
@@ -2396,21 +2289,26 @@ mod tests {
             "--decision".to_owned(),
         ])
         .unwrap();
-        let Options::Inputs {
-            decision,
-            window_gap_ms,
-            ..
-        } = decision
-        else {
+        let Options::Inputs { human_report, .. } = legacy_report else {
             panic!("expected inputs");
         };
-        assert!(decision);
-        assert_eq!(window_gap_ms, Some(15_000));
+        assert!(human_report);
         assert!(
             parse_options(vec![
                 "--session".to_owned(),
                 "1234-77".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "15000".to_owned(),
+                "--report".to_owned(),
                 "--decision".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--report".to_owned(),
             ])
             .is_err()
         );
@@ -2420,7 +2318,7 @@ mod tests {
                 "1234-77".to_owned(),
                 "--window-gap-ms".to_owned(),
                 "15000".to_owned(),
-                "--decision".to_owned(),
+                "--report".to_owned(),
                 "--compact".to_owned(),
             ])
             .is_err()
@@ -2729,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_report_is_short_redacted_and_conservative_with_small_samples() {
+    fn human_report_is_redacted_factual_and_contains_no_research_plan() {
         let mut report = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
         report.capsules = 1;
         report.events = 4;
@@ -2782,120 +2680,34 @@ mod tests {
             ..CaptureHealthReport::default()
         };
 
-        let rendered = render_decision_report(&report, &health);
+        let rendered = render_human_report(&report, &health);
 
-        assert_eq!(rendered.lines().count(), 14);
+        assert_eq!(rendered.lines().count(), 13);
         assert!(rendered.starts_with(
-            "DECISION_REPORT schema=ziranma-replay-decision-report-v3 contains_text=false"
+            "REPLAY_HUMAN_REPORT schema=ziranma-replay-human-report-v1 contains_text=false"
         ));
-        assert!(rendered.contains("一句话结论：样本还在自然积累"));
+        assert!(rendered.contains("只陈列观察值与反事实比较"));
         assert!(rendered.contains("实际字母与规范码不同"));
         assert!(rendered.contains("编辑不自动等于打错"));
         assert!(rendered.contains("非拼音或当前码表暂不适用 1"));
         assert!(rendered.contains("合计 1 次，占全部 3 次提交的 33.3%"));
         assert!(rendered.contains("Top-1 1/1（100.0%）"));
-        assert!(rendered.contains("样本还少，继续自然记录，暂不改变协议"));
-        assert!(rendered.contains("至少 20 个可比较窗口后再决定"));
+        assert!(!rendered.contains("一句话结论"));
+        assert!(!rendered.contains("下一步："));
+        assert!(!rendered.contains("判断："));
+        assert!(!rendered.contains("进入 V1"));
+        assert!(!rendered.contains("冻结"));
         assert!(!rendered.contains("猫"));
         assert!(!rendered.contains("mao"));
     }
 
     #[test]
-    fn decision_report_percentages_are_deterministic_and_zero_safe() {
+    fn human_report_percentages_are_deterministic_and_zero_safe() {
         assert_eq!(format_percentage(73, 119), "61.3%");
         assert_eq!(format_percentage(117, 119), "98.3%");
         assert_eq!(format_percentage(119, 119), "100.0%");
         assert_eq!(format_percentage(0, 0), "—");
         assert_eq!(format_percentage(u64::MAX, u64::MAX), "100.0%");
-    }
-
-    #[test]
-    fn decision_headline_prioritizes_full_code_ranking_after_shorthand_drops() {
-        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(15_000)).unwrap();
-        report.continuous_windows = 119;
-        report.window_canonical_full = ReplayStrategyStats {
-            attempts: 119,
-            hits_at_1: 73,
-            hits_at_5: 117,
-            hits_at_10: 119,
-            ..ReplayStrategyStats::default()
-        };
-        let strategy = ReplayStrategyStats {
-            attempts: 119,
-            ..ReplayStrategyStats::default()
-        };
-        let paired = PairedReplayStrategyStats {
-            comparisons: 119,
-            input_keys_saved: 196,
-            baseline_visible_at_10: 119,
-            dropped_from_top_10: 21,
-            rank_worsened: 45,
-            ..PairedReplayStrategyStats::default()
-        };
-        let strategies = [("synthetic", &strategy, &paired)];
-
-        assert_eq!(
-            decision_headline(&report, &CaptureHealthReport::default(), &strategies),
-            "完整码连续输入值得继续；通用简写暂不采用；下一步改善完整码 Top-1 排序。"
-        );
-    }
-
-    #[test]
-    fn decision_gate_requires_enough_safe_net_saving_comparisons() {
-        let insufficient = PairedReplayStrategyStats {
-            comparisons: 19,
-            input_keys_saved: 19,
-            baseline_visible_at_10: 19,
-            ..PairedReplayStrategyStats::default()
-        };
-        assert_eq!(
-            strategy_decision(&insufficient),
-            StrategyDecision::NeedMoreData
-        );
-
-        let baseline_blocked = PairedReplayStrategyStats {
-            comparisons: 20,
-            input_keys_saved: 20,
-            baseline_visible_at_10: 19,
-            ..PairedReplayStrategyStats::default()
-        };
-        assert_eq!(
-            strategy_decision(&baseline_blocked),
-            StrategyDecision::BaselineBlocked
-        );
-
-        let top_ten_drop = PairedReplayStrategyStats {
-            comparisons: 20,
-            input_keys_saved: 20,
-            baseline_visible_at_10: 20,
-            dropped_from_top_10: 1,
-            rank_worsened: 1,
-            ..PairedReplayStrategyStats::default()
-        };
-        assert_eq!(
-            strategy_decision(&top_ten_drop),
-            StrategyDecision::TopTenDrop
-        );
-
-        let rank_cost = PairedReplayStrategyStats {
-            comparisons: 20,
-            input_keys_saved: 20,
-            baseline_visible_at_10: 20,
-            rank_worsened: 1,
-            ..PairedReplayStrategyStats::default()
-        };
-        assert_eq!(strategy_decision(&rank_cost), StrategyDecision::RankCost);
-
-        let safe = PairedReplayStrategyStats {
-            comparisons: 20,
-            input_keys_saved: 20,
-            baseline_visible_at_10: 20,
-            ..PairedReplayStrategyStats::default()
-        };
-        assert_eq!(
-            strategy_decision(&safe),
-            StrategyDecision::ValidateNextSession
-        );
     }
 
     #[test]
