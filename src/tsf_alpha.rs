@@ -23,11 +23,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
-    ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
-    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor_Impl,
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, TF_AE_NONE, TF_ANCHOR_END,
-    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION,
-    TF_SELECTION, TF_SELECTIONSTYLE,
+    ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfSource, ITfTextInputProcessor_Impl,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
+    ITfThreadMgrEventSink_Impl, TF_AE_NONE, TF_ANCHOR_END, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+    TF_ES_ASYNC, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION, TF_SELECTION,
+    TF_SELECTIONSTYLE,
 };
 use windows::core::{
     Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -257,6 +258,7 @@ struct ActiveDocumentComposition {
 #[derive(Default)]
 struct DocumentCompositionState {
     active: Option<ActiveDocumentComposition>,
+    cleanup_scheduled: bool,
 }
 
 impl DocumentCompositionState {
@@ -267,11 +269,32 @@ impl DocumentCompositionState {
         let Some(active) = self.active.as_ref() else {
             return Ok(None);
         };
-        if !same_com_identity(&active.context, context)? {
+        if active.context.as_raw() != context.as_raw() {
             return Err(lifecycle_error(E_UNEXPECTED));
         }
         Ok(Some(active.clone()))
     }
+}
+
+fn move_selection_after_range(context: &ITfContext, range: &ITfRange, ec: u32) -> Result<()> {
+    let caret = range.clone();
+    // SAFETY: this clone is an independent range owned by the context;
+    // collapsing it does not mutate document text.
+    unsafe { caret.Collapse(ec, TF_ANCHOR_END) }?;
+    let mut selection = TF_SELECTION {
+        range: std::mem::ManuallyDrop::new(Some(caret)),
+        style: TF_SELECTIONSTYLE {
+            ase: TF_AE_NONE,
+            fInterimChar: false.into(),
+        },
+    };
+    // SAFETY: the selection range belongs to this context and remains alive
+    // through the call. TSF copies the selection synchronously.
+    let result = unsafe { context.SetSelection(ec, std::slice::from_ref(&selection)) };
+    // SAFETY: TF_SELECTION is an ABI struct whose interface field is
+    // ManuallyDrop; release our cloned range exactly once after the call.
+    unsafe { std::mem::ManuallyDrop::drop(&mut selection.range) };
+    result
 }
 
 /// Receives host-driven termination without keeping the service state alive.
@@ -303,7 +326,7 @@ impl Drop for TsfCompositionSink {
 impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
     fn OnCompositionTerminated(
         &self,
-        _ecwrite: u32,
+        ecwrite: u32,
         composition: Ref<ITfComposition>,
     ) -> Result<()> {
         let Some(composition) = composition.cloned() else {
@@ -321,17 +344,37 @@ impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
             .map(|active| same_com_identity(&active.composition, &composition))
             .transpose()?
             .unwrap_or(false);
-        if terminated_active {
-            state.active = None;
-        }
+        let active = if terminated_active {
+            state.cleanup_scheduled = false;
+            state.active.take()
+        } else {
+            None
+        };
         drop(state);
-        if terminated_active && let Some(logical_composition) = self.logical_composition.upgrade() {
+        let Some(active) = active else {
+            return Ok(());
+        };
+        // The context owner terminated uncommitted preedit. Use the supplied
+        // write cookie to erase it instead of leaving raw phonetic text behind.
+        // SAFETY: OnCompositionTerminated supplies write access for this range.
+        let text_result = unsafe { active.range.SetText(ecwrite, 0, &[]) };
+        let selection_result = if text_result.is_ok() {
+            move_selection_after_range(&active.context, &active.range, ecwrite)
+        } else {
+            Ok(())
+        };
+        let logical_result = if let Some(logical_composition) = self.logical_composition.upgrade() {
             logical_composition
                 .try_borrow_mut()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?
                 .finish_commit();
-        }
-        Ok(())
+            Ok(())
+        } else {
+            Ok(())
+        };
+        text_result?;
+        selection_result?;
+        logical_result
     }
 }
 
@@ -343,6 +386,8 @@ struct TsfDocumentEditSession {
     document_composition: Rc<RefCell<DocumentCompositionState>>,
     logical_composition: Rc<RefCell<CompositionSession>>,
     telemetry: Arc<Mutex<EditSessionTelemetry>>,
+    mode: EditSessionMode,
+    cleanup_target: Option<ITfComposition>,
 }
 
 impl TsfDocumentEditSession {
@@ -352,6 +397,8 @@ impl TsfDocumentEditSession {
         document_composition: Rc<RefCell<DocumentCompositionState>>,
         logical_composition: Rc<RefCell<CompositionSession>>,
         telemetry: Arc<Mutex<EditSessionTelemetry>>,
+        mode: EditSessionMode,
+        cleanup_target: Option<ITfComposition>,
     ) -> Self {
         object_created();
         Self {
@@ -360,6 +407,8 @@ impl TsfDocumentEditSession {
             document_composition,
             logical_composition,
             telemetry,
+            mode,
+            cleanup_target,
         }
     }
 
@@ -368,6 +417,16 @@ impl TsfDocumentEditSession {
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .active_for_context(&self.context)
+    }
+
+    fn cleanup_target_is_current(&self) -> Result<bool> {
+        let Some(target) = self.cleanup_target.as_ref() else {
+            return Ok(false);
+        };
+        self.active_composition()?
+            .map(|active| same_com_identity(&active.composition, target))
+            .transpose()
+            .map(|matches| matches.unwrap_or(false))
     }
 
     fn start_composition(&self, ec: u32, text: &str) -> Result<()> {
@@ -412,6 +471,7 @@ impl TsfDocumentEditSession {
             composition,
             range,
         });
+        state.cleanup_scheduled = false;
         Ok(())
     }
 
@@ -434,6 +494,7 @@ impl TsfDocumentEditSession {
                 .try_borrow_mut()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
             state.active_for_context(&self.context)?;
+            state.cleanup_scheduled = false;
             state
                 .active
                 .take()
@@ -446,7 +507,7 @@ impl TsfDocumentEditSession {
             self.restore_active(active)?;
             return Err(error);
         }
-        if let Err(error) = self.move_selection_after(&active, ec) {
+        if let Err(error) = move_selection_after_range(&self.context, &active.range, ec) {
             self.restore_active(active)?;
             return Err(error);
         }
@@ -458,30 +519,6 @@ impl TsfDocumentEditSession {
         Ok(())
     }
 
-    fn move_selection_after(&self, active: &ActiveDocumentComposition, ec: u32) -> Result<()> {
-        let caret = active.range.clone();
-        // SAFETY: this clone is an independent range owned by the active
-        // context; collapsing it does not mutate document text.
-        unsafe { caret.Collapse(ec, TF_ANCHOR_END) }?;
-        let mut selection = TF_SELECTION {
-            range: std::mem::ManuallyDrop::new(Some(caret)),
-            style: TF_SELECTIONSTYLE {
-                ase: TF_AE_NONE,
-                fInterimChar: false.into(),
-            },
-        };
-        // SAFETY: the selection range belongs to this context and remains
-        // alive through the call. TSF copies the selection synchronously.
-        let result = unsafe {
-            self.context
-                .SetSelection(ec, std::slice::from_ref(&selection))
-        };
-        // SAFETY: TF_SELECTION is an ABI struct whose interface field is
-        // ManuallyDrop; release our cloned range exactly once after the call.
-        unsafe { std::mem::ManuallyDrop::drop(&mut selection.range) };
-        result
-    }
-
     fn restore_active(&self, active: ActiveDocumentComposition) -> Result<()> {
         let mut state = self
             .document_composition
@@ -491,6 +528,7 @@ impl TsfDocumentEditSession {
             return Err(lifecycle_error(E_UNEXPECTED));
         }
         state.active = Some(active);
+        state.cleanup_scheduled = false;
         Ok(())
     }
 }
@@ -503,13 +541,26 @@ impl Drop for TsfDocumentEditSession {
 
 impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let mut cleanup_applied = false;
         match &self.action {
             PendingDocumentEdit::UpdatePreedit(text) => match self.active_composition()? {
                 Some(active) => self.update_composition(ec, &active, text)?,
                 None => self.start_composition(ec, text)?,
             },
+            PendingDocumentEdit::Cancel if self.mode == EditSessionMode::CleanupAsync => {
+                if self.cleanup_target_is_current()? {
+                    self.finish_composition(ec, "")?;
+                    cleanup_applied = true;
+                }
+            }
             PendingDocumentEdit::Cancel => self.finish_composition(ec, "")?,
             PendingDocumentEdit::Commit(text) => self.finish_composition(ec, text)?,
+        }
+        if cleanup_applied {
+            self.logical_composition
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+                .finish_commit();
         }
         let mut telemetry = self
             .telemetry
@@ -521,34 +572,18 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
     }
 }
 
-fn request_document_edit_session(
-    context: &ITfContext,
-    client_id: u32,
-    action: PendingDocumentEdit,
-    document_composition: Rc<RefCell<DocumentCompositionState>>,
-    logical_composition: Rc<RefCell<CompositionSession>>,
-    telemetry: Arc<Mutex<EditSessionTelemetry>>,
-) -> Result<()> {
-    let edit_session: ITfEditSession = TsfDocumentEditSession::counted(
-        context.clone(),
-        action,
-        document_composition,
-        logical_composition,
-        telemetry,
-    )
-    .into();
-    let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
-    // SAFETY: keystroke callbacks are one of the documented situations where
-    // a synchronous read/write edit session can be requested. Both COM
-    // interfaces remain owned for the duration of this call.
-    let session_result = unsafe { context.RequestEditSession(client_id, &edit_session, flags) }?;
-    session_result.ok()
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EditSessionMode {
+    KeySynchronous,
+    CleanupAsync,
 }
 
 #[derive(Default)]
 struct ActivationState {
     thread_manager: Option<ITfThreadMgr>,
     keystroke_manager: Option<ITfKeystrokeMgr>,
+    thread_source: Option<ITfSource>,
+    thread_event_cookie: Option<u32>,
     client_id: u32,
     flags: u32,
     activating: bool,
@@ -561,7 +596,7 @@ enum KeyAdviceMode {
     DisabledForProcessTest,
 }
 
-#[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
+#[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
 struct TsfTextService {
     activation: Mutex<ActivationState>,
     composition: Rc<RefCell<CompositionSession>>,
@@ -612,6 +647,126 @@ impl TsfTextService_Impl {
         }
     }
 
+    fn request_document_edit_session(
+        &self,
+        context: &ITfContext,
+        client_id: u32,
+        action: PendingDocumentEdit,
+        mode: EditSessionMode,
+        cleanup_target: Option<ITfComposition>,
+    ) -> Result<()> {
+        let edit_session: ITfEditSession = TsfDocumentEditSession::counted(
+            context.clone(),
+            action,
+            Rc::clone(&self.document_composition),
+            Rc::clone(&self.composition),
+            Arc::clone(&self.edit_telemetry),
+            mode,
+            cleanup_target,
+        )
+        .into();
+        let scheduling = match mode {
+            EditSessionMode::KeySynchronous => TF_ES_SYNC,
+            EditSessionMode::CleanupAsync => TF_ES_ASYNC,
+        };
+        let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(scheduling.0 | TF_ES_READWRITE.0);
+        // SAFETY: keystroke callbacks use the documented synchronous mode.
+        // Focus cleanup is always queued so it cannot re-enter while TSF is
+        // changing focus. TSF owns the edit-session reference after accepting
+        // that work.
+        let session_result =
+            unsafe { context.RequestEditSession(client_id, &edit_session, flags) }?;
+        session_result.ok()
+    }
+
+    fn active_client_id(&self) -> Result<Option<u32>> {
+        let activation = self
+            .activation
+            .lock()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        Ok(activation
+            .thread_manager
+            .as_ref()
+            .map(|_| activation.client_id))
+    }
+
+    fn active_document_has_focus(&self, focused: Ref<ITfDocumentMgr>) -> Result<bool> {
+        let active_context = self
+            .document_composition
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .active
+            .as_ref()
+            .map(|active| active.context.clone());
+        let Some(active_context) = active_context else {
+            return Ok(true);
+        };
+        let Some(focused) = focused.cloned() else {
+            return Ok(false);
+        };
+        // SAFETY: the active context remains connected to its document while
+        // its composition is tracked.
+        let active_document = unsafe { active_context.GetDocumentMgr() }?;
+        Ok(active_document.as_raw() == focused.as_raw())
+    }
+
+    fn schedule_active_composition_cleanup(&self, client_id: u32) -> Result<()> {
+        let (context, cleanup_target) = {
+            let mut state = self
+                .document_composition
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            if state.cleanup_scheduled {
+                return Ok(());
+            }
+            let Some((context, composition)) = state
+                .active
+                .as_ref()
+                .map(|active| (active.context.clone(), active.composition.clone()))
+            else {
+                return Ok(());
+            };
+            state.cleanup_scheduled = true;
+            (context, composition)
+        };
+
+        let request = self.request_document_edit_session(
+            &context,
+            client_id,
+            PendingDocumentEdit::Cancel,
+            EditSessionMode::CleanupAsync,
+            Some(cleanup_target),
+        );
+        if let Err(error) = request {
+            let mut state = self
+                .document_composition
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.context.as_raw() == context.as_raw())
+            {
+                state.cleanup_scheduled = false;
+            }
+            return Err(error);
+        }
+
+        // An asynchronous cleanup may run after this callback returns. Stop
+        // treating the old phonetic buffer as active as soon as TSF accepts it.
+        if let Ok(mut composition) = self.composition.try_borrow_mut() {
+            composition.finish_commit();
+        }
+        Ok(())
+    }
+
+    fn cleanup_after_focus_loss(&self) -> Result<()> {
+        if let Some(client_id) = self.active_client_id()? {
+            self.schedule_active_composition_cleanup(client_id)?;
+        }
+        Ok(())
+    }
+
     fn activate_inner(
         &self,
         thread_manager: Ref<ITfThreadMgr>,
@@ -632,21 +787,40 @@ impl TsfTextService_Impl {
             activation.activating = true;
         }
 
-        let setup = (|| match self.key_advice_mode {
-            KeyAdviceMode::Foreground => {
-                let keystroke_manager: ITfKeystrokeMgr = thread_manager.cast()?;
-                let sink = self.to_interface::<ITfKeyEventSink>();
-                // SAFETY: a real TSF activation supplies a text-service client
-                // id and owns `sink` until the matching Unadvise call.
-                unsafe { keystroke_manager.AdviseKeyEventSink(client_id, &sink, true) }?;
-                Ok(Some(keystroke_manager))
-            }
-            #[cfg(test)]
-            KeyAdviceMode::DisabledForProcessTest => Ok(None),
+        let setup = (|| {
+            let thread_source: ITfSource = thread_manager.cast()?;
+            let event_sink = self.to_interface::<ITfThreadMgrEventSink>();
+            // SAFETY: the thread manager source owns the event-sink reference
+            // until the matching UnadviseSink call.
+            let thread_event_cookie =
+                unsafe { thread_source.AdviseSink(&ITfThreadMgrEventSink::IID, &event_sink) }?;
+            let key_setup: Result<Option<ITfKeystrokeMgr>> = (|| {
+                match self.key_advice_mode {
+                    KeyAdviceMode::Foreground => {
+                        let manager: ITfKeystrokeMgr = thread_manager.cast()?;
+                        let sink = self.to_interface::<ITfKeyEventSink>();
+                        // SAFETY: a real TSF activation supplies a text-service
+                        // client id and owns `sink` until matching Unadvise.
+                        unsafe { manager.AdviseKeyEventSink(client_id, &sink, true) }?;
+                        Ok(Some(manager))
+                    }
+                    #[cfg(test)]
+                    KeyAdviceMode::DisabledForProcessTest => Ok(None),
+                }
+            })();
+            let keystroke_manager = match key_setup {
+                Ok(manager) => manager,
+                Err(error) => {
+                    // SAFETY: rolls back the successful thread-event advice.
+                    let _ = unsafe { thread_source.UnadviseSink(thread_event_cookie) };
+                    return Err(error);
+                }
+            };
+            Ok((keystroke_manager, thread_source, thread_event_cookie))
         })();
 
-        let keystroke_manager = match setup {
-            Ok(manager) => manager,
+        let (keystroke_manager, thread_source, thread_event_cookie) = match setup {
+            Ok(state) => state,
             Err(error) => {
                 if let Ok(mut activation) = self.activation.lock() {
                     activation.activating = false;
@@ -662,11 +836,15 @@ impl TsfTextService_Impl {
                 if let Some(keystroke_manager) = &keystroke_manager {
                     let _ = unsafe { keystroke_manager.UnadviseKeyEventSink(client_id) };
                 }
+                // SAFETY: balances the successful AdviseSink above.
+                let _ = unsafe { thread_source.UnadviseSink(thread_event_cookie) };
                 return Err(lifecycle_error(E_UNEXPECTED));
             }
         };
         activation.thread_manager = Some(thread_manager);
         activation.keystroke_manager = keystroke_manager;
+        activation.thread_source = Some(thread_source);
+        activation.thread_event_cookie = Some(thread_event_cookie);
         activation.client_id = client_id;
         activation.flags = flags;
         activation.activating = false;
@@ -683,6 +861,14 @@ impl TsfTextService_Impl {
         let Some(input) = decode_virtual_key(vkey, modifiers) else {
             return Ok(None);
         };
+        if self
+            .document_composition
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .cleanup_scheduled
+        {
+            return Ok(None);
+        }
         let session = self
             .composition
             .try_borrow()
@@ -714,13 +900,12 @@ impl TsfTextService_Impl {
             activation.client_id
         };
 
-        request_document_edit_session(
+        self.request_document_edit_session(
             &context,
             client_id,
             plan.edit,
-            Rc::clone(&self.document_composition),
-            Rc::clone(&self.composition),
-            Arc::clone(&self.edit_telemetry),
+            EditSessionMode::KeySynchronous,
+            None,
         )?;
 
         let mut composition = self
@@ -748,6 +933,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
             std::mem::take(&mut *activation)
         };
+        let cleanup_result = self.schedule_active_composition_cleanup(previous.client_id);
         let composition_result = match self.composition.try_borrow_mut() {
             Ok(mut composition) => {
                 composition.finish_commit();
@@ -755,13 +941,23 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             }
             Err(_) => Err(lifecycle_error(E_UNEXPECTED)),
         };
-        let unadvise_result = if let Some(keystroke_manager) = previous.keystroke_manager {
+        let key_unadvise_result = if let Some(keystroke_manager) = previous.keystroke_manager {
             // SAFETY: balances the successful advice owned by `previous`.
             unsafe { keystroke_manager.UnadviseKeyEventSink(previous.client_id) }
         } else {
             Ok(())
         };
-        unadvise_result?;
+        let thread_unadvise_result = match (previous.thread_source, previous.thread_event_cookie) {
+            (Some(source), Some(cookie)) => {
+                // SAFETY: balances the successful thread-event advice.
+                unsafe { source.UnadviseSink(cookie) }
+            }
+            (None, None) => Ok(()),
+            _ => Err(lifecycle_error(E_UNEXPECTED)),
+        };
+        cleanup_result?;
+        key_unadvise_result?;
+        thread_unadvise_result?;
         composition_result
     }
 }
@@ -773,7 +969,10 @@ impl ITfTextInputProcessorEx_Impl for TsfTextService_Impl {
 }
 
 impl ITfKeyEventSink_Impl for TsfTextService_Impl {
-    fn OnSetFocus(&self, _fforeground: windows::core::BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: windows::core::BOOL) -> Result<()> {
+        if !fforeground.as_bool() {
+            self.cleanup_after_focus_loss()?;
+        }
         Ok(())
     }
 
@@ -831,6 +1030,35 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
         _rguid: *const GUID,
     ) -> Result<windows::core::BOOL> {
         Ok(false.into())
+    }
+}
+
+impl ITfThreadMgrEventSink_Impl for TsfTextService_Impl {
+    fn OnInitDocumentMgr(&self, _document: Ref<ITfDocumentMgr>) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnUninitDocumentMgr(&self, _document: Ref<ITfDocumentMgr>) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnSetFocus(
+        &self,
+        focused: Ref<ITfDocumentMgr>,
+        _previous: Ref<ITfDocumentMgr>,
+    ) -> Result<()> {
+        if !self.active_document_has_focus(focused)? {
+            self.cleanup_after_focus_loss()?;
+        }
+        Ok(())
+    }
+
+    fn OnPushContext(&self, _context: Ref<ITfContext>) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1109,6 +1337,7 @@ mod tests {
         )));
         let service: ITfTextInputProcessorEx = service_object.to_interface();
         let key_sink: ITfKeyEventSink = service_object.to_interface();
+        let thread_event_sink: ITfThreadMgrEventSink = service_object.to_interface();
 
         // SAFETY: COM is initialized on this test thread.
         let thread_manager: ITfThreadMgr = unsafe {
@@ -1151,6 +1380,8 @@ mod tests {
         let space = WPARAM(usize::from(VK_SPACE.0));
         let b = WPARAM(usize::from(VK_A.0 + 1));
         let c = WPARAM(usize::from(VK_A.0 + 2));
+        let d = WPARAM(usize::from(VK_A.0 + 3));
+        let e = WPARAM(usize::from(VK_A.0 + 4));
         let escape = WPARAM(usize::from(VK_ESCAPE.0));
         let lparam = LPARAM(0);
 
@@ -1269,6 +1500,60 @@ mod tests {
                 .as_bool()
         );
         assert_eq!(read_context_text(&context, client_id), "啊c");
+        let second_document =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("second document creation");
+        let mut second_context = None;
+        let mut second_text_store_cookie = 0;
+        // SAFETY: output pointers remain valid and this is another synthetic
+        // context owned by the same apartment thread.
+        unsafe {
+            second_document.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut second_context,
+                &mut second_text_store_cookie,
+            )
+        }
+        .expect("second context creation");
+        let second_context = second_context.expect("second context should be returned");
+        // SAFETY: both documents and contexts belong to this apartment.
+        unsafe { second_document.Push(&second_context) }.expect("second context push");
+        unsafe { thread_manager.SetFocus(&second_document) }.expect("second document focus");
+        unsafe { thread_event_sink.OnSetFocus(&second_document, &document_manager) }
+            .expect("document focus cleanup notification");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .cleanup_scheduled
+        );
+        assert!(service_object.composition.borrow().phonetic().is_empty());
+        terminate_composition_from_host(&context);
+        assert_eq!(read_context_text(&context, client_id), "啊");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
+        );
+        // SAFETY: restore the original focus before the next direct key call.
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("original document focus");
+
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, c, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(read_context_text(&context, client_id), "啊c");
         assert!(
             service_object
                 .document_composition
@@ -1277,7 +1562,7 @@ mod tests {
                 .is_some()
         );
         terminate_composition_from_host(&context);
-        assert_eq!(read_context_text(&context, client_id), "啊c");
+        assert_eq!(read_context_text(&context, client_id), "啊");
         assert!(service_object.composition.borrow().phonetic().is_empty());
         assert!(
             service_object
@@ -1292,12 +1577,84 @@ mod tests {
                 .as_bool()
         );
 
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, d, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(read_context_text(&context, client_id), "啊d");
+        // SAFETY: directly exercises the advised key sink's foreground-loss
+        // callback with no system registration.
+        unsafe { key_sink.OnSetFocus(false) }.expect("foreground loss cleanup");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .cleanup_scheduled
+        );
+        terminate_composition_from_host(&context);
+        assert_eq!(read_context_text(&context, client_id), "啊");
+        assert!(service_object.composition.borrow().phonetic().is_empty());
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
+        );
+        // SAFETY: models the service becoming foreground again.
+        unsafe { key_sink.OnSetFocus(true) }.expect("foreground restore");
+
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, e, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(read_context_text(&context, client_id), "啊e");
+        // SAFETY: deactivation schedules the same bounded cancellation before
+        // releasing both event subscriptions.
+        unsafe { service.Deactivate() }.expect("active composition deactivation");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .cleanup_scheduled
+        );
+        terminate_composition_from_host(&context);
+        assert_eq!(read_context_text(&context, client_id), "啊");
+        assert!(service_object.composition.borrow().phonetic().is_empty());
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
+        );
+
         // SAFETY: cleanup is the exact reverse of the setup above.
+        unsafe { second_document.Pop(TF_POPF_ALL) }.expect("second context pop");
         unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
-        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { service.Deactivate() }.expect("repeated service deactivation");
         unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(thread_event_sink);
         drop(key_sink);
         drop(service);
+        drop(second_context);
+        drop(second_document);
         drop(context);
         drop(document_manager);
         drop(thread_manager);
