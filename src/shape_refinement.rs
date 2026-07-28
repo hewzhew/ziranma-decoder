@@ -204,6 +204,11 @@ impl CharacterShapeIndex {
         self.shapes.contains_key(&character)
     }
 
+    /// Returns the complete audited record for one character, if present.
+    pub fn get(&self, character: char) -> Option<&CharacterShape> {
+        self.shapes.get(&character)
+    }
+
     /// Refines an existing candidate pool without changing its order or score.
     ///
     /// The unmarked suffix is interpreted against both stroke and component

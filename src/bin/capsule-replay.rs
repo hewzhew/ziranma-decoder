@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 
 use ziranma_decoder::{
     BigramLanguageModel, CAPTURE_INTEGRITY_SCHEMA_V1, CapsuleReplayReport, CaptureIntegrityV1,
-    CaptureSessionKind, CharacterBigramLanguageModel, ContinuousSegmentMetadata, Decoder,
-    DeltaPositionEvidence, EventCapsuleV1, PersonalCacheReplayState, RawKey, SegmentCloseReason,
-    TrackerOutput, parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    CaptureSessionKind, CharacterBigramLanguageModel, CharacterShapeIndex,
+    ContinuousSegmentMetadata, Decoder, DeltaPositionEvidence, EventCapsuleV1,
+    PHRASE_TRIM_MAX_GAP_MS, PersonalCacheReplayState, PrivateShapeActionComparisonStats,
+    PrivateShapeReplayAudit, RawKey, SegmentCloseReason, TrackerOutput, parse_rime_lexicon,
+    parse_stroke_sequence_tsv, parse_ud_conllu, select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
 use ziranma_decoder::{
@@ -19,6 +21,8 @@ use ziranma_decoder::{
 
 const PUBLIC_RIME_LEXICON: &str =
     include_str!("../../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+const PUBLIC_STROKE_DATA: &str =
+    include_str!("../../data/public/conway-stroke-data/sequence-characters.txt");
 const PUBLIC_UD_TRAIN: &str =
     include_str!("../../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu");
 const MAX_CAPSULE_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -45,6 +49,7 @@ enum Options {
         public_character_context: bool,
         personal_cache: bool,
         personal_pair_cache: bool,
+        shape_audit: bool,
         health_only: bool,
     },
 }
@@ -61,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             public_character_context,
             personal_cache,
             personal_pair_cache,
+            shape_audit,
             health_only,
         } => {
             let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -92,6 +98,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
                 println!("{}", health.terminal_line());
                 println!("{}", health.integrity_terminal_line());
+                return Ok(());
+            }
+            if shape_audit {
+                let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+                let stroke_import = parse_stroke_sequence_tsv(PUBLIC_STROKE_DATA)?;
+                let shapes = CharacterShapeIndex::new(stroke_import.into_shapes())?;
+                let mut audit = PrivateShapeReplayAudit::new(&imported.entries, &shapes);
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |capsule| {
+                        audit.observe_capsule(capsule);
+                        Ok(())
+                    },
+                )?;
+                print_private_shape_report(audit.report());
                 return Ok(());
             }
             let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
@@ -240,6 +264,7 @@ fn parse_options(
     let mut public_character_context = false;
     let mut personal_cache = false;
     let mut personal_pair_cache = false;
+    let mut shape_audit = false;
     let mut health_only = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -306,6 +331,12 @@ fn parse_options(
                 }
                 personal_pair_cache = true;
             }
+            "--shape-audit" => {
+                if shape_audit {
+                    return Err("--shape-audit can be given only once".into());
+                }
+                shape_audit = true;
+            }
             "--health-only" => {
                 if health_only {
                     return Err("--health-only can be given only once".into());
@@ -321,6 +352,7 @@ fn parse_options(
                     && !public_character_context
                     && !personal_cache
                     && !personal_pair_cache
+                    && !shape_audit
                     && !health_only
                     && arguments.next().is_none() =>
             {
@@ -351,11 +383,12 @@ fn parse_options(
         + usize::from(public_character_context)
         + usize::from(personal_cache)
         + usize::from(personal_pair_cache)
+        + usize::from(shape_audit)
         > 1
     {
         return Err(
-            "--public-context, --public-character-context, --personal-cache, and \
-             --personal-pair-cache are mutually exclusive"
+            "--public-context, --public-character-context, --personal-cache, \
+             --personal-pair-cache, and --shape-audit are mutually exclusive"
                 .into(),
         );
     }
@@ -373,11 +406,17 @@ fn parse_options(
             || public_context
             || public_character_context
             || personal_cache
-            || personal_pair_cache)
+            || personal_pair_cache
+            || shape_audit)
     {
         return Err(
             "--health-only cannot be combined with history, decoding, cache, or compact options"
                 .into(),
+        );
+    }
+    if shape_audit && (!history_inputs.is_empty() || window_gap_ms.is_some() || compact) {
+        return Err(
+            "--shape-audit cannot be combined with history, window, or compact options".into(),
         );
     }
     Ok(Options::Inputs {
@@ -389,11 +428,16 @@ fn parse_options(
         public_character_context,
         personal_cache,
         personal_pair_cache,
+        shape_audit,
         health_only,
     })
 }
 
 fn print_usage() {
+    eprintln!(
+        "Usage (shape): cargo run --bin capsule-replay -- \
+         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... --shape-audit"
+    );
     eprintln!(
         "Usage (health): cargo run --bin capsule-replay -- \\\n         <--input <FILE.zic|FILE.zcs>|--session <SESSION>> ... --health-only"
     );
@@ -414,6 +458,93 @@ fn print_usage() {
          --personal-pair-cache."
     );
     eprintln!("{CAPTURE_HEALTH_PRIVACY_NOTICE}");
+}
+
+fn print_private_shape_report(report: &ziranma_decoder::PrivateShapeReplayReport) {
+    println!(
+        "PRIVATE_SHAPE_REPLAY contains_text=false capsules={} events={} commits={} revisions={} keys_complete_commits={} candidate_order=public_rime_weight_proxy",
+        report.capsules,
+        report.events,
+        report.commits,
+        report.revisions,
+        report.keys_complete_commits
+    );
+    println!(
+        "INPUT_SIGNALS digit_selection_commits={} space_selection_commits={} vertical_navigation_commits={} internal_edit_commits={}",
+        report.commits_with_digit_selection_signal,
+        report.commits_with_space_selection_signal,
+        report.commits_with_vertical_navigation_signal,
+        report.commits_with_internal_edit_keys
+    );
+    println!(
+        "SINGLE_CHARACTER inserted={} phonetic_aligned={} noncanonical_observations={} public_ranked={} public_top_10={} public_beyond_top_10={} hard_with_stroke_data={} hard_noncanonical_observations={}",
+        report.single_character_insert_commits,
+        report.single_character_phonetic_commits,
+        report.single_character_noncanonical_observations,
+        report.single_character_public_ranked_commits,
+        report.single_character_public_top_10_commits,
+        report.single_character_public_beyond_top_10_commits,
+        report.single_character_hard_with_stroke_data,
+        report.single_character_hard_noncanonical_observations
+    );
+    for prefix_index in 0..report.single_character_hard_visible_with_any_sequence.len() {
+        println!(
+            "SHAPE_VISIBILITY scope=single prefix_keys={} any_sequence={} all_sequences={}",
+            prefix_index + 1,
+            report.single_character_hard_visible_with_any_sequence[prefix_index],
+            report.single_character_hard_visible_with_all_sequences[prefix_index]
+        );
+    }
+    print_action_comparison(
+        "single_best_sequence",
+        report.single_character_best_action_comparison,
+    );
+    print_action_comparison(
+        "single_all_sequences",
+        report.single_character_robust_action_comparison,
+    );
+    println!(
+        "PHRASE_TRIM max_gap_ms={} candidates={} completed={} phonetic_aligned={} noncanonical_observations={} public_ranked={} public_beyond_top_10={} hard_with_stroke_data={}",
+        PHRASE_TRIM_MAX_GAP_MS,
+        report.phrase_trim_candidates,
+        report.phrase_trim_completed,
+        report.phrase_trim_phonetic_aligned,
+        report.phrase_trim_noncanonical_observations,
+        report.phrase_trim_public_ranked,
+        report.phrase_trim_public_beyond_top_10,
+        report.phrase_trim_hard_with_stroke_data
+    );
+    for prefix_index in 0..report.phrase_trim_hard_visible_with_any_sequence.len() {
+        println!(
+            "SHAPE_VISIBILITY scope=phrase_trim prefix_keys={} any_sequence={} all_sequences={}",
+            prefix_index + 1,
+            report.phrase_trim_hard_visible_with_any_sequence[prefix_index],
+            report.phrase_trim_hard_visible_with_all_sequences[prefix_index]
+        );
+    }
+    print_action_comparison(
+        "phrase_trim_best_sequence",
+        report.phrase_trim_best_action_comparison,
+    );
+    print_action_comparison(
+        "phrase_trim_all_sequences",
+        report.phrase_trim_robust_action_comparison,
+    );
+    println!(
+        "LIMITATIONS contains_text=false recorded_actions_are_lower_bounds=true raw_keys_exclude_tab_page_enter=true candidate_order_is_not_installed_ime=true phrase_trim_is_intent_agnostic=true cross_capsule_trim_counted=false writes=false network=false"
+    );
+}
+
+fn print_action_comparison(name: &str, stats: PrivateShapeActionComparisonStats) {
+    println!(
+        "ACTION_COMPARISON scope={name} cases={} recorded_action_lower_bound={} projected_shape_actions={} projected_fewer={} projected_equal={} projected_more={}",
+        stats.cases,
+        stats.recorded_action_lower_bound,
+        stats.projected_shape_actions,
+        stats.projected_fewer,
+        stats.projected_equal,
+        stats.projected_more
+    );
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1851,6 +1982,7 @@ mod tests {
             public_character_context,
             personal_cache,
             personal_pair_cache,
+            shape_audit,
             health_only,
         } = options
         else {
@@ -1864,6 +1996,7 @@ mod tests {
         assert!(!public_character_context);
         assert!(!personal_cache);
         assert!(!personal_pair_cache);
+        assert!(!shape_audit);
         assert!(!health_only);
 
         let by_session = parse_options(vec!["--session".to_owned(), "1234-77".to_owned()]).unwrap();
@@ -1888,6 +2021,37 @@ mod tests {
                 "1234-77".to_owned(),
                 "--health-only".to_owned(),
                 "--compact".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let shape = parse_options(vec![
+            "--session".to_owned(),
+            "1234-77".to_owned(),
+            "--shape-audit".to_owned(),
+        ])
+        .unwrap();
+        let Options::Inputs { shape_audit, .. } = shape else {
+            panic!("expected inputs");
+        };
+        assert!(shape_audit);
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--shape-audit".to_owned(),
+                "--compact".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--session".to_owned(),
+                "1234-77".to_owned(),
+                "--shape-audit".to_owned(),
+                "--public-context".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "5000".to_owned(),
             ])
             .is_err()
         );

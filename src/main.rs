@@ -1,26 +1,33 @@
 use std::env;
 use std::error::Error;
+use std::io::{self, IsTerminal, Write as _};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use ziranma_decoder::{
-    BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel, Decoder,
-    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport, analyze_candidate_lab,
-    audit_abbreviation_codebook, audit_anchored_tail_failures, audit_continuous_composition,
-    audit_public_protocol_context, audit_public_protocols, encode_pinyin_phrase,
+    BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel,
+    CharacterShapeIndex, Decoder, ProtocolContextLaneReport, ProtocolIndexStats,
+    ProtocolStrategyReport, ShapeLab, analyze_candidate_lab, audit_abbreviation_codebook,
+    audit_anchored_tail_failures, audit_continuous_composition, audit_public_protocol_context,
+    audit_public_protocols, audit_shape_refinement_course, encode_pinyin_phrase,
     evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
     evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
     evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
-    parse_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
-    select_public_calibration_cases, select_public_continuous_composition_cases,
-    select_public_protocol_audit_cases,
+    parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
+    select_public_bigram_training_sequences, select_public_calibration_cases,
+    select_public_continuous_composition_cases, select_public_protocol_audit_cases,
 };
 
 mod benchmark;
 mod candidate_lab_cli;
+mod shape_lab_cli;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
 use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
+use shape_lab_cli::{
+    SHAPE_LAB_USAGE, ShapeLabInput, parse_shape_lab_arguments, parse_shape_lab_input,
+    render_shape_lab_details, render_shape_lab_screen,
+};
 
 const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const DEMO_BIGRAM_CORPUS: &str = include_str!("../tests/fixtures/public/demo_bigram_corpus.tsv");
@@ -29,6 +36,8 @@ const LONG_SENTENCE_CASES: &str = include_str!("../tests/fixtures/public/long_se
 const OOV_CASES: &str = include_str!("../tests/fixtures/public/oov_lexicon.tsv");
 const PUBLIC_RIME_LEXICON: &str =
     include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+const PUBLIC_STROKE_DATA: &str =
+    include_str!("../data/public/conway-stroke-data/sequence-characters.txt");
 const PUBLIC_UD_TEST: &str =
     include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu");
 const PUBLIC_UD_TRAIN: &str =
@@ -72,14 +81,123 @@ fn run() -> Result<(), Box<dyn Error>> {
         "public-sentence" => run_public_sentence(&arguments[1..]),
         "public-compose" => run_public_compose(&arguments[1..]),
         "candidate-lab" => run_candidate_lab(&arguments[1..]),
+        "shape-lab" => run_shape_lab(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
         "public-compose-audit" => run_public_compose_audit(&arguments[1..]),
         "public-protocol-audit" => run_public_protocol_audit(&arguments[1..]),
         "public-protocol-failure-audit" => run_public_protocol_failure_audit(&arguments[1..]),
         "public-protocol-context-audit" => run_public_protocol_context_audit(&arguments[1..]),
+        "public-shape-audit" => run_public_shape_audit(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
         observed => run_decode_legacy(observed, &arguments[1..]),
+    }
+}
+
+fn run_public_shape_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-shape-audit 不接受额外参数".into());
+    }
+
+    let started = Instant::now();
+    let lexicon = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let strokes = parse_stroke_sequence_tsv(PUBLIC_STROKE_DATA)?;
+    let shapes = CharacterShapeIndex::new(strokes.into_shapes())?;
+    let report = audit_shape_refinement_course(&lexicon.entries, &shapes);
+
+    println!("公开 Tab 笔画课程评测：固定 Rime + Conway 快照；不读取私人记录");
+    println!(
+        "单字：源词条 {}，去重候选 {}；完整双拼码池 {}，其中歧义池 {}（候选出现 {}）",
+        report.single_character_entries,
+        report.distinct_single_character_candidates,
+        report.phonetic_pools,
+        report.ambiguous_pools,
+        report.candidates_in_ambiguous_pools
+    );
+    println!(
+        "首屏外课程：超过 10 个候选的码池 {}，最大池 {}；池内候选出现 {}，有笔画数据 {}（{:.2}%）",
+        report.hard_pools,
+        report.maximum_pool_size,
+        report.candidates_in_hard_pools,
+        report.hard_pool_candidates_with_stroke_data,
+        percentage(
+            report.hard_pool_candidates_with_stroke_data,
+            report.candidates_in_hard_pools
+        )
+    );
+    println!(
+        "困难目标：原排名 11 以后共 {}；有笔画 {}，缺笔画 {}，含替代笔顺 {}",
+        report.hard_targets,
+        report.hard_targets_with_stroke_data,
+        report.hard_targets_without_stroke_data,
+        report.hard_targets_with_alternative_sequences
+    );
+    println!(
+        "笔画  额外模式动作  笔顺试次留存   试次进入Top-10  目标任一/全部笔顺可见  平均池缩小"
+    );
+    for stats in &report.prefixes {
+        let average_before = mean(stats.candidates_before_sum, stats.sequence_attempts);
+        let average_after = mean(stats.candidates_after_sum, stats.sequence_attempts);
+        let reduction = if stats.candidates_before_sum == 0 {
+            0.0
+        } else {
+            (1.0 - stats.candidates_after_sum as f64 / stats.candidates_before_sum as f64) * 100.0
+        };
+        println!(
+            "{:>2}        Tab+{:>1}       {:>5}/{:<5} {:>6.2}%   {:>5}/{:<5} {:>6.2}%   {:>5}/{:<5} / {:>5}/{:<5}   {:>6.2}→{:<6.2} ({:>6.2}%)",
+            stats.prefix_keys,
+            stats.prefix_keys,
+            stats.target_retained_attempts,
+            stats.sequence_attempts,
+            percentage(stats.target_retained_attempts, stats.sequence_attempts),
+            stats.target_visible_attempts,
+            stats.sequence_attempts,
+            percentage(stats.target_visible_attempts, stats.sequence_attempts),
+            stats.targets_visible_with_any_sequence,
+            report.hard_targets_with_stroke_data,
+            stats.targets_visible_with_all_sequences,
+            report.hard_targets_with_stroke_data,
+            average_before,
+            average_after,
+            reduction
+        );
+        println!(
+            "          唯一定位：笔顺试次 {}/{}（{:.2}%）；目标任一/全部笔顺 {}/{} / {}/{}",
+            stats.target_isolated_attempts,
+            stats.sequence_attempts,
+            percentage(stats.target_isolated_attempts, stats.sequence_attempts),
+            stats.targets_isolated_with_any_sequence,
+            report.hard_targets_with_stroke_data,
+            stats.targets_isolated_with_all_sequences,
+            report.hard_targets_with_stroke_data
+        );
+    }
+    println!(
+        "口径：同码池按上游权重稳定排序；形码只过滤、不重排。任一/全部分别是替代笔顺的乐观/稳健边界。"
+    );
+    println!(
+        "限制：这不是现实输入频率，也未估算翻页、视觉寻找和最终选择；动作栏只列新增的 Tab 与笔画键。"
+    );
+    println!(
+        "本次公开课程耗时：{:.3} ms（固定本机观察）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn percentage(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64 * 100.0
+    }
+}
+
+fn mean(total: usize, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total as f64 / count as f64
     }
 }
 
@@ -841,6 +959,119 @@ fn run_candidate_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_shape_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
+        println!("{SHAPE_LAB_USAGE}");
+        return Ok(());
+    }
+
+    let options = parse_shape_lab_arguments(arguments)?;
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let strokes = parse_stroke_sequence_tsv(PUBLIC_STROKE_DATA)?;
+    let shapes = CharacterShapeIndex::new(strokes.into_shapes())?;
+    let lab = ShapeLab::new(&imported.entries, &shapes);
+
+    if options.details {
+        println!("Tab 笔画详细审计（固定公开快照；不学习；不写文件）");
+        let ordinary = lab.snapshot(
+            &options.pinyin,
+            "",
+            options.expected_character,
+            options.visible_limit,
+        )?;
+        print!("{}", render_shape_lab_details(&ordinary));
+        if let Some(prefix) = options.prefix.as_deref() {
+            println!();
+            let filtered = lab.snapshot(
+                &options.pinyin,
+                prefix,
+                options.expected_character,
+                options.visible_limit,
+            )?;
+            print!("{}", render_shape_lab_details(&filtered));
+        }
+        return Ok(());
+    }
+
+    if let Some(prefix) = options.prefix.as_deref() {
+        let snapshot = lab.snapshot(
+            &options.pinyin,
+            prefix,
+            options.expected_character,
+            options.visible_limit,
+        )?;
+        print!("{}", render_shape_lab_screen(&snapshot, true, false, None));
+        return Ok(());
+    }
+
+    let stdin = io::stdin();
+    let mut tab_mode = false;
+    let mut prefix = String::new();
+    let mut notice = None::<String>;
+    loop {
+        let active_prefix = if tab_mode { prefix.as_str() } else { "" };
+        let snapshot = lab.snapshot(
+            &options.pinyin,
+            active_prefix,
+            options.expected_character,
+            options.visible_limit,
+        )?;
+        clear_shape_lab_screen();
+        print!(
+            "{}",
+            render_shape_lab_screen(&snapshot, tab_mode, true, notice.as_deref())
+        );
+        print!("> ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        if stdin.read_line(&mut input)? == 0 {
+            break;
+        }
+        notice = None;
+        match parse_shape_lab_input(&input) {
+            ShapeLabInput::Noop => {}
+            ShapeLabInput::EnterTab => tab_mode = true,
+            ShapeLabInput::Stroke(strokes) if tab_mode => prefix.push_str(&strokes),
+            ShapeLabInput::Stroke(_) => {
+                notice = Some("先输入 t 进入笔画辅助".to_owned());
+            }
+            ShapeLabInput::Select(rank) => {
+                if let Some(character) = snapshot
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.filtered_rank == rank)
+                    .map(|candidate| candidate.character)
+                {
+                    clear_shape_lab_screen();
+                    println!("{character}");
+                    break;
+                }
+                notice = Some("这个位置没有候选".to_owned());
+            }
+            ShapeLabInput::Backspace if tab_mode => {
+                if prefix.pop().is_none() {
+                    tab_mode = false;
+                }
+            }
+            ShapeLabInput::Backspace => {}
+            ShapeLabInput::LeaveTab => {
+                tab_mode = false;
+                prefix.clear();
+            }
+            ShapeLabInput::Quit => break,
+            ShapeLabInput::Invalid => notice = Some("没有这个操作".to_owned()),
+        }
+    }
+    Ok(())
+}
+
+fn clear_shape_lab_screen() {
+    if io::stdout().is_terminal() {
+        print!("\x1b[2J\x1b[H");
+    }
+}
+
 fn run_public_compose_evaluate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if !arguments.is_empty() {
         return Err("public-compose-evaluate 不接受额外参数".into());
@@ -1501,11 +1732,13 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--expect <文字>] [--recovery] [--verbose|--json]
+  cargo run --release -- shape-lab <公开单字拼音> [--expect <单字>] [--prefix <hspnz...>] [--limit <1～10>] [--details]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
   cargo run --release -- public-protocol-failure-audit [--details]
   cargo run --release -- public-protocol-context-audit
+  cargo run --release -- public-shape-audit
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
   cargo run -- public-index-stats
@@ -1529,11 +1762,15 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- candidate-lab mafmkm 3
   cargo run -- candidate-lab mafmkm 3 --expect 麻烦猫猫
   cargo run -- candidate-lab mafkmm 3 --recovery
+  cargo run --release -- shape-lab shi --expect 事
+  cargo run --release -- shape-lab da --expect 龘 --prefix n
+  cargo run --release -- shape-lab da --expect 龘 --prefix n --details
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
   cargo run --release -- public-protocol-failure-audit --details
   cargo run --release -- public-protocol-context-audit
+  cargo run --release -- public-shape-audit
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats
   cargo run -- public-index-stats

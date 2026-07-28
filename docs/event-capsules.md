@@ -83,6 +83,35 @@ cargo run --release --bin capsule-replay -- `
 输出一行
 `CAPSULE_REPLAY_REPORT contains_text=false ...`。
 
+显式 `--shape-audit` 是另一条互斥的只读诊断：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --session <SESSION_ID> `
+  --shape-audit
+```
+
+它仍只展开操作者点名的会话，使用固定公开 Rime 单字同码池和 Conway
+笔画表，在内存中读取真实事件后只输出 `contains_text=false` 聚合。普通
+单字路径报告数字选择、空格选择、上下移动、组合内删改及公开排名代理；
+只有按键完整、拼音可编码、文档净插入恰为一个字的提交才进入课程。
+
+“短语裁剪”只是严格的非意图标签：2～4 字的干净提交，在同一胶囊内五秒
+以内经过纯删除、确实只留下原短语中的一个字。插入、替换、模糊位置、
+按键不完整、超时、跨胶囊或删空都不算。对公开代理池第 11 名以后的目标，
+回放分别报告任一/全部替代笔顺在一至三画后的 Top-10 可见数，并比较：
+
+```text
+已捕获动作下界
+  vs
+目标单字规范完整双拼 + Tab + 最短笔画前缀 + 一次选择
+```
+
+原始按键枚举不含 Tab、PageUp/PageDown 或 Enter，因此“已捕获动作”明确是
+下界；公开词典权重也不是已安装输入法当时的真实候选顺序。输出不会声称
+短语裁剪必然是找字意图，也不会把聚合写回磁盘。`--shape-audit` 不接受
+history、window、cache、context 或 compact 选项，避免混合统计口径。
+
 CLI 的 selector 展开、载入或分析错误按所在阶段至多报告历史/评测组、
 输入序号及通用类别，不把文件名、路径、正文或实际按键串复制到错误输出。
 命令行本身仍包含操作者显式输入的路径或会话号，PowerShell 历史和进程

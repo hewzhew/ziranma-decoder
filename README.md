@@ -123,6 +123,13 @@ cargo run --release -- public-protocol-failure-audit
 # 用 fit-only 词上下文重排冻结候选池，同时检查完整码是否退化
 cargo run --release -- public-protocol-context-audit
 
+# 公开同码单字课程：测一至三画能否把首屏外目标筛回 Top-10
+cargo run --release -- public-shape-audit
+
+# 公开 Tab 笔画实验台：t 进入辅助，逐笔输入，数字选择
+cargo run --release -- shape-lab shi --expect 事
+cargo run --release -- shape-lab da --expect 龘 --prefix n
+
 # release 模式固定工作负载、预热后重复采样
 cargo run --release -- benchmark 3
 ```
@@ -155,6 +162,17 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 包含自由混合简拼，也不等于最终输入协议。完整边界、首份实例和停止条件见
 [候选实验台：从程序指标到真实手感](docs/candidate-lab.md)。
 
+`shape-lab` 是更窄的单字课程与沙盒。默认界面只显示可选目标、规范双拼、
+当前笔画前缀和候选：输入 `t` 进入 Tab 辅助，再逐笔输入 `h/s/p/n/z`，
+用数字选择，`-` 撤回，`esc` 返回普通候选。交互终端会原地刷新；选择后
+只输出选中的字，不替使用者总结手感。`--prefix` 可直接查看一个公开前缀。
+
+候选池大小、原排名、动作投影与完整公开笔画码不属于体验界面，只有显式
+加入 `--details` 才会输出并立即退出。筛选仍只删除不匹配项、不重排；
+动作投影也仍只是研究口径，不代表真实翻页、视觉搜索或输入法延迟。拼音、
+目标和候选会出现在终端，因此只应用于公开或合成材料；程序不学习、不写
+文件。
+
 ## Tab 音形辅助原型
 
 对于“已经知道读音，但目标生僻字在同音候选中很靠后”的情况，仓库现有
@@ -165,8 +183,13 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 
 现在已有一份固定到确切提交、保留 CC BY 4.0 署名与完整账目的真实五类
 笔画快照，以及拒绝畸形或越界输入的严格导入器；一个字的替代笔顺不会被
-静默丢掉。真实部件数据库和 Tab 热键仍未接入。覆盖率、地区字形偏差与
-净操作成本通过验证以前，它不会进入实时主线。设计与停止条件见
+静默丢掉。`public-shape-audit` 现已在固定公开同码单字池中专测原排名
+第 11 名以后的 13,285 个目标：最多三画时，12,589 个目标在**全部**上游
+替代笔顺下都能进入 Top-10，平均候选池从 91.94 缩到 5.47；29,906 个
+笔顺试次全部保留目标。这个强结构信号支持继续研究 Tab 笔画筛选，但公开
+词典权重不等于现实候选顺序，评测也尚未计入 Tab、选词、翻页和视觉寻找
+的净成本。公开 `shape-lab` 已能逐字查看同一冻结池与笔画过滤，但真实
+部件数据库、已安装输入法候选和 Tab 热键仍未接入。设计与停止条件见
 [Tab 音形辅助：显式的第二阶段筛选](docs/tab-shape-refinement.md)。
 
 ## 自然码 codec
@@ -534,6 +557,11 @@ cargo run --release --bin capsule-replay -- `
   --window-gap-ms 5000 `
   --public-context `
   --compact
+
+# 明确授权后：只输出 Tab 笔画、单字上屏与短语裁剪的脱敏动作账
+cargo run --release --bin capsule-replay -- `
+  --session <SESSION_ID> `
+  --shape-audit
 
 # 最后一个公开对照：同一冻结候选池改用平均字符 bigram 分数重排
 # 与 --public-context 互斥，仍只读、脱敏且不使用胶囊训练

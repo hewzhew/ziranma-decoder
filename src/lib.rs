@@ -25,7 +25,11 @@ mod language_model;
 mod protocol_audit;
 mod public_corpus;
 mod session_summary;
+mod shape_evaluation;
+mod shape_lab;
 mod shape_refinement;
+mod shape_replay;
+mod single_character_pool;
 mod stroke_data;
 mod tracker;
 
@@ -99,9 +103,20 @@ pub use session_summary::{
     AggregatedSessionSummary, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryError,
     SessionSummaryV1,
 };
+pub use shape_evaluation::{
+    SHAPE_COURSE_MAX_PREFIX_KEYS, SHAPE_COURSE_VISIBLE_LIMIT, ShapeCourseAuditReport,
+    ShapePrefixCourseStats, audit_shape_refinement_course,
+};
+pub use shape_lab::{
+    MAX_SHAPE_LAB_VISIBLE, ShapeLab, ShapeLabCandidate, ShapeLabError, ShapeLabSnapshot,
+};
 pub use shape_refinement::{
     CharacterShape, CharacterShapeIndex, RefinedCandidate, ShapeMatchEvidence,
     ShapeRefinementError, TabShapeQuery, TabShapeRefinementReport,
+};
+pub use shape_replay::{
+    PHRASE_TRIM_MAX_CHARACTERS, PHRASE_TRIM_MAX_GAP_MS, PrivateShapeActionComparisonStats,
+    PrivateShapeReplayAudit, PrivateShapeReplayReport,
 };
 pub use stroke_data::{
     LexiconShapeCoverageStats, MAX_STROKE_DATA_ASSIGNMENTS, MAX_STROKE_DATA_LINE_BYTES,
