@@ -45,7 +45,8 @@ pub use candidate_lab::{
 pub use capsule_replay::{
     CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
     KeyInterpretationError, MAX_REPLAY_CODE_KEYS, PairedReplayStrategyStats,
-    PersonalCacheReplayError, PersonalCacheReplayState, ReplayStrategyStats, effective_letter_code,
+    PersonalCacheReplayError, PersonalCacheReplayState, ReplayStrategyStats, WindowExclusionStats,
+    effective_letter_code,
 };
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 #[cfg(windows)]

@@ -648,6 +648,82 @@ impl ContextReplayComparisonStats {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowExclusionStats {
+    pub incomplete_keys: u64,
+    pub key_interpretation_failure: u64,
+    pub missing_letter_code: u64,
+    pub code_over_limit: u64,
+    pub composition_unencodable: u64,
+    pub canonical_word_boundaries_unavailable: u64,
+    pub ambiguous_position: u64,
+    pub non_append_document_change: u64,
+}
+
+impl WindowExclusionStats {
+    pub fn total(&self) -> u64 {
+        self.incomplete_keys
+            .saturating_add(self.key_interpretation_failure)
+            .saturating_add(self.missing_letter_code)
+            .saturating_add(self.code_over_limit)
+            .saturating_add(self.composition_unencodable)
+            .saturating_add(self.canonical_word_boundaries_unavailable)
+            .saturating_add(self.ambiguous_position)
+            .saturating_add(self.non_append_document_change)
+    }
+
+    fn observe(&mut self, reason: WindowExclusionReason) {
+        let field = match reason {
+            WindowExclusionReason::IncompleteKeys => &mut self.incomplete_keys,
+            WindowExclusionReason::KeyInterpretationFailure => &mut self.key_interpretation_failure,
+            WindowExclusionReason::MissingLetterCode => &mut self.missing_letter_code,
+            WindowExclusionReason::CodeOverLimit => &mut self.code_over_limit,
+            WindowExclusionReason::CompositionUnencodable => &mut self.composition_unencodable,
+            WindowExclusionReason::CanonicalWordBoundariesUnavailable => {
+                &mut self.canonical_word_boundaries_unavailable
+            }
+            WindowExclusionReason::AmbiguousPosition => &mut self.ambiguous_position,
+            WindowExclusionReason::NonAppendDocumentChange => &mut self.non_append_document_change,
+        };
+        *field = field.saturating_add(1);
+    }
+
+    fn terminal_fields(&self) -> String {
+        format!(
+            "window_exclusion_incomplete_keys={} \
+             window_exclusion_key_interpretation_failure={} \
+             window_exclusion_missing_letter_code={} \
+             window_exclusion_code_over_limit={} \
+             window_exclusion_composition_unencodable={} \
+             window_exclusion_canonical_word_boundaries_unavailable={} \
+             window_exclusion_ambiguous_position={} \
+             window_exclusion_non_append_document_change={} \
+             window_exclusion_total={}",
+            self.incomplete_keys,
+            self.key_interpretation_failure,
+            self.missing_letter_code,
+            self.code_over_limit,
+            self.composition_unencodable,
+            self.canonical_word_boundaries_unavailable,
+            self.ambiguous_position,
+            self.non_append_document_change,
+            self.total()
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowExclusionReason {
+    IncompleteKeys,
+    KeyInterpretationFailure,
+    MissingLetterCode,
+    CodeOverLimit,
+    CompositionUnencodable,
+    CanonicalWordBoundariesUnavailable,
+    AmbiguousPosition,
+    NonAppendDocumentChange,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CapsuleReplayReport {
     window_gap_limit_ms: Option<u64>,
     public_context_kind: Option<PublicContextKind>,
@@ -675,6 +751,8 @@ pub struct CapsuleReplayReport {
     pub word_head_anchored: ReplayStrategyStats,
     pub window_eligible_commits: u64,
     pub window_ineligible_commits: u64,
+    pub window_exclusions: WindowExclusionStats,
+    pub isolated_eligible_commits: u64,
     pub continuous_windows: u64,
     pub continuous_window_commits: u64,
     pub continuous_window_recorded_logical_key_actions: u64,
@@ -752,6 +830,12 @@ impl CapsuleReplayReport {
         capsule: &EventCapsuleV1,
     ) -> Result<(), KeySequenceError> {
         self.observe_capsule_internal(decoder, None, capsule)
+    }
+
+    fn observe_window_exclusion(&mut self, reason: WindowExclusionReason) {
+        if self.window_gap_limit_ms.is_some() {
+            self.window_exclusions.observe(reason);
+        }
     }
 
     pub fn observe_capsule_with_public_context(
@@ -901,6 +985,7 @@ impl CapsuleReplayReport {
                         .saturating_add(saturating_len(record.keys.len()));
                     if !record.keys_complete {
                         self.incomplete_key_commits = self.incomplete_key_commits.saturating_add(1);
+                        self.observe_window_exclusion(WindowExclusionReason::IncompleteKeys);
                         continue;
                     }
                     let observed = match effective_letter_code(&record.keys) {
@@ -908,16 +993,21 @@ impl CapsuleReplayReport {
                         Ok(None) => {
                             self.commits_without_letter_code =
                                 self.commits_without_letter_code.saturating_add(1);
+                            self.observe_window_exclusion(WindowExclusionReason::MissingLetterCode);
                             continue;
                         }
                         Err(_) => {
                             self.key_interpretation_failures =
                                 self.key_interpretation_failures.saturating_add(1);
+                            self.observe_window_exclusion(
+                                WindowExclusionReason::KeyInterpretationFailure,
+                            );
                             continue;
                         }
                     };
                     if observed.len() > MAX_REPLAY_CODE_KEYS {
                         self.commits_over_key_limit = self.commits_over_key_limit.saturating_add(1);
+                        self.observe_window_exclusion(WindowExclusionReason::CodeOverLimit);
                         continue;
                     }
 
@@ -929,6 +1019,9 @@ impl CapsuleReplayReport {
 
                     let normalized_pinyin = record.composition.replace('\'', " ");
                     let Ok(encoded) = encode_pinyin_phrase(&normalized_pinyin) else {
+                        self.observe_window_exclusion(
+                            WindowExclusionReason::CompositionUnencodable,
+                        );
                         continue;
                     };
                     self.composition_encodable_commits =
@@ -1016,32 +1109,39 @@ impl CapsuleReplayReport {
                                 &mut self.word_head_anchored,
                             )?;
                         }
-                        if self.window_gap_limit_ms.is_some()
-                            && window_document_delta_is_eligible(record)
-                        {
-                            prepared_windows.insert(
-                                event_index,
-                                WindowCommit {
-                                    elapsed_ms: event.elapsed_ms,
-                                    document_start: record.document_change.start,
-                                    document_inserted_chars: record
-                                        .document_change
-                                        .inserted
-                                        .chars()
-                                        .count(),
-                                    observed,
-                                    canonical_full: encoded.full_code.as_str().to_owned(),
-                                    syllable_codes: encoded.syllable_codes,
-                                    word_lengths: segmentation.word_lengths,
-                                    words: segmentation.words,
-                                    target: target.clone(),
-                                    recorded_logical_key_actions: saturating_len(record.keys.len()),
-                                },
-                            );
+                        if self.window_gap_limit_ms.is_some() {
+                            if let Some(reason) = window_document_exclusion(record) {
+                                self.observe_window_exclusion(reason);
+                            } else {
+                                prepared_windows.insert(
+                                    event_index,
+                                    WindowCommit {
+                                        elapsed_ms: event.elapsed_ms,
+                                        document_start: record.document_change.start,
+                                        document_inserted_chars: record
+                                            .document_change
+                                            .inserted
+                                            .chars()
+                                            .count(),
+                                        observed,
+                                        canonical_full: encoded.full_code.as_str().to_owned(),
+                                        syllable_codes: encoded.syllable_codes,
+                                        word_lengths: segmentation.word_lengths,
+                                        words: segmentation.words,
+                                        target: target.clone(),
+                                        recorded_logical_key_actions: saturating_len(
+                                            record.keys.len(),
+                                        ),
+                                    },
+                                );
+                            }
                         }
                     } else {
                         self.word_boundaries_unavailable_commits =
                             self.word_boundaries_unavailable_commits.saturating_add(1);
+                        self.observe_window_exclusion(
+                            WindowExclusionReason::CanonicalWordBoundariesUnavailable,
+                        );
                     }
                 }
             }
@@ -1054,6 +1154,15 @@ impl CapsuleReplayReport {
                 max_gap_ms,
                 &mut prepared_windows,
             )?;
+            debug_assert_eq!(
+                self.window_ineligible_commits,
+                self.window_exclusions.total()
+            );
+            debug_assert_eq!(
+                self.window_eligible_commits,
+                self.continuous_window_commits
+                    .saturating_add(self.isolated_eligible_commits)
+            );
         }
         Ok(())
     }
@@ -1368,6 +1477,9 @@ impl CapsuleReplayReport {
         run: &mut Vec<WindowCommit>,
     ) -> Result<(), KeySequenceError> {
         if run.len() < 2 {
+            self.isolated_eligible_commits = self
+                .isolated_eligible_commits
+                .saturating_add(u64::try_from(run.len()).unwrap_or(u64::MAX));
             run.clear();
             return Ok(());
         }
@@ -1563,7 +1675,8 @@ impl CapsuleReplayReport {
              noncanonical_code_observations={} noncanonical_is_error=false \
              word_boundaries_available_commits={} word_boundaries_unavailable_commits={} \
              {} {} {} {} {} {} {} {} \
-             window_eligible_commits={} window_ineligible_commits={} continuous_windows={} \
+             window_eligible_commits={} window_ineligible_commits={} \
+             isolated_eligible_commits={} {} continuous_windows={} \
              continuous_window_commits={} \
              continuous_window_recorded_logical_key_actions={} \
              continuous_windows_over_key_limit={} {} {} {} {} {} {} {} {} \
@@ -1624,6 +1737,8 @@ impl CapsuleReplayReport {
                 .terminal_fields("word_head_anchored"),
             self.window_eligible_commits,
             self.window_ineligible_commits,
+            self.isolated_eligible_commits,
+            self.window_exclusions.terminal_fields(),
             self.continuous_windows,
             self.continuous_window_commits,
             self.continuous_window_recorded_logical_key_actions,
@@ -1749,7 +1864,8 @@ impl CapsuleReplayReport {
         ];
         if self.window_gap_limit_ms.is_some() {
             lines.push(format!(
-                "WINDOWS gap_ms={} eligible_commits={} ineligible_commits={} windows={} \
+                "WINDOWS gap_ms={} eligible_commits={} ineligible_commits={} \
+                 isolated_eligible_commits={} {} windows={} \
                  window_commits={} recorded_actions={} over_key_limit={} \
                  public_context_windows={} public_context_pool_depth={} \
                  personal_cache_kind={} personal_cache_history_capsules={} \
@@ -1781,6 +1897,8 @@ impl CapsuleReplayReport {
                 display_optional(self.window_gap_limit_ms),
                 self.window_eligible_commits,
                 self.window_ineligible_commits,
+                self.isolated_eligible_commits,
+                self.window_exclusions.terminal_fields(),
                 self.continuous_windows,
                 self.continuous_window_commits,
                 self.continuous_window_recorded_logical_key_actions,
@@ -1965,7 +2083,7 @@ fn prepare_window_commit(
     elapsed_ms: u64,
     record: &crate::CommitRecord,
 ) -> Result<Option<WindowCommit>, KeySequenceError> {
-    if !record.keys_complete || !window_document_delta_is_eligible(record) {
+    if !record.keys_complete || window_document_exclusion(record).is_some() {
         return Ok(None);
     }
     let Some(observed) = effective_letter_code(&record.keys).ok().flatten() else {
@@ -2000,12 +2118,19 @@ fn prepare_window_commit(
     }))
 }
 
-fn window_document_delta_is_eligible(record: &crate::CommitRecord) -> bool {
-    record.change.position_evidence != crate::DeltaPositionEvidence::Ambiguous
-        && record.document_change.position_evidence != crate::DeltaPositionEvidence::Ambiguous
-        && record.document_change.deleted.is_empty()
-        && !record.document_change.inserted.is_empty()
-        && record.document_change.inserted == record.change.inserted
+fn window_document_exclusion(record: &crate::CommitRecord) -> Option<WindowExclusionReason> {
+    if record.change.position_evidence == crate::DeltaPositionEvidence::Ambiguous
+        || record.document_change.position_evidence == crate::DeltaPositionEvidence::Ambiguous
+    {
+        Some(WindowExclusionReason::AmbiguousPosition)
+    } else if !record.document_change.deleted.is_empty()
+        || record.document_change.inserted.is_empty()
+        || record.document_change.inserted != record.change.inserted
+    {
+        Some(WindowExclusionReason::NonAppendDocumentChange)
+    } else {
+        None
+    }
 }
 
 fn prepare_personal_learning_words(
@@ -2955,6 +3080,90 @@ text\tpinyin\tfrequency
             .observe_capsule(&decoder, &nonadjacent)
             .unwrap();
         assert_eq!(position_report.continuous_windows, 0);
+    }
+
+    #[test]
+    fn window_exclusions_are_mutually_exclusive_and_eligible_singletons_balance() {
+        let mut incomplete = commit_event(100, 0, "mk", "mao", "猫猫");
+        let TrackerOutput::Commit(record) = &mut incomplete.output else {
+            unreachable!();
+        };
+        record.keys_complete = false;
+
+        let mut key_failure = commit_event(200, 0, "mk", "mao", "猫猫");
+        let TrackerOutput::Commit(record) = &mut key_failure.output else {
+            unreachable!();
+        };
+        record.keys = vec![RawKey::Letter('m'), RawKey::Space, RawKey::Letter('k')];
+
+        let mut missing_code = commit_event(300, 0, "mk", "mao", "猫猫");
+        let TrackerOutput::Commit(record) = &mut missing_code.output else {
+            unreachable!();
+        };
+        record.keys = vec![RawKey::Space];
+
+        let over_limit = commit_event(400, 0, &"m".repeat(65), "mao", "猫猫");
+        let unencodable = commit_event(500, 0, "mk", "not-a-pinyin", "猫猫");
+        let missing_boundaries = commit_event(600, 0, "mkmk", "mao'mao", "不存在");
+
+        let mut ambiguous = commit_event(700, 0, "mkmk", "mao'mao", "猫猫");
+        let TrackerOutput::Commit(record) = &mut ambiguous.output else {
+            unreachable!();
+        };
+        record.document_change.position_evidence = DeltaPositionEvidence::Ambiguous;
+
+        let mut non_append = commit_event(800, 0, "mkmk", "mao'mao", "猫猫");
+        let TrackerOutput::Commit(record) = &mut non_append.output else {
+            unreachable!();
+        };
+        record.document_change.deleted = "旧".to_owned();
+
+        let isolated = commit_event(900, 0, "mkmk", "mao'mao", "猫猫");
+        let capsule = EventCapsuleV1::new(vec![
+            incomplete,
+            key_failure,
+            missing_code,
+            over_limit,
+            unencodable,
+            missing_boundaries,
+            ambiguous,
+            non_append,
+            isolated,
+        ])
+        .unwrap();
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+
+        report.observe_capsule(&decoder, &capsule).unwrap();
+
+        assert_eq!(report.window_ineligible_commits, 8);
+        assert_eq!(report.window_exclusions.incomplete_keys, 1);
+        assert_eq!(report.window_exclusions.key_interpretation_failure, 1);
+        assert_eq!(report.window_exclusions.missing_letter_code, 1);
+        assert_eq!(report.window_exclusions.code_over_limit, 1);
+        assert_eq!(report.window_exclusions.composition_unencodable, 1);
+        assert_eq!(
+            report
+                .window_exclusions
+                .canonical_word_boundaries_unavailable,
+            1
+        );
+        assert_eq!(report.window_exclusions.ambiguous_position, 1);
+        assert_eq!(report.window_exclusions.non_append_document_change, 1);
+        assert_eq!(
+            report.window_exclusions.total(),
+            report.window_ineligible_commits
+        );
+        assert_eq!(report.window_eligible_commits, 1);
+        assert_eq!(report.isolated_eligible_commits, 1);
+        assert_eq!(report.continuous_window_commits, 0);
+        assert_eq!(report.continuous_windows, 0);
+
+        let compact = report.compact_terminal_report();
+        assert!(compact.contains("isolated_eligible_commits=1"));
+        assert!(compact.contains("window_exclusion_total=8"));
+        assert!(!compact.contains("不存在"));
+        assert!(!compact.contains("not-a-pinyin"));
     }
 
     #[test]

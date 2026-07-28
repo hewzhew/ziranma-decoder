@@ -136,6 +136,23 @@ CLI 的 selector 展开、载入或分析错误按所在阶段至多报告历史
 - 两次提交的会话内间隔不超过显式毫秒边界；
 - 中间没有 `REVISION` 或其他不合格提交。
 
+给出窗口边界后，每次提交若不合格，只按处理顺序记录**首个**未满足条件：
+按键不完整、按键解释失败、没有字母码、码串超过上限、组合拼音无法编码、
+规范完整码 Top-10 无法确认目标词界、位置不确定、文档变化不是纯追加。
+八类互斥，合计必须等于 `window_ineligible_commits`，不会把同一次自定义
+词输入同时包装成多个问题。
+
+满足单条资格也不等于已经形成连续样本。没有与相邻合格提交连接起来的
+单条另记 `isolated_eligible_commits`；它与真正进入连续窗口的提交满足：
+
+```text
+window_eligible_commits
+  = continuous_window_commits + isolated_eligible_commits
+```
+
+孤立可能来自自然停顿、位置不连续、修订/不合格提交隔断或胶囊轮换边界，
+不能自动解释为宝宝“不使用长句”。
+
 窗口不做滑动切片，因此一个最大连续段只贡献一次样本。随后分别报告
 `window_raw_joined`、`window_canonical_full`、
 `window_word_tail_one_short`、`window_word_tail_keep_singletons` 与
@@ -208,9 +225,11 @@ cargo run --release --bin capsule-replay -- `
 ```
 
 `--decision` 仍按显式 selector 流式读取、在内存解密并且不写文件。它把
-同一次读取中的采集健康、完整性可用性、非规范码观察、连续窗口限域动作、
-完整码 Top-K 和三条逐词简写的配对结果压成一份中文报告；首行固定声明
-`contains_text=false` 与 `contains_behavioral_metadata=true`。报告不会
+同一次读取中的采集健康、完整性可用性、非规范码观察、互斥排除原因、
+孤立合格提交、连续窗口限域动作、完整码 Top-K 和三条逐词简写的配对
+结果压成一份中文报告；首行固定声明
+`ziranma-replay-decision-report-v2`、`contains_text=false` 与
+`contains_behavioral_metadata=true`。报告不会
 显示文字、拼音、按键串、路径或会话号。
 
 这里的“非规范码”只表示有效字母串不同于从输入法组合拼音重新编码出的

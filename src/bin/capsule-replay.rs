@@ -30,7 +30,7 @@ const MAX_CAPSULE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_SEGMENTS: u64 = 1_000_000;
 const CAPTURE_HEALTH_REPORT_SCHEMA_V1: &str = "ziranma-capture-health-report-v1";
 const CAPTURE_INTEGRITY_REPORT_SCHEMA_V1: &str = "ziranma-capture-integrity-report-v1";
-const REPLAY_DECISION_REPORT_SCHEMA_V1: &str = "ziranma-replay-decision-report-v1";
+const REPLAY_DECISION_REPORT_SCHEMA_V2: &str = "ziranma-replay-decision-report-v2";
 const REPLAY_DECISION_MIN_WINDOWS: u64 = 20;
 const CAPTURE_HEALTH_PRIVACY_NOTICE: &str = "--health-only prints CAPTURE_HEALTH and CAPTURE_INTEGRITY; both contain behavioral \
      metadata; legacy v1/.zic integrity is unavailable, never zero-filled.";
@@ -855,7 +855,7 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
 
     let mut lines = vec![
         format!(
-            "DECISION_REPORT schema={REPLAY_DECISION_REPORT_SCHEMA_V1} \
+            "DECISION_REPORT schema={REPLAY_DECISION_REPORT_SCHEMA_V2} \
              contains_text=false contains_behavioral_metadata=true writes=false network=false"
         ),
         "私人输入决策报告（不显示原文）".to_owned(),
@@ -879,12 +879,30 @@ fn render_decision_report(report: &CapsuleReplayReport, health: &CaptureHealthRe
             report.composition_encodable_commits, noncanonical_observations
         ),
         format!(
-            "连续输入：{} 次提交可进入窗口，{} 次被排除，形成 {} 个可比较窗口；\
-             这些窗口记录到 {} 次限域操作。",
+            "连续输入：{} 次提交满足单条资格，其中 {} 次组成了 {} 个连续窗口，{} 次保持孤立；\
+             连续窗口记录到 {} 次限域操作。",
             report.window_eligible_commits,
-            report.window_ineligible_commits,
+            report.continuous_window_commits,
             report.continuous_windows,
+            report.isolated_eligible_commits,
             report.continuous_window_recorded_logical_key_actions
+        ),
+        format!(
+            "排除原因（每次提交只记首个不满足条件）：按键不完整 {}，按键解释失败 {}，\
+             没有字母码 {}，码串过长 {}，组合拼音无法编码 {}，规范码 Top-10 无法确认目标词界 {}，\
+             位置不确定 {}，不是纯追加 {}；合计 {}/{}。",
+            report.window_exclusions.incomplete_keys,
+            report.window_exclusions.key_interpretation_failure,
+            report.window_exclusions.missing_letter_code,
+            report.window_exclusions.code_over_limit,
+            report.window_exclusions.composition_unencodable,
+            report
+                .window_exclusions
+                .canonical_word_boundaries_unavailable,
+            report.window_exclusions.ambiguous_position,
+            report.window_exclusions.non_append_document_change,
+            report.window_exclusions.total(),
+            report.window_ineligible_commits
         ),
         format!(
             "完整码连打：{} 个窗口；Top-1 {}/{}，Top-5 {}/{}，Top-10 {}/{}；{}。",
@@ -2655,6 +2673,8 @@ mod tests {
         report.observed_matches_canonical = 1;
         report.word_boundaries_available_commits = 2;
         report.window_eligible_commits = 2;
+        report.window_ineligible_commits = 1;
+        report.window_exclusions.composition_unencodable = 1;
         report.continuous_windows = 1;
         report.continuous_window_commits = 2;
         report.continuous_window_recorded_logical_key_actions = 10;
@@ -2698,12 +2718,14 @@ mod tests {
 
         let rendered = render_decision_report(&report, &health);
 
-        assert_eq!(rendered.lines().count(), 12);
+        assert_eq!(rendered.lines().count(), 13);
         assert!(rendered.starts_with(
-            "DECISION_REPORT schema=ziranma-replay-decision-report-v1 contains_text=false"
+            "DECISION_REPORT schema=ziranma-replay-decision-report-v2 contains_text=false"
         ));
         assert!(rendered.contains("实际字母与规范码不同"));
         assert!(rendered.contains("编辑不自动等于打错"));
+        assert!(rendered.contains("组合拼音无法编码 1"));
+        assert!(rendered.contains("合计 1/1"));
         assert!(rendered.contains("样本还少，继续自然记录，暂不改变协议"));
         assert!(rendered.contains("至少 20 个可比较窗口后再决定"));
         assert!(!rendered.contains("猫"));
