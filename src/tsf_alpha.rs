@@ -1,11 +1,13 @@
-//! Build-only Windows TSF COM lifecycle probe.
+//! Build-only Windows TSF COM and composition probe.
 //!
 //! This module intentionally exports no registration functions. It proves
 //! class-factory, activation, deactivation, server-lock, and unload behavior
 //! without adding an input profile to Windows.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,10 +22,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
 };
 use windows::Win32::UI::TextServices::{
-    ITfContext, ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl,
-    ITfKeystrokeMgr, ITfTextInputProcessor_Impl, ITfTextInputProcessorEx,
-    ITfTextInputProcessorEx_Impl, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE,
-    TF_ES_SYNC,
+    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
+    ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor_Impl,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, TF_AE_NONE, TF_ANCHOR_END,
+    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION,
+    TF_SELECTION, TF_SELECTIONSTYLE,
 };
 use windows::core::{
     Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -60,13 +64,6 @@ impl PendingDocumentEdit {
             Self::UpdatePreedit(_) => DocumentEditKind::UpdatePreedit,
             Self::Cancel => DocumentEditKind::Cancel,
             Self::Commit(_) => DocumentEditKind::Commit,
-        }
-    }
-
-    fn transient_text(&self) -> Option<&str> {
-        match self {
-            Self::UpdatePreedit(text) | Self::Commit(text) => Some(text),
-            Self::Cancel => None,
         }
     }
 }
@@ -176,6 +173,12 @@ fn lifecycle_error(code: HRESULT) -> Error {
     Error::from_hresult(code)
 }
 
+fn same_com_identity<L: Interface, R: Interface>(left: &L, right: &R) -> Result<bool> {
+    let left_identity: IUnknown = left.cast()?;
+    let right_identity: IUnknown = right.cast()?;
+    Ok(left_identity.as_raw() == right_identity.as_raw())
+}
+
 fn object_created() {
     ACTIVE_COM_OBJECTS.fetch_add(1, Ordering::AcqRel);
 }
@@ -244,33 +247,270 @@ impl IClassFactory_Impl for TsfClassFactory_Impl {
     }
 }
 
-/// A synchronous TSF edit-session boundary.
-///
-/// This build-only phase deliberately records only bounded structural
-/// telemetry. Actual ITfRange mutation is the next gate; transient text stays
-/// inside this object and is dropped as soon as the session completes.
-#[implement(ITfEditSession)]
-struct TsfEditSessionProbe {
-    action: PendingDocumentEdit,
-    telemetry: Arc<Mutex<EditSessionTelemetry>>,
+#[derive(Clone)]
+struct ActiveDocumentComposition {
+    context: ITfContext,
+    composition: ITfComposition,
+    range: ITfRange,
 }
 
-impl TsfEditSessionProbe {
-    fn counted(action: PendingDocumentEdit, telemetry: Arc<Mutex<EditSessionTelemetry>>) -> Self {
-        object_created();
-        Self { action, telemetry }
+#[derive(Default)]
+struct DocumentCompositionState {
+    active: Option<ActiveDocumentComposition>,
+}
+
+impl DocumentCompositionState {
+    fn active_for_context(
+        &self,
+        context: &ITfContext,
+    ) -> Result<Option<ActiveDocumentComposition>> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(None);
+        };
+        if !same_com_identity(&active.context, context)? {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        Ok(Some(active.clone()))
     }
 }
 
-impl Drop for TsfEditSessionProbe {
+/// Receives host-driven termination without keeping the service state alive.
+#[implement(ITfCompositionSink)]
+struct TsfCompositionSink {
+    document_composition: Weak<RefCell<DocumentCompositionState>>,
+    logical_composition: Weak<RefCell<CompositionSession>>,
+}
+
+impl TsfCompositionSink {
+    fn counted(
+        document_composition: Weak<RefCell<DocumentCompositionState>>,
+        logical_composition: Weak<RefCell<CompositionSession>>,
+    ) -> Self {
+        object_created();
+        Self {
+            document_composition,
+            logical_composition,
+        }
+    }
+}
+
+impl Drop for TsfCompositionSink {
     fn drop(&mut self) {
         object_dropped();
     }
 }
 
-impl ITfEditSession_Impl for TsfEditSessionProbe_Impl {
-    fn DoEditSession(&self, _ec: u32) -> Result<()> {
-        let _transient_text = self.action.transient_text();
+impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _ecwrite: u32,
+        composition: Ref<ITfComposition>,
+    ) -> Result<()> {
+        let Some(composition) = composition.cloned() else {
+            return Err(lifecycle_error(E_POINTER));
+        };
+        let Some(document_composition) = self.document_composition.upgrade() else {
+            return Ok(());
+        };
+        let mut state = document_composition
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        let terminated_active = state
+            .active
+            .as_ref()
+            .map(|active| same_com_identity(&active.composition, &composition))
+            .transpose()?
+            .unwrap_or(false);
+        if terminated_active {
+            state.active = None;
+        }
+        drop(state);
+        if terminated_active && let Some(logical_composition) = self.logical_composition.upgrade() {
+            logical_composition
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+                .finish_commit();
+        }
+        Ok(())
+    }
+}
+
+/// Applies one planned composition change inside a synchronous TSF edit session.
+#[implement(ITfEditSession)]
+struct TsfDocumentEditSession {
+    context: ITfContext,
+    action: PendingDocumentEdit,
+    document_composition: Rc<RefCell<DocumentCompositionState>>,
+    logical_composition: Rc<RefCell<CompositionSession>>,
+    telemetry: Arc<Mutex<EditSessionTelemetry>>,
+}
+
+impl TsfDocumentEditSession {
+    fn counted(
+        context: ITfContext,
+        action: PendingDocumentEdit,
+        document_composition: Rc<RefCell<DocumentCompositionState>>,
+        logical_composition: Rc<RefCell<CompositionSession>>,
+        telemetry: Arc<Mutex<EditSessionTelemetry>>,
+    ) -> Self {
+        object_created();
+        Self {
+            context,
+            action,
+            document_composition,
+            logical_composition,
+            telemetry,
+        }
+    }
+
+    fn active_composition(&self) -> Result<Option<ActiveDocumentComposition>> {
+        self.document_composition
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .active_for_context(&self.context)
+    }
+
+    fn start_composition(&self, ec: u32, text: &str) -> Result<()> {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let insertion: ITfInsertAtSelection = self.context.cast()?;
+        let context_composition: ITfContextComposition = self.context.cast()?;
+        // SAFETY: `ec` is the read/write cookie issued for this synchronous
+        // session. The returned range owns the newly inserted synthetic text.
+        let range =
+            unsafe { insertion.InsertTextAtSelection(ec, TF_IAS_NO_DEFAULT_COMPOSITION, &utf16) }?;
+        let sink: ITfCompositionSink = TsfCompositionSink::counted(
+            Rc::downgrade(&self.document_composition),
+            Rc::downgrade(&self.logical_composition),
+        )
+        .into();
+        // SAFETY: the same write cookie and inserted range remain valid. The
+        // weak sink lets host-driven termination clear our active handle.
+        let composition = match unsafe { context_composition.StartComposition(ec, &range, &sink) } {
+            Ok(composition) => composition,
+            Err(error) => {
+                // SAFETY: roll back the insertion while the write cookie is
+                // still valid if TSF refuses to create the composition.
+                let _ = unsafe { range.SetText(ec, 0, &[]) };
+                return Err(error);
+            }
+        };
+
+        let mut state = self
+            .document_composition
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        if state.active.is_some() {
+            drop(state);
+            // SAFETY: this defensive race cleanup uses the same write cookie.
+            let _ = unsafe { range.SetText(ec, 0, &[]) };
+            // SAFETY: balances StartComposition above before returning.
+            let _ = unsafe { composition.EndComposition(ec) };
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        state.active = Some(ActiveDocumentComposition {
+            context: self.context.clone(),
+            composition,
+            range,
+        });
+        Ok(())
+    }
+
+    fn update_composition(
+        &self,
+        ec: u32,
+        active: &ActiveDocumentComposition,
+        text: &str,
+    ) -> Result<()> {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        // SAFETY: the range belongs to the active composition in this context,
+        // and `ec` grants synchronous write access for this call.
+        unsafe { active.range.SetText(ec, 0, &utf16) }
+    }
+
+    fn finish_composition(&self, ec: u32, replacement: &str) -> Result<()> {
+        let active = {
+            let mut state = self
+                .document_composition
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            state.active_for_context(&self.context)?;
+            state
+                .active
+                .take()
+                .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?
+        };
+        let utf16: Vec<u16> = replacement.encode_utf16().collect();
+        // SAFETY: the active range and composition belong to this context and
+        // `ec` is the current write cookie.
+        if let Err(error) = unsafe { active.range.SetText(ec, 0, &utf16) } {
+            self.restore_active(active)?;
+            return Err(error);
+        }
+        if let Err(error) = self.move_selection_after(&active, ec) {
+            self.restore_active(active)?;
+            return Err(error);
+        }
+        // SAFETY: successful completion balances StartComposition.
+        if let Err(error) = unsafe { active.composition.EndComposition(ec) } {
+            self.restore_active(active)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn move_selection_after(&self, active: &ActiveDocumentComposition, ec: u32) -> Result<()> {
+        let caret = active.range.clone();
+        // SAFETY: this clone is an independent range owned by the active
+        // context; collapsing it does not mutate document text.
+        unsafe { caret.Collapse(ec, TF_ANCHOR_END) }?;
+        let mut selection = TF_SELECTION {
+            range: std::mem::ManuallyDrop::new(Some(caret)),
+            style: TF_SELECTIONSTYLE {
+                ase: TF_AE_NONE,
+                fInterimChar: false.into(),
+            },
+        };
+        // SAFETY: the selection range belongs to this context and remains
+        // alive through the call. TSF copies the selection synchronously.
+        let result = unsafe {
+            self.context
+                .SetSelection(ec, std::slice::from_ref(&selection))
+        };
+        // SAFETY: TF_SELECTION is an ABI struct whose interface field is
+        // ManuallyDrop; release our cloned range exactly once after the call.
+        unsafe { std::mem::ManuallyDrop::drop(&mut selection.range) };
+        result
+    }
+
+    fn restore_active(&self, active: ActiveDocumentComposition) -> Result<()> {
+        let mut state = self
+            .document_composition
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        if state.active.is_some() {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        state.active = Some(active);
+        Ok(())
+    }
+}
+
+impl Drop for TsfDocumentEditSession {
+    fn drop(&mut self) {
+        object_dropped();
+    }
+}
+
+impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        match &self.action {
+            PendingDocumentEdit::UpdatePreedit(text) => match self.active_composition()? {
+                Some(active) => self.update_composition(ec, &active, text)?,
+                None => self.start_composition(ec, text)?,
+            },
+            PendingDocumentEdit::Cancel => self.finish_composition(ec, "")?,
+            PendingDocumentEdit::Commit(text) => self.finish_composition(ec, text)?,
+        }
         let mut telemetry = self
             .telemetry
             .lock()
@@ -281,13 +521,22 @@ impl ITfEditSession_Impl for TsfEditSessionProbe_Impl {
     }
 }
 
-fn request_probe_edit_session(
+fn request_document_edit_session(
     context: &ITfContext,
     client_id: u32,
     action: PendingDocumentEdit,
+    document_composition: Rc<RefCell<DocumentCompositionState>>,
+    logical_composition: Rc<RefCell<CompositionSession>>,
     telemetry: Arc<Mutex<EditSessionTelemetry>>,
 ) -> Result<()> {
-    let edit_session: ITfEditSession = TsfEditSessionProbe::counted(action, telemetry).into();
+    let edit_session: ITfEditSession = TsfDocumentEditSession::counted(
+        context.clone(),
+        action,
+        document_composition,
+        logical_composition,
+        telemetry,
+    )
+    .into();
     let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
     // SAFETY: keystroke callbacks are one of the documented situations where
     // a synchronous read/write edit session can be requested. Both COM
@@ -315,7 +564,8 @@ enum KeyAdviceMode {
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
 struct TsfTextService {
     activation: Mutex<ActivationState>,
-    composition: Mutex<CompositionSession>,
+    composition: Rc<RefCell<CompositionSession>>,
+    document_composition: Rc<RefCell<DocumentCompositionState>>,
     candidate_provider: Option<Arc<dyn CandidateProvider>>,
     edit_telemetry: Arc<Mutex<EditSessionTelemetry>>,
     key_advice_mode: KeyAdviceMode,
@@ -333,7 +583,8 @@ impl TsfTextService {
         object_created();
         Self {
             activation: Mutex::new(ActivationState::default()),
-            composition: Mutex::new(CompositionSession::default()),
+            composition: Rc::new(RefCell::new(CompositionSession::default())),
+            document_composition: Rc::new(RefCell::new(DocumentCompositionState::default())),
             candidate_provider,
             edit_telemetry: Arc::new(Mutex::new(EditSessionTelemetry::default())),
             key_advice_mode,
@@ -434,7 +685,7 @@ impl TsfTextService_Impl {
         };
         let session = self
             .composition
-            .lock()
+            .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .clone();
         let selected_text = match input {
@@ -463,16 +714,18 @@ impl TsfTextService_Impl {
             activation.client_id
         };
 
-        request_probe_edit_session(
+        request_document_edit_session(
             &context,
             client_id,
             plan.edit,
+            Rc::clone(&self.document_composition),
+            Rc::clone(&self.composition),
             Arc::clone(&self.edit_telemetry),
         )?;
 
         let mut composition = self
             .composition
-            .lock()
+            .try_borrow_mut()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
         if *composition != plan.before {
             return Err(lifecycle_error(E_UNEXPECTED));
@@ -495,7 +748,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
             std::mem::take(&mut *activation)
         };
-        let composition_result = match self.composition.lock() {
+        let composition_result = match self.composition.try_borrow_mut() {
             Ok(mut composition) => {
                 composition.finish_commit();
                 Ok(())
@@ -627,7 +880,10 @@ mod tests {
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize,
     };
-    use windows::Win32::UI::TextServices::{CLSID_TF_ThreadMgr, TF_POPF_ALL};
+    use windows::Win32::UI::TextServices::{
+        CLSID_TF_ThreadMgr, ITfCompositionView, ITfContextOwnerCompositionServices, TF_ES_READ,
+        TF_POPF_ALL, TF_TF_MOVESTART,
+    };
     use windows::core::ComObject;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -668,6 +924,77 @@ mod tests {
             // the same test thread.
             unsafe { CoUninitialize() };
         }
+    }
+
+    #[implement(ITfEditSession)]
+    struct ContextTextReader {
+        context: ITfContext,
+        output: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ITfEditSession_Impl for ContextTextReader_Impl {
+        fn DoEditSession(&self, ec: u32) -> Result<()> {
+            // SAFETY: `ec` is the read cookie issued for this callback. Moving
+            // a cloned start range does not change the document or selection.
+            let range = unsafe { self.context.GetStart(ec) }?;
+            // SAFETY: the end range belongs to the same context and cookie.
+            let end = unsafe { self.context.GetEnd(ec) }?;
+            // SAFETY: expands the local range to cover the full context.
+            unsafe { range.ShiftEndToRange(ec, &end, TF_ANCHOR_END) }?;
+
+            let mut utf16 = Vec::new();
+            loop {
+                let mut chunk = [0u16; 64];
+                let mut fetched = 0;
+                // SAFETY: the output buffer is valid and TF_TF_MOVESTART only
+                // advances this local range while reading successive chunks.
+                unsafe { range.GetText(ec, TF_TF_MOVESTART, &mut chunk, &mut fetched) }?;
+                let fetched =
+                    usize::try_from(fetched).map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+                utf16.extend_from_slice(&chunk[..fetched]);
+                if fetched < chunk.len() {
+                    break;
+                }
+            }
+            let text = String::from_utf16(&utf16).map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            *self
+                .output
+                .lock()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))? = Some(text);
+            Ok(())
+        }
+    }
+
+    fn read_context_text(context: &ITfContext, client_id: u32) -> String {
+        let output = Arc::new(Mutex::new(None));
+        let reader: ITfEditSession = ContextTextReader {
+            context: context.clone(),
+            output: Arc::clone(&output),
+        }
+        .into();
+        let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READ.0);
+        // SAFETY: this synthetic context is focused on the current apartment;
+        // the read session owns all interfaces until the synchronous return.
+        let session_result = unsafe { context.RequestEditSession(client_id, &reader, flags) }
+            .expect("context read session should be scheduled");
+        session_result
+            .ok()
+            .expect("context read session should complete");
+        output
+            .lock()
+            .unwrap()
+            .take()
+            .expect("read callback should populate its output")
+    }
+
+    fn terminate_composition_from_host(context: &ITfContext) {
+        let owner: ITfContextOwnerCompositionServices = context
+            .cast()
+            .expect("synthetic context should expose owner composition services");
+        // SAFETY: a null view asks the context owner to terminate every active
+        // composition, modeling focus loss or host-driven cleanup.
+        unsafe { owner.TerminateComposition(None::<&ITfCompositionView>) }
+            .expect("host termination should succeed");
     }
 
     fn class_factory() -> IClassFactory {
@@ -820,8 +1147,10 @@ mod tests {
         unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
 
         let a = WPARAM(usize::from(VK_A.0));
+        let backspace = WPARAM(usize::from(VK_BACK.0));
         let space = WPARAM(usize::from(VK_SPACE.0));
         let b = WPARAM(usize::from(VK_A.0 + 1));
+        let c = WPARAM(usize::from(VK_A.0 + 2));
         let escape = WPARAM(usize::from(VK_ESCAPE.0));
         let lparam = LPARAM(0);
 
@@ -837,12 +1166,35 @@ mod tests {
                 .unwrap()
                 .as_bool()
         );
-        assert_eq!(service_object.composition.lock().unwrap().phonetic(), "a");
+        assert_eq!(service_object.composition.borrow().phonetic(), "a");
+        assert_eq!(read_context_text(&context, client_id), "a");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
         {
             let telemetry = service_object.edit_telemetry.lock().unwrap();
             assert_eq!(telemetry.completed, 1);
             assert_eq!(telemetry.last_kind, Some(DocumentEditKind::UpdatePreedit));
         }
+
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, a, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(service_object.composition.borrow().phonetic(), "aa");
+        assert_eq!(read_context_text(&context, client_id), "aa");
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, backspace, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(service_object.composition.borrow().phonetic(), "a");
+        assert_eq!(read_context_text(&context, client_id), "a");
 
         assert!(
             unsafe { key_sink.OnTestKeyDown(&context, space, lparam) }
@@ -854,17 +1206,18 @@ mod tests {
                 .unwrap()
                 .as_bool()
         );
+        assert!(service_object.composition.borrow().phonetic().is_empty());
+        assert_eq!(read_context_text(&context, client_id), "啊");
         assert!(
             service_object
-                .composition
-                .lock()
-                .unwrap()
-                .phonetic()
-                .is_empty()
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
         );
         {
             let telemetry = service_object.edit_telemetry.lock().unwrap();
-            assert_eq!(telemetry.completed, 2);
+            assert_eq!(telemetry.completed, 4);
             assert_eq!(telemetry.last_kind, Some(DocumentEditKind::Commit));
         }
 
@@ -878,18 +1231,63 @@ mod tests {
                 .unwrap()
                 .as_bool()
         );
+        assert_eq!(read_context_text(&context, client_id), "啊b");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
         assert!(
             unsafe { key_sink.OnKeyDown(&context, escape, lparam) }
                 .unwrap()
                 .as_bool()
         );
+        assert_eq!(read_context_text(&context, client_id), "啊");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
+        );
         {
             let telemetry = service_object.edit_telemetry.lock().unwrap();
-            assert_eq!(telemetry.completed, 4);
+            assert_eq!(telemetry.completed, 6);
             assert_eq!(telemetry.last_kind, Some(DocumentEditKind::Cancel));
         }
         assert!(
             !unsafe { key_sink.OnKeyUp(&context, a, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, c, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(read_context_text(&context, client_id), "啊c");
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
+        terminate_composition_from_host(&context);
+        assert_eq!(read_context_text(&context, client_id), "啊c");
+        assert!(service_object.composition.borrow().phonetic().is_empty());
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
+        );
+        assert!(
+            !unsafe { key_sink.OnTestKeyDown(&context, space, lparam) }
                 .unwrap()
                 .as_bool()
         );

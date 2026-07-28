@@ -3,9 +3,9 @@
 ## 状态
 
 这是用户明确批准的新里程碑。当前已完成与宿主无关的 `CompositionSession`
-抽取、TSF COM 生命周期探针，以及只在测试进程中工作的按键与同步编辑事务
-探针。仓库尚未注册或安装 TSF 输入法，也没有修改 Windows 默认输入方式；
-编辑事务目前不修改 `ITfRange`，因此还不能在真实编辑框显示或提交文字。
+抽取、TSF COM 生命周期探针，以及只在测试进程中工作的按键与真实组合范围
+闭环。仓库尚未注册或安装 TSF 输入法，也没有修改 Windows 默认输入方式；
+文字变更目前只在进程内的合成 Context 中验证，尚未进入记事本或 Codex。
 
 ## 目标
 
@@ -64,7 +64,8 @@ CompositionSession
 - 未注册测试进程拿到的是应用 client id，Windows 会拒绝用它冒充前台文本
   服务。测试因此只绕过“前台订阅”这一项，直接调用同一个按键接收器；
 - 测试按键仍经过真实的 Thread Manager、Document Manager、Context 与同步
-  `RequestEditSession`。事务只记录有界的“更新/取消/提交”结构，不保存原文；
+  `RequestEditSession`。事务用 `ITfRange` 修改合成文档，同时只保留有界的
+  “更新/取消/提交”结构遥测，不保存原文；
 - 默认类工厂没有候选源，任何按键都会交还宿主。测试候选源只能由仓库内测试
   显式注入；
 - 在用户再次确认安装前，只构建和检查，不注册。
@@ -78,9 +79,12 @@ CompositionSession
 
 - `a`～`z`、Backspace、Esc、Space / Enter 与数字键的路由和事务计划已有
   进程内覆盖；
-- 下一步用 `ITfInsertAtSelection`、`ITfContextComposition` 和 `ITfRange` 真正
-  创建、更新、取消与提交组合；
-- 提交、焦点丢失和输入法切换都正确结束组合；
+- 已用 `ITfInsertAtSelection`、`ITfContextComposition` 和 `ITfRange` 在合成
+  Context 中创建、更新、取消与提交组合；
+- 测试会逐步读回合成正文，验证同一范围更新、候选替换、取消删除以及提交后
+  光标落在文字末尾；
+- `ITfCompositionSink` 已处理宿主主动终止并同步清理内部状态；真实激活下的
+  焦点丢失和输入法切换清理仍是注册前的下一道门；
 - 未激活或没有组合时，普通按键交还宿主。
 
 ### 3. 候选窗口与现有功能
