@@ -36,6 +36,10 @@ use windows::core::{
 
 /// Fixed COM class identity reserved for the local TSF alpha.
 pub const TSF_ALPHA_CLSID: GUID = GUID::from_u128(0x4cc8427b_d0f5_439e_b6af_d45eacd7e577);
+/// Fixed Simplified Chinese language-profile identity reserved for the alpha.
+pub const TSF_ALPHA_PROFILE_GUID: GUID = GUID::from_u128(0x8099d3f8_9f40_4da5_9b01_c12de0cd6370);
+/// Simplified Chinese (zh-CN) language identifier used by the alpha profile.
+pub const TSF_ALPHA_LANGID: u16 = 0x0804;
 
 static ACTIVE_COM_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);

@@ -77,6 +77,10 @@ CompositionSession
 中创建并释放系统 TSF Thread Manager，不写注册表、不创建输入配置文件，也不
 改变 Windows 输入法列表。
 
+注册前可运行[TSF 开发检查](tsf-dev-inspection.md)，只读核对 DLL 的 PE 架构、
+COM/注册入口、证书目录，以及固定 zh-CN 语言配置是否已存在。检查器没有任何
+注册、注销、启用或激活子命令；“证书目录存在”也不冒充签名验证。
+
 ### 2. 最小可输入闭环
 
 - `a`～`z`、Backspace、Esc、Space / Enter 与数字键的路由和事务计划已有
@@ -121,6 +125,11 @@ CompositionSession
 - 注册失败或候选版本启动失败时，微软拼音和 previous 必须保持可用；
 - 不申请网络能力，不把解码或私人数据发送给其他进程；
 - 在签名与 Windows 兼容要求没有验证前，不称为可分发安装包。
+- Vista 以后优先使用 `ITfInputProcessorProfileMgr` 管理语言配置；键盘 TIP 类别
+  通过 `ITfCategoryMgr` 明确注册。标准 COM 激活信息、TSF 配置和类别必须各自
+  有可验证的反向清理；
+- 当前默认类工厂仍没有候选源，真实实例不会接管按键，因此只读检查通过也不
+  等于已经适合安装。
 
 微软要求现代自定义 IME 使用 TSF，并说明输入法 DLL 会被加载进当前应用、
 受到该应用容器能力约束：

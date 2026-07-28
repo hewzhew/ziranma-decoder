@@ -302,8 +302,12 @@ $requiredFiles = @(
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu',
     'docs/candidate-lab.md',
     'docs/open-source-boundary-audit.md',
+    'docs/tsf-alpha.md',
+    'docs/tsf-dev-inspection.md',
     'scripts/release-audit.ps1',
-    'src/candidate_lab_cli.rs'
+    'src/bin/tsf-devctl.rs',
+    'src/candidate_lab_cli.rs',
+    'src/tsf_alpha.rs'
 )
 foreach ($requiredFile in $requiredFiles) {
     Assert-RequiredFile -RelativePath $requiredFile -CandidateSet $candidateSet

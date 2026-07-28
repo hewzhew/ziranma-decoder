@@ -165,6 +165,16 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 不会注册输入法、修改默认键盘或读取私人记录。首个系统边界里程碑只做可构建的
 TSF 生命周期探针；任何本机注册仍需要用户再次明确确认。
 
+发布 DLL 的架构、COM 导出、证书目录和固定 zh-CN 语言配置可以先用只读工具
+核对；它不提供注册或激活命令：
+
+```powershell
+cargo build --release --lib --bin tsf-devctl
+.\target\release\tsf-devctl.exe inspect --dll .\target\release\ziranma_core.dll
+```
+
+检查口径与尚未满足的安装条件见[TSF 开发检查](docs/tsf-dev-inspection.md)。
+
 ## 候选实验台
 
 `candidate-lab` 默认只显示适合直接阅读的中文：普通候选、预计操作数、
