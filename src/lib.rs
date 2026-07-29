@@ -16,6 +16,7 @@ use std::fmt;
 mod abbreviation;
 mod candidate_lab;
 mod candidate_package;
+mod candidate_runtime;
 mod candidate_slots;
 mod candidate_snapshot;
 mod capsule_replay;
@@ -58,6 +59,13 @@ pub use candidate_lab::{
 pub use candidate_package::{
     CANDIDATE_PACKAGE_LEXICON_TSV_V1, CANDIDATE_PACKAGE_SCHEMA_V1, CandidatePackageError,
     CandidatePackageManifest, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+};
+pub use candidate_runtime::{
+    CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGES_DIRECTORY,
+    CANDIDATE_PREFLIGHT_HOST_V1, CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V1,
+    CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_RUNTIME_DIRECTORY, CANDIDATE_SLOT_STATE_FILE,
+    CandidateRuntimeError, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, candidate_package_storage_id,
+    candidate_preflight_receipt_body, load_current_candidate_snapshot,
 };
 pub use candidate_slots::{
     CANDIDATE_SLOT_STATE_SCHEMA_V1, CandidateSlotError, CandidateSlotState,

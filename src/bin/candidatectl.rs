@@ -19,19 +19,13 @@ use windows::core::PCWSTR;
 #[cfg(windows)]
 use ziranma_core::preflight_candidate_snapshot;
 use ziranma_core::{
-    CandidatePackageManifest, CandidateSlotState, CandidateSnapshot,
-    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, candidate_payload_fingerprint, parse_lexicon_tsv,
+    CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGES_DIRECTORY,
+    CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CandidatePackageManifest,
+    CandidateSlotState, CandidateSnapshot, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, candidate_package_storage_id, candidate_preflight_receipt_body,
+    parse_lexicon_tsv,
 };
-
-const PACKAGE_MANIFEST_FILE: &str = "manifest.zcm";
-const PACKAGE_PAYLOAD_FILE: &str = "lexicon.tsv";
-const PACKAGES_DIRECTORY: &str = "packages";
-const PREFLIGHTS_DIRECTORY: &str = "preflights";
-const SLOT_STATE_FILE: &str = "slots.zcs";
-const PREFLIGHT_RECEIPT_SCHEMA: &str = "ziranma-candidate-preflight-v1";
-const PREFLIGHT_HOST_SCHEMA: &str = "tsf-synthetic-context-v1";
-const MAX_PREFLIGHT_RECEIPT_BYTES: usize = 256;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -316,9 +310,12 @@ fn build_public_package(
     let manifest_text = manifest.render();
 
     fs::create_dir(output).map_err(|_| "cannot create explicitly named package output")?;
-    write_new_synced(&output.join(PACKAGE_PAYLOAD_FILE), payload.as_bytes())?;
     write_new_synced(
-        &output.join(PACKAGE_MANIFEST_FILE),
+        &output.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+        payload.as_bytes(),
+    )?;
+    write_new_synced(
+        &output.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
         manifest_text.as_bytes(),
     )?;
 
@@ -527,12 +524,12 @@ fn load_public_package_directory(
 fn load_package_directory(package: &Path) -> Result<LoadedPackage, Box<dyn std::error::Error>> {
     ensure_regular_directory(package, "candidate package")?;
     let manifest_text = read_explicit_text(
-        &package.join(PACKAGE_MANIFEST_FILE),
+        &package.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
         "candidate manifest",
         MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
     )?;
     let payload_text = read_explicit_text(
-        &package.join(PACKAGE_PAYLOAD_FILE),
+        &package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
         "candidate payload",
         MAX_CANDIDATE_SNAPSHOT_BYTES,
     )?;
@@ -558,11 +555,11 @@ fn load_installed_package(
     root: &Path,
     package_id: &str,
 ) -> Result<LoadedPackage, Box<dyn std::error::Error>> {
-    let loaded = load_package_directory(&root.join(PACKAGES_DIRECTORY).join(package_id))?;
+    let loaded = load_package_directory(&root.join(CANDIDATE_PACKAGES_DIRECTORY).join(package_id))?;
     if loaded.snapshot.contains_private_text() {
         return Err("candidate slot unexpectedly contains plaintext private text".into());
     }
-    if package_storage_id(&loaded) != package_id {
+    if candidate_package_storage_id(&loaded.manifest_text, &loaded.payload_text) != package_id {
         return Err("installed candidate package no longer matches its storage identifier".into());
     }
     Ok(loaded)
@@ -572,8 +569,8 @@ fn install_package(
     root: &Path,
     loaded: &LoadedPackage,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let package_id = package_storage_id(loaded);
-    let packages = root.join(PACKAGES_DIRECTORY);
+    let package_id = candidate_package_storage_id(&loaded.manifest_text, &loaded.payload_text);
+    let packages = root.join(CANDIDATE_PACKAGES_DIRECTORY);
     let destination = packages.join(&package_id);
 
     match fs::symlink_metadata(&destination) {
@@ -594,11 +591,11 @@ fn install_package(
     let temporary = packages.join(format!(".install-{}-{stamp}", std::process::id()));
     fs::create_dir(&temporary).map_err(|_| "cannot create temporary candidate package")?;
     write_new_synced(
-        &temporary.join(PACKAGE_PAYLOAD_FILE),
+        &temporary.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
         loaded.payload_text.as_bytes(),
     )?;
     write_new_synced(
-        &temporary.join(PACKAGE_MANIFEST_FILE),
+        &temporary.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
         loaded.manifest_text.as_bytes(),
     )?;
     fs::rename(&temporary, &destination).map_err(|_| "cannot install candidate package")?;
@@ -609,20 +606,8 @@ fn install_package(
     Ok(package_id)
 }
 
-fn package_storage_id(loaded: &LoadedPackage) -> String {
-    let manifest_id = candidate_payload_fingerprint(loaded.manifest_text.as_bytes());
-    let payload_id = candidate_payload_fingerprint(loaded.payload_text.as_bytes());
-    format!("pkg-{manifest_id:016x}-{payload_id:016x}")
-}
-
-fn preflight_receipt_body(package_id: &str) -> String {
-    format!(
-        "schema={PREFLIGHT_RECEIPT_SCHEMA}\npackage={package_id}\nhost={PREFLIGHT_HOST_SCHEMA}\n"
-    )
-}
-
 fn preflight_receipt_path(root: &Path, package_id: &str) -> PathBuf {
-    root.join(PREFLIGHTS_DIRECTORY)
+    root.join(CANDIDATE_PREFLIGHTS_DIRECTORY)
         .join(format!("{package_id}.zpf"))
 }
 
@@ -630,14 +615,14 @@ fn write_preflight_receipt(
     root: &Path,
     package_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected = preflight_receipt_body(package_id);
+    let expected = candidate_preflight_receipt_body(package_id);
     let path = preflight_receipt_path(root, package_id);
     match fs::symlink_metadata(&path) {
         Ok(_) => {
             let existing = read_explicit_text(
                 &path,
                 "candidate preflight receipt",
-                MAX_PREFLIGHT_RECEIPT_BYTES,
+                MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
             )?;
             if existing != expected {
                 return Err("candidate preflight receipt does not match its package".into());
@@ -658,9 +643,9 @@ fn validate_preflight_receipt(
     let receipt = read_explicit_text(
         &preflight_receipt_path(root, package_id),
         "candidate preflight receipt",
-        MAX_PREFLIGHT_RECEIPT_BYTES,
+        MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     )?;
-    if receipt != preflight_receipt_body(package_id) {
+    if receipt != candidate_preflight_receipt_body(package_id) {
         return Err("candidate preflight receipt does not match its package".into());
     }
     Ok(())
@@ -675,7 +660,7 @@ fn prepare_slot_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => return Err("cannot inspect candidate slot root".into()),
     }
-    let packages = root.join(PACKAGES_DIRECTORY);
+    let packages = root.join(CANDIDATE_PACKAGES_DIRECTORY);
     match fs::symlink_metadata(&packages) {
         Ok(_) => ensure_regular_directory(&packages, "candidate package store")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -683,7 +668,7 @@ fn prepare_slot_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => return Err("cannot inspect candidate package store".into()),
     }
-    let preflights = root.join(PREFLIGHTS_DIRECTORY);
+    let preflights = root.join(CANDIDATE_PREFLIGHTS_DIRECTORY);
     match fs::symlink_metadata(&preflights) {
         Ok(_) => ensure_regular_directory(&preflights, "candidate preflight store")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -702,7 +687,7 @@ fn read_slot_state(root: &Path) -> Result<CandidateSlotState, Box<dyn std::error
         }
         Err(_) => return Err("cannot inspect candidate slot root".into()),
     }
-    let path = root.join(SLOT_STATE_FILE);
+    let path = root.join(CANDIDATE_SLOT_STATE_FILE);
     match fs::symlink_metadata(&path) {
         Ok(_) => {
             let contents = read_explicit_text(
@@ -729,7 +714,7 @@ fn write_slot_state(
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temporary = root.join(format!(".slots-{}-{stamp}.tmp", std::process::id()));
     write_new_synced(&temporary, body.as_bytes())?;
-    let result = move_replace(&temporary, &root.join(SLOT_STATE_FILE));
+    let result = move_replace(&temporary, &root.join(CANDIDATE_SLOT_STATE_FILE));
     if result.is_err() && temporary.exists() {
         let _ = fs::remove_file(&temporary);
     }
@@ -932,7 +917,7 @@ mod tests {
         assert!(built_a.contains("版本：public-a"));
         assert!(built_b.contains("版本：public-b"));
         assert_eq!(
-            fs::read_to_string(package_a.join(PACKAGE_PAYLOAD_FILE)).unwrap(),
+            fs::read_to_string(package_a.join(CANDIDATE_PACKAGE_PAYLOAD_FILE)).unwrap(),
             LEXICON
         );
         assert_eq!(
@@ -1018,9 +1003,9 @@ mod tests {
                 .render();
         fs::write(
             slots
-                .join(PACKAGES_DIRECTORY)
+                .join(CANDIDATE_PACKAGES_DIRECTORY)
                 .join(candidate)
-                .join(PACKAGE_MANIFEST_FILE),
+                .join(CANDIDATE_PACKAGE_MANIFEST_FILE),
             changed_manifest,
         )
         .unwrap();
@@ -1088,8 +1073,8 @@ mod tests {
         let manifest = CandidatePackageManifest::from_payload("private-v1", true, LEXICON)
             .unwrap()
             .render();
-        fs::write(package.join(PACKAGE_PAYLOAD_FILE), LEXICON).unwrap();
-        fs::write(package.join(PACKAGE_MANIFEST_FILE), manifest).unwrap();
+        fs::write(package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE), LEXICON).unwrap();
+        fs::write(package.join(CANDIDATE_PACKAGE_MANIFEST_FILE), manifest).unwrap();
 
         assert!(adopt(&slots, &package).is_err());
         assert!(!slots.exists());

@@ -69,11 +69,11 @@ CompositionSession
 - 测试按键仍经过真实的 Thread Manager、Document Manager、Context 与同步
   `RequestEditSession`。事务用 `ITfRange` 修改合成文档，同时只保留有界的
   “更新/取消/提交”结构遥测，不保存原文；
-- 默认类工厂带有一个进程内只初始化一次的开发候选源。它复用 50 词公开演示
-  词典，先解析严格的候选包清单，再通过
+- DLL 同目录没有 `candidate-data` 时，默认类工厂使用进程内只初始化一次的
+  开发候选源。它复用 50 词公开演示词典，先解析严格的候选包清单，再通过
   [只读候选快照](candidate-snapshots.md)校验 schema、版本、字节数、指纹和
-  词条数后建立现有 `Decoder`；它不读文件、不学习、不联网，这只用于接通
-  正式类工厂，不能代表日用词量或候选质量；
+  词条数后建立现有 `Decoder`；`candidate-data` 存在时，新类工厂只读其中
+  经过预检的公开 current。两条路径都不学习、不联网；
 - 在用户再次确认安装前，只构建和检查，不注册。
 
 当前构建命令为 `cargo build --release --lib`，产物是
@@ -139,11 +139,12 @@ COM/注册入口、证书目录，以及固定 zh-CN 语言配置是否已存在
 - Vista 以后优先使用 `ITfInputProcessorProfileMgr` 管理语言配置；键盘 TIP 类别
   通过 `ITfCategoryMgr` 明确注册。标准 COM 激活信息、TSF 配置和类别必须各自
   有可验证的反向清理；
-- 当前默认类工厂只有 50 词开发候选源。它足以验证对象创建、解码和上屏，
-  不足以日用；只读检查通过也不等于已经适合安装。
-- 独立 `candidatectl` 已能确定性生成公开包并原子管理
-  current/candidate/previous 数据槽，但默认类工厂尚未读取该槽位。提升数据槽
-  不会改变已加载 DLL；接通以前也不把它称为输入法热更新。
+- DLL 同目录没有 `candidate-data` 时，默认类工厂只有 50 词开发候选源。它足以
+  验证对象创建、解码和上屏，不足以日用；只读检查通过也不等于适合安装。
+- 独立 `candidatectl` 能确定性生成公开包并原子管理
+  current/candidate/previous。新类工厂会从 DLL 相邻的固定槽根读取 current；
+  已有类工厂继续持有旧快照，活动组合不会热换。配置目录存在却无效时拒绝
+  建立类工厂，不静默使用演示包。
 - `candidatectl preflight` 会用包内确定性探针创建真实系统 Thread Manager 与
   合成 Context，经过同一个类工厂、预编辑和首选上屏。`adopt` / `stage` 只有在
   该预检通过后才写内容绑定凭据；提升和回退会复核凭据与当前包内容。

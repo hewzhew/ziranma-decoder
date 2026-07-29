@@ -6,24 +6,31 @@
 
 use std::cell::RefCell;
 use std::error::Error as StdError;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fmt;
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
-    CandidatePackageError, CandidatePackageManifest, CandidateSnapshot, CompositionEffect,
-    CompositionInput, CompositionSession,
+    CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
+    CandidateRuntimeError, CandidateSnapshot, CompositionEffect, CompositionInput,
+    CompositionSession, load_current_candidate_snapshot,
 };
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, LPARAM, S_FALSE,
-    S_OK, WPARAM,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, HMODULE, LPARAM,
+    S_FALSE, S_OK, WPARAM,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, IClassFactory, IClassFactory_Impl,
+};
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    GetModuleFileNameW, GetModuleHandleExW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_0, VK_9, VK_A, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_NEXT,
@@ -39,7 +46,7 @@ use windows::Win32::UI::TextServices::{
     TF_IAS_NO_DEFAULT_COMPOSITION, TF_POPF_ALL, TF_SELECTION, TF_SELECTIONSTYLE, TF_TF_MOVESTART,
 };
 use windows::core::{
-    Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
+    Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
 };
 
 /// Fixed COM class identity reserved for the local TSF alpha.
@@ -66,13 +73,20 @@ trait CandidateProvider: Send + Sync {
 }
 
 type CandidateProviderLoadResult =
-    std::result::Result<Arc<dyn CandidateProvider>, CandidatePackageError>;
+    std::result::Result<Arc<dyn CandidateProvider>, CandidateProviderLoadError>;
 
-struct DevelopmentCandidateProvider {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CandidateProviderLoadError {
+    Embedded(CandidatePackageError),
+    Runtime(CandidateRuntimeError),
+    ModuleLocation,
+}
+
+struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
 }
 
-impl CandidateProvider for DevelopmentCandidateProvider {
+impl CandidateProvider for SnapshotCandidateProvider {
     fn candidate(&self, code: &str, rank: usize) -> Option<String> {
         self.snapshot.candidate_text(code, rank).ok().flatten()
     }
@@ -82,11 +96,59 @@ fn development_candidate_provider() -> CandidateProviderLoadResult {
     static PROVIDER: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
     PROVIDER
         .get_or_init(|| {
-            let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST)?;
-            let snapshot = Arc::new(manifest.load_snapshot(TSF_DEVELOPMENT_LEXICON)?);
-            Ok(Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
+            let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST)
+                .map_err(CandidateProviderLoadError::Embedded)?;
+            let snapshot = Arc::new(
+                manifest
+                    .load_snapshot(TSF_DEVELOPMENT_LEXICON)
+                    .map_err(CandidateProviderLoadError::Embedded)?,
+            );
+            Ok(Arc::new(SnapshotCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
         })
         .clone()
+}
+
+fn candidate_provider_for_root(root: &Path) -> CandidateProviderLoadResult {
+    match load_current_candidate_snapshot(root).map_err(CandidateProviderLoadError::Runtime)? {
+        Some(snapshot) => {
+            Ok(Arc::new(SnapshotCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
+        }
+        None => development_candidate_provider(),
+    }
+}
+
+fn module_candidate_runtime_root() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
+    let mut module = HMODULE::default();
+    let address = DllGetClassObject as *const () as *const u16;
+    // SAFETY: FROM_ADDRESS treats the non-null value as an address within the
+    // current module rather than a string. UNCHANGED_REFCOUNT avoids taking a
+    // library reference that would interfere with COM unload accounting.
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(address),
+            &mut module,
+        )
+    }
+    .map_err(|_| CandidateProviderLoadError::ModuleLocation)?;
+
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: `module` identifies the image containing this function and the
+    // writable buffer remains alive for the synchronous call.
+    let length = unsafe { GetModuleFileNameW(Some(module), &mut buffer) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(CandidateProviderLoadError::ModuleLocation);
+    }
+    let module_path = PathBuf::from(OsString::from_wide(&buffer[..length]));
+    let parent = module_path
+        .parent()
+        .ok_or(CandidateProviderLoadError::ModuleLocation)?;
+    Ok(parent.join(CANDIDATE_RUNTIME_DIRECTORY))
+}
+
+fn class_factory_candidate_provider() -> CandidateProviderLoadResult {
+    let root = module_candidate_runtime_root()?;
+    candidate_provider_for_root(&root)
 }
 
 const MAX_TSF_PREFLIGHT_CODE_KEYS: usize = 64;
@@ -359,8 +421,7 @@ fn run_candidate_preflight(
     expected_text: &str,
 ) -> std::result::Result<(), TsfCandidatePreflightError> {
     let _apartment = PreflightApartment::enter()?;
-    let provider =
-        Arc::new(DevelopmentCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>;
+    let provider = Arc::new(SnapshotCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>;
     let factory: IClassFactory =
         TsfClassFactory::counted_with_options(Ok(provider), KeyAdviceMode::SyntheticHost).into();
     // SAFETY: aggregation is disabled and the local factory implements this interface.
@@ -627,8 +688,12 @@ struct TsfClassFactory {
 }
 
 impl TsfClassFactory {
-    fn counted() -> Self {
-        Self::counted_with_options(development_candidate_provider(), KeyAdviceMode::Foreground)
+    fn counted() -> std::result::Result<Self, CandidateProviderLoadError> {
+        let provider = class_factory_candidate_provider()?;
+        Ok(Self::counted_with_options(
+            Ok(provider),
+            KeyAdviceMode::Foreground,
+        ))
     }
 
     fn counted_with_options(
@@ -1537,7 +1602,11 @@ pub unsafe extern "system" fn DllGetClassObject(
         return CLASS_E_CLASSNOTAVAILABLE;
     }
 
-    let factory: IClassFactory = TsfClassFactory::counted().into();
+    let factory = match TsfClassFactory::counted() {
+        Ok(factory) => factory,
+        Err(_) => return E_UNEXPECTED,
+    };
+    let factory: IClassFactory = factory.into();
     // SAFETY: `riid` and `ppv` were validated above. QueryInterface transfers
     // one owned reference to `ppv` on success.
     unsafe { factory.query(riid, ppv) }
@@ -1553,6 +1622,8 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::AtomicU64;
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize,
@@ -1562,6 +1633,34 @@ mod tests {
         TF_POPF_ALL, TF_TF_MOVESTART,
     };
     use windows::core::ComObject;
+
+    #[test]
+    fn runtime_root_is_fixed_beside_the_loaded_module() {
+        let root = module_candidate_runtime_root().unwrap();
+        assert_eq!(
+            root.file_name().and_then(|name| name.to_str()),
+            Some(CANDIDATE_RUNTIME_DIRECTORY)
+        );
+    }
+
+    #[test]
+    fn present_invalid_runtime_root_never_falls_back_to_embedded_data() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-invalid-runtime-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let result = candidate_provider_for_root(&root);
+        fs::remove_dir(&root).unwrap();
+        assert!(matches!(
+            result,
+            Err(CandidateProviderLoadError::Runtime(
+                CandidateRuntimeError::SlotStateUnavailable
+            ))
+        ));
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         SYNTHETIC_HOST_LOCK
@@ -1712,7 +1811,9 @@ mod tests {
         let _guard = test_lock();
         assert_eq!(DllCanUnloadNow(), S_OK);
         let factory: IClassFactory = TsfClassFactory::counted_with_options(
-            Err(CandidatePackageError::UnsupportedSchema),
+            Err(CandidateProviderLoadError::Embedded(
+                CandidatePackageError::UnsupportedSchema,
+            )),
             KeyAdviceMode::SyntheticHost,
         )
         .into();

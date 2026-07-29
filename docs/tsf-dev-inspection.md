@@ -50,9 +50,9 @@ cargo build --release --lib --bin tsf-devctl
 
 当前 Alpha 尚有明确缺口：
 
-- 默认类工厂只接入了经过只读快照校验的 50 词公开开发候选源；它用于合成
-  Context 闭环，不是日用词典。严格包格式、公开生成、真实 TSF 合成预检及
-  current/candidate/previous 槽位已有，但默认类工厂尚未加载外部 current；
+- DLL 同目录没有 `candidate-data` 时，默认类工厂接入经过只读快照校验的 50 词
+  公开开发候选源；它用于合成 Context 闭环，不是日用词典。目录存在时，新类
+  工厂严格加载带有效 TSF 预检凭据的外部 current；
 - 没有候选 UI、品牌图标或经验证的数字签名；
 - 没有安装、释放已加载实例、反向注销和失败回滚实现；
 - 尚未在记事本或 Codex 中验证真实焦点与异步编辑时序。
