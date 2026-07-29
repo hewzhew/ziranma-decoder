@@ -410,6 +410,10 @@ mod tests {
     fn exact_manifest_payload_and_provenance_bytes_affect_authentication_digest() {
         let provenance = provenance().render();
         let baseline = candidate_package_authentication_sha256(&provenance, MANIFEST, PAYLOAD);
+        assert_eq!(
+            baseline,
+            "1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2"
+        );
         assert_ne!(
             baseline,
             candidate_package_authentication_sha256(

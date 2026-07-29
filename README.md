@@ -194,6 +194,17 @@ cargo run --release --bin candidatectl -- build `
   --public
 ```
 
+`build` 会输出绑定三份包材料的“发布 SHA-256”。发布者应把它放在与候选包
+分开的可信渠道；使用者不能从同一个待验证目录读取摘要再称为可信。拿到独立
+摘要后，可以先只读验证。这个值是 `candidatectl` 对三份规范文件计算的域分隔
+摘要，不是 ZIP 文件摘要，不能拿 `Get-FileHash` 对压缩包的结果直接替代：
+
+```powershell
+cargo run --release --bin candidatectl -- verify `
+  --package .local/candidate-demo-v1 `
+  --expected-sha256 1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2
+```
+
 候选包可以在不注册输入法的情况下经过真实 Windows TSF 合成 Context 预检：
 
 ```powershell
@@ -213,9 +224,14 @@ SHA-256 绑定来源侧车、清单、载荷、宿主和解码兼容标识。
 ```powershell
 cargo run --release --bin candidatectl -- adopt `
   --root .local/candidate-slots `
-  --package .local/candidate-demo-v1
+  --package .local/candidate-demo-v1 `
+  --expected-sha256 1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2
 cargo run --release --bin candidatectl -- status --root .local/candidate-slots
 ```
+
+`adopt` 和 `stage` 强制要求该独立摘要，并在创建或改变槽位前核对；摘要缺失、
+格式错误或不匹配时不安装、不预检、不改变状态。SHA-256 仍不认证发布者，
+正式多人分发还需要受信签名。
 
 若槽根固定为 DLL 同目录的 `candidate-data`，新类工厂会读取经过预检的
 `current`。目录完全不存在时才使用编译进 DLL 的公开演示包；目录存在但损坏、

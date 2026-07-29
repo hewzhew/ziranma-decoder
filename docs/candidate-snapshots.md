@@ -80,6 +80,19 @@ cargo run --release --bin candidatectl -- build `
 留下一个无法通过完整加载的不完整目录，不会冒充有效包。当前命令刻意不提供
 私人明文生成；私人候选必须另行设计 DPAPI 封装和授权边界。
 
+生成报告会显示绑定三份精确材料的“发布 SHA-256”。它适合由发布者复制到
+GitHub Release、签名公告或另一个受信渠道，不应与待验证包放在同一目录后由包
+自行证明。这个值是对来源侧车、清单和载荷按固定域与长度编码计算的材料摘要，
+不是目录或 ZIP 的文件摘要。使用者拿到独立摘要后可先运行：
+
+```powershell
+cargo run --release --bin candidatectl -- verify `
+  --package .local/candidate-demo-v1 `
+  --expected-sha256 1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2
+```
+
+`verify` 只读三份固定文件，摘要不符时不写状态；报告不回显摘要或候选正文。
+
 ### Alpha 格式迁移
 
 早期实验生成的双文件包和 `ziranma-candidate-preflight-v1` 凭据不再接受，也
@@ -91,8 +104,10 @@ TSF alpha 尚未注册，因此开发迁移应重建测试根，而不是手工�
 ## 开发槽位
 
 `candidatectl` 的 `adopt`、`stage`、`promote`、`rollback` 和 `status` 接收显式
-`--root`。`adopt` / `stage` 还要求显式 `--package`，只从固定的
-`manifest.zcm`、`lexicon.tsv` 与 `provenance.zcp` 加载，不扫描相邻目录。
+`--root`。`adopt` / `stage` 还要求显式 `--package` 和从独立可信渠道取得的
+`--expected-sha256`，只从固定的 `manifest.zcm`、`lexicon.tsv` 与
+`provenance.zcp` 加载，不扫描相邻目录。摘要缺失、格式错误或不匹配时，它们
+在创建槽根、复制包或运行预检之前失败。
 
 槽库把验证后的公开包复制到内容寻址、只增不改的内部目录。四行
 `ziranma-candidate-slots-v1` 状态只保存 current/candidate/previous 三个内部
@@ -133,7 +148,8 @@ cargo run --release --bin candidatectl -- preflight `
 ```powershell
 cargo run --release --bin candidatectl -- adopt `
   --root .\target\release\candidate-data `
-  --package .local\candidate-demo-v1
+  --package .local\candidate-demo-v1 `
+  --expected-sha256 1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2
 ```
 
 运行时只打开以下确定路径：`slots.zcs`、`packages/<current>/manifest.zcm`、
@@ -183,8 +199,8 @@ cargo run --release --bin candidatectl -- adopt `
 包清单、显式来源与许可、SHA-256 材料绑定、解码兼容边界、TSF 合成宿主预检、
 三槽状态以及新类工厂读取 `current` 已经完成。接下来仍有两道门：
 
-1. 正式分发需要由受信发布密钥签名包，或由独立受信渠道固定包 SHA-256；当前
-   侧车只是可审计声明，不认证声明者；
+1. 独立可信 SHA-256 已能在安装槽位前钉住一个精确包，但正式多人分发仍宜由
+   受信发布密钥签名；当前侧车和摘要都不认证声明者；
 2. 当前仍没有注册、安装、签名或跨进程升级协调。实际宿主中的版本观察、启动
    延迟、内存重复量和回退操作必须在用户另行授权注册之后测量。
 

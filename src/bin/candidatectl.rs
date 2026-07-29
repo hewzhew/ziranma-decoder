@@ -46,16 +46,22 @@ enum Options {
     Preflight {
         package: PathBuf,
     },
+    Verify {
+        package: PathBuf,
+        expected_sha256: String,
+    },
     Status {
         root: PathBuf,
     },
     Adopt {
         root: PathBuf,
         package: PathBuf,
+        expected_sha256: String,
     },
     Stage {
         root: PathBuf,
         package: PathBuf,
+        expected_sha256: String,
     },
     Promote {
         root: PathBuf,
@@ -107,9 +113,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             declaration,
         } => build_public_package(&source, &output, &revision, &declaration)?,
         Options::Preflight { package } => preflight(&package)?,
+        Options::Verify {
+            package,
+            expected_sha256,
+        } => verify(&package, &expected_sha256)?,
         Options::Status { root } => status(&root)?,
-        Options::Adopt { root, package } => adopt(&root, &package)?,
-        Options::Stage { root, package } => stage(&root, &package)?,
+        Options::Adopt {
+            root,
+            package,
+            expected_sha256,
+        } => adopt(&root, &package, &expected_sha256)?,
+        Options::Stage {
+            root,
+            package,
+            expected_sha256,
+        } => stage(&root, &package, &expected_sha256)?,
         Options::Promote { root } => promote(&root)?,
         Options::Rollback { root } => rollback(&root)?,
     };
@@ -135,16 +153,34 @@ fn parse_options(
         "preflight" => Ok(Options::Preflight {
             package: parse_package_only(arguments, "preflight")?,
         }),
+        "verify" => {
+            let (package, expected_sha256) =
+                parse_package_and_expected_sha256(arguments, "verify")?;
+            Ok(Options::Verify {
+                package,
+                expected_sha256,
+            })
+        }
         "status" => Ok(Options::Status {
             root: parse_root_only(arguments, "status")?,
         }),
         "adopt" => {
-            let (root, package) = parse_root_and_package(arguments, "adopt")?;
-            Ok(Options::Adopt { root, package })
+            let (root, package, expected_sha256) =
+                parse_root_package_and_expected_sha256(arguments, "adopt")?;
+            Ok(Options::Adopt {
+                root,
+                package,
+                expected_sha256,
+            })
         }
         "stage" => {
-            let (root, package) = parse_root_and_package(arguments, "stage")?;
-            Ok(Options::Stage { root, package })
+            let (root, package, expected_sha256) =
+                parse_root_package_and_expected_sha256(arguments, "stage")?;
+            Ok(Options::Stage {
+                root,
+                package,
+                expected_sha256,
+            })
         }
         "promote" => Ok(Options::Promote {
             root: parse_root_only(arguments, "promote")?,
@@ -245,22 +281,54 @@ fn parse_root_only(
     root.ok_or_else(|| format!("{command} requires exactly one --root path").into())
 }
 
-fn parse_root_and_package(
+fn parse_root_package_and_expected_sha256(
     mut arguments: impl Iterator<Item = String>,
     command: &str,
-) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, PathBuf, String), Box<dyn std::error::Error>> {
     let mut root = None;
     let mut package = None;
+    let mut expected_sha256 = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--root" => set_path(&mut root, &mut arguments, "--root")?,
             "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--expected-sha256" => {
+                set_value(&mut expected_sha256, &mut arguments, "--expected-sha256")?
+            }
             _ => return Err(format!("unknown {command} argument; value was suppressed").into()),
         }
     }
     Ok((
         root.ok_or_else(|| format!("{command} requires exactly one --root path"))?,
         package.ok_or_else(|| format!("{command} requires exactly one --package path"))?,
+        canonical_expected_sha256(
+            &expected_sha256
+                .ok_or_else(|| format!("{command} requires exactly one --expected-sha256 value"))?,
+        )?,
+    ))
+}
+
+fn parse_package_and_expected_sha256(
+    mut arguments: impl Iterator<Item = String>,
+    command: &str,
+) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+    let mut package = None;
+    let mut expected_sha256 = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--expected-sha256" => {
+                set_value(&mut expected_sha256, &mut arguments, "--expected-sha256")?
+            }
+            _ => return Err(format!("unknown {command} argument; value was suppressed").into()),
+        }
+    }
+    Ok((
+        package.ok_or_else(|| format!("{command} requires exactly one --package path"))?,
+        canonical_expected_sha256(
+            &expected_sha256
+                .ok_or_else(|| format!("{command} requires exactly one --expected-sha256 value"))?,
+        )?,
     ))
 }
 
@@ -310,6 +378,18 @@ fn set_value(
     Ok(())
 }
 
+fn canonical_expected_sha256(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(value.to_owned())
+    } else {
+        Err("--expected-sha256 must be one lowercase SHA-256 value".into())
+    }
+}
+
 fn reject_extra(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -328,8 +408,9 @@ fn print_usage() {
         "  build --source <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
     eprintln!("  preflight --package <PACKAGE_DIR>");
+    eprintln!("  verify --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!("  status --root <SLOT_DIR>");
-    eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR>");
+    eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!("  promote|rollback --root <SLOT_DIR>");
 }
 
@@ -402,7 +483,11 @@ fn build_public_package(
     )?;
 
     let loaded = load_package_directory(output)?;
-    Ok(render_build_report(&loaded.snapshot, &loaded.provenance))
+    Ok(render_build_report(
+        &loaded.snapshot,
+        &loaded.provenance,
+        &loaded.authentication_sha256,
+    ))
 }
 
 fn status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -416,12 +501,23 @@ fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {
     Ok(render_preflight_report(&summary))
 }
 
-fn adopt(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn verify(package: &Path, expected_sha256: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    verify_expected_sha256(&loaded, expected_sha256)?;
+    Ok(render_verify_report(&loaded))
+}
+
+fn adopt(
+    root: &Path,
+    package: &Path,
+    expected_sha256: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_some() {
         return Err("current candidate package is already configured".into());
     }
     let loaded = load_public_package_directory(package)?;
+    verify_expected_sha256(&loaded, expected_sha256)?;
     let revision = loaded.snapshot.revision().to_owned();
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
@@ -436,12 +532,17 @@ fn adopt(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Erro
     ))
 }
 
-fn stage(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn stage(
+    root: &Path,
+    package: &Path,
+    expected_sha256: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_none() {
         return Err("current candidate package is not configured".into());
     }
     let loaded = load_public_package_directory(package)?;
+    verify_expected_sha256(&loaded, expected_sha256)?;
     let revision = loaded.snapshot.revision().to_owned();
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
@@ -517,14 +618,27 @@ fn render_inspect_report(
 fn render_build_report(
     snapshot: &CandidateSnapshot,
     provenance: &CandidatePackageProvenance,
+    authentication_sha256: &str,
 ) -> String {
     format!(
-        "公开候选包已生成\n版本：{}\n来源：{}\n许可：{}\n词条：{}\n载荷：{} 字节\n写入：3 个新文件\n",
+        "公开候选包已生成\n版本：{}\n来源：{}\n许可：{}\n词条：{}\n载荷：{} 字节\n\
+         发布 SHA-256：{}\n写入：3 个新文件\n",
         snapshot.revision(),
         provenance.source_id(),
         provenance.source_license(),
         snapshot.entry_count(),
-        snapshot.payload_bytes()
+        snapshot.payload_bytes(),
+        authentication_sha256
+    )
+}
+
+fn render_verify_report(loaded: &LoadedPackage) -> String {
+    format!(
+        "候选包验证\n版本：{}\n来源：{}\n许可：{}\n结果：与可信 SHA-256 一致\n\
+         本次操作：只读\n",
+        loaded.snapshot.revision(),
+        loaded.provenance.source_id(),
+        loaded.provenance.source_license()
     )
 }
 
@@ -613,6 +727,16 @@ fn load_public_package_directory(
         );
     }
     Ok(loaded)
+}
+
+fn verify_expected_sha256(
+    loaded: &LoadedPackage,
+    expected_sha256: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if loaded.authentication_sha256 != expected_sha256 {
+        return Err("candidate package does not match the expected SHA-256".into());
+    }
+    Ok(())
 }
 
 fn load_package_directory(package: &Path) -> Result<LoadedPackage, Box<dyn std::error::Error>> {
@@ -974,6 +1098,12 @@ mod tests {
         .unwrap()
     }
 
+    fn package_sha256(package: &Path) -> String {
+        load_public_package_directory(package)
+            .unwrap()
+            .authentication_sha256
+    }
+
     #[test]
     fn parser_requires_explicit_write_intent_and_paths() {
         let source_hash = candidate_sha256_hex(LEXICON.as_bytes());
@@ -1039,6 +1169,48 @@ mod tests {
             }
         );
         assert!(parse_options(["preflight".to_owned()]).is_err());
+        let expected_sha256 = "a".repeat(64);
+        assert_eq!(
+            parse_options([
+                "verify".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--expected-sha256".to_owned(),
+                expected_sha256.clone(),
+            ])
+            .unwrap(),
+            Options::Verify {
+                package: PathBuf::from("package"),
+                expected_sha256: expected_sha256.clone(),
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "adopt".to_owned(),
+                "--root".to_owned(),
+                "slots".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--expected-sha256".to_owned(),
+                expected_sha256.clone(),
+            ])
+            .unwrap(),
+            Options::Adopt {
+                root: PathBuf::from("slots"),
+                package: PathBuf::from("package"),
+                expected_sha256,
+            }
+        );
+        assert!(
+            parse_options([
+                "verify".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--expected-sha256".to_owned(),
+                "A".repeat(64),
+            ])
+            .is_err()
+        );
         assert!(
             parse_options([
                 "build".to_owned(),
@@ -1098,7 +1270,10 @@ mod tests {
         let declaration = test_declaration(LEXICON);
         let built_a = build_public_package(&source, &package_a, "public-a", &declaration).unwrap();
         let built_b = build_public_package(&source, &package_b, "public-b", &declaration).unwrap();
+        let package_a_sha256 = package_sha256(&package_a);
+        let package_b_sha256 = package_sha256(&package_b);
         assert!(built_a.contains("版本：public-a"));
+        assert!(built_a.contains(&format!("发布 SHA-256：{package_a_sha256}")));
         assert!(built_b.contains("版本：public-b"));
         assert_eq!(
             fs::read_to_string(package_a.join(CANDIDATE_PACKAGE_PAYLOAD_FILE)).unwrap(),
@@ -1110,7 +1285,14 @@ mod tests {
         );
         assert!(!slots.exists());
 
-        adopt(&slots, &package_a).unwrap();
+        let wrong_sha256 = "0".repeat(64);
+        assert!(verify(&package_a, &wrong_sha256).is_err());
+        assert!(adopt(&slots, &package_a, &wrong_sha256).is_err());
+        assert!(!slots.exists());
+        let verified = verify(&package_a, &package_a_sha256).unwrap();
+        assert!(verified.contains("结果：与可信 SHA-256 一致"));
+        assert!(!verified.contains(&package_a_sha256));
+        adopt(&slots, &package_a, &package_a_sha256).unwrap();
         let adopted_state = read_slot_state(&slots).unwrap();
         let receipt = fs::read_to_string(preflight_receipt_path(
             &slots,
@@ -1123,7 +1305,10 @@ mod tests {
             status(&slots).unwrap(),
             "候选数据槽\n当前：public-a\n待切换：无\n可回退：无\n本次操作：只读\n"
         );
-        stage(&slots, &package_b).unwrap();
+        let before_failed_stage = read_slot_state(&slots).unwrap();
+        assert!(stage(&slots, &package_b, &wrong_sha256).is_err());
+        assert_eq!(read_slot_state(&slots).unwrap(), before_failed_stage);
+        stage(&slots, &package_b, &package_b_sha256).unwrap();
         assert_eq!(
             status(&slots).unwrap(),
             "候选数据槽\n当前：public-a\n待切换：public-b\n可回退：无\n本次操作：只读\n"
@@ -1154,8 +1339,8 @@ mod tests {
         let declaration = test_declaration(LEXICON);
         build_public_package(&source, &package_a, "receipt-a", &declaration).unwrap();
         build_public_package(&source, &package_b, "receipt-b", &declaration).unwrap();
-        adopt(&slots, &package_a).unwrap();
-        stage(&slots, &package_b).unwrap();
+        adopt(&slots, &package_a, &package_sha256(&package_a)).unwrap();
+        stage(&slots, &package_b, &package_sha256(&package_b)).unwrap();
 
         let before = read_slot_state(&slots).unwrap();
         let candidate = before.candidate().unwrap();
@@ -1178,8 +1363,8 @@ mod tests {
         let declaration = test_declaration(LEXICON);
         build_public_package(&source, &package_a, "immutable-a", &declaration).unwrap();
         build_public_package(&source, &package_b, "immutable-b", &declaration).unwrap();
-        adopt(&slots, &package_a).unwrap();
-        stage(&slots, &package_b).unwrap();
+        adopt(&slots, &package_a, &package_sha256(&package_a)).unwrap();
+        stage(&slots, &package_b, &package_sha256(&package_b)).unwrap();
 
         let before = read_slot_state(&slots).unwrap();
         let candidate = before.candidate().unwrap();
@@ -1227,10 +1412,12 @@ mod tests {
             &test_declaration(&source_b_text),
         )
         .unwrap();
-        adopt(&slots, &package_a).unwrap();
+        adopt(&slots, &package_a, &package_sha256(&package_a)).unwrap();
 
         let before = read_slot_state(&slots).unwrap();
-        let error = stage(&slots, &package_b).unwrap_err().to_string();
+        let error = stage(&slots, &package_b, &package_sha256(&package_b))
+            .unwrap_err()
+            .to_string();
         assert!(!error.contains('测'));
         assert_eq!(read_slot_state(&slots).unwrap(), before);
 
@@ -1280,7 +1467,7 @@ mod tests {
         fs::write(package.join(CANDIDATE_PACKAGE_MANIFEST_FILE), manifest).unwrap();
         fs::write(package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE), provenance).unwrap();
 
-        assert!(adopt(&slots, &package).is_err());
+        assert!(adopt(&slots, &package, &"0".repeat(64)).is_err());
         assert!(!slots.exists());
         assert_eq!(
             status(&slots).unwrap(),
