@@ -1,23 +1,34 @@
-# TSF 开发检查：注册前先核对什么
+# TSF Alpha：检查、开发注册与撤回
 
-`tsf-devctl inspect` 是 Windows TSF Alpha 的只读检查器。它只读取一个明确
-指定的 DLL，检查固定 CLSID 的标准 COM 注册位置，并通过系统 TSF 枚举简体
-中文语言配置；没有注册、注销、启用、激活、文件写入或网络请求。
+`tsf-devctl` 管理固定身份的 Windows TSF Alpha。检查是只读操作；注册和注销
+必须在管理员 PowerShell 中使用各自的显式命令，并附上
+`--confirm-machine-wide-development-alpha`。
 
 ```powershell
 Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
 
 cargo build --release --lib --bin tsf-devctl
+
 .\target\release\tsf-devctl.exe inspect `
   --dll .\target\release\ziranma_core.dll
+
+.\target\release\tsf-devctl.exe register-machine `
+  --dll .\target\release\ziranma_core.dll `
+  --confirm-machine-wide-development-alpha
 ```
 
-默认输出只保留七类事实：DLL 路径、PE 格式、COM 入口、注册入口、证书目录、
-COM 注册和系统语言配置。它不会在报告末尾替研究者安排下一步。
+本轮开发注册固定为：
+
+- 本机范围，需要管理员权限；
+- 64 位进程内 COM 服务器；
+- 简体中文 `zh-CN` 配置；
+- 键盘 TIP 类别；
+- 默认不启用、不激活，也不设为默认输入法。
+
+微软拼音和现有默认输入法不会被修改。注册、启用、激活和设为默认仍是四个
+不同边界；当前工具只实现第一项。
 
 ## 固定身份
-
-开发 Alpha 为后续注册预留了三项固定身份：
 
 | 项目 | 值 |
 |---|---|
@@ -25,52 +36,76 @@ COM 注册和系统语言配置。它不会在报告末尾替研究者安排下�
 | 语言配置 GUID | `{8099D3F8-9F40-4DA5-9B01-C12DE0CD6370}` |
 | 语言 | 简体中文 `zh-CN`，LANGID `0x0804` |
 
-固定 GUID 只是身份，不会自行注册任何东西。当前 DLL 仍只导出
-`DllGetClassObject` 和 `DllCanUnloadNow`，没有 `DllRegisterServer` 或
-`DllUnregisterServer`。
+DLL 只导出 `DllGetClassObject` 和 `DllCanUnloadNow`，没有自注册入口。
+`tsf-devctl` 负责标准 COM、TSF 文本服务身份、语言配置和键盘类别四层注册，避免
+`regsvr32` 把这些边界藏进 DLL 回调。
 
-## 检查口径
+## 不可变开发副本
 
-- PE 解析器有 64 MiB 文件上限、节表与 RVA 边界检查，只接受 x86-64、PE32+
-  且带 DLL 标志的产物；
-- 必须存在两个 COM 加载入口；发现注册/注销入口会使检查失败；
-- “证书目录存在”只表示 PE 安全目录非空，不代表证书可信、未过期或签名验证
-  成功；候选数据包的 Ed25519 验签与 PE/Authenticode 是相互独立的边界；
-- “COM 注册”只读检查固定 CLSID 的
-  `HKCU\Software\Classes\CLSID\…\InprocServer32` 与
-  `HKLM\Software\Classes\CLSID\…\InprocServer32`，分别查看 64 位和 32 位注册
-  视图。报告只显示命中的作用域与位数，不读取或回显默认值，不扫描其他 CLSID；
-  因此它能发现固定身份的孤立服务器键，但不声称其中的服务器路径正确或可加载；
-- “系统语言配置”来自 `ITfInputProcessorProfileMgr::EnumProfiles(0x0804)`，只
-  查找上表中的确切 CLSID 与配置 GUID；它不扫描其他语言，也不读取私人数据；
-- “COM 注册：未发现”与“系统语言配置：未发现”同时出现时，表示上述四个标准
-  COM 视图和固定 zh-CN 配置中都没有这个 Alpha 身份；它不对其他 GUID 或非标准
-  注册位置作推断。
+注册命令先检查 DLL 的 x86-64、PE32+、导出和大小边界，再计算 SHA-256，
+复制到：
 
-## 为什么现在仍不注册
+```text
+.local/tsf-alpha/builds/<sha256>/ziranma_core.dll
+```
 
-微软把可用 TSF 输入服务分成多道边界：标准进程内 COM 服务器注册、TSF 语言
-配置、TIP 类别，以及现代第三方 IME 所需的数字签名与兼容能力。Vista 以后
-推荐使用 `ITfInputProcessorProfileMgr::RegisterProfile` 管理配置；键盘输入服务
-还要通过 `ITfCategoryMgr` 声明 `GUID_TFCAT_TIP_KEYBOARD`。
+注册表只指向这份按内容寻址的副本，不指向可能被下一次 `cargo build`
+覆盖的 `target\release\ziranma_core.dll`。安装记录位于
+`.local/tsf-alpha/install-v1.txt`；两者都在 Git 忽略的本地目录中。
+安装记录只保存版本、摘要和相对路径，不含输入数据。
 
-当前 Alpha 尚有明确缺口：
+注册前，固定 CLSID 在四个标准 COM 视图、TSF 文本服务列表、固定 zh-CN 配置
+和键盘类别中都必须不存在；工具不会接管或覆盖来历不明的同名注册。四层写入
+完成后还会重新枚举并确认：只存在本机 64 位 COM 注册，配置未启用、未活动，
+键盘类别存在，服务器路径和注册表形状与安装记录完全一致。
 
-- DLL 同目录没有 `candidate-data` 时，默认类工厂接入经过只读快照校验的 50 词
-  公开开发候选源；它用于合成 Context 闭环，不是日用词典。目录存在时，新类
-  工厂严格加载来源、许可、SHA-256、解码兼容性及 TSF 预检凭据全部有效的
-  外部 current；
-- 没有候选 UI、品牌图标或经验证的 PE/Authenticode 签名；
-- 没有安装、释放已加载实例、反向注销和失败回滚实现；
-- 尚未在记事本或 Codex 中验证真实焦点与异步编辑时序。
+普通权限进程无法完成 Windows 的持久 TSF 文本服务登记；本机实测正式接口返回
+`E_FAIL`，事务会移除先前创建的 COM 键。因此工具不把 HKCU 直接注册表拼装
+冒充受支持安装，也不混合“当前用户 COM + 本机 TSF”两种不完整作用域。
 
-因此本阶段只保留检查器。以后若实现开发安装，注册、启用、激活和设为默认必须
-继续分成不同操作；工具不得直接把自己设为默认输入法，卸载也必须先释放加载中
-的实例并逐项反向清理。
+任一步失败都会按“类别、配置、文本服务身份、COM”的相反顺序撤回。若撤回
+本身失败，命令会明确报告 `rollback incomplete`，不会把半完成状态说成成功。
+
+## 只读检查
+
+```powershell
+.\target\release\tsf-devctl.exe inspect `
+  --dll .\.local\tsf-alpha\builds\<sha256>\ziranma_core.dll
+```
+
+检查报告包括：
+
+- DLL 路径、PE 格式、COM 导出和证书目录；
+- 固定 CLSID 在当前用户/本机、64/32 位 COM 视图中的存在情况；
+- 固定 TSF 文本服务身份是否存在；
+- 固定 zh-CN 配置是否注册、启用或活动；
+- 固定 CLSID 是否属于键盘 TIP 类别。
+
+“证书目录存在”只表示 PE 安全目录非空，不验证证书可信、有效或未过期。
+候选数据包的 Ed25519 验签也不能代替 DLL 的 PE/Authenticode 签名。
+
+## 注销
+
+开发注册可以用下列命令完整撤回：
+
+```powershell
+.\target\release\tsf-devctl.exe unregister-machine `
+  --confirm-machine-wide-development-alpha
+```
+
+注销不依赖 `target\release` 中的旧构建，而是读取严格的本地安装记录，复核
+不可变 DLL 摘要和系统状态，再按“类别、配置、文本服务身份、COM”的顺序
+移除。若中途失败，已经移除的层会尽量恢复；只有全部移除并复查通过后，安装
+记录才会删除。
+按摘要保存的无引用 DLL 可以留在 `.local` 供审计或以后清理，不会再被系统
+加载。
+
+当前 Alpha 仍没有候选窗口、品牌图标或经验证的 Authenticode 签名。注册成功
+只表示 Windows 能识别这个默认关闭的开发文本服务，不表示它适合日用或分发。
 
 官方依据：
 
 - <https://learn.microsoft.com/en-us/windows/win32/tsf/text-service-registration>
-- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nn-msctf-itfinputprocessorprofilemgr>
-- <https://learn.microsoft.com/en-us/windows/win32/tsf/predefined-category-values>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-registerprofile>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcategorymgr-registercategory>
 - <https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editors>

@@ -4,9 +4,9 @@
 
 这是用户明确批准的新里程碑。当前已完成与宿主无关的 `CompositionSession`
 抽取、TSF COM 生命周期探针，以及只在测试进程中工作的按键、真实组合范围、
-焦点清理和公开候选上屏闭环。仓库尚未注册或安装 TSF 输入法，也没有修改
-Windows 默认输入方式；文字变更目前只在进程内的合成 Context 中验证，尚未
-进入记事本或 Codex。
+焦点清理和公开候选上屏闭环。仓库也提供本机范围、64 位、默认关闭的显式
+开发注册和反向注销事务；它不会启用、激活或设为默认输入法。真实宿主输入
+仍未开始验证，文字变更目前只在进程内的合成 Context 中验证。
 
 ## 目标
 
@@ -74,7 +74,8 @@ CompositionSession
   [只读候选快照](candidate-snapshots.md)校验 schema、版本、字节数、指纹和
   词条数后建立现有 `Decoder`；`candidate-data` 存在时，新类工厂只读其中
   经过预检的公开 current。两条路径都不学习、不联网；
-- 在用户再次确认安装前，只构建和检查，不注册。
+- 注册前仍可只构建和检查；获得用户明确确认后，`tsf-devctl` 可以把经过检查
+  的 DLL 复制到按 SHA-256 寻址的本地不可变目录，并完成本机开发注册。
 
 当前构建命令为 `cargo build --release --lib`，产物是
 `target/release/ziranma_core.dll`。它只生成未注册的 DLL；单元测试会在测试线程
@@ -82,9 +83,10 @@ CompositionSession
 改变 Windows 输入法列表。
 
 注册前可运行[TSF 开发检查](tsf-dev-inspection.md)，只读核对 DLL 的 PE 架构、
-COM/注册入口、证书目录、固定 CLSID 的标准 COM 注册位置，以及固定 zh-CN
-语言配置是否已存在。检查器没有任何注册、注销、启用或激活子命令；“证书目录
-存在”也不冒充签名验证。
+COM/注册入口、证书目录、固定 CLSID 的标准 COM 注册位置、固定 zh-CN
+语言配置和键盘类别。显式注册与注销命令都要求
+`--confirm-machine-wide-development-alpha`；注册固定为本机 64 位且默认关闭，
+需要管理员权限，不包含启用或激活。“证书目录存在”也不冒充签名验证。
 候选包的 Ed25519 脱离验签是另一条数据发布边界，不验证 DLL / EXE 的
 PE/Authenticode 签名。
 
@@ -157,6 +159,11 @@ PE/Authenticode 签名。
   `adopt-signed` / `stage-signed` 也可在任何槽位写入前完成相同验签，并把同一
   份已验证材料交给安装与预检。所有命令都要求显式公钥，不发现或保存信任根；
   当前也没有真实发布公钥、签名命令或密钥轮换与吊销策略。
+- `tsf-devctl register-machine` 先把 DLL 固定到
+  `.local/tsf-alpha/builds/<sha256>`，再依次注册本机 64 位 COM、TSF
+  文本服务身份、默认关闭的 zh-CN 配置和键盘类别。任何失败都会逆序撤回；
+  注销也会先复核严格安装记录与系统状态，再执行反向事务。注册、启用、激活
+  和设为默认仍不合并。
 
 微软要求现代自定义 IME 使用 TSF，并说明输入法 DLL 会被加载进当前应用、
 受到该应用容器能力约束：

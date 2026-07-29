@@ -255,15 +255,29 @@ PE/Authenticode 签名。
 早期双文件包和 v1 预检凭据不会原地升级；Alpha 开发环境应重新构建包并采用
 全新的 `candidate-data` 根，避免旧格式或半迁移状态被误认为当前包。
 
-发布 DLL 的架构、COM 导出、证书目录、固定 CLSID 的标准 COM 注册位置和
-zh-CN 语言配置可以先用只读工具核对；它不提供注册或激活命令：
+发布 DLL 的架构、COM 导出、证书目录、固定 CLSID 的标准 COM 注册位置、
+zh-CN 语言配置和键盘类别可以先用只读工具核对：
 
 ```powershell
 cargo build --release --lib --bin tsf-devctl
 .\target\release\tsf-devctl.exe inspect --dll .\target\release\ziranma_core.dll
 ```
 
-检查口径与尚未满足的安装条件见[TSF 开发检查](docs/tsf-dev-inspection.md)。
+获得明确确认后，可以在管理员 PowerShell 中执行本机范围、64 位、默认关闭的
+开发注册。它把 DLL 复制到按 SHA-256 寻址的 `.local` 不可变目录，不启用、
+不激活、不设为默认，也不修改微软拼音：
+
+```powershell
+.\target\release\tsf-devctl.exe register-machine `
+  --dll .\target\release\ziranma_core.dll `
+  --confirm-machine-wide-development-alpha
+
+.\target\release\tsf-devctl.exe unregister-machine `
+  --confirm-machine-wide-development-alpha
+```
+
+四层注册、失败回滚、安装记录和反向注销口径见
+[TSF Alpha 开发注册](docs/tsf-dev-inspection.md)。
 
 ## 候选实验台
 
