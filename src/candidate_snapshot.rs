@@ -157,6 +157,36 @@ impl CandidateSnapshot {
         }
         Ok((rank == 1).then(|| code.to_owned()))
     }
+
+    /// Returns one contiguous candidate page for an interactive host.
+    ///
+    /// The decoder runs once at the requested bounded depth. Fully resolved
+    /// candidates retain their order. If the first result is unresolved, the
+    /// raw composition is returned as the only fallback; later unresolved
+    /// results end the visible page instead of exposing research markers.
+    pub fn candidate_texts(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KeySequenceError> {
+        let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let candidates = self.decoder.decode_sentence(code, limit)?;
+        let mut visible = Vec::with_capacity(candidates.len());
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if candidate.unresolved_key_count == 0 {
+                visible.push(candidate.text);
+            } else if index == 0 {
+                visible.push(code.to_owned());
+                break;
+            } else {
+                break;
+            }
+        }
+        Ok(visible)
+    }
 }
 
 /// Errors raised before an interactive host can use a snapshot.
@@ -289,6 +319,14 @@ mod tests {
         assert_eq!(
             snapshot.candidate_text("zzzzzzzz", 1).unwrap().as_deref(),
             Some("zzzzzzzz")
+        );
+        let page = snapshot.candidate_texts("nihk", 5).unwrap();
+        assert_eq!(page.first().map(String::as_str), Some("你好"));
+        assert!(page.len() <= 5);
+        assert!(snapshot.candidate_texts("nihk", 0).unwrap().is_empty());
+        assert_eq!(
+            snapshot.candidate_texts("zzzzzzzz", 5).unwrap(),
+            ["zzzzzzzz"]
         );
     }
 

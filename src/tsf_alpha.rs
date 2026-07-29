@@ -21,8 +21,11 @@ use crate::{
     CompositionSession, load_current_candidate_snapshot,
 };
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, HMODULE, LPARAM,
-    S_FALSE, S_OK, WPARAM,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER, E_UNEXPECTED,
+    HMODULE, HWND, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -32,21 +35,32 @@ use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
+use windows::Win32::System::SystemServices::{SS_LEFTNOWORDWRAP, SS_NOPREFIX};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_0, VK_9, VK_A, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_NEXT,
+    GetKeyState, VK_1, VK_5, VK_A, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_NEXT,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
 };
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_ThreadMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
-    ITfContextComposition, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange,
-    ITfSource, ITfTextInputProcessor_Impl, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
-    ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_AE_NONE, TF_ANCHOR_END,
-    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_IAS_NO_DEFAULT_COMPOSITION, TF_POPF_ALL, TF_SELECTION, TF_SELECTIONSTYLE, TF_TF_MOVESTART,
+    CLSID_TF_ThreadMgr, ITfCandidateListUIElement, ITfCandidateListUIElement_Impl, ITfComposition,
+    ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition, ITfDocumentMgr,
+    ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfSource, ITfTextInputProcessor_Impl,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
+    ITfThreadMgrEventSink_Impl, ITfUIElement, ITfUIElement_Impl, ITfUIElementMgr, TF_AE_NONE,
+    TF_ANCHOR_END, TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR, TF_CLUIE_PAGEINDEX,
+    TF_CLUIE_SELECTION, TF_CLUIE_STRING, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_ASYNC, TF_ES_READ,
+    TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION, TF_POPF_ALL, TF_SELECTION,
+    TF_SELECTIONSTYLE, TF_TF_MOVESTART,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, HWND_TOPMOST, SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
-    Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
+    BSTR, Error, GUID, HRESULT, HSTRING, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result,
+    implement, w,
 };
 
 /// Fixed COM class identity reserved for the local TSF alpha.
@@ -66,10 +80,15 @@ static SYNTHETIC_HOST_LOCK: Mutex<()> = Mutex::new(());
 const TSF_DEVELOPMENT_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
 const TSF_DEVELOPMENT_MANIFEST: &str =
     include_str!("../tests/fixtures/public/demo_candidate_manifest.zcm");
+const CANDIDATE_PAGE_SIZE: usize = 5;
+const CANDIDATE_LIMIT: usize = 10;
+const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
+const CANDIDATE_UI_GUID: GUID = GUID::from_u128(0xb9fdad61_3f19_4d6c_86f7_72e9d3064f84);
 
 trait CandidateProvider: Send + Sync {
-    /// Returns one deterministic, one-based candidate without learning or I/O.
-    fn candidate(&self, code: &str, rank: usize) -> Option<String>;
+    /// Returns one deterministic, bounded candidate page without learning or
+    /// I/O. Implementations should decode once rather than once per rank.
+    fn candidates(&self, code: &str, limit: usize) -> Vec<String>;
 }
 
 type CandidateProviderLoadResult =
@@ -87,8 +106,73 @@ struct SnapshotCandidateProvider {
 }
 
 impl CandidateProvider for SnapshotCandidateProvider {
-    fn candidate(&self, code: &str, rank: usize) -> Option<String> {
-        self.snapshot.candidate_text(code, rank).ok().flatten()
+    fn candidates(&self, code: &str, limit: usize) -> Vec<String> {
+        self.snapshot
+            .candidate_texts(code, limit)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Default)]
+struct CandidateDisplay {
+    candidates: Vec<String>,
+    page_start: usize,
+}
+
+impl CandidateDisplay {
+    fn from_candidates(candidates: Vec<String>, requested_page_start: usize) -> Self {
+        let page_start = if candidates.is_empty() {
+            0
+        } else {
+            requested_page_start
+                .min((candidates.len() - 1) / CANDIDATE_PAGE_SIZE * CANDIDATE_PAGE_SIZE)
+        };
+        Self {
+            candidates,
+            page_start,
+        }
+    }
+
+    fn visible(&self) -> &[String] {
+        let end = self
+            .page_start
+            .saturating_add(CANDIDATE_PAGE_SIZE)
+            .min(self.candidates.len());
+        &self.candidates[self.page_start.min(end)..end]
+    }
+
+    fn page_starts(&self) -> Vec<u32> {
+        (0..self.candidates.len())
+            .step_by(CANDIDATE_PAGE_SIZE)
+            .filter_map(|index| u32::try_from(index).ok())
+            .collect()
+    }
+
+    fn current_page(&self) -> u32 {
+        u32::try_from(self.page_start / CANDIDATE_PAGE_SIZE).unwrap_or(0)
+    }
+
+    fn selected_index(&self) -> u32 {
+        u32::try_from(self.page_start).unwrap_or(0)
+    }
+
+    fn native_text(&self) -> String {
+        let mut output = String::new();
+        for (index, candidate) in self.visible().iter().enumerate() {
+            if index > 0 {
+                output.push('\n');
+            }
+            let mut clipped = candidate
+                .chars()
+                .take(CANDIDATE_DISPLAY_MAX_CHARS)
+                .collect::<String>();
+            if candidate.chars().count() > CANDIDATE_DISPLAY_MAX_CHARS {
+                clipped.push('…');
+            }
+            use std::fmt::Write as _;
+            let _ = write!(output, "{}  {clipped}", index + 1);
+        }
+        output
     }
 }
 
@@ -566,7 +650,8 @@ struct EditSessionTelemetry {
 struct PlannedKey {
     before: CompositionSession,
     after: CompositionSession,
-    edit: PendingDocumentEdit,
+    edit: Option<PendingDocumentEdit>,
+    candidate_display: Option<CandidateDisplay>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -609,13 +694,8 @@ fn decode_virtual_key(vkey: u16, modifiers: KeyModifiers) -> Option<CompositionI
         key if (VK_A.0..=VK_Z.0).contains(&key) => Some(CompositionInput::Letters(
             char::from(b'a' + u8::try_from(key - VK_A.0).expect("A-Z offset fits u8")).to_string(),
         )),
-        key if (VK_0.0..=VK_9.0).contains(&key) => {
-            let digit = usize::from(key - VK_0.0);
-            Some(CompositionInput::Select(if digit == 0 {
-                10
-            } else {
-                digit
-            }))
+        key if (VK_1.0..=VK_5.0).contains(&key) => {
+            Some(CompositionInput::Select(usize::from(key - VK_1.0) + 1))
         }
         _ => None,
     }
@@ -625,29 +705,41 @@ fn plan_session_input(
     session: &CompositionSession,
     input: CompositionInput,
     selected_text: Option<String>,
+    candidate_count: usize,
 ) -> Option<PlannedKey> {
     let before = session.clone();
     let mut after = before.clone();
     let effect = after.apply(input.clone());
     let edit = match (input, effect) {
-        (CompositionInput::Letters(_), CompositionEffect::Continue) => {
-            PendingDocumentEdit::UpdatePreedit(after.phonetic().to_owned())
-        }
+        (CompositionInput::Letters(_), CompositionEffect::Continue) => Some(
+            PendingDocumentEdit::UpdatePreedit(after.phonetic().to_owned()),
+        ),
         (CompositionInput::Backspace | CompositionInput::Escape, CompositionEffect::Continue)
             if before.phonetic() != after.phonetic() && after.phonetic().is_empty() =>
         {
-            PendingDocumentEdit::Cancel
+            Some(PendingDocumentEdit::Cancel)
         }
         (CompositionInput::Backspace | CompositionInput::Escape, CompositionEffect::Continue)
             if before.phonetic() != after.phonetic() =>
         {
-            PendingDocumentEdit::UpdatePreedit(after.phonetic().to_owned())
+            Some(PendingDocumentEdit::UpdatePreedit(
+                after.phonetic().to_owned(),
+            ))
         }
         (CompositionInput::Confirm, CompositionEffect::Confirm)
         | (CompositionInput::Select(_), CompositionEffect::Select(_)) => {
             let text = selected_text.filter(|text| !text.is_empty())?;
             after.finish_commit();
-            PendingDocumentEdit::Commit(text)
+            Some(PendingDocumentEdit::Commit(text))
+        }
+        (CompositionInput::PreviousPage, CompositionEffect::PreviousPage) => {
+            after.previous_candidate_page(CANDIDATE_PAGE_SIZE);
+            None
+        }
+        (CompositionInput::NextPage, CompositionEffect::NextPage) => {
+            after.next_candidate_page(candidate_count, CANDIDATE_PAGE_SIZE, CANDIDATE_LIMIT);
+            after.normalize_candidate_page(candidate_count, CANDIDATE_PAGE_SIZE);
+            None
         }
         _ => return None,
     };
@@ -655,6 +747,7 @@ fn plan_session_input(
         before,
         after,
         edit,
+        candidate_display: None,
     })
 }
 
@@ -797,6 +890,513 @@ impl DocumentCompositionState {
     }
 }
 
+#[derive(Default)]
+struct CandidateElementState {
+    display: Option<CandidateDisplay>,
+    document_manager: Option<ITfDocumentMgr>,
+    shown: bool,
+}
+
+#[derive(Default)]
+struct CandidatePopup {
+    hwnd: Option<HWND>,
+    owner: Option<HWND>,
+    anchor: Option<RECT>,
+}
+
+impl CandidatePopup {
+    fn show(&mut self, owner: HWND, anchor: RECT, display: &CandidateDisplay) -> Result<()> {
+        if display.visible().is_empty() {
+            self.hide();
+            return Ok(());
+        }
+        if self.owner.is_some_and(|current| current != owner) {
+            self.destroy();
+        }
+        let text = HSTRING::from(display.native_text());
+        let hwnd = match self.hwnd {
+            Some(hwnd) => {
+                // SAFETY: this process owns the popup handle until destroy.
+                unsafe { SetWindowTextW(hwnd, &text) }?;
+                hwnd
+            }
+            None => {
+                let ex_style =
+                    WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0);
+                let style =
+                    WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | SS_LEFTNOWORDWRAP.0 | SS_NOPREFIX.0);
+                // SAFETY: STATIC is a system window class. The window is an
+                // owned, nonactivating popup and receives no application data
+                // through lpParam.
+                let created = unsafe {
+                    CreateWindowExW(
+                        ex_style,
+                        w!("STATIC"),
+                        &text,
+                        style,
+                        0,
+                        0,
+                        0,
+                        0,
+                        (!owner.is_invalid()).then_some(owner),
+                        None,
+                        None,
+                        None,
+                    )
+                }?;
+                self.hwnd = Some(created);
+                self.owner = Some(owner);
+                created
+            }
+        };
+
+        let dpi = if owner.is_invalid() {
+            96
+        } else {
+            // SAFETY: GetDpiForWindow is read-only and accepts this host-owned
+            // HWND. A zero result falls back to the platform baseline.
+            unsafe { GetDpiForWindow(owner) }.max(96)
+        };
+        let scale = |logical: i32| {
+            i32::try_from(
+                i64::from(logical)
+                    .saturating_mul(i64::from(dpi))
+                    .saturating_add(48)
+                    / 96,
+            )
+            .unwrap_or(i32::MAX)
+        };
+        let width = scale(320);
+        let height = scale(12_i32.saturating_add(
+            28_i32.saturating_mul(i32::try_from(display.visible().len()).unwrap_or(5)),
+        ));
+        let gap = scale(4);
+        let mut x = anchor.left;
+        let mut y = anchor.bottom.saturating_add(gap);
+
+        // SAFETY: the anchor is initialized screen geometry from TSF.
+        let monitor = unsafe { MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST) };
+        let mut monitor_info = MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(u32::MAX),
+            ..Default::default()
+        };
+        // SAFETY: monitor_info is writable for the duration of the call.
+        if !monitor.is_invalid() && unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool()
+        {
+            let work = monitor_info.rcWork;
+            if y.saturating_add(height) > work.bottom {
+                y = anchor.top.saturating_sub(height).saturating_sub(gap);
+            }
+            let max_x = work.right.saturating_sub(width).max(work.left);
+            let max_y = work.bottom.saturating_sub(height).max(work.top);
+            x = x.clamp(work.left, max_x);
+            y = y.clamp(work.top, max_y);
+        }
+
+        let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_SHOWWINDOW.0);
+        // SAFETY: the popup belongs to this controller. NOACTIVATE preserves
+        // the editor's keyboard focus while TOPMOST keeps the short-lived list
+        // above its owner.
+        unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, width, height, flags) }?;
+        self.anchor = Some(anchor);
+        Ok(())
+    }
+
+    fn update(&mut self, display: &CandidateDisplay) -> Result<()> {
+        let (Some(owner), Some(anchor)) = (self.owner, self.anchor) else {
+            return Ok(());
+        };
+        self.show(owner, anchor, display)
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        // SAFETY: this process owns the popup handle. ShowWindow does not
+        // transfer ownership and SW_SHOWNOACTIVATE preserves editor focus.
+        unsafe {
+            let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
+    }
+
+    fn hide(&mut self) {
+        self.set_visible(false);
+    }
+
+    fn destroy(&mut self) {
+        if let Some(hwnd) = self.hwnd.take() {
+            // SAFETY: this controller created and still owns the popup.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        self.owner = None;
+        self.anchor = None;
+    }
+}
+
+impl Drop for CandidatePopup {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+#[implement(ITfCandidateListUIElement)]
+struct CandidateListElement {
+    state: Rc<RefCell<CandidateElementState>>,
+    popup: Weak<RefCell<CandidatePopup>>,
+}
+
+impl CandidateListElement {
+    fn counted(
+        state: Rc<RefCell<CandidateElementState>>,
+        popup: Weak<RefCell<CandidatePopup>>,
+    ) -> Self {
+        object_created();
+        Self { state, popup }
+    }
+}
+
+impl Drop for CandidateListElement {
+    fn drop(&mut self) {
+        object_dropped();
+    }
+}
+
+impl ITfUIElement_Impl for CandidateListElement_Impl {
+    fn GetDescription(&self) -> Result<BSTR> {
+        Ok(BSTR::from("Ziranma Decoder Alpha candidates"))
+    }
+
+    fn GetGUID(&self) -> Result<GUID> {
+        Ok(CANDIDATE_UI_GUID)
+    }
+
+    fn Show(&self, show: windows::core::BOOL) -> Result<()> {
+        let visible = show.as_bool();
+        self.state
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .shown = visible;
+        if let Some(popup) = self.popup.upgrade() {
+            popup
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+                .set_visible(visible);
+        }
+        Ok(())
+    }
+
+    fn IsShown(&self) -> Result<windows::core::BOOL> {
+        Ok(self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .shown
+            .into())
+    }
+}
+
+impl ITfCandidateListUIElement_Impl for CandidateListElement_Impl {
+    fn GetUpdatedFlags(&self) -> Result<u32> {
+        Ok(TF_CLUIE_DOCUMENTMGR
+            | TF_CLUIE_COUNT
+            | TF_CLUIE_SELECTION
+            | TF_CLUIE_STRING
+            | TF_CLUIE_PAGEINDEX
+            | TF_CLUIE_CURRENTPAGE)
+    }
+
+    fn GetDocumentMgr(&self) -> Result<ITfDocumentMgr> {
+        self.state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .document_manager
+            .clone()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))
+    }
+
+    fn GetCount(&self) -> Result<u32> {
+        let count = self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .display
+            .as_ref()
+            .map_or(0, |display| display.candidates.len());
+        u32::try_from(count).map_err(|_| lifecycle_error(E_UNEXPECTED))
+    }
+
+    fn GetSelection(&self) -> Result<u32> {
+        Ok(self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .display
+            .as_ref()
+            .map_or(0, CandidateDisplay::selected_index))
+    }
+
+    fn GetString(&self, index: u32) -> Result<BSTR> {
+        let index = usize::try_from(index).map_err(|_| lifecycle_error(E_INVALIDARG))?;
+        let state = self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        let candidate = state
+            .display
+            .as_ref()
+            .and_then(|display| display.candidates.get(index))
+            .ok_or_else(|| lifecycle_error(E_INVALIDARG))?;
+        Ok(BSTR::from(candidate.as_str()))
+    }
+
+    fn GetPageIndex(&self, indices: *mut u32, size: u32, page_count: *mut u32) -> Result<()> {
+        if page_count.is_null() {
+            return Err(lifecycle_error(E_POINTER));
+        }
+        let starts = self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .display
+            .as_ref()
+            .map_or_else(Vec::new, CandidateDisplay::page_starts);
+        let capacity = usize::try_from(size).map_err(|_| lifecycle_error(E_INVALIDARG))?;
+        let copied = starts.len().min(capacity);
+        if copied > 0 && indices.is_null() {
+            return Err(lifecycle_error(E_POINTER));
+        }
+        // SAFETY: the caller supplies `size` writable u32 entries. We copy no
+        // more than that bound and page_count is non-null.
+        unsafe {
+            if copied > 0 {
+                ptr::copy_nonoverlapping(starts.as_ptr(), indices, copied);
+            }
+            *page_count = u32::try_from(starts.len()).map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        }
+        Ok(())
+    }
+
+    fn SetPageIndex(&self, indices: *const u32, page_count: u32) -> Result<()> {
+        let count = usize::try_from(page_count).map_err(|_| lifecycle_error(E_INVALIDARG))?;
+        if count > 0 && indices.is_null() {
+            return Err(lifecycle_error(E_POINTER));
+        }
+        let expected = self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .display
+            .as_ref()
+            .map_or_else(Vec::new, CandidateDisplay::page_starts);
+        // SAFETY: a non-null pointer is required above when count is nonzero;
+        // the caller promises exactly page_count readable entries.
+        let supplied = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: non-null was required above and the caller promises
+            // exactly page_count readable entries.
+            unsafe { std::slice::from_raw_parts(indices, count) }
+        };
+        if supplied == expected {
+            Ok(())
+        } else {
+            Err(lifecycle_error(E_INVALIDARG))
+        }
+    }
+
+    fn GetCurrentPage(&self) -> Result<u32> {
+        Ok(self
+            .state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .display
+            .as_ref()
+            .map_or(0, CandidateDisplay::current_page))
+    }
+}
+
+struct CandidateUiController {
+    enabled: bool,
+    manager: Option<ITfUIElementMgr>,
+    state: Rc<RefCell<CandidateElementState>>,
+    popup: Rc<RefCell<CandidatePopup>>,
+    element: Option<ITfCandidateListUIElement>,
+    element_id: Option<u32>,
+    show_native: bool,
+}
+
+impl CandidateUiController {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            manager: None,
+            state: Rc::new(RefCell::new(CandidateElementState::default())),
+            popup: Rc::new(RefCell::new(CandidatePopup::default())),
+            element: None,
+            element_id: None,
+            show_native: false,
+        }
+    }
+
+    fn activate(&mut self, thread_manager: &ITfThreadMgr) {
+        if self.enabled {
+            self.manager = thread_manager.cast().ok();
+        }
+    }
+
+    fn show(&mut self, context: &ITfContext, range: &ITfRange, ec: u32, display: CandidateDisplay) {
+        if !self.enabled || display.candidates.is_empty() {
+            self.end();
+            return;
+        }
+        let document_manager = match unsafe { context.GetDocumentMgr() } {
+            Ok(manager) => manager,
+            Err(_) => {
+                self.end();
+                return;
+            }
+        };
+        let view = match unsafe { context.GetActiveView() } {
+            Ok(view) => view,
+            Err(_) => {
+                self.end();
+                return;
+            }
+        };
+        let mut anchor = RECT::default();
+        let mut clipped = false.into();
+        // SAFETY: ec grants read access to the active composition range.
+        if unsafe { view.GetTextExt(ec, range, &mut anchor, &mut clipped) }.is_err() {
+            self.end();
+            return;
+        }
+        let owner = unsafe { view.GetWnd() }.unwrap_or_default();
+        {
+            let Ok(mut state) = self.state.try_borrow_mut() else {
+                self.end();
+                return;
+            };
+            state.display = Some(display.clone());
+            state.document_manager = Some(document_manager);
+        }
+
+        if self.element.is_none() {
+            let element: ITfCandidateListUIElement =
+                CandidateListElement::counted(Rc::clone(&self.state), Rc::downgrade(&self.popup))
+                    .into();
+            let mut show_native = true.into();
+            let mut element_id = 0_u32;
+            let began = self.manager.as_ref().is_none_or(|manager| {
+                let base: Result<ITfUIElement> = element.cast();
+                base.and_then(|base| unsafe {
+                    manager.BeginUIElement(&base, &mut show_native, &mut element_id)
+                })
+                .is_ok()
+            });
+            if began {
+                self.show_native = show_native.as_bool();
+                self.element_id = self.manager.as_ref().map(|_| element_id);
+                self.element = Some(element);
+                if let Ok(mut state) = self.state.try_borrow_mut() {
+                    state.shown = true;
+                }
+            } else {
+                self.show_native = true;
+                self.element = None;
+                self.element_id = None;
+                if let Ok(mut state) = self.state.try_borrow_mut() {
+                    state.shown = true;
+                }
+            }
+        } else if let (Some(manager), Some(element_id)) = (&self.manager, self.element_id) {
+            // SAFETY: the id belongs to the element begun by this controller.
+            if unsafe { manager.UpdateUIElement(element_id) }.is_err() {
+                self.end();
+                return;
+            }
+        }
+
+        let element_visible = self
+            .state
+            .try_borrow()
+            .map(|state| state.shown)
+            .unwrap_or(false);
+        let show_popup = self.show_native && element_visible && !clipped.as_bool();
+        if let Ok(mut popup) = self.popup.try_borrow_mut() {
+            if show_popup {
+                let _ = popup.show(owner, anchor, &display);
+            } else {
+                popup.hide();
+            }
+        }
+    }
+
+    fn update_contents(&mut self, display: CandidateDisplay) {
+        if !self.enabled || display.candidates.is_empty() {
+            self.end();
+            return;
+        }
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.display = Some(display.clone());
+        } else {
+            self.end();
+            return;
+        }
+        if let (Some(manager), Some(element_id)) = (&self.manager, self.element_id) {
+            // SAFETY: the id belongs to the element begun by this controller.
+            if unsafe { manager.UpdateUIElement(element_id) }.is_err() {
+                self.end();
+                return;
+            }
+        }
+        let element_visible = self
+            .state
+            .try_borrow()
+            .map(|state| state.shown)
+            .unwrap_or(false);
+        if let Ok(mut popup) = self.popup.try_borrow_mut() {
+            if self.show_native && element_visible {
+                let _ = popup.update(&display);
+            } else {
+                popup.hide();
+            }
+        }
+    }
+
+    fn end(&mut self) {
+        if let (Some(manager), Some(element_id)) = (&self.manager, self.element_id.take()) {
+            // SAFETY: best-effort cleanup of the id begun by this controller.
+            unsafe {
+                let _ = manager.EndUIElement(element_id);
+            }
+        }
+        self.element = None;
+        self.show_native = false;
+        if let Ok(mut popup) = self.popup.try_borrow_mut() {
+            popup.hide();
+        }
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.display = None;
+            state.document_manager = None;
+            state.shown = false;
+        }
+    }
+
+    fn deactivate(&mut self) {
+        self.end();
+        self.manager = None;
+    }
+}
+
+impl Drop for CandidateUiController {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
+
 fn move_selection_after_range(context: &ITfContext, range: &ITfRange, ec: u32) -> Result<()> {
     let caret = range.clone();
     // SAFETY: this clone is an independent range owned by the context;
@@ -823,17 +1423,20 @@ fn move_selection_after_range(context: &ITfContext, range: &ITfRange, ec: u32) -
 struct TsfCompositionSink {
     document_composition: Weak<RefCell<DocumentCompositionState>>,
     logical_composition: Weak<RefCell<CompositionSession>>,
+    candidate_ui: Weak<RefCell<CandidateUiController>>,
 }
 
 impl TsfCompositionSink {
     fn counted(
         document_composition: Weak<RefCell<DocumentCompositionState>>,
         logical_composition: Weak<RefCell<CompositionSession>>,
+        candidate_ui: Weak<RefCell<CandidateUiController>>,
     ) -> Self {
         object_created();
         Self {
             document_composition,
             logical_composition,
+            candidate_ui,
         }
     }
 }
@@ -875,6 +1478,11 @@ impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
         let Some(active) = active else {
             return Ok(());
         };
+        if let Some(candidate_ui) = self.candidate_ui.upgrade()
+            && let Ok(mut candidate_ui) = candidate_ui.try_borrow_mut()
+        {
+            candidate_ui.end();
+        }
         // The context owner terminated uncommitted preedit. Use the supplied
         // write cookie to erase it instead of leaving raw phonetic text behind.
         // SAFETY: OnCompositionTerminated supplies write access for this range.
@@ -900,6 +1508,13 @@ impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
 }
 
 /// Applies one planned composition change inside a synchronous TSF edit session.
+struct EditSessionShared {
+    document_composition: Rc<RefCell<DocumentCompositionState>>,
+    logical_composition: Rc<RefCell<CompositionSession>>,
+    telemetry: Arc<Mutex<EditSessionTelemetry>>,
+    candidate_ui: Rc<RefCell<CandidateUiController>>,
+}
+
 #[implement(ITfEditSession)]
 struct TsfDocumentEditSession {
     context: ITfContext,
@@ -907,6 +1522,8 @@ struct TsfDocumentEditSession {
     document_composition: Rc<RefCell<DocumentCompositionState>>,
     logical_composition: Rc<RefCell<CompositionSession>>,
     telemetry: Arc<Mutex<EditSessionTelemetry>>,
+    candidate_ui: Rc<RefCell<CandidateUiController>>,
+    candidate_display: Option<CandidateDisplay>,
     mode: EditSessionMode,
     cleanup_target: Option<ITfComposition>,
 }
@@ -915,9 +1532,8 @@ impl TsfDocumentEditSession {
     fn counted(
         context: ITfContext,
         action: PendingDocumentEdit,
-        document_composition: Rc<RefCell<DocumentCompositionState>>,
-        logical_composition: Rc<RefCell<CompositionSession>>,
-        telemetry: Arc<Mutex<EditSessionTelemetry>>,
+        shared: EditSessionShared,
+        candidate_display: Option<CandidateDisplay>,
         mode: EditSessionMode,
         cleanup_target: Option<ITfComposition>,
     ) -> Self {
@@ -925,9 +1541,11 @@ impl TsfDocumentEditSession {
         Self {
             context,
             action,
-            document_composition,
-            logical_composition,
-            telemetry,
+            document_composition: shared.document_composition,
+            logical_composition: shared.logical_composition,
+            telemetry: shared.telemetry,
+            candidate_ui: shared.candidate_ui,
+            candidate_display,
             mode,
             cleanup_target,
         }
@@ -961,6 +1579,7 @@ impl TsfDocumentEditSession {
         let sink: ITfCompositionSink = TsfCompositionSink::counted(
             Rc::downgrade(&self.document_composition),
             Rc::downgrade(&self.logical_composition),
+            Rc::downgrade(&self.candidate_ui),
         )
         .into();
         // SAFETY: the same write cookie and inserted range remain valid. The
@@ -1077,6 +1696,16 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
             PendingDocumentEdit::Cancel => self.finish_composition(ec, "")?,
             PendingDocumentEdit::Commit(text) => self.finish_composition(ec, text)?,
         }
+        if matches!(self.action, PendingDocumentEdit::UpdatePreedit(_)) {
+            if let (Some(active), Some(display)) =
+                (self.active_composition()?, self.candidate_display.clone())
+                && let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut()
+            {
+                candidate_ui.show(&self.context, &active.range, ec, display);
+            }
+        } else if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
+            candidate_ui.end();
+        }
         if cleanup_applied {
             self.logical_composition
                 .try_borrow_mut()
@@ -1122,6 +1751,7 @@ struct TsfTextService {
     composition: Rc<RefCell<CompositionSession>>,
     document_composition: Rc<RefCell<DocumentCompositionState>>,
     candidate_provider: Option<Arc<dyn CandidateProvider>>,
+    candidate_ui: Rc<RefCell<CandidateUiController>>,
     edit_telemetry: Arc<Mutex<EditSessionTelemetry>>,
     key_advice_mode: KeyAdviceMode,
 }
@@ -1137,6 +1767,10 @@ impl TsfTextService {
             composition: Rc::new(RefCell::new(CompositionSession::default())),
             document_composition: Rc::new(RefCell::new(DocumentCompositionState::default())),
             candidate_provider,
+            candidate_ui: Rc::new(RefCell::new(CandidateUiController::new(matches!(
+                key_advice_mode,
+                KeyAdviceMode::Foreground
+            )))),
             edit_telemetry: Arc::new(Mutex::new(EditSessionTelemetry::default())),
             key_advice_mode,
         }
@@ -1167,15 +1801,20 @@ impl TsfTextService_Impl {
         context: &ITfContext,
         client_id: u32,
         action: PendingDocumentEdit,
+        candidate_display: Option<CandidateDisplay>,
         mode: EditSessionMode,
         cleanup_target: Option<ITfComposition>,
     ) -> Result<()> {
         let edit_session: ITfEditSession = TsfDocumentEditSession::counted(
             context.clone(),
             action,
-            Rc::clone(&self.document_composition),
-            Rc::clone(&self.composition),
-            Arc::clone(&self.edit_telemetry),
+            EditSessionShared {
+                document_composition: Rc::clone(&self.document_composition),
+                logical_composition: Rc::clone(&self.composition),
+                telemetry: Arc::clone(&self.edit_telemetry),
+                candidate_ui: Rc::clone(&self.candidate_ui),
+            },
+            candidate_display,
             mode,
             cleanup_target,
         )
@@ -1249,6 +1888,7 @@ impl TsfTextService_Impl {
             &context,
             client_id,
             PendingDocumentEdit::Cancel,
+            None,
             EditSessionMode::CleanupAsync,
             Some(cleanup_target),
         );
@@ -1276,6 +1916,9 @@ impl TsfTextService_Impl {
     }
 
     fn cleanup_after_focus_loss(&self) -> Result<()> {
+        if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
+            candidate_ui.end();
+        }
         if let Some(client_id) = self.active_client_id()? {
             self.schedule_active_composition_cleanup(client_id)?;
         }
@@ -1355,6 +1998,7 @@ impl TsfTextService_Impl {
                 return Err(lifecycle_error(E_UNEXPECTED));
             }
         };
+        let ui_thread_manager = thread_manager.clone();
         activation.thread_manager = Some(thread_manager);
         activation.keystroke_manager = keystroke_manager;
         activation.thread_source = Some(thread_source);
@@ -1362,6 +2006,10 @@ impl TsfTextService_Impl {
         activation.client_id = client_id;
         activation.flags = flags;
         activation.activating = false;
+        drop(activation);
+        if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
+            candidate_ui.activate(&ui_thread_manager);
+        }
         Ok(())
     }
 
@@ -1388,12 +2036,46 @@ impl TsfTextService_Impl {
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .clone();
+        let needs_existing_candidates = matches!(
+            &input,
+            CompositionInput::Confirm
+                | CompositionInput::Select(_)
+                | CompositionInput::PreviousPage
+                | CompositionInput::NextPage
+        );
+        let existing_candidates = if needs_existing_candidates && !session.phonetic().is_empty() {
+            provider.candidates(session.phonetic(), CANDIDATE_LIMIT)
+        } else {
+            Vec::new()
+        };
         let selected_text = match input {
-            CompositionInput::Confirm => provider.candidate(session.phonetic(), 1),
-            CompositionInput::Select(rank) => provider.candidate(session.phonetic(), rank),
+            CompositionInput::Confirm => existing_candidates.first().cloned(),
+            CompositionInput::Select(rank) => {
+                let absolute = session
+                    .candidate_page_start()
+                    .saturating_add(rank.saturating_sub(1));
+                existing_candidates.get(absolute).cloned()
+            }
             _ => None,
         };
-        Ok(plan_session_input(&session, input, selected_text))
+        let mut plan =
+            match plan_session_input(&session, input, selected_text, existing_candidates.len()) {
+                Some(plan) => plan,
+                None => return Ok(None),
+            };
+        if !plan.after.phonetic().is_empty() {
+            let candidates =
+                if plan.after.phonetic() == session.phonetic() && !existing_candidates.is_empty() {
+                    existing_candidates
+                } else {
+                    provider.candidates(plan.after.phonetic(), CANDIDATE_LIMIT)
+                };
+            plan.candidate_display = Some(CandidateDisplay::from_candidates(
+                candidates,
+                plan.after.candidate_page_start(),
+            ));
+        }
+        Ok(Some(plan))
     }
 
     fn apply_key(&self, context: Ref<ITfContext>, wparam: WPARAM) -> Result<windows::core::BOOL> {
@@ -1414,22 +2096,39 @@ impl TsfTextService_Impl {
             activation.client_id
         };
 
-        self.request_document_edit_session(
-            &context,
-            client_id,
-            plan.edit,
-            EditSessionMode::KeySynchronous,
-            None,
-        )?;
+        let PlannedKey {
+            before,
+            after,
+            edit,
+            candidate_display,
+        } = plan;
+        let ui_only = edit.is_none();
+        if let Some(edit) = edit {
+            self.request_document_edit_session(
+                &context,
+                client_id,
+                edit,
+                candidate_display.clone(),
+                EditSessionMode::KeySynchronous,
+                None,
+            )?;
+        }
 
         let mut composition = self
             .composition
             .try_borrow_mut()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
-        if *composition != plan.before {
+        if *composition != before {
             return Err(lifecycle_error(E_UNEXPECTED));
         }
-        *composition = plan.after;
+        *composition = after;
+        drop(composition);
+        if ui_only
+            && let Some(display) = candidate_display
+            && let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut()
+        {
+            candidate_ui.update_contents(display);
+        }
         Ok(true.into())
     }
 }
@@ -1448,6 +2147,13 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             std::mem::take(&mut *activation)
         };
         let cleanup_result = self.schedule_active_composition_cleanup(previous.client_id);
+        let candidate_ui_result = match self.candidate_ui.try_borrow_mut() {
+            Ok(mut candidate_ui) => {
+                candidate_ui.deactivate();
+                Ok(())
+            }
+            Err(_) => Err(lifecycle_error(E_UNEXPECTED)),
+        };
         let composition_result = match self.composition.try_borrow_mut() {
             Ok(mut composition) => {
                 composition.finish_commit();
@@ -1472,7 +2178,8 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         cleanup_result?;
         key_unadvise_result?;
         thread_unadvise_result?;
-        composition_result
+        composition_result?;
+        candidate_ui_result
     }
 }
 
@@ -1671,10 +2378,11 @@ mod tests {
     struct FixedCandidateProvider;
 
     impl CandidateProvider for FixedCandidateProvider {
-        fn candidate(&self, code: &str, rank: usize) -> Option<String> {
-            match (code, rank) {
-                ("a", 1) => Some("啊".to_owned()),
-                _ => None,
+        fn candidates(&self, code: &str, limit: usize) -> Vec<String> {
+            if code == "a" && limit > 0 {
+                vec!["啊".to_owned()]
+            } else {
+                Vec::new()
             }
         }
     }
@@ -1830,13 +2538,11 @@ mod tests {
     #[test]
     fn development_provider_decodes_public_fixture_and_preserves_unknown_input() {
         let provider = development_candidate_provider().unwrap();
-        assert_eq!(provider.candidate("nihk", 1).as_deref(), Some("你好"));
-        assert_eq!(provider.candidate("nihk", 0), None);
-        assert_eq!(provider.candidate("nihk", 11), None);
-        assert_eq!(
-            provider.candidate("zzzzzzzz", 1).as_deref(),
-            Some("zzzzzzzz")
-        );
+        let candidates = provider.candidates("nihk", CANDIDATE_LIMIT);
+        assert_eq!(candidates.first().map(String::as_str), Some("你好"));
+        assert!(candidates.len() <= CANDIDATE_LIMIT);
+        assert!(provider.candidates("nihk", 0).is_empty());
+        assert_eq!(provider.candidates("zzzzzzzz", 1), ["zzzzzzzz"]);
     }
 
     #[test]
@@ -2403,5 +3109,81 @@ mod tests {
             decode_virtual_key(VK_OEM_PLUS.0, KeyModifiers::default()),
             Some(CompositionInput::NextPage)
         );
+        assert_eq!(
+            decode_virtual_key(VK_5.0, KeyModifiers::default()),
+            Some(CompositionInput::Select(5))
+        );
+        assert_eq!(
+            decode_virtual_key(VK_5.0 + 1, KeyModifiers::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_display_pages_and_bounds_native_text() {
+        let candidates = (1..=7)
+            .map(|index| format!("候选{index}"))
+            .collect::<Vec<_>>();
+        let display = CandidateDisplay::from_candidates(candidates, 5);
+        assert_eq!(display.visible(), ["候选6", "候选7"]);
+        assert_eq!(display.page_starts(), [0, 5]);
+        assert_eq!(display.current_page(), 1);
+        assert_eq!(display.selected_index(), 5);
+        assert_eq!(display.native_text(), "1  候选6\n2  候选7");
+
+        let long = "甲".repeat(CANDIDATE_DISPLAY_MAX_CHARS + 1);
+        let clipped = CandidateDisplay::from_candidates(vec![long], 0).native_text();
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clipped.chars().count(), 3 + CANDIDATE_DISPLAY_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn page_keys_are_ui_only_session_changes() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("nihk".to_owned()));
+        let next = plan_session_input(&session, CompositionInput::NextPage, None, 7).unwrap();
+        assert!(next.edit.is_none());
+        assert_eq!(next.after.candidate_page_start(), 5);
+
+        let previous =
+            plan_session_input(&next.after, CompositionInput::PreviousPage, None, 7).unwrap();
+        assert!(previous.edit.is_none());
+        assert_eq!(previous.after.candidate_page_start(), 0);
+    }
+
+    #[test]
+    fn candidate_ui_element_exposes_the_same_bounded_page_without_a_window() {
+        let before = ACTIVE_COM_OBJECTS.load(Ordering::Acquire);
+        let state = Rc::new(RefCell::new(CandidateElementState {
+            display: Some(CandidateDisplay::from_candidates(
+                (1..=7)
+                    .map(|index| format!("候选{index}"))
+                    .collect::<Vec<_>>(),
+                5,
+            )),
+            document_manager: None,
+            shown: true,
+        }));
+        let popup = Rc::new(RefCell::new(CandidatePopup::default()));
+        let element: ITfCandidateListUIElement =
+            CandidateListElement::counted(state, Rc::downgrade(&popup)).into();
+        assert_eq!(unsafe { element.GetCount() }.unwrap(), 7);
+        assert_eq!(unsafe { element.GetSelection() }.unwrap(), 5);
+        assert_eq!(
+            unsafe { element.GetString(5) }.unwrap().to_string(),
+            "候选6"
+        );
+        assert!(unsafe { element.GetString(7) }.is_err());
+        let mut starts = [u32::MAX; 2];
+        let mut page_count = 0;
+        unsafe { element.GetPageIndex(&mut starts, &mut page_count) }.unwrap();
+        assert_eq!(starts, [0, 5]);
+        assert_eq!(page_count, 2);
+        assert_eq!(unsafe { element.GetCurrentPage() }.unwrap(), 1);
+        unsafe { element.SetPageIndex(&starts) }.unwrap();
+        unsafe { element.Show(false) }.unwrap();
+        assert!(!unsafe { element.IsShown() }.unwrap().as_bool());
+        drop(element);
+        assert_eq!(ACTIVE_COM_OBJECTS.load(Ordering::Acquire), before);
     }
 }
