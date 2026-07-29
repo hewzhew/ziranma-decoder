@@ -1,8 +1,8 @@
 # TSF Alpha：检查、开发注册与撤回
 
-`tsf-devctl` 管理固定身份的 Windows TSF Alpha。检查是只读操作；注册和注销
-必须在管理员 PowerShell 中使用各自的显式命令，并附上
-`--confirm-machine-wide-development-alpha`。
+`tsf-devctl` 管理固定身份的 Windows TSF Alpha。检查是只读操作；本机注册和
+注销必须在管理员 PowerShell 中使用各自的显式命令。当前用户启用和禁用使用
+另外两个普通权限命令。四项写操作都有与动作对应的完整确认参数。
 
 ```powershell
 Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
@@ -26,7 +26,33 @@ cargo build --release --lib --bin tsf-devctl
 - 默认不启用、不激活，也不设为默认输入法。
 
 微软拼音和现有默认输入法不会被修改。注册、启用、激活和设为默认仍是四个
-不同边界；当前工具只实现第一项。
+不同边界；当前工具实现注册和当前用户启用，但没有激活或设置默认的命令。
+
+## 当前用户启用
+
+注册只让 Windows 认识 Alpha，配置最初仍为禁用。准备进行隔离宿主测试时，
+可以在普通 PowerShell 中让它出现在当前用户的输入法选择范围：
+
+```powershell
+.\target\release\tsf-devctl.exe enable-current-user `
+  --confirm-enable-current-user-development-alpha
+```
+
+这个命令先依据本地安装记录复核不可变 DLL、COM 注册、文本服务身份、语言
+配置和键盘类别，再只调用 Windows 的当前用户配置启用接口。完成后必须复查
+为“已启用、未活动”。工具不调用 TSF 激活或默认配置接口；是否通过输入法
+切换器选中 Alpha，仍由用户单独决定。
+
+测试前后都可以运行禁用命令：
+
+```powershell
+.\target\release\tsf-devctl.exe disable-current-user `
+  --confirm-disable-current-user-development-alpha
+```
+
+禁用必须复查为“未启用、未活动”。启用或复查失败时，工具会立即尝试恢复并
+确认这个安全状态；如果恢复也不完整，会明确报错。两个命令都不会读取输入
+内容、启动后台进程或修改微软拼音。
 
 ## 固定身份
 
@@ -107,5 +133,6 @@ DLL 只导出 `DllGetClassObject` 和 `DllCanUnloadNow`，没有自注册入口�
 
 - <https://learn.microsoft.com/en-us/windows/win32/tsf/text-service-registration>
 - <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-registerprofile>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofiles-enablelanguageprofile>
 - <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcategorymgr-registercategory>
 - <https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editors>

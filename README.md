@@ -276,7 +276,18 @@ cargo build --release --lib --bin tsf-devctl
   --confirm-machine-wide-development-alpha
 ```
 
-四层注册、失败回滚、安装记录和反向注销口径见
+注册完成后，可以在普通 PowerShell 中显式更改当前用户的“可选”状态。启用
+不会激活 Alpha，也不会更改默认输入法；禁用是测试后的安全退路：
+
+```powershell
+.\target\release\tsf-devctl.exe enable-current-user `
+  --confirm-enable-current-user-development-alpha
+
+.\target\release\tsf-devctl.exe disable-current-user `
+  --confirm-disable-current-user-development-alpha
+```
+
+四层注册、当前用户启用边界、失败回滚、安装记录和反向注销口径见
 [TSF Alpha 开发注册](docs/tsf-dev-inspection.md)。
 
 ## 候选实验台

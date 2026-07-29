@@ -18,6 +18,8 @@ const PE32_PLUS_MAGIC: u16 = 0x020b;
 const REQUIRED_COM_EXPORTS: [&str; 2] = ["DllCanUnloadNow", "DllGetClassObject"];
 const REGISTRATION_EXPORTS: [&str; 2] = ["DllRegisterServer", "DllUnregisterServer"];
 const CONFIRMATION_FLAG: &str = "--confirm-machine-wide-development-alpha";
+const ENABLE_CONFIRMATION_FLAG: &str = "--confirm-enable-current-user-development-alpha";
+const DISABLE_CONFIRMATION_FLAG: &str = "--confirm-disable-current-user-development-alpha";
 const INSTALL_SCHEMA: &str = "ziranma-tsf-alpha-install-v1";
 const INSTALL_ROOT: &str = ".local/tsf-alpha";
 const RECEIPT_FILE: &str = "install-v1.txt";
@@ -30,6 +32,8 @@ enum Options {
     Inspect { dll: PathBuf },
     RegisterMachine { dll: PathBuf },
     UnregisterMachine,
+    EnableCurrentUser,
+    DisableCurrentUser,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -81,6 +85,29 @@ enum RegistrationAction {
     VerifyUnregistered,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProfileTransitionAction {
+    Enable,
+    VerifyEnabled,
+    Disable,
+    VerifyDisabled,
+}
+
+impl ProfileTransitionAction {
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::Enable => "cannot enable the current-user TSF alpha profile",
+            Self::VerifyEnabled => {
+                "the current-user TSF alpha profile did not verify as enabled and inactive"
+            }
+            Self::Disable => "cannot disable the current-user TSF alpha profile",
+            Self::VerifyDisabled => {
+                "the current-user TSF alpha profile did not verify as disabled and inactive"
+            }
+        }
+    }
+}
+
 impl RegistrationAction {
     fn failure_message(self) -> &'static str {
         match self {
@@ -129,6 +156,32 @@ impl std::fmt::Display for RegistrationTransactionError {
 
 impl std::error::Error for RegistrationTransactionError {}
 
+#[derive(Debug, Eq, PartialEq)]
+struct ProfileTransitionError {
+    failed: ProfileTransitionAction,
+    recovery_failed: Vec<ProfileTransitionAction>,
+}
+
+impl std::fmt::Display for ProfileTransitionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.failed.failure_message())?;
+        if self.recovery_failed.is_empty() {
+            formatter.write_str("; the safe disabled state was restored")?;
+        } else {
+            formatter.write_str("; recovery to the disabled state is incomplete: ")?;
+            for (index, action) in self.recovery_failed.iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str(", ")?;
+                }
+                formatter.write_str(action.failure_message())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProfileTransitionError {}
+
 trait RegistrationBackend {
     fn register_com(&mut self, dll: &Path) -> Result<(), RegistrationAction>;
     fn register_text_service(&mut self) -> Result<(), RegistrationAction>;
@@ -140,6 +193,13 @@ trait RegistrationBackend {
     fn unregister_text_service(&mut self) -> Result<(), RegistrationAction>;
     fn unregister_com(&mut self, dll: &Path) -> Result<(), RegistrationAction>;
     fn verify_unregistered(&mut self) -> Result<(), RegistrationAction>;
+}
+
+trait ProfileToggleBackend {
+    fn enable_profile(&mut self) -> Result<(), ProfileTransitionAction>;
+    fn verify_profile_enabled(&mut self) -> Result<(), ProfileTransitionAction>;
+    fn disable_profile(&mut self) -> Result<(), ProfileTransitionAction>;
+    fn verify_profile_disabled(&mut self) -> Result<(), ProfileTransitionAction>;
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +223,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Options::Inspect { dll } => inspect(&dll)?,
         Options::RegisterMachine { dll } => register_machine(&dll)?,
         Options::UnregisterMachine => unregister_machine()?,
+        Options::EnableCurrentUser => enable_current_user()?,
+        Options::DisableCurrentUser => disable_current_user()?,
     }
     Ok(())
 }
@@ -199,8 +261,31 @@ fn parse_options(
             }
             Ok(Options::UnregisterMachine)
         }
+        "enable-current-user" => {
+            parse_confirmation_only(arguments, "enable-current-user", ENABLE_CONFIRMATION_FLAG)?;
+            Ok(Options::EnableCurrentUser)
+        }
+        "disable-current-user" => {
+            parse_confirmation_only(arguments, "disable-current-user", DISABLE_CONFIRMATION_FLAG)?;
+            Ok(Options::DisableCurrentUser)
+        }
         _ => Err("unknown tsf-devctl command; value was suppressed".into()),
     }
+}
+
+fn parse_confirmation_only(
+    arguments: impl IntoIterator<Item = String>,
+    command: &str,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = arguments.into_iter();
+    let confirmation = arguments
+        .next()
+        .ok_or_else(|| format!("{command} requires {expected}"))?;
+    if confirmation != expected || arguments.next().is_some() {
+        return Err(format!("{command} accepts only {expected}").into());
+    }
+    Ok(())
 }
 
 fn parse_dll_arguments(
@@ -252,9 +337,17 @@ fn print_usage() {
          --confirm-machine-wide-development-alpha"
     );
     eprintln!(
-        "Registration is machine-wide, 64-bit, and disabled by default. These commands require \
-         elevation and never \
-         enable, activate, or make the alpha the default input method."
+        "       cargo run --release --bin tsf-devctl -- enable-current-user \
+         --confirm-enable-current-user-development-alpha"
+    );
+    eprintln!(
+        "       cargo run --release --bin tsf-devctl -- disable-current-user \
+         --confirm-disable-current-user-development-alpha"
+    );
+    eprintln!(
+        "Machine registration is 64-bit, requires elevation, and is disabled by default. \
+         Current-user enable/disable never activates the alpha or makes it the default input \
+         method."
     );
 }
 
@@ -303,14 +396,7 @@ fn register_machine(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn unregister_machine() -> Result<(), Box<dyn std::error::Error>> {
-    let install_root = checked_install_root(false)?;
-    let receipt = read_install_receipt(&install_root)?;
-    let installed_dll = resolve_receipt_dll(&install_root, &receipt)?;
-    let bytes = read_explicit_dll(&installed_dll)?;
-    validate_alpha_dll(&inspect_pe(&bytes)?)?;
-    if hex_sha256(&bytes) != receipt.dll_sha256 {
-        return Err("the installed DLL no longer matches the installation receipt".into());
-    }
+    let (install_root, installed_dll) = verified_installed_dll()?;
     let com = inspect_com_registration()?;
     let profile = inspect_system_profile()?;
     if com == ComRegistrationStatus::default()
@@ -334,6 +420,56 @@ fn unregister_machine() -> Result<(), Box<dyn std::error::Error>> {
     println!("TSF Alpha 已注销（本机）");
     println!("微软拼音与默认输入法：未改动");
     Ok(())
+}
+
+fn enable_current_user() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, installed_dll) = verified_installed_dll()?;
+    let profile = require_exact_registered_layout(&installed_dll)?;
+    if profile.active {
+        return Err(
+            "the TSF alpha profile is unexpectedly active; refusing to change it implicitly".into(),
+        );
+    }
+    if profile.enabled {
+        println!("TSF Alpha 已为当前用户启用");
+        println!("状态：尚未激活；默认输入法未改动");
+        return Ok(());
+    }
+
+    let mut backend = create_registration_backend()?;
+    enable_profile_transaction(&mut backend)?;
+    println!("TSF Alpha 已为当前用户启用");
+    println!("状态：尚未激活；需要时可由输入法切换器主动选择");
+    println!("微软拼音与默认输入法：未改动");
+    Ok(())
+}
+
+fn disable_current_user() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, installed_dll) = verified_installed_dll()?;
+    let profile = require_exact_registered_layout(&installed_dll)?;
+    if !profile.enabled && !profile.active {
+        println!("TSF Alpha 已处于当前用户禁用状态");
+        println!("微软拼音与默认输入法：未改动");
+        return Ok(());
+    }
+
+    let mut backend = create_registration_backend()?;
+    disable_profile_transaction(&mut backend)?;
+    println!("TSF Alpha 已为当前用户禁用");
+    println!("状态：未激活；默认输入法未改动");
+    Ok(())
+}
+
+fn verified_installed_dll() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let install_root = checked_install_root(false)?;
+    let receipt = read_install_receipt(&install_root)?;
+    let installed_dll = resolve_receipt_dll(&install_root, &receipt)?;
+    let bytes = read_explicit_dll(&installed_dll)?;
+    validate_alpha_dll(&inspect_pe(&bytes)?)?;
+    if hex_sha256(&bytes) != receipt.dll_sha256 {
+        return Err("the installed DLL no longer matches the installation receipt".into());
+    }
+    Ok((install_root, installed_dll))
 }
 
 fn register_transaction<B: RegistrationBackend + ?Sized>(
@@ -445,6 +581,55 @@ fn collect_failures<const N: usize>(
     results: [Result<(), RegistrationAction>; N],
 ) -> Vec<RegistrationAction> {
     results.into_iter().filter_map(Result::err).collect()
+}
+
+fn enable_profile_transaction<B: ProfileToggleBackend + ?Sized>(
+    backend: &mut B,
+) -> Result<(), ProfileTransitionError> {
+    if let Err(failed) = backend.enable_profile() {
+        return Err(ProfileTransitionError {
+            failed,
+            recovery_failed: recover_disabled_profile(backend),
+        });
+    }
+    if let Err(failed) = backend.verify_profile_enabled() {
+        return Err(ProfileTransitionError {
+            failed,
+            recovery_failed: recover_disabled_profile(backend),
+        });
+    }
+    Ok(())
+}
+
+fn disable_profile_transaction<B: ProfileToggleBackend + ?Sized>(
+    backend: &mut B,
+) -> Result<(), ProfileTransitionError> {
+    if let Err(failed) = backend.disable_profile() {
+        return Err(ProfileTransitionError {
+            failed,
+            recovery_failed: recover_disabled_profile(backend),
+        });
+    }
+    if let Err(failed) = backend.verify_profile_disabled() {
+        return Err(ProfileTransitionError {
+            failed,
+            recovery_failed: recover_disabled_profile(backend),
+        });
+    }
+    Ok(())
+}
+
+fn recover_disabled_profile<B: ProfileToggleBackend + ?Sized>(
+    backend: &mut B,
+) -> Vec<ProfileTransitionAction> {
+    let disable_failure = backend.disable_profile().err();
+    match backend.verify_profile_disabled() {
+        Ok(()) => Vec::new(),
+        Err(verify_failure) => disable_failure
+            .into_iter()
+            .chain([verify_failure])
+            .collect(),
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -1260,6 +1445,18 @@ fn require_unregistered_state() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn require_exact_registered_state(dll: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = require_exact_registered_layout(dll)?;
+    if profile.enabled || profile.active {
+        return Err(
+            "the installed TSF alpha must be disabled and inactive before machine removal".into(),
+        );
+    }
+    Ok(())
+}
+
+fn require_exact_registered_layout(
+    dll: &Path,
+) -> Result<ProfileStatus, Box<dyn std::error::Error>> {
     let com = inspect_com_registration()?;
     let expected_com = ComRegistrationStatus {
         local_machine_64: true,
@@ -1269,17 +1466,23 @@ fn require_exact_registered_state(dll: &Path) -> Result<(), Box<dyn std::error::
     if com != expected_com
         || !profile.registered
         || !profile.text_service_registered
-        || profile.enabled
-        || profile.active
         || !profile.keyboard_category
         || !verify_machine_com_registration(dll)?
     {
         return Err(
-            "the installed TSF alpha state does not exactly match the removable development state"
+            "the installed TSF alpha layout does not exactly match its local installation receipt"
                 .into(),
         );
     }
-    Ok(())
+    Ok(profile)
+}
+
+fn profile_matches_toggle_state(profile: ProfileStatus, enabled: bool) -> bool {
+    profile.text_service_registered
+        && profile.registered
+        && profile.enabled == enabled
+        && !profile.active
+        && profile.keyboard_category
 }
 
 #[cfg(windows)]
@@ -1551,6 +1754,86 @@ impl RegistrationBackend for WindowsRegistrationBackend {
             Err(RegistrationAction::VerifyUnregistered)
         }
     }
+}
+
+#[cfg(not(windows))]
+impl ProfileToggleBackend for WindowsRegistrationBackend {
+    fn enable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
+        Err(ProfileTransitionAction::Enable)
+    }
+
+    fn verify_profile_enabled(&mut self) -> Result<(), ProfileTransitionAction> {
+        Err(ProfileTransitionAction::VerifyEnabled)
+    }
+
+    fn disable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
+        Err(ProfileTransitionAction::Disable)
+    }
+
+    fn verify_profile_disabled(&mut self) -> Result<(), ProfileTransitionAction> {
+        Err(ProfileTransitionAction::VerifyDisabled)
+    }
+}
+
+#[cfg(windows)]
+impl ProfileToggleBackend for WindowsRegistrationBackend {
+    fn enable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
+        set_current_user_profile_enabled(&self.text_services, true)
+            .map_err(|_| ProfileTransitionAction::Enable)
+    }
+
+    fn verify_profile_enabled(&mut self) -> Result<(), ProfileTransitionAction> {
+        let profile =
+            inspect_profile_with_managers(&self.text_services, &self.profiles, &self.categories)
+                .map_err(|_| ProfileTransitionAction::VerifyEnabled)?;
+        if profile_matches_toggle_state(profile, true) {
+            Ok(())
+        } else {
+            Err(ProfileTransitionAction::VerifyEnabled)
+        }
+    }
+
+    fn disable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
+        set_current_user_profile_enabled(&self.text_services, false)
+            .map_err(|_| ProfileTransitionAction::Disable)
+    }
+
+    fn verify_profile_disabled(&mut self) -> Result<(), ProfileTransitionAction> {
+        let profile =
+            inspect_profile_with_managers(&self.text_services, &self.profiles, &self.categories)
+                .map_err(|_| ProfileTransitionAction::VerifyDisabled)?;
+        if profile_matches_toggle_state(profile, false) {
+            Ok(())
+        } else {
+            Err(ProfileTransitionAction::VerifyDisabled)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_current_user_profile_enabled(
+    profiles: &windows::Win32::UI::TextServices::ITfInputProcessorProfiles,
+    enabled: bool,
+) -> windows::core::Result<()> {
+    use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
+
+    // SAFETY: changes only the current user's enabled bit for the fixed alpha
+    // profile. This API neither activates the profile nor changes the default
+    // profile; those are separate TSF operations that this tool never calls.
+    unsafe {
+        profiles.EnableLanguageProfile(
+            &TSF_ALPHA_CLSID,
+            TSF_ALPHA_LANGID,
+            &TSF_ALPHA_PROFILE_GUID,
+            enabled,
+        )
+    }
+    .inspect_err(|error| {
+        eprintln!(
+            "TSF_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
+            error.code().0 as u32
+        );
+    })
 }
 
 #[cfg(windows)]
@@ -2088,10 +2371,44 @@ mod tests {
             .unwrap(),
             Options::UnregisterMachine
         );
+        assert_eq!(
+            parse_options(
+                [
+                    "enable-current-user",
+                    "--confirm-enable-current-user-development-alpha",
+                ]
+                .map(str::to_owned)
+            )
+            .unwrap(),
+            Options::EnableCurrentUser
+        );
+        assert_eq!(
+            parse_options(
+                [
+                    "disable-current-user",
+                    "--confirm-disable-current-user-development-alpha",
+                ]
+                .map(str::to_owned)
+            )
+            .unwrap(),
+            Options::DisableCurrentUser
+        );
         assert!(
             parse_options(["register-machine", "--dll", "alpha.dll"].map(str::to_owned)).is_err()
         );
         assert!(parse_options(["unregister-machine"].map(str::to_owned)).is_err());
+        assert!(parse_options(["enable-current-user"].map(str::to_owned)).is_err());
+        assert!(parse_options(["disable-current-user"].map(str::to_owned)).is_err());
+        assert!(
+            parse_options(
+                [
+                    "enable-current-user",
+                    "--confirm-disable-current-user-development-alpha",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
         assert!(parse_options(["inspect"].map(str::to_owned)).is_err());
         assert!(
             parse_options(["inspect", "--dll", "a.dll", "--dll", "b.dll"].map(str::to_owned))
@@ -2231,6 +2548,37 @@ mod tests {
         let mut wrong_profile = exact;
         wrong_profile.guidProfile = GUID::from_u128(1);
         assert_eq!(alpha_profile_status(&wrong_profile), None);
+    }
+
+    #[test]
+    fn toggle_state_requires_complete_registration_and_never_accepts_active() {
+        let disabled = ProfileStatus {
+            text_service_registered: true,
+            registered: true,
+            enabled: false,
+            active: false,
+            keyboard_category: true,
+        };
+        assert!(profile_matches_toggle_state(disabled, false));
+        assert!(!profile_matches_toggle_state(disabled, true));
+
+        let enabled = ProfileStatus {
+            enabled: true,
+            ..disabled
+        };
+        assert!(profile_matches_toggle_state(enabled, true));
+
+        let active = ProfileStatus {
+            active: true,
+            ..enabled
+        };
+        assert!(!profile_matches_toggle_state(active, true));
+
+        let incomplete = ProfileStatus {
+            keyboard_category: false,
+            ..disabled
+        };
+        assert!(!profile_matches_toggle_state(incomplete, false));
     }
 
     #[test]
@@ -2403,6 +2751,150 @@ mod tests {
                 RegistrationAction::RegisterCategory,
             ]
         );
+    }
+
+    #[test]
+    fn current_user_enable_verifies_inactive_and_recovers_to_disabled() {
+        let mut success = FakeProfileToggleBackend::default();
+        enable_profile_transaction(&mut success).unwrap();
+        assert_eq!(
+            success.calls,
+            [
+                ProfileTransitionAction::Enable,
+                ProfileTransitionAction::VerifyEnabled,
+            ]
+        );
+
+        let mut enable_failure =
+            FakeProfileToggleBackend::failing([ProfileTransitionAction::Enable]);
+        let error = enable_profile_transaction(&mut enable_failure).unwrap_err();
+        assert_eq!(error.failed, ProfileTransitionAction::Enable);
+        assert!(error.recovery_failed.is_empty());
+        assert_eq!(
+            enable_failure.calls,
+            [
+                ProfileTransitionAction::Enable,
+                ProfileTransitionAction::Disable,
+                ProfileTransitionAction::VerifyDisabled,
+            ]
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("safe disabled state was restored")
+        );
+
+        let mut verify_failure =
+            FakeProfileToggleBackend::failing([ProfileTransitionAction::VerifyEnabled]);
+        let error = enable_profile_transaction(&mut verify_failure).unwrap_err();
+        assert_eq!(error.failed, ProfileTransitionAction::VerifyEnabled);
+        assert!(error.recovery_failed.is_empty());
+        assert_eq!(
+            verify_failure.calls,
+            [
+                ProfileTransitionAction::Enable,
+                ProfileTransitionAction::VerifyEnabled,
+                ProfileTransitionAction::Disable,
+                ProfileTransitionAction::VerifyDisabled,
+            ]
+        );
+    }
+
+    #[test]
+    fn current_user_disable_retries_toward_the_safe_state() {
+        let mut success = FakeProfileToggleBackend::default();
+        disable_profile_transaction(&mut success).unwrap();
+        assert_eq!(
+            success.calls,
+            [
+                ProfileTransitionAction::Disable,
+                ProfileTransitionAction::VerifyDisabled,
+            ]
+        );
+
+        let mut first_disable_failure =
+            FakeProfileToggleBackend::failing_once(ProfileTransitionAction::Disable);
+        let error = disable_profile_transaction(&mut first_disable_failure).unwrap_err();
+        assert_eq!(error.failed, ProfileTransitionAction::Disable);
+        assert!(error.recovery_failed.is_empty());
+        assert_eq!(
+            first_disable_failure.calls,
+            [
+                ProfileTransitionAction::Disable,
+                ProfileTransitionAction::Disable,
+                ProfileTransitionAction::VerifyDisabled,
+            ]
+        );
+
+        let mut recovery_failure = FakeProfileToggleBackend::failing([
+            ProfileTransitionAction::VerifyEnabled,
+            ProfileTransitionAction::VerifyDisabled,
+        ]);
+        let error = enable_profile_transaction(&mut recovery_failure).unwrap_err();
+        assert_eq!(
+            error.recovery_failed,
+            [ProfileTransitionAction::VerifyDisabled]
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("recovery to the disabled state is incomplete")
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeProfileToggleBackend {
+        calls: Vec<ProfileTransitionAction>,
+        failures: BTreeSet<ProfileTransitionAction>,
+        fail_once: Option<ProfileTransitionAction>,
+    }
+
+    impl FakeProfileToggleBackend {
+        fn failing<const N: usize>(failures: [ProfileTransitionAction; N]) -> Self {
+            Self {
+                calls: Vec::new(),
+                failures: failures.into_iter().collect(),
+                fail_once: None,
+            }
+        }
+
+        fn failing_once(action: ProfileTransitionAction) -> Self {
+            Self {
+                calls: Vec::new(),
+                failures: BTreeSet::new(),
+                fail_once: Some(action),
+            }
+        }
+
+        fn call(&mut self, action: ProfileTransitionAction) -> Result<(), ProfileTransitionAction> {
+            self.calls.push(action);
+            if self.fail_once == Some(action) {
+                self.fail_once = None;
+                Err(action)
+            } else if self.failures.contains(&action) {
+                Err(action)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ProfileToggleBackend for FakeProfileToggleBackend {
+        fn enable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
+            self.call(ProfileTransitionAction::Enable)
+        }
+
+        fn verify_profile_enabled(&mut self) -> Result<(), ProfileTransitionAction> {
+            self.call(ProfileTransitionAction::VerifyEnabled)
+        }
+
+        fn disable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
+            self.call(ProfileTransitionAction::Disable)
+        }
+
+        fn verify_profile_disabled(&mut self) -> Result<(), ProfileTransitionAction> {
+            self.call(ProfileTransitionAction::VerifyDisabled)
+        }
     }
 
     #[derive(Default)]
