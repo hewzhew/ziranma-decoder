@@ -1,6 +1,6 @@
 # 开源边界审计：MPL-2.0 已应用
 
-审计日期：2026-07-27。
+审计日期：2026-07-29（初始公开边界建立于 2026-07-27）。
 
 ## 当前结论
 
@@ -23,7 +23,7 @@
 | 类别 | 当前内容 | 建议处理 |
 | --- | --- | --- |
 | 项目原创材料 | `src/`、`tests/`、`docs/`、README、Cargo 配置和仓库规则 | MPL-2.0 |
-| 第三方依赖 | crates.io 的 `windows*`、RustCrypto `sha2`、过程宏及其传递依赖 | 不复制其源码；保留 Cargo 锁定与上游 MIT/Apache/Unicode 许可 |
+| 第三方依赖 | crates.io 的 `windows*`、RustCrypto `sha2`、`ed25519-dalek`、过程宏及其传递依赖 | 不复制其源码；保留 Cargo 锁定与上游 MIT/Apache/BSD/Unicode 许可 |
 | 第三方公开数据 | Rime 字典、UD GSDSimp、Conway Stroke Data | 逐目录保留原许可证、署名、固定提交、来源、校验和与转换账目 |
 | 私人和本地材料 | `data/private/`、`data/raw/`、`logs/`、`models/private/`、`.local/` | 永不纳入项目许可证、Git 历史或公开发行包 |
 
@@ -61,12 +61,18 @@
 - `windows`、`windows-core` 及其传递依赖：MIT OR Apache-2.0；
 - RustCrypto `sha2`、`digest`、`block-buffer`、`crypto-common`、
   `cpufeatures` 及相关支持依赖：MIT OR Apache-2.0；`generic-array`：MIT；
+- `ed25519-dalek` 与 `curve25519-dalek`：BSD-3-Clause；`ed25519` 和
+  `signature`：Apache-2.0 OR MIT；`subtle`：BSD-3-Clause；
+  `fiat-crypto`：MIT OR Apache-2.0 OR BSD-1-Clause；
+- `curve25519-dalek-derive`、构建期 `rustc_version` 与 `semver`：
+  MIT OR Apache-2.0；
 - `proc-macro2`、`quote`、`syn`：MIT OR Apache-2.0；
 - `unicode-ident`：`(MIT OR Apache-2.0) AND Unicode-3.0`。
 
-这些依赖源码没有复制进仓库。该组合没有显示出阻止项目原创 Rust 代码采用
-MPL-2.0 的许可冲突，但发行二进制时仍需生成依赖许可清单并随包提供必要
-通知。
+`ed25519-dalek` 关闭默认功能；运行时代码只验签，不启用随机密钥生成，也没有
+私钥文件接口。上述依赖源码没有复制进仓库。该组合没有显示出阻止项目原创
+Rust 代码采用 MPL-2.0 的许可冲突，但发行二进制时仍需生成依赖许可清单并随包
+提供必要通知。
 
 ## 数据包边界
 

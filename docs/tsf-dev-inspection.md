@@ -35,7 +35,7 @@ cargo build --release --lib --bin tsf-devctl
   且带 DLL 标志的产物；
 - 必须存在两个 COM 加载入口；发现注册/注销入口会使检查失败；
 - “证书目录存在”只表示 PE 安全目录非空，不代表证书可信、未过期或签名验证
-  成功；
+  成功；候选数据包的 Ed25519 验签与 PE/Authenticode 是相互独立的边界；
 - “系统语言配置”来自 `ITfInputProcessorProfileMgr::EnumProfiles(0x0804)`，只
   查找上表中的确切 CLSID 与配置 GUID；它不扫描其他语言，也不读取私人数据；
 - 此检查尚未读取标准 COM 类注册位置。因此“语言配置未发现”不能证明系统里
@@ -54,7 +54,7 @@ cargo build --release --lib --bin tsf-devctl
   公开开发候选源；它用于合成 Context 闭环，不是日用词典。目录存在时，新类
   工厂严格加载来源、许可、SHA-256、解码兼容性及 TSF 预检凭据全部有效的
   外部 current；
-- 没有候选 UI、品牌图标或经验证的数字签名；
+- 没有候选 UI、品牌图标或经验证的 PE/Authenticode 签名；
 - 没有安装、释放已加载实例、反向注销和失败回滚实现；
 - 尚未在记事本或 Codex 中验证真实焦点与异步编辑时序。
 

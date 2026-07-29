@@ -18,6 +18,7 @@ mod candidate_lab;
 mod candidate_package;
 mod candidate_provenance;
 mod candidate_runtime;
+mod candidate_signature;
 mod candidate_slots;
 mod candidate_snapshot;
 mod capsule_replay;
@@ -72,6 +73,11 @@ pub use candidate_runtime::{
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_RUNTIME_DIRECTORY, CANDIDATE_SLOT_STATE_FILE,
     CandidateRuntimeError, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, candidate_package_storage_id,
     candidate_preflight_receipt_body, load_current_candidate_snapshot,
+};
+pub use candidate_signature::{
+    CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519, CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1,
+    CandidateReleaseSignature, CandidateReleaseSignatureError,
+    MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, candidate_release_signing_message,
 };
 pub use candidate_slots::{
     CANDIDATE_SLOT_STATE_SCHEMA_V1, CandidateSlotError, CandidateSlotState,

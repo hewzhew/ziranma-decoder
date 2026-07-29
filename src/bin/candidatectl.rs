@@ -22,9 +22,10 @@ use ziranma_core::{
     CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE,
     CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_PACKAGES_DIRECTORY,
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CandidatePackageManifest,
-    CandidatePackageProvenance, CandidateSlotState, CandidateSnapshot,
+    CandidatePackageProvenance, CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
-    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
+    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_preflight_receipt_body, candidate_sha256_hex, parse_lexicon_tsv,
 };
@@ -49,6 +50,11 @@ enum Options {
     Verify {
         package: PathBuf,
         expected_sha256: String,
+    },
+    VerifySignature {
+        package: PathBuf,
+        signature: PathBuf,
+        trusted_public_key: String,
     },
     Status {
         root: PathBuf,
@@ -117,6 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             package,
             expected_sha256,
         } => verify(&package, &expected_sha256)?,
+        Options::VerifySignature {
+            package,
+            signature,
+            trusted_public_key,
+        } => verify_signature(&package, &signature, &trusted_public_key)?,
         Options::Status { root } => status(&root)?,
         Options::Adopt {
             root,
@@ -161,6 +172,7 @@ fn parse_options(
                 expected_sha256,
             })
         }
+        "verify-signature" => parse_verify_signature(arguments),
         "status" => Ok(Options::Status {
             root: parse_root_only(arguments, "status")?,
         }),
@@ -332,6 +344,34 @@ fn parse_package_and_expected_sha256(
     ))
 }
 
+fn parse_verify_signature(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut package = None;
+    let mut signature = None;
+    let mut trusted_public_key = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--signature" => set_path(&mut signature, &mut arguments, "--signature")?,
+            "--trusted-public-key" => set_value(
+                &mut trusted_public_key,
+                &mut arguments,
+                "--trusted-public-key",
+            )?,
+            _ => return Err("unknown verify-signature argument; value was suppressed".into()),
+        }
+    }
+    Ok(Options::VerifySignature {
+        package: package.ok_or("verify-signature requires exactly one --package path")?,
+        signature: signature.ok_or("verify-signature requires exactly one --signature path")?,
+        trusted_public_key: canonical_trusted_public_key(
+            &trusted_public_key
+                .ok_or("verify-signature requires exactly one --trusted-public-key value")?,
+        )?,
+    })
+}
+
 fn parse_package_only(
     mut arguments: impl Iterator<Item = String>,
     command: &str,
@@ -379,14 +419,34 @@ fn set_value(
 }
 
 fn canonical_expected_sha256(value: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if value.len() == 64
+    canonical_lowercase_hex(
+        value,
+        32,
+        "--expected-sha256 must be one lowercase SHA-256 value",
+    )
+}
+
+fn canonical_trusted_public_key(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    canonical_lowercase_hex(
+        value,
+        32,
+        "--trusted-public-key must be one lowercase Ed25519 public key",
+    )
+}
+
+fn canonical_lowercase_hex(
+    value: &str,
+    bytes: usize,
+    error: &'static str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if value.len() == bytes.saturating_mul(2)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         Ok(value.to_owned())
     } else {
-        Err("--expected-sha256 must be one lowercase SHA-256 value".into())
+        Err(error.into())
     }
 }
 
@@ -409,6 +469,9 @@ fn print_usage() {
     );
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!("  verify --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
+    eprintln!(
+        "  verify-signature --package <PACKAGE_DIR> --signature <STATEMENT> --trusted-public-key <ED25519_HEX>"
+    );
     eprintln!("  status --root <SLOT_DIR>");
     eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!("  promote|rollback --root <SLOT_DIR>");
@@ -505,6 +568,22 @@ fn verify(package: &Path, expected_sha256: &str) -> Result<String, Box<dyn std::
     let loaded = load_public_package_directory(package)?;
     verify_expected_sha256(&loaded, expected_sha256)?;
     Ok(render_verify_report(&loaded))
+}
+
+fn verify_signature(
+    package: &Path,
+    signature_path: &Path,
+    trusted_public_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    let signature_text = read_explicit_text(
+        signature_path,
+        "candidate release signature",
+        MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
+    )?;
+    let signature = CandidateReleaseSignature::parse(&signature_text)?;
+    signature.verify(trusted_public_key, &loaded.authentication_sha256)?;
+    Ok(render_signature_verify_report(&loaded, &signature))
 }
 
 fn adopt(
@@ -639,6 +718,20 @@ fn render_verify_report(loaded: &LoadedPackage) -> String {
         loaded.snapshot.revision(),
         loaded.provenance.source_id(),
         loaded.provenance.source_license()
+    )
+}
+
+fn render_signature_verify_report(
+    loaded: &LoadedPackage,
+    signature: &CandidateReleaseSignature,
+) -> String {
+    format!(
+        "候选包签名验证\n版本：{}\n来源：{}\n许可：{}\n结果：可信 Ed25519 签名有效\n\
+         发布 SHA-256：{}\n本次操作：只读\n",
+        loaded.snapshot.revision(),
+        loaded.provenance.source_id(),
+        loaded.provenance.source_license(),
+        signature.package_sha256()
     )
 }
 
@@ -1067,7 +1160,12 @@ fn move_replace(source: &Path, destination: &Path) -> Result<(), Box<dyn std::er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use ziranma_core::{
+        CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519, CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1,
+        candidate_release_signing_message,
+    };
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1102,6 +1200,34 @@ mod tests {
         load_public_package_directory(package)
             .unwrap()
             .authentication_sha256
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn test_release_signature(package_sha256: &str, seed: u8) -> (String, String) {
+        // Public synthetic test material only; this is not a release key.
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_hex = encode_hex(&public_key);
+        let key_sha256 = candidate_sha256_hex(&public_key);
+        let message = candidate_release_signing_message(&key_sha256, package_sha256).unwrap();
+        let signature = encode_hex(&signing_key.sign(&message).to_bytes());
+        (
+            format!(
+                "schema={CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1}\n\
+                 algorithm={CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519}\n\
+                 key_sha256={key_sha256}\n\
+                 package_sha256={package_sha256}\n\
+                 signature={signature}\n"
+            ),
+            public_key_hex,
+        )
     }
 
     #[test]
@@ -1199,6 +1325,24 @@ mod tests {
                 root: PathBuf::from("slots"),
                 package: PathBuf::from("package"),
                 expected_sha256,
+            }
+        );
+        let trusted_public_key = "b".repeat(64);
+        assert_eq!(
+            parse_options([
+                "verify-signature".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--signature".to_owned(),
+                "release.zrs".to_owned(),
+                "--trusted-public-key".to_owned(),
+                trusted_public_key.clone(),
+            ])
+            .unwrap(),
+            Options::VerifySignature {
+                package: PathBuf::from("package"),
+                signature: PathBuf::from("release.zrs"),
+                trusted_public_key,
             }
         );
         assert!(
@@ -1323,6 +1467,35 @@ mod tests {
             status(&slots).unwrap(),
             "候选数据槽\n当前：public-a\n待切换：无\n可回退：public-b\n本次操作：只读\n"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_signature_verification_binds_trusted_key_and_exact_package() {
+        let root = temporary_test_root();
+        let source = root.join("source.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let signature_path = root.join("release.zrs");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, LEXICON).unwrap();
+        let declaration = test_declaration(LEXICON);
+        build_public_package(&source, &package_a, "signed-a", &declaration).unwrap();
+        build_public_package(&source, &package_b, "signed-b", &declaration).unwrap();
+        let package_a_sha256 = package_sha256(&package_a);
+        let (signature_text, trusted_public_key) = test_release_signature(&package_a_sha256, 11);
+        fs::write(&signature_path, &signature_text).unwrap();
+
+        let report = verify_signature(&package_a, &signature_path, &trusted_public_key).unwrap();
+        assert!(report.contains("结果：可信 Ed25519 签名有效"));
+        assert!(report.contains(&format!("发布 SHA-256：{package_a_sha256}")));
+        assert!(!report.contains(&trusted_public_key));
+        assert!(!report.contains("signature="));
+
+        let (_, wrong_public_key) = test_release_signature(&package_a_sha256, 12);
+        assert!(verify_signature(&package_a, &signature_path, &wrong_public_key).is_err());
+        assert!(verify_signature(&package_b, &signature_path, &trusted_public_key).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }

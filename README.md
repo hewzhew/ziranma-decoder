@@ -44,8 +44,9 @@
 ## 运行
 
 需要稳定版 Rust。Windows TSF 使用官方 `windows` crate；候选包材料绑定使用
-RustCrypto `sha2`，避免手写密码学原语。仓库另含许可和来源均单独保留的公开
-Rime 词典与 UD Chinese GSDSimp train/test 快照。
+RustCrypto `sha2`，候选发布验签使用关闭默认功能的 `ed25519-dalek`，避免手写
+密码学原语。仓库另含许可和来源均单独保留的公开 Rime 词典与
+UD Chinese GSDSimp train/test 快照。
 
 ```powershell
 Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
@@ -205,6 +206,13 @@ cargo run --release --bin candidatectl -- verify `
   --expected-sha256 1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2
 ```
 
+`candidatectl verify-signature` 还能只读核对一份严格的 Ed25519 脱离签名声明。
+它要求明确指定包目录、声明文件，以及从独立可信渠道取得的公钥；公钥若与包和
+签名来自同一未验证来源，就没有建立信任。成功报告中的发布 SHA-256 可继续作为
+`adopt` / `stage` 的 `--expected-sha256`。验签不会自动安装或改变槽位，也不会
+回显公钥和签名正文。项目目前尚未发布真实发布公钥，也没有签名命令、私钥存储、
+密钥轮换或吊销策略，因此这里不提供可误执行的示例密钥命令。
+
 候选包可以在不注册输入法的情况下经过真实 Windows TSF 合成 Context 预检：
 
 ```powershell
@@ -230,8 +238,9 @@ cargo run --release --bin candidatectl -- status --root .local/candidate-slots
 ```
 
 `adopt` 和 `stage` 强制要求该独立摘要，并在创建或改变槽位前核对；摘要缺失、
-格式错误或不匹配时不安装、不预检、不改变状态。SHA-256 仍不认证发布者，
-正式多人分发还需要受信签名。
+格式错误或不匹配时不安装、不预检、不改变状态。Ed25519 验签是取得该摘要的
+一个只读信任步骤，尚未与槽位命令自动串联。它认证候选包发布声明，不代替
+Windows DLL / EXE 的 PE/Authenticode 签名。
 
 若槽根固定为 DLL 同目录的 `candidate-data`，新类工厂会读取经过预检的
 `current`。目录完全不存在时才使用编译进 DLL 的公开演示包；目录存在但损坏、

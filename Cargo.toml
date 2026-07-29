@@ -13,6 +13,7 @@ name = "ziranma_core"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+ed25519-dalek = { version = "2.2.0", default-features = false }
 sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
