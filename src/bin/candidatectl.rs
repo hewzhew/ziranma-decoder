@@ -69,6 +69,18 @@ enum Options {
         package: PathBuf,
         expected_sha256: String,
     },
+    AdoptSigned {
+        root: PathBuf,
+        package: PathBuf,
+        signature: PathBuf,
+        trusted_public_key: String,
+    },
+    StageSigned {
+        root: PathBuf,
+        package: PathBuf,
+        signature: PathBuf,
+        trusted_public_key: String,
+    },
     Promote {
         root: PathBuf,
     },
@@ -139,6 +151,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             package,
             expected_sha256,
         } => stage(&root, &package, &expected_sha256)?,
+        Options::AdoptSigned {
+            root,
+            package,
+            signature,
+            trusted_public_key,
+        } => adopt_signed(&root, &package, &signature, &trusted_public_key)?,
+        Options::StageSigned {
+            root,
+            package,
+            signature,
+            trusted_public_key,
+        } => stage_signed(&root, &package, &signature, &trusted_public_key)?,
         Options::Promote { root } => promote(&root)?,
         Options::Rollback { root } => rollback(&root)?,
     };
@@ -192,6 +216,26 @@ fn parse_options(
                 root,
                 package,
                 expected_sha256,
+            })
+        }
+        "adopt-signed" => {
+            let (root, package, signature, trusted_public_key) =
+                parse_root_package_and_signature(arguments, "adopt-signed")?;
+            Ok(Options::AdoptSigned {
+                root,
+                package,
+                signature,
+                trusted_public_key,
+            })
+        }
+        "stage-signed" => {
+            let (root, package, signature, trusted_public_key) =
+                parse_root_package_and_signature(arguments, "stage-signed")?;
+            Ok(Options::StageSigned {
+                root,
+                package,
+                signature,
+                trusted_public_key,
             })
         }
         "promote" => Ok(Options::Promote {
@@ -317,6 +361,37 @@ fn parse_root_package_and_expected_sha256(
             &expected_sha256
                 .ok_or_else(|| format!("{command} requires exactly one --expected-sha256 value"))?,
         )?,
+    ))
+}
+
+fn parse_root_package_and_signature(
+    mut arguments: impl Iterator<Item = String>,
+    command: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf, String), Box<dyn std::error::Error>> {
+    let mut root = None;
+    let mut package = None;
+    let mut signature = None;
+    let mut trusted_public_key = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--signature" => set_path(&mut signature, &mut arguments, "--signature")?,
+            "--trusted-public-key" => set_value(
+                &mut trusted_public_key,
+                &mut arguments,
+                "--trusted-public-key",
+            )?,
+            _ => return Err(format!("unknown {command} argument; value was suppressed").into()),
+        }
+    }
+    Ok((
+        root.ok_or_else(|| format!("{command} requires exactly one --root path"))?,
+        package.ok_or_else(|| format!("{command} requires exactly one --package path"))?,
+        signature.ok_or_else(|| format!("{command} requires exactly one --signature path"))?,
+        canonical_trusted_public_key(&trusted_public_key.ok_or_else(|| {
+            format!("{command} requires exactly one --trusted-public-key value")
+        })?)?,
     ))
 }
 
@@ -474,6 +549,9 @@ fn print_usage() {
     );
     eprintln!("  status --root <SLOT_DIR>");
     eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
+    eprintln!(
+        "  adopt-signed|stage-signed --root <SLOT_DIR> --package <PACKAGE_DIR> --signature <STATEMENT> --trusted-public-key <ED25519_HEX>"
+    );
     eprintln!("  promote|rollback --root <SLOT_DIR>");
 }
 
@@ -575,15 +653,8 @@ fn verify_signature(
     signature_path: &Path,
     trusted_public_key: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let loaded = load_public_package_directory(package)?;
-    let signature_text = read_explicit_text(
-        signature_path,
-        "candidate release signature",
-        MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
-    )?;
-    let signature = CandidateReleaseSignature::parse(&signature_text)?;
-    signature.verify(trusted_public_key, &loaded.authentication_sha256)?;
-    Ok(render_signature_verify_report(&loaded, &signature))
+    let loaded = load_signature_verified_package(package, signature_path, trusted_public_key)?;
+    Ok(render_signature_verify_report(&loaded))
 }
 
 fn adopt(
@@ -591,12 +662,46 @@ fn adopt(
     package: &Path,
     expected_sha256: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    verify_expected_sha256(&loaded, expected_sha256)?;
+    adopt_loaded(root, loaded)
+}
+
+fn stage(
+    root: &Path,
+    package: &Path,
+    expected_sha256: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    verify_expected_sha256(&loaded, expected_sha256)?;
+    stage_loaded(root, loaded)
+}
+
+fn adopt_signed(
+    root: &Path,
+    package: &Path,
+    signature_path: &Path,
+    trusted_public_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_signature_verified_package(package, signature_path, trusted_public_key)?;
+    adopt_loaded(root, loaded)
+}
+
+fn stage_signed(
+    root: &Path,
+    package: &Path,
+    signature_path: &Path,
+    trusted_public_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_signature_verified_package(package, signature_path, trusted_public_key)?;
+    stage_loaded(root, loaded)
+}
+
+fn adopt_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_some() {
         return Err("current candidate package is already configured".into());
     }
-    let loaded = load_public_package_directory(package)?;
-    verify_expected_sha256(&loaded, expected_sha256)?;
     let revision = loaded.snapshot.revision().to_owned();
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
@@ -611,17 +716,11 @@ fn adopt(
     ))
 }
 
-fn stage(
-    root: &Path,
-    package: &Path,
-    expected_sha256: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn stage_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_none() {
         return Err("current candidate package is not configured".into());
     }
-    let loaded = load_public_package_directory(package)?;
-    verify_expected_sha256(&loaded, expected_sha256)?;
     let revision = loaded.snapshot.revision().to_owned();
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
@@ -721,17 +820,14 @@ fn render_verify_report(loaded: &LoadedPackage) -> String {
     )
 }
 
-fn render_signature_verify_report(
-    loaded: &LoadedPackage,
-    signature: &CandidateReleaseSignature,
-) -> String {
+fn render_signature_verify_report(loaded: &LoadedPackage) -> String {
     format!(
         "候选包签名验证\n版本：{}\n来源：{}\n许可：{}\n结果：可信 Ed25519 签名有效\n\
          发布 SHA-256：{}\n本次操作：只读\n",
         loaded.snapshot.revision(),
         loaded.provenance.source_id(),
         loaded.provenance.source_license(),
-        signature.package_sha256()
+        loaded.authentication_sha256
     )
 }
 
@@ -819,6 +915,22 @@ fn load_public_package_directory(
             "plaintext private candidate packages are not accepted by this slot store".into(),
         );
     }
+    Ok(loaded)
+}
+
+fn load_signature_verified_package(
+    package: &Path,
+    signature_path: &Path,
+    trusted_public_key: &str,
+) -> Result<LoadedPackage, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    let signature_text = read_explicit_text(
+        signature_path,
+        "candidate release signature",
+        MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
+    )?;
+    let signature = CandidateReleaseSignature::parse(&signature_text)?;
+    signature.verify(trusted_public_key, &loaded.authentication_sha256)?;
     Ok(loaded)
 }
 
@@ -1345,6 +1457,48 @@ mod tests {
                 trusted_public_key,
             }
         );
+        let trusted_public_key = "c".repeat(64);
+        assert_eq!(
+            parse_options([
+                "adopt-signed".to_owned(),
+                "--root".to_owned(),
+                "slots".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--signature".to_owned(),
+                "release.zrs".to_owned(),
+                "--trusted-public-key".to_owned(),
+                trusted_public_key.clone(),
+            ])
+            .unwrap(),
+            Options::AdoptSigned {
+                root: PathBuf::from("slots"),
+                package: PathBuf::from("package"),
+                signature: PathBuf::from("release.zrs"),
+                trusted_public_key: trusted_public_key.clone(),
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "stage-signed".to_owned(),
+                "--signature".to_owned(),
+                "release.zrs".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--trusted-public-key".to_owned(),
+                trusted_public_key.clone(),
+                "--root".to_owned(),
+                "slots".to_owned(),
+            ])
+            .unwrap(),
+            Options::StageSigned {
+                root: PathBuf::from("slots"),
+                package: PathBuf::from("package"),
+                signature: PathBuf::from("release.zrs"),
+                trusted_public_key,
+            }
+        );
+        assert!(parse_options(["adopt-signed".to_owned()]).is_err());
         assert!(
             parse_options([
                 "verify".to_owned(),
@@ -1496,6 +1650,51 @@ mod tests {
         let (_, wrong_public_key) = test_release_signature(&package_a_sha256, 12);
         assert!(verify_signature(&package_a, &signature_path, &wrong_public_key).is_err());
         assert!(verify_signature(&package_b, &signature_path, &trusted_public_key).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signed_slot_writes_verify_before_creating_or_changing_state() {
+        let root = temporary_test_root();
+        let source = root.join("source.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let signature_path = root.join("release.zrs");
+        let slots = root.join("slots");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, LEXICON).unwrap();
+        let declaration = test_declaration(LEXICON);
+        build_public_package(&source, &package_a, "signed-a", &declaration).unwrap();
+        build_public_package(&source, &package_b, "signed-b", &declaration).unwrap();
+
+        let package_a_sha256 = package_sha256(&package_a);
+        let (signature_a, trusted_key_a) = test_release_signature(&package_a_sha256, 21);
+        let (_, wrong_key) = test_release_signature(&package_a_sha256, 22);
+        fs::write(&signature_path, &signature_a).unwrap();
+        assert!(adopt_signed(&slots, &package_a, &signature_path, &wrong_key).is_err());
+        assert!(!slots.exists());
+
+        adopt_signed(&slots, &package_a, &signature_path, &trusted_key_a).unwrap();
+        let before_failed_stage = read_slot_state(&slots).unwrap();
+        let installed_before = fs::read_dir(slots.join(CANDIDATE_PACKAGES_DIRECTORY))
+            .unwrap()
+            .count();
+
+        assert!(stage_signed(&slots, &package_b, &signature_path, &trusted_key_a).is_err());
+        assert_eq!(read_slot_state(&slots).unwrap(), before_failed_stage);
+        assert_eq!(
+            fs::read_dir(slots.join(CANDIDATE_PACKAGES_DIRECTORY))
+                .unwrap()
+                .count(),
+            installed_before
+        );
+
+        let package_b_sha256 = package_sha256(&package_b);
+        let (signature_b, trusted_key_b) = test_release_signature(&package_b_sha256, 23);
+        fs::write(&signature_path, signature_b).unwrap();
+        stage_signed(&slots, &package_b, &signature_path, &trusted_key_b).unwrap();
+        assert!(read_slot_state(&slots).unwrap().candidate().is_some());
 
         fs::remove_dir_all(root).unwrap();
     }

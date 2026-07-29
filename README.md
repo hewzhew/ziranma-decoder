@@ -209,9 +209,14 @@ cargo run --release --bin candidatectl -- verify `
 `candidatectl verify-signature` 还能只读核对一份严格的 Ed25519 脱离签名声明。
 它要求明确指定包目录、声明文件，以及从独立可信渠道取得的公钥；公钥若与包和
 签名来自同一未验证来源，就没有建立信任。成功报告中的发布 SHA-256 可继续作为
-`adopt` / `stage` 的 `--expected-sha256`。验签不会自动安装或改变槽位，也不会
-回显公钥和签名正文。项目目前尚未发布真实发布公钥，也没有签名命令、私钥存储、
-密钥轮换或吊销策略，因此这里不提供可误执行的示例密钥命令。
+`adopt` / `stage` 的 `--expected-sha256`；只读验签不会自动安装或改变槽位。
+也可以显式使用 `adopt-signed` / `stage-signed`，同时给出槽根、包、签名文件
+和可信公钥。它们先完成验签，再把同一份已加载材料交给现有安装与预检路径，
+避免验签后重新读取外部包。验签失败时不创建或改变槽位。所有签名命令都不
+回显公钥和签名正文，也不会发现或保存信任密钥。
+
+项目目前尚未发布真实发布公钥，也没有签名命令、私钥存储、密钥轮换或吊销
+策略，因此这里不提供可误执行的示例密钥命令。
 
 候选包可以在不注册输入法的情况下经过真实 Windows TSF 合成 Context 预检：
 
@@ -224,10 +229,10 @@ cargo run --release --bin candidatectl -- preflight `
 报告只显示版本、按键数、上屏字数和结果，不显示候选正文。预检凭据使用
 SHA-256 绑定来源侧车、清单、载荷、宿主和解码兼容标识。
 
-显式指定的本地槽库支持 `status`、`adopt`、`stage`、`promote` 和 `rollback`。
-它只接受通过完整校验和 TSF 预检的公开明文包；槽位状态原子替换，包文件不
-就地改写。预检凭据以 SHA-256 绑定三份包材料和兼容标识，缺失、损坏或包被
-改写都会阻止提升：
+显式指定的本地槽库支持 `status`、摘要驱动或签名驱动的 `adopt` / `stage`、
+`promote` 和 `rollback`。它只接受通过完整校验和 TSF 预检的公开明文包；槽位
+状态原子替换，包文件不就地改写。预检凭据以 SHA-256 绑定三份包材料和兼容
+标识，缺失、损坏或包被改写都会阻止提升：
 
 ```powershell
 cargo run --release --bin candidatectl -- adopt `
@@ -238,9 +243,10 @@ cargo run --release --bin candidatectl -- status --root .local/candidate-slots
 ```
 
 `adopt` 和 `stage` 强制要求该独立摘要，并在创建或改变槽位前核对；摘要缺失、
-格式错误或不匹配时不安装、不预检、不改变状态。Ed25519 验签是取得该摘要的
-一个只读信任步骤，尚未与槽位命令自动串联。它认证候选包发布声明，不代替
-Windows DLL / EXE 的 PE/Authenticode 签名。
+格式错误或不匹配时不安装、不预检、不改变状态。对应的 `adopt-signed` /
+`stage-signed` 强制要求显式签名文件和可信公钥，并在任何槽位写入前完成
+Ed25519 验证。它们认证候选包发布声明，不代替 Windows DLL / EXE 的
+PE/Authenticode 签名。
 
 若槽根固定为 DLL 同目录的 `candidate-data`，新类工厂会读取经过预检的
 `current`。目录完全不存在时才使用编译进 DLL 的公开演示包；目录存在但损坏、
