@@ -13,9 +13,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    CandidatePackageError, CandidatePackageManifest, CandidateSlotError, CandidateSlotState,
-    CandidateSnapshot, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, candidate_payload_fingerprint,
+    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_PACKAGE_PROVENANCE_FILE, CandidatePackageError,
+    CandidatePackageManifest, CandidatePackageProvenance, CandidateProvenanceError,
+    CandidateSlotError, CandidateSlotState, CandidateSnapshot,
+    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
+    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    candidate_package_authentication_sha256,
 };
 
 /// Fixed directory beside the TSF DLL that opts into managed candidate data.
@@ -30,26 +33,39 @@ pub const CANDIDATE_PACKAGES_DIRECTORY: &str = "packages";
 pub const CANDIDATE_PREFLIGHTS_DIRECTORY: &str = "preflights";
 /// Slot-state filename within a candidate-data root.
 pub const CANDIDATE_SLOT_STATE_FILE: &str = "slots.zcs";
-/// Schema for a successful local TSF preflight receipt.
-pub const CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V1: &str = "ziranma-candidate-preflight-v1";
+/// Schema for a SHA-256-bound local TSF preflight receipt.
+pub const CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V2: &str = "ziranma-candidate-preflight-v2";
 /// Host exercised by the first preflight receipt schema.
 pub const CANDIDATE_PREFLIGHT_HOST_V1: &str = "tsf-synthetic-context-v1";
 /// Maximum accepted size of one preflight receipt.
-pub const MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES: usize = 256;
+pub const MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES: usize = 512;
 
-/// Computes the internal immutable-package identifier from exact file bytes.
-pub fn candidate_package_storage_id(manifest_text: &str, payload_text: &str) -> String {
-    let manifest_id = candidate_payload_fingerprint(manifest_text.as_bytes());
-    let payload_id = candidate_payload_fingerprint(payload_text.as_bytes());
-    format!("pkg-{manifest_id:016x}-{payload_id:016x}")
+/// Computes the internal immutable-package identifier from all exact package bytes.
+pub fn candidate_package_storage_id(
+    provenance_text: &str,
+    manifest_text: &str,
+    payload_text: &str,
+) -> String {
+    let authentication_sha256 =
+        candidate_package_authentication_sha256(provenance_text, manifest_text, payload_text);
+    format!(
+        "pkg-{}-{}",
+        &authentication_sha256[..16],
+        &authentication_sha256[16..32]
+    )
 }
 
 /// Renders the exact receipt expected after a package passes local TSF preflight.
-pub fn candidate_preflight_receipt_body(package_id: &str) -> String {
+pub fn candidate_preflight_receipt_body(
+    package_id: &str,
+    package_authentication_sha256: &str,
+) -> String {
     format!(
-        "schema={CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V1}\n\
+        "schema={CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V2}\n\
          package={package_id}\n\
-         host={CANDIDATE_PREFLIGHT_HOST_V1}\n"
+         package_sha256={package_authentication_sha256}\n\
+         host={CANDIDATE_PREFLIGHT_HOST_V1}\n\
+         decoder_compatibility={CANDIDATE_DECODER_COMPATIBILITY_V1}\n"
     )
 }
 
@@ -94,17 +110,29 @@ pub fn load_current_candidate_snapshot(
     if manifest.contains_private_text() {
         return Err(CandidateRuntimeError::PrivatePlaintext);
     }
+    let provenance_text = read_regular_utf8(
+        &package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+        MAX_CANDIDATE_PROVENANCE_BYTES,
+        CandidateRuntimeError::ProvenanceUnavailable,
+    )?;
+    let provenance = CandidatePackageProvenance::parse(&provenance_text)
+        .map_err(CandidateRuntimeError::Provenance)?;
     let payload_text = read_regular_utf8(
         &package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
         MAX_CANDIDATE_SNAPSHOT_BYTES,
         CandidateRuntimeError::PayloadUnavailable,
     )?;
+    provenance
+        .validate_materials(&manifest_text, &payload_text)
+        .map_err(CandidateRuntimeError::Provenance)?;
     let snapshot = manifest
         .load_snapshot(&payload_text)
         .map_err(CandidateRuntimeError::Package)?;
-    if candidate_package_storage_id(&manifest_text, &payload_text) != package_id {
+    if candidate_package_storage_id(&provenance_text, &manifest_text, &payload_text) != package_id {
         return Err(CandidateRuntimeError::StorageIdentifierMismatch);
     }
+    let package_authentication_sha256 =
+        candidate_package_authentication_sha256(&provenance_text, &manifest_text, &payload_text);
 
     let preflights = root.join(CANDIDATE_PREFLIGHTS_DIRECTORY);
     ensure_regular_directory(&preflights, CandidateRuntimeError::InvalidPreflightStore)?;
@@ -113,7 +141,7 @@ pub fn load_current_candidate_snapshot(
         MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
         CandidateRuntimeError::PreflightReceiptUnavailable,
     )?;
-    if receipt != candidate_preflight_receipt_body(package_id) {
+    if receipt != candidate_preflight_receipt_body(package_id, &package_authentication_sha256) {
         return Err(CandidateRuntimeError::PreflightReceiptMismatch);
     }
 
@@ -181,10 +209,14 @@ pub enum CandidateRuntimeError {
     InvalidPackageDirectory,
     /// The exact manifest is missing, unsafe, or unreadable.
     ManifestUnavailable,
+    /// The exact public-source sidecar is missing, unsafe, or unreadable.
+    ProvenanceUnavailable,
     /// The exact lexicon payload is missing, unsafe, or unreadable.
     PayloadUnavailable,
     /// The package metadata or payload did not validate.
     Package(CandidatePackageError),
+    /// The source declaration, compatibility, or SHA-256 binding failed.
+    Provenance(CandidateProvenanceError),
     /// Plaintext private candidate data is outside the TSF alpha boundary.
     PrivatePlaintext,
     /// The package bytes no longer match their immutable storage identifier.
@@ -208,8 +240,10 @@ impl fmt::Display for CandidateRuntimeError {
             Self::InvalidPackageStore => "候选包存储无效",
             Self::InvalidPackageDirectory => "当前候选包目录无效",
             Self::ManifestUnavailable => "当前候选包清单不可用",
+            Self::ProvenanceUnavailable => "当前候选包来源声明不可用",
             Self::PayloadUnavailable => "当前候选包载荷不可用",
             Self::Package(_) => "当前候选包校验失败",
+            Self::Provenance(_) => "当前候选包来源或兼容性校验失败",
             Self::PrivatePlaintext => "TSF alpha 不接受明文私人候选包",
             Self::StorageIdentifierMismatch => "当前候选包与存储标识不符",
             Self::InvalidPreflightStore => "候选包预检存储无效",
@@ -225,6 +259,7 @@ impl Error for CandidateRuntimeError {
         match self {
             Self::SlotState(error) => Some(error),
             Self::Package(error) => Some(error),
+            Self::Provenance(error) => Some(error),
             _ => None,
         }
     }
@@ -276,16 +311,33 @@ mod tests {
     fn install_test_package(root: &Path, revision: &str, private: bool, payload: &str) -> String {
         let manifest = CandidatePackageManifest::from_payload(revision, private, payload).unwrap();
         let manifest_text = manifest.render();
-        let package_id = candidate_package_storage_id(&manifest_text, payload);
+        let provenance_text = CandidatePackageProvenance::from_materials(
+            "runtime-test-source",
+            "MPL-2.0",
+            "https://github.com/hewzhew/ziranma-decoder",
+            &crate::candidate_sha256_hex(payload.as_bytes()),
+            &manifest_text,
+            payload,
+        )
+        .unwrap()
+        .render();
+        let package_id = candidate_package_storage_id(&provenance_text, &manifest_text, payload);
+        let package_authentication_sha256 =
+            candidate_package_authentication_sha256(&provenance_text, &manifest_text, payload);
         let package = root.join(CANDIDATE_PACKAGES_DIRECTORY).join(&package_id);
         fs::create_dir_all(&package).unwrap();
         fs::write(package.join(CANDIDATE_PACKAGE_MANIFEST_FILE), manifest_text).unwrap();
+        fs::write(
+            package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            provenance_text,
+        )
+        .unwrap();
         fs::write(package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE), payload).unwrap();
         let preflights = root.join(CANDIDATE_PREFLIGHTS_DIRECTORY);
         fs::create_dir_all(&preflights).unwrap();
         fs::write(
             preflights.join(format!("{package_id}.zpf")),
-            candidate_preflight_receipt_body(&package_id),
+            candidate_preflight_receipt_body(&package_id, &package_authentication_sha256),
         )
         .unwrap();
         package_id
@@ -322,6 +374,19 @@ mod tests {
             .path()
             .join(CANDIDATE_PREFLIGHTS_DIRECTORY)
             .join(format!("{package_id}.zpf"));
+        fs::write(
+            &receipt,
+            format!(
+                "schema=ziranma-candidate-preflight-v1\n\
+                 package={package_id}\n\
+                 host={CANDIDATE_PREFLIGHT_HOST_V1}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_current_candidate_snapshot(root.path()).unwrap_err(),
+            CandidateRuntimeError::PreflightReceiptMismatch
+        );
         fs::write(&receipt, "schema=wrong\n").unwrap();
         assert_eq!(
             load_current_candidate_snapshot(root.path()).unwrap_err(),
@@ -331,6 +396,54 @@ mod tests {
         assert_eq!(
             load_current_candidate_snapshot(root.path()).unwrap_err(),
             CandidateRuntimeError::PreflightReceiptUnavailable
+        );
+    }
+
+    #[test]
+    fn provenance_changes_the_immutable_storage_identifier() {
+        let manifest =
+            CandidatePackageManifest::from_payload("storage-id", false, PAYLOAD).unwrap();
+        let manifest_text = manifest.render();
+        let provenance = CandidatePackageProvenance::from_materials(
+            "runtime-test-source",
+            "MPL-2.0",
+            "https://github.com/hewzhew/ziranma-decoder",
+            &crate::candidate_sha256_hex(PAYLOAD.as_bytes()),
+            &manifest_text,
+            PAYLOAD,
+        )
+        .unwrap()
+        .render();
+        let changed = provenance.replace("source_license=MPL-2.0", "source_license=Apache-2.0");
+
+        assert_ne!(
+            candidate_package_storage_id(&provenance, &manifest_text, PAYLOAD),
+            candidate_package_storage_id(&changed, &manifest_text, PAYLOAD)
+        );
+    }
+
+    #[test]
+    fn missing_or_incompatible_provenance_is_rejected() {
+        let (root, package_id) = configured_root("runtime-provenance", false);
+        let provenance = root
+            .path()
+            .join(CANDIDATE_PACKAGES_DIRECTORY)
+            .join(package_id)
+            .join(CANDIDATE_PACKAGE_PROVENANCE_FILE);
+        let original = fs::read_to_string(&provenance).unwrap();
+        fs::remove_file(&provenance).unwrap();
+        assert_eq!(
+            load_current_candidate_snapshot(root.path()).unwrap_err(),
+            CandidateRuntimeError::ProvenanceUnavailable
+        );
+        fs::write(
+            provenance,
+            original.replace(CANDIDATE_DECODER_COMPATIBILITY_V1, "future-decoder"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_current_candidate_snapshot(root.path()).unwrap_err(),
+            CandidateRuntimeError::Provenance(CandidateProvenanceError::IncompatibleDecoder)
         );
     }
 
@@ -347,7 +460,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             load_current_candidate_snapshot(root.path()).unwrap_err(),
-            CandidateRuntimeError::Package(_)
+            CandidateRuntimeError::Package(_) | CandidateRuntimeError::Provenance(_)
         ));
     }
 

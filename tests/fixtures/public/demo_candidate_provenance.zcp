@@ -1,0 +1,9 @@
+schema=ziranma-candidate-provenance-v1
+package_schema=ziranma-candidate-package-v1
+decoder_compatibility=ziranma-candidate-decoder-v1
+source_id=ziranma-demo-v1
+source_license=MPL-2.0
+source_url=https://github.com/hewzhew/ziranma-decoder
+source_sha256=b7b65f5b9e826fdb4075089f26c4051575fa6a7b197be0d1da8d6ff8d714e100
+manifest_sha256=41ef8ee9af2efbb2b64b1e13d2828cc3ca422dfb7850f3c8a62759c55771a332
+payload_sha256=b7b65f5b9e826fdb4075089f26c4051575fa6a7b197be0d1da8d6ff8d714e100

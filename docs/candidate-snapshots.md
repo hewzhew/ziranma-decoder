@@ -28,44 +28,71 @@ payload_fingerprint_fnv1a64=<16 位小写十六进制>
 entry_count=<词条数>
 ```
 
-清单不含候选正文，载荷单独保存为 UTF-8 TSV。核心库只接收调用者已经明确
-提供的两段内存，不解析路径。`candidatectl inspect` 才负责只读打开用户点名的
-两个普通文件；它拒绝符号链接、空文件、非 UTF-8 和超过固定上限的文件，不
-扫描相邻目录，也不尝试猜测配对文件。
+清单不含候选正文，载荷单独保存为 UTF-8 TSV。外部公开包还必须有严格九行的
+`ziranma-candidate-provenance-v1`：
+
+```text
+schema=ziranma-candidate-provenance-v1
+package_schema=ziranma-candidate-package-v1
+decoder_compatibility=ziranma-candidate-decoder-v1
+source_id=<公开来源标识>
+source_license=<单一 SPDX 风格许可证标识>
+source_url=<HTTPS 来源>
+source_sha256=<源文件 SHA-256>
+manifest_sha256=<清单 SHA-256>
+payload_sha256=<载荷 SHA-256>
+```
+
+核心快照仍只接收调用者明确提供的清单和载荷内存，不解析路径；来源层独立校验
+侧车及其材料绑定。`candidatectl inspect` 只读打开用户分别点名的三个普通文件；
+它拒绝符号链接、空文件、非 UTF-8 和超过固定上限的文件，不扫描相邻目录。
 
 ```powershell
 cargo run --release --bin candidatectl -- inspect `
   --manifest tests/fixtures/public/demo_candidate_manifest.zcm `
-  --payload tests/fixtures/public/demo_lexicon.tsv
+  --payload tests/fixtures/public/demo_lexicon.tsv `
+  --provenance tests/fixtures/public/demo_candidate_provenance.zcp
 ```
 
-报告只显示版本、公开/私人标记、词条数、载荷字节数和“校验通过”，不显示
-文件路径、指纹值或任何候选文字。检查器不写文件、不学习、不修改 TSF 配置、
-不联网，也不会替操作者安排下一步。
+报告只显示版本、公开/私人标记、来源 ID、许可证、词条数、载荷字节数和校验
+结果，不显示文件路径、摘要值、来源 URL 或候选文字。检查器不写文件、不学习、
+不修改 TSF 配置、不联网，也不会替操作者安排下一步。
 
 ## 确定性生成
 
-`candidatectl build` 只接受显式 `--public`、一个普通 UTF-8 TSV 和一个尚不存在
-的输出目录。它先严格解析词典，再计算字节数、词条数和 FNV-1a 损坏检测值，
-写入原样载荷与规范清单，最后从新目录完整回读一次：
+`candidatectl build` 只接受显式 `--public`、一个普通 UTF-8 TSV、完整公开来源
+声明和一个尚不存在的输出目录。它先检查源文件字节是否等于操作者显式提供的
+SHA-256，再严格解析词典，生成清单与来源侧车，最后从新目录完整回读三份材料：
 
 ```powershell
 cargo run --release --bin candidatectl -- build `
   --source tests/fixtures/public/demo_lexicon.tsv `
   --output .local/candidate-demo-v1 `
   --revision tsf-public-demo-v1 `
+  --source-id ziranma-demo-v1 `
+  --source-license MPL-2.0 `
+  --source-url https://github.com/hewzhew/ziranma-decoder `
+  --source-sha256 b7b65f5b9e826fdb4075089f26c4051575fa6a7b197be0d1da8d6ff8d714e100 `
   --public
 ```
 
-输出目录已存在时一律拒绝覆盖。载荷先写、清单后写，因此中途失败最多留下
-一个无法通过完整加载的不完整目录，不会冒充有效包。当前命令刻意不提供私人
-明文生成；私人候选必须另行设计 DPAPI 封装和授权边界。
+输出目录已存在时一律拒绝覆盖。载荷、清单先写，来源侧车最后写；中途失败最多
+留下一个无法通过完整加载的不完整目录，不会冒充有效包。当前命令刻意不提供
+私人明文生成；私人候选必须另行设计 DPAPI 封装和授权边界。
+
+### Alpha 格式迁移
+
+早期实验生成的双文件包和 `ziranma-candidate-preflight-v1` 凭据不再接受，也
+不会被原地补写或静默升级。新包必须由 `candidatectl build` 写入全新的输出
+目录，再由 `adopt` 写入全新的 `candidate-data` 槽根；旧凭据不能复用。当前
+TSF alpha 尚未注册，因此开发迁移应重建测试根，而不是手工修改旧包或内部
+槽位。这样旧格式、半迁移状态与新三文件包不会共用一个内部标识。
 
 ## 开发槽位
 
 `candidatectl` 的 `adopt`、`stage`、`promote`、`rollback` 和 `status` 接收显式
 `--root`。`adopt` / `stage` 还要求显式 `--package`，只从固定的
-`manifest.zcm` 与 `lexicon.tsv` 加载，不扫描相邻目录。
+`manifest.zcm`、`lexicon.tsv` 与 `provenance.zcp` 加载，不扫描相邻目录。
 
 槽库把验证后的公开包复制到内容寻址、只增不改的内部目录。四行
 `ziranma-candidate-slots-v1` 状态只保存 current/candidate/previous 三个内部
@@ -84,13 +111,14 @@ cargo run --release --bin candidatectl -- preflight `
 ```
 
 成功后，槽库在包目录之外写一个不含按键和正文的
-`ziranma-candidate-preflight-v1` 凭据。凭据绑定由清单和载荷共同计算的内部
-内容标识。`promote` / `rollback` 会重新加载包、重算标识并复核凭据；包被
-手工改写、凭据缺失或不匹配时，状态文件保持不变。
+`ziranma-candidate-preflight-v2` 凭据。凭据同时绑定预检宿主、解码兼容标识、
+内部包标识，以及由来源侧车、清单和载荷精确字节计算的完整 SHA-256。
+`promote` / `rollback` 会重新加载三份材料并复核凭据；任一材料被手工改写、
+凭据缺失或不匹配时，状态文件保持不变。
 
-这个凭据只是本地生命周期证据，不是数字签名，也不抵抗主动伪造。它用于防止
-把未预检包、旧凭据或普通文件漂移误当成已验证版本；公开来源认证仍需要未来的
-固定 SHA-256、许可证和发布流程。
+这个凭据仍只是本地生命周期证据，不是数字签名。来源 URL、许可证和源摘要是
+操作者声明；SHA-256 可以绑定精确材料，不能独自证明声明真实，也不能阻止有权
+改写槽库的人重新预检另一份材料。可信发布仍需要签名或独立可信摘要清单。
 
 槽库不删除废弃包，也不接受 `contains_private_text=true` 的明文包。提升和
 回退只原子改变数据指针：已有类工厂继续使用取得时的快照，提升之后创建的
@@ -109,9 +137,10 @@ cargo run --release --bin candidatectl -- adopt `
 ```
 
 运行时只打开以下确定路径：`slots.zcs`、`packages/<current>/manifest.zcm`、
-`packages/<current>/lexicon.tsv` 与 `preflights/<current>.zpf`。根目录、固定子目录、
-包目录和文件都必须是普通对象；文件有固定大小上限并需为 UTF-8。包内容标识、
-清单、载荷、公开标记和预检凭据全部复核后才建立类工厂。
+`packages/<current>/provenance.zcp`、`packages/<current>/lexicon.tsv` 与
+`preflights/<current>.zpf`。根目录、固定子目录、包目录和文件都必须是普通
+对象；文件有固定大小上限并需为 UTF-8。包内容标识、来源与许可、解码兼容性、
+三份材料 SHA-256、公开标记和预检凭据全部复核后才建立类工厂。
 
 “目录不存在”是唯一使用内嵌开发包的状态。目录存在但未配置、损坏、缺少凭据、
 内容标识漂移或出现明文私人包时，`DllGetClassObject` 返回失败，不静默回退。
@@ -131,10 +160,11 @@ cargo run --release --bin candidatectl -- adopt `
 1～131,072。字节数、指纹或实际词条数任一不符都会拒绝；候选接口只接受
 第 1～10 名。
 
-FNV-1a 只用于发现损坏、拿错版本或构建材料漂移。它不是密码学摘要、数字签名
-或来源认证；`contains_private_text` 也是调用者声明，不可能从文字本身推断隐私
-归属。未来若加载外部公开包，仍需固定来源和 SHA-256；私人包则必须先经过
-既定的 DPAPI 外层校验与解密，再把内存明文交给快照解析器。
+清单内的 FNV-1a 只用于普通损坏检测，不承担安全含义。外部包的内部目录标识
+截取自三份精确材料的 SHA-256，完整 SHA-256 同时写入预检凭据；这可以绑定
+来源侧车、清单和载荷，却仍不是数字签名。`contains_private_text` 也是调用者
+声明，不可能从文字本身推断隐私归属。私人包必须先经过既定的 DPAPI 外层校验
+与解密，再把内存明文交给快照解析器。
 
 ## 输入失败时怎样处理
 
@@ -148,13 +178,13 @@ FNV-1a 只用于发现损坏、拿错版本或构建材料漂移。它不是密�
 这些规则首先保证不吞字。它们不声称未知双拼已经被正确转换，也不把按键直通
 包装成候选质量。
 
-## 尚未接通的发布认证层
+## 尚未接通的签名分发层
 
-包清单、确定性公开生成、完整加载、TSF 合成宿主预检、三槽状态以及新类工厂
-读取 `current` 已经完成。接下来仍有两道门：
+包清单、显式来源与许可、SHA-256 材料绑定、解码兼容边界、TSF 合成宿主预检、
+三槽状态以及新类工厂读取 `current` 已经完成。接下来仍有两道门：
 
-1. 固定外部公开来源时，另行记录上游 SHA-256、许可证与解码兼容指纹；当前
-   FNV-1a 只能发现普通损坏，不能认证来源；
+1. 正式分发需要由受信发布密钥签名包，或由独立受信渠道固定包 SHA-256；当前
+   侧车只是可审计声明，不认证声明者；
 2. 当前仍没有注册、安装、签名或跨进程升级协调。实际宿主中的版本观察、启动
    延迟、内存重复量和回退操作必须在用户另行授权注册之后测量。
 

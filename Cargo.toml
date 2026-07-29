@@ -13,6 +13,7 @@ name = "ziranma_core"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

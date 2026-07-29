@@ -23,7 +23,7 @@
 | 类别 | 当前内容 | 建议处理 |
 | --- | --- | --- |
 | 项目原创材料 | `src/`、`tests/`、`docs/`、README、Cargo 配置和仓库规则 | MPL-2.0 |
-| 第三方依赖 | crates.io 的 `windows*`、过程宏依赖与 Unicode 标识依赖 | 不复制其源码；保留 Cargo 锁定与上游 MIT/Apache/Unicode 许可 |
+| 第三方依赖 | crates.io 的 `windows*`、RustCrypto `sha2`、过程宏及其传递依赖 | 不复制其源码；保留 Cargo 锁定与上游 MIT/Apache/Unicode 许可 |
 | 第三方公开数据 | Rime 字典、UD GSDSimp、Conway Stroke Data | 逐目录保留原许可证、署名、固定提交、来源、校验和与转换账目 |
 | 私人和本地材料 | `data/private/`、`data/raw/`、`logs/`、`models/private/`、`.local/` | 永不纳入项目许可证、Git 历史或公开发行包 |
 
@@ -59,6 +59,8 @@
 `cargo metadata` 在审计时报告：
 
 - `windows`、`windows-core` 及其传递依赖：MIT OR Apache-2.0；
+- RustCrypto `sha2`、`digest`、`block-buffer`、`crypto-common`、
+  `cpufeatures` 及相关支持依赖：MIT OR Apache-2.0；`generic-array`：MIT；
 - `proc-macro2`、`quote`、`syn`：MIT OR Apache-2.0；
 - `unicode-ident`：`(MIT OR Apache-2.0) AND Unicode-3.0`。
 

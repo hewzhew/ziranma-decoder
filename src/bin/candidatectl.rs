@@ -19,12 +19,14 @@ use windows::core::PCWSTR;
 #[cfg(windows)]
 use ziranma_core::preflight_candidate_snapshot;
 use ziranma_core::{
-    CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGES_DIRECTORY,
+    CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE,
+    CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_PACKAGES_DIRECTORY,
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CandidatePackageManifest,
-    CandidateSlotState, CandidateSnapshot, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
-    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, candidate_package_storage_id, candidate_preflight_receipt_body,
-    parse_lexicon_tsv,
+    CandidatePackageProvenance, CandidateSlotState, CandidateSnapshot,
+    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
+    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    candidate_package_authentication_sha256, candidate_package_storage_id,
+    candidate_preflight_receipt_body, candidate_sha256_hex, parse_lexicon_tsv,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -33,11 +35,13 @@ enum Options {
     Inspect {
         manifest: PathBuf,
         payload: PathBuf,
+        provenance: PathBuf,
     },
     Build {
         source: PathBuf,
         output: PathBuf,
         revision: String,
+        declaration: PublicSourceDeclaration,
     },
     Preflight {
         package: PathBuf,
@@ -64,8 +68,19 @@ enum Options {
 struct LoadedPackage {
     manifest_text: String,
     payload_text: String,
+    provenance_text: String,
     manifest: CandidatePackageManifest,
+    provenance: CandidatePackageProvenance,
     snapshot: Arc<CandidateSnapshot>,
+    authentication_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicSourceDeclaration {
+    id: String,
+    license: String,
+    url: String,
+    sha256: String,
 }
 
 struct PreflightSummary {
@@ -80,12 +95,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_usage();
             return Ok(());
         }
-        Options::Inspect { manifest, payload } => inspect(&manifest, &payload)?,
+        Options::Inspect {
+            manifest,
+            payload,
+            provenance,
+        } => inspect(&manifest, &payload, &provenance)?,
         Options::Build {
             source,
             output,
             revision,
-        } => build_public_package(&source, &output, &revision)?,
+            declaration,
+        } => build_public_package(&source, &output, &revision, &declaration)?,
         Options::Preflight { package } => preflight(&package)?,
         Options::Status { root } => status(&root)?,
         Options::Adopt { root, package } => adopt(&root, &package)?,
@@ -141,16 +161,19 @@ fn parse_inspect(
 ) -> Result<Options, Box<dyn std::error::Error>> {
     let mut manifest = None;
     let mut payload = None;
+    let mut provenance = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--manifest" => set_path(&mut manifest, &mut arguments, "--manifest")?,
             "--payload" => set_path(&mut payload, &mut arguments, "--payload")?,
+            "--provenance" => set_path(&mut provenance, &mut arguments, "--provenance")?,
             _ => return Err("unknown inspect argument; value was suppressed".into()),
         }
     }
     Ok(Options::Inspect {
         manifest: manifest.ok_or("inspect requires exactly one --manifest path")?,
         payload: payload.ok_or("inspect requires exactly one --payload path")?,
+        provenance: provenance.ok_or("inspect requires exactly one --provenance path")?,
     })
 }
 
@@ -160,6 +183,10 @@ fn parse_build(
     let mut source = None;
     let mut output = None;
     let mut revision = None;
+    let mut source_id = None;
+    let mut source_license = None;
+    let mut source_url = None;
+    let mut source_sha256 = None;
     let mut public = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -171,6 +198,12 @@ fn parse_build(
                 }
                 revision = Some(arguments.next().ok_or("--revision requires a value")?);
             }
+            "--source-id" => set_value(&mut source_id, &mut arguments, "--source-id")?,
+            "--source-license" => {
+                set_value(&mut source_license, &mut arguments, "--source-license")?
+            }
+            "--source-url" => set_value(&mut source_url, &mut arguments, "--source-url")?,
+            "--source-sha256" => set_value(&mut source_sha256, &mut arguments, "--source-sha256")?,
             "--public" => {
                 if public {
                     return Err("--public can be given only once".into());
@@ -189,6 +222,12 @@ fn parse_build(
         source: source.ok_or("build requires exactly one --source path")?,
         output: output.ok_or("build requires exactly one --output path")?,
         revision: revision.ok_or("build requires exactly one --revision value")?,
+        declaration: PublicSourceDeclaration {
+            id: source_id.ok_or("build requires exactly one --source-id value")?,
+            license: source_license.ok_or("build requires exactly one --source-license value")?,
+            url: source_url.ok_or("build requires exactly one --source-url value")?,
+            sha256: source_sha256.ok_or("build requires exactly one --source-sha256 value")?,
+        },
     })
 }
 
@@ -255,6 +294,22 @@ fn set_path(
     Ok(())
 }
 
+fn set_value(
+    slot: &mut Option<String>,
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if slot.is_some() {
+        return Err(format!("{option} can be given only once").into());
+    }
+    *slot = Some(
+        arguments
+            .next()
+            .ok_or_else(|| format!("{option} requires a value"))?,
+    );
+    Ok(())
+}
+
 fn reject_extra(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -266,9 +321,11 @@ fn reject_extra(
 
 fn print_usage() {
     eprintln!("candidatectl commands:");
-    eprintln!("  inspect --manifest <PACKAGE.zcm> --payload <LEXICON.tsv>");
     eprintln!(
-        "  build --source <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --public"
+        "  inspect --manifest <PACKAGE.zcm> --payload <LEXICON.tsv> --provenance <SOURCE.zcp>"
+    );
+    eprintln!(
+        "  build --source <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!("  status --root <SLOT_DIR>");
@@ -279,6 +336,7 @@ fn print_usage() {
 fn inspect(
     manifest_path: &Path,
     payload_path: &Path,
+    provenance_path: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let manifest_text = read_explicit_text(
         manifest_path,
@@ -286,19 +344,27 @@ fn inspect(
         MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
     )?;
     let manifest = CandidatePackageManifest::parse(&manifest_text)?;
+    let provenance_text = read_explicit_text(
+        provenance_path,
+        "candidate provenance",
+        MAX_CANDIDATE_PROVENANCE_BYTES,
+    )?;
+    let provenance = CandidatePackageProvenance::parse(&provenance_text)?;
     let payload_text = read_explicit_text(
         payload_path,
         "candidate payload",
         MAX_CANDIDATE_SNAPSHOT_BYTES,
     )?;
+    provenance.validate_materials(&manifest_text, &payload_text)?;
     let snapshot = manifest.load_snapshot(&payload_text)?;
-    Ok(render_inspect_report(&snapshot))
+    Ok(render_inspect_report(&snapshot, &provenance))
 }
 
 fn build_public_package(
     source: &Path,
     output: &Path,
     revision: &str,
+    declaration: &PublicSourceDeclaration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     ensure_path_absent(output, "package output")?;
     let payload = read_explicit_text(
@@ -306,8 +372,20 @@ fn build_public_package(
         "public lexicon source",
         MAX_CANDIDATE_SNAPSHOT_BYTES,
     )?;
+    if candidate_sha256_hex(payload.as_bytes()) != declaration.sha256 {
+        return Err("public lexicon source SHA-256 does not match the explicit pin".into());
+    }
     let manifest = CandidatePackageManifest::from_payload(revision, false, &payload)?;
     let manifest_text = manifest.render();
+    let provenance_text = CandidatePackageProvenance::from_materials(
+        &declaration.id,
+        &declaration.license,
+        &declaration.url,
+        &declaration.sha256,
+        &manifest_text,
+        &payload,
+    )?
+    .render();
 
     fs::create_dir(output).map_err(|_| "cannot create explicitly named package output")?;
     write_new_synced(
@@ -318,9 +396,13 @@ fn build_public_package(
         &output.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
         manifest_text.as_bytes(),
     )?;
+    write_new_synced(
+        &output.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+        provenance_text.as_bytes(),
+    )?;
 
     let loaded = load_package_directory(output)?;
-    Ok(render_build_report(&loaded.snapshot))
+    Ok(render_build_report(&loaded.snapshot, &loaded.provenance))
 }
 
 fn status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -345,7 +427,7 @@ fn adopt(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Erro
     let package_id = install_package(root, &loaded)?;
     let installed = load_installed_package(root, &package_id)?;
     preflight_loaded_package(&installed)?;
-    write_preflight_receipt(root, &package_id)?;
+    write_preflight_receipt(root, &package_id, &installed.authentication_sha256)?;
     state.adopt(&package_id)?;
     write_slot_state(root, &state)?;
     Ok(render_preflight_change_report(
@@ -365,7 +447,7 @@ fn stage(root: &Path, package: &Path) -> Result<String, Box<dyn std::error::Erro
     let package_id = install_package(root, &loaded)?;
     let installed = load_installed_package(root, &package_id)?;
     preflight_loaded_package(&installed)?;
-    write_preflight_receipt(root, &package_id)?;
+    write_preflight_receipt(root, &package_id, &installed.authentication_sha256)?;
     state.stage(&package_id)?;
     write_slot_state(root, &state)?;
     Ok(render_preflight_change_report(
@@ -383,6 +465,7 @@ fn promote(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
         state
             .candidate()
             .ok_or("required candidate slot is empty")?,
+        &next.authentication_sha256,
     )?;
     let revision = next.snapshot.revision().to_owned();
     state.promote()?;
@@ -397,6 +480,7 @@ fn rollback(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     validate_preflight_receipt(
         root,
         state.previous().ok_or("required previous slot is empty")?,
+        &previous.authentication_sha256,
     )?;
     let revision = previous.snapshot.revision().to_owned();
     state.rollback()?;
@@ -404,7 +488,10 @@ fn rollback(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     Ok(render_change_report("候选数据槽已回退", &revision))
 }
 
-fn render_inspect_report(snapshot: &CandidateSnapshot) -> String {
+fn render_inspect_report(
+    snapshot: &CandidateSnapshot,
+    provenance: &CandidatePackageProvenance,
+) -> String {
     let mut output = String::new();
     writeln!(output, "候选包检查").unwrap();
     writeln!(output, "版本：{}", snapshot.revision()).unwrap();
@@ -420,15 +507,22 @@ fn render_inspect_report(snapshot: &CandidateSnapshot) -> String {
     .unwrap();
     writeln!(output, "词条：{}", snapshot.entry_count()).unwrap();
     writeln!(output, "载荷：{} 字节", snapshot.payload_bytes()).unwrap();
-    writeln!(output, "校验：通过").unwrap();
+    writeln!(output, "来源：{}", provenance.source_id()).unwrap();
+    writeln!(output, "许可：{}", provenance.source_license()).unwrap();
+    writeln!(output, "SHA-256 与兼容性：通过").unwrap();
     writeln!(output, "本次操作：只读").unwrap();
     output
 }
 
-fn render_build_report(snapshot: &CandidateSnapshot) -> String {
+fn render_build_report(
+    snapshot: &CandidateSnapshot,
+    provenance: &CandidatePackageProvenance,
+) -> String {
     format!(
-        "公开候选包已生成\n版本：{}\n词条：{}\n载荷：{} 字节\n写入：2 个新文件\n",
+        "公开候选包已生成\n版本：{}\n来源：{}\n许可：{}\n词条：{}\n载荷：{} 字节\n写入：3 个新文件\n",
         snapshot.revision(),
+        provenance.source_id(),
+        provenance.source_license(),
         snapshot.entry_count(),
         snapshot.payload_bytes()
     )
@@ -528,18 +622,30 @@ fn load_package_directory(package: &Path) -> Result<LoadedPackage, Box<dyn std::
         "candidate manifest",
         MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
     )?;
+    let provenance_text = read_explicit_text(
+        &package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+        "candidate provenance",
+        MAX_CANDIDATE_PROVENANCE_BYTES,
+    )?;
     let payload_text = read_explicit_text(
         &package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
         "candidate payload",
         MAX_CANDIDATE_SNAPSHOT_BYTES,
     )?;
     let manifest = CandidatePackageManifest::parse(&manifest_text)?;
+    let provenance = CandidatePackageProvenance::parse(&provenance_text)?;
+    provenance.validate_materials(&manifest_text, &payload_text)?;
     let snapshot = Arc::new(manifest.load_snapshot(&payload_text)?);
+    let authentication_sha256 =
+        candidate_package_authentication_sha256(&provenance_text, &manifest_text, &payload_text);
     Ok(LoadedPackage {
         manifest_text,
         payload_text,
+        provenance_text,
         manifest,
+        provenance,
         snapshot,
+        authentication_sha256,
     })
 }
 
@@ -559,7 +665,12 @@ fn load_installed_package(
     if loaded.snapshot.contains_private_text() {
         return Err("candidate slot unexpectedly contains plaintext private text".into());
     }
-    if candidate_package_storage_id(&loaded.manifest_text, &loaded.payload_text) != package_id {
+    if candidate_package_storage_id(
+        &loaded.provenance_text,
+        &loaded.manifest_text,
+        &loaded.payload_text,
+    ) != package_id
+    {
         return Err("installed candidate package no longer matches its storage identifier".into());
     }
     Ok(loaded)
@@ -569,7 +680,11 @@ fn install_package(
     root: &Path,
     loaded: &LoadedPackage,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let package_id = candidate_package_storage_id(&loaded.manifest_text, &loaded.payload_text);
+    let package_id = candidate_package_storage_id(
+        &loaded.provenance_text,
+        &loaded.manifest_text,
+        &loaded.payload_text,
+    );
     let packages = root.join(CANDIDATE_PACKAGES_DIRECTORY);
     let destination = packages.join(&package_id);
 
@@ -578,6 +693,7 @@ fn install_package(
             let installed = load_public_package_directory(&destination)?;
             if installed.manifest_text != loaded.manifest_text
                 || installed.payload_text != loaded.payload_text
+                || installed.provenance_text != loaded.provenance_text
             {
                 return Err("candidate package storage identifier collision".into());
             }
@@ -598,9 +714,16 @@ fn install_package(
         &temporary.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
         loaded.manifest_text.as_bytes(),
     )?;
+    write_new_synced(
+        &temporary.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+        loaded.provenance_text.as_bytes(),
+    )?;
     fs::rename(&temporary, &destination).map_err(|_| "cannot install candidate package")?;
     let installed = load_public_package_directory(&destination)?;
-    if installed.manifest != loaded.manifest || installed.payload_text != loaded.payload_text {
+    if installed.manifest != loaded.manifest
+        || installed.payload_text != loaded.payload_text
+        || installed.provenance != loaded.provenance
+    {
         return Err("installed candidate package failed exact verification".into());
     }
     Ok(package_id)
@@ -614,8 +737,9 @@ fn preflight_receipt_path(root: &Path, package_id: &str) -> PathBuf {
 fn write_preflight_receipt(
     root: &Path,
     package_id: &str,
+    authentication_sha256: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected = candidate_preflight_receipt_body(package_id);
+    let expected = candidate_preflight_receipt_body(package_id, authentication_sha256);
     let path = preflight_receipt_path(root, package_id);
     match fs::symlink_metadata(&path) {
         Ok(_) => {
@@ -639,13 +763,14 @@ fn write_preflight_receipt(
 fn validate_preflight_receipt(
     root: &Path,
     package_id: &str,
+    authentication_sha256: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let receipt = read_explicit_text(
         &preflight_receipt_path(root, package_id),
         "candidate preflight receipt",
         MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     )?;
-    if receipt != candidate_preflight_receipt_body(package_id) {
+    if receipt != candidate_preflight_receipt_body(package_id, authentication_sha256) {
         return Err("candidate preflight receipt does not match its package".into());
     }
     Ok(())
@@ -824,9 +949,34 @@ mod tests {
 
     const MANIFEST: &str = include_str!("../../tests/fixtures/public/demo_candidate_manifest.zcm");
     const LEXICON: &str = include_str!("../../tests/fixtures/public/demo_lexicon.tsv");
+    const PROVENANCE: &str =
+        include_str!("../../tests/fixtures/public/demo_candidate_provenance.zcp");
+
+    fn test_declaration(payload: &str) -> PublicSourceDeclaration {
+        PublicSourceDeclaration {
+            id: "ziranma-demo-v1".to_owned(),
+            license: "MPL-2.0".to_owned(),
+            url: "https://github.com/hewzhew/ziranma-decoder".to_owned(),
+            sha256: candidate_sha256_hex(payload.as_bytes()),
+        }
+    }
+
+    fn test_provenance(manifest: &str, payload: &str) -> CandidatePackageProvenance {
+        let declaration = test_declaration(payload);
+        CandidatePackageProvenance::from_materials(
+            &declaration.id,
+            &declaration.license,
+            &declaration.url,
+            &declaration.sha256,
+            manifest,
+            payload,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn parser_requires_explicit_write_intent_and_paths() {
+        let source_hash = candidate_sha256_hex(LEXICON.as_bytes());
         assert_eq!(
             parse_options([
                 "build".to_owned(),
@@ -837,15 +987,46 @@ mod tests {
                 "words.tsv".to_owned(),
                 "--output".to_owned(),
                 "package".to_owned(),
+                "--source-id".to_owned(),
+                "ziranma-demo-v1".to_owned(),
+                "--source-license".to_owned(),
+                "MPL-2.0".to_owned(),
+                "--source-url".to_owned(),
+                "https://github.com/hewzhew/ziranma-decoder".to_owned(),
+                "--source-sha256".to_owned(),
+                source_hash.clone(),
             ])
             .unwrap(),
             Options::Build {
                 source: PathBuf::from("words.tsv"),
                 output: PathBuf::from("package"),
                 revision: "demo-v2".to_owned(),
+                declaration: PublicSourceDeclaration {
+                    id: "ziranma-demo-v1".to_owned(),
+                    license: "MPL-2.0".to_owned(),
+                    url: "https://github.com/hewzhew/ziranma-decoder".to_owned(),
+                    sha256: source_hash,
+                },
             }
         );
         assert!(parse_options(["build".to_owned()]).is_err());
+        assert_eq!(
+            parse_options([
+                "inspect".to_owned(),
+                "--manifest".to_owned(),
+                "manifest.zcm".to_owned(),
+                "--payload".to_owned(),
+                "lexicon.tsv".to_owned(),
+                "--provenance".to_owned(),
+                "provenance.zcp".to_owned(),
+            ])
+            .unwrap(),
+            Options::Inspect {
+                manifest: PathBuf::from("manifest.zcm"),
+                payload: PathBuf::from("lexicon.tsv"),
+                provenance: PathBuf::from("provenance.zcp"),
+            }
+        );
         assert_eq!(
             parse_options([
                 "preflight".to_owned(),
@@ -878,11 +1059,13 @@ mod tests {
     fn report_is_compact_and_never_echoes_candidate_text_or_fingerprint() {
         let manifest = CandidatePackageManifest::parse(MANIFEST).unwrap();
         let snapshot = manifest.load_snapshot(LEXICON).unwrap();
-        let report = render_inspect_report(&snapshot);
+        let provenance = CandidatePackageProvenance::parse(PROVENANCE).unwrap();
+        let report = render_inspect_report(&snapshot, &provenance);
         assert_eq!(
             report,
             "候选包检查\n版本：tsf-public-demo-v1\n内容：公开\n词条：50\n\
-             载荷：1132 字节\n校验：通过\n本次操作：只读\n"
+             载荷：1132 字节\n来源：ziranma-demo-v1\n许可：MPL-2.0\n\
+             SHA-256 与兼容性：通过\n本次操作：只读\n"
         );
         assert!(!report.contains("你好"));
         assert!(!report.contains("nihk"));
@@ -912,8 +1095,9 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(&source, LEXICON).unwrap();
 
-        let built_a = build_public_package(&source, &package_a, "public-a").unwrap();
-        let built_b = build_public_package(&source, &package_b, "public-b").unwrap();
+        let declaration = test_declaration(LEXICON);
+        let built_a = build_public_package(&source, &package_a, "public-a", &declaration).unwrap();
+        let built_b = build_public_package(&source, &package_b, "public-b", &declaration).unwrap();
         assert!(built_a.contains("版本：public-a"));
         assert!(built_b.contains("版本：public-b"));
         assert_eq!(
@@ -967,8 +1151,9 @@ mod tests {
         let slots = root.join("slots");
         fs::create_dir(&root).unwrap();
         fs::write(&source, LEXICON).unwrap();
-        build_public_package(&source, &package_a, "receipt-a").unwrap();
-        build_public_package(&source, &package_b, "receipt-b").unwrap();
+        let declaration = test_declaration(LEXICON);
+        build_public_package(&source, &package_a, "receipt-a", &declaration).unwrap();
+        build_public_package(&source, &package_b, "receipt-b", &declaration).unwrap();
         adopt(&slots, &package_a).unwrap();
         stage(&slots, &package_b).unwrap();
 
@@ -982,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_installed_package_cannot_reuse_an_old_preflight_receipt() {
+    fn changed_installed_provenance_cannot_reuse_an_old_preflight_receipt() {
         let root = temporary_test_root();
         let source = root.join("source.tsv");
         let package_a = root.join("package-a");
@@ -990,25 +1175,22 @@ mod tests {
         let slots = root.join("slots");
         fs::create_dir(&root).unwrap();
         fs::write(&source, LEXICON).unwrap();
-        build_public_package(&source, &package_a, "immutable-a").unwrap();
-        build_public_package(&source, &package_b, "immutable-b").unwrap();
+        let declaration = test_declaration(LEXICON);
+        build_public_package(&source, &package_a, "immutable-a", &declaration).unwrap();
+        build_public_package(&source, &package_b, "immutable-b", &declaration).unwrap();
         adopt(&slots, &package_a).unwrap();
         stage(&slots, &package_b).unwrap();
 
         let before = read_slot_state(&slots).unwrap();
         let candidate = before.candidate().unwrap();
-        let changed_manifest =
-            CandidatePackageManifest::from_payload("changed-after-preflight", false, LEXICON)
-                .unwrap()
-                .render();
-        fs::write(
-            slots
-                .join(CANDIDATE_PACKAGES_DIRECTORY)
-                .join(candidate)
-                .join(CANDIDATE_PACKAGE_MANIFEST_FILE),
-            changed_manifest,
-        )
-        .unwrap();
+        let provenance_path = slots
+            .join(CANDIDATE_PACKAGES_DIRECTORY)
+            .join(candidate)
+            .join(CANDIDATE_PACKAGE_PROVENANCE_FILE);
+        let changed_provenance = fs::read_to_string(&provenance_path)
+            .unwrap()
+            .replace("source_license=MPL-2.0", "source_license=Apache-2.0");
+        fs::write(provenance_path, changed_provenance).unwrap();
         assert!(promote(&slots).is_err());
         assert_eq!(read_slot_state(&slots).unwrap(), before);
 
@@ -1030,8 +1212,21 @@ mod tests {
             format!("text\tpinyin\tfrequency\n{}\ta\t1\n", "测".repeat(257)),
         )
         .unwrap();
-        build_public_package(&source_a, &package_a, "preflight-good").unwrap();
-        build_public_package(&source_b, &package_b, "preflight-rejected").unwrap();
+        let source_b_text = fs::read_to_string(&source_b).unwrap();
+        build_public_package(
+            &source_a,
+            &package_a,
+            "preflight-good",
+            &test_declaration(LEXICON),
+        )
+        .unwrap();
+        build_public_package(
+            &source_b,
+            &package_b,
+            "preflight-rejected",
+            &test_declaration(&source_b_text),
+        )
+        .unwrap();
         adopt(&slots, &package_a).unwrap();
 
         let before = read_slot_state(&slots).unwrap();
@@ -1057,8 +1252,15 @@ mod tests {
         fs::write(&file, LEXICON).unwrap();
 
         let package = root.join("package");
-        build_public_package(&file, &package, "public-once").unwrap();
-        assert!(build_public_package(&file, &package, "public-twice").is_err());
+        let declaration = test_declaration(LEXICON);
+        build_public_package(&file, &package, "public-once", &declaration).unwrap();
+        assert!(build_public_package(&file, &package, "public-twice", &declaration).is_err());
+
+        let mut wrong_pin = declaration.clone();
+        wrong_pin.sha256 = "0".repeat(64);
+        let wrong_output = root.join("wrong-pin");
+        assert!(build_public_package(&file, &wrong_output, "wrong-pin", &wrong_pin).is_err());
+        assert!(!wrong_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1073,8 +1275,10 @@ mod tests {
         let manifest = CandidatePackageManifest::from_payload("private-v1", true, LEXICON)
             .unwrap()
             .render();
+        let provenance = test_provenance(&manifest, LEXICON).render();
         fs::write(package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE), LEXICON).unwrap();
         fs::write(package.join(CANDIDATE_PACKAGE_MANIFEST_FILE), manifest).unwrap();
+        fs::write(package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE), provenance).unwrap();
 
         assert!(adopt(&slots, &package).is_err());
         assert!(!slots.exists());

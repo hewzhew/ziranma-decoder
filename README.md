@@ -43,8 +43,9 @@
 
 ## 运行
 
-需要稳定版 Rust。Rust 代码没有第三方 crate 依赖；仓库另含许可和来源
-均单独保留的公开 Rime 词典与 UD Chinese GSDSimp train/test 快照。
+需要稳定版 Rust。Windows TSF 使用官方 `windows` crate；候选包材料绑定使用
+RustCrypto `sha2`，避免手写密码学原语。仓库另含许可和来源均单独保留的公开
+Rime 词典与 UD Chinese GSDSimp train/test 快照。
 
 ```powershell
 Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
@@ -173,17 +174,23 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 ```powershell
 cargo run --release --bin candidatectl -- inspect `
   --manifest tests/fixtures/public/demo_candidate_manifest.zcm `
-  --payload tests/fixtures/public/demo_lexicon.tsv
+  --payload tests/fixtures/public/demo_lexicon.tsv `
+  --provenance tests/fixtures/public/demo_candidate_provenance.zcp
 ```
 
-检查器只读两个明确指定的普通文件，不扫描目录、不写文件、不学习、不联网。
-公开 TSV 也可以确定性生成一个全新的候选包目录；目标目录必须尚不存在：
+检查器只读三个明确指定的普通文件，不扫描目录、不写文件、不学习、不联网。
+公开 TSV 也可以在显式来源、许可和源文件 SHA-256 钉住后，确定性生成一个
+全新的候选包目录；目标目录必须尚不存在：
 
 ```powershell
 cargo run --release --bin candidatectl -- build `
   --source tests/fixtures/public/demo_lexicon.tsv `
   --output .local/candidate-demo-v1 `
   --revision tsf-public-demo-v1 `
+  --source-id ziranma-demo-v1 `
+  --source-license MPL-2.0 `
+  --source-url https://github.com/hewzhew/ziranma-decoder `
+  --source-sha256 b7b65f5b9e826fdb4075089f26c4051575fa6a7b197be0d1da8d6ff8d714e100 `
   --public
 ```
 
@@ -195,11 +202,13 @@ cargo run --release --bin candidatectl -- preflight `
 ```
 
 预检从包内确定性选择一个完整码首选，逐键验证预编辑，再用空格确认上屏；
-报告只显示版本、按键数、上屏字数和结果，不显示候选正文。
+报告只显示版本、按键数、上屏字数和结果，不显示候选正文。预检凭据使用
+SHA-256 绑定来源侧车、清单、载荷、宿主和解码兼容标识。
 
 显式指定的本地槽库支持 `status`、`adopt`、`stage`、`promote` 和 `rollback`。
 它只接受通过完整校验和 TSF 预检的公开明文包；槽位状态原子替换，包文件不
-就地改写。预检凭据绑定包的内容标识，缺失、损坏或包被改写都会阻止提升：
+就地改写。预检凭据以 SHA-256 绑定三份包材料和兼容标识，缺失、损坏或包被
+改写都会阻止提升：
 
 ```powershell
 cargo run --release --bin candidatectl -- adopt `
@@ -212,6 +221,8 @@ cargo run --release --bin candidatectl -- status --root .local/candidate-slots
 `current`。目录完全不存在时才使用编译进 DLL 的公开演示包；目录存在但损坏、
 未配置、缺少预检凭据或含明文私人数据时拒绝建立类工厂，不静默回退。已有
 类工厂继续持有旧的不可变快照，提升后创建的新类工厂才观察到新版本。
+早期双文件包和 v1 预检凭据不会原地升级；Alpha 开发环境应重新构建包并采用
+全新的 `candidate-data` 根，避免旧格式或半迁移状态被误认为当前包。
 
 发布 DLL 的架构、COM 导出、证书目录和固定 zh-CN 语言配置可以先用只读工具
 核对；它不提供注册或激活命令：
