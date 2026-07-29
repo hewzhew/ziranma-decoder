@@ -255,8 +255,8 @@ PE/Authenticode 签名。
 早期双文件包和 v1 预检凭据不会原地升级；Alpha 开发环境应重新构建包并采用
 全新的 `candidate-data` 根，避免旧格式或半迁移状态被误认为当前包。
 
-发布 DLL 的架构、COM 导出、证书目录和固定 zh-CN 语言配置可以先用只读工具
-核对；它不提供注册或激活命令：
+发布 DLL 的架构、COM 导出、证书目录、固定 CLSID 的标准 COM 注册位置和
+zh-CN 语言配置可以先用只读工具核对；它不提供注册或激活命令：
 
 ```powershell
 cargo build --release --lib --bin tsf-devctl

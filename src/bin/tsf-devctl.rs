@@ -37,6 +37,14 @@ struct ProfileStatus {
     keyboard_category: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ComRegistrationStatus {
+    current_user_64: bool,
+    local_machine_64: bool,
+    current_user_32: bool,
+    local_machine_32: bool,
+}
+
 #[derive(Clone, Copy)]
 struct PeSection {
     virtual_size: u32,
@@ -97,8 +105,9 @@ fn print_usage() {
          target/release/ziranma_core.dll"
     );
     eprintln!(
-        "Reads one explicitly named DLL and the current TSF profile list. It does not register, \
-         unregister, activate, write files, or use the network."
+        "Reads one explicitly named DLL, the fixed COM registration locations, and the current \
+         TSF profile list. It does not register, unregister, activate, write files, or use the \
+         network."
     );
 }
 
@@ -106,8 +115,9 @@ fn inspect(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = read_explicit_dll(path)?;
     let image = inspect_pe(&bytes)?;
     validate_alpha_dll(&image)?;
+    let registration = inspect_com_registration()?;
     let profile = inspect_system_profile()?;
-    print!("{}", render_report(path, &image, profile));
+    print!("{}", render_report(path, &image, registration, profile));
     Ok(())
 }
 
@@ -365,7 +375,12 @@ fn validate_alpha_dll(image: &PeInspection) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn render_report(path: &Path, image: &PeInspection, profile: ProfileStatus) -> String {
+fn render_report(
+    path: &Path,
+    image: &PeInspection,
+    registration: ComRegistrationStatus,
+    profile: ProfileStatus,
+) -> String {
     let mut output = String::new();
     writeln!(output, "TSF 开发检查").unwrap();
     writeln!(output, "DLL：{}", path.display()).unwrap();
@@ -380,6 +395,12 @@ fn render_report(path: &Path, image: &PeInspection, profile: ProfileStatus) -> S
         } else {
             "无"
         }
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "COM 注册：{}",
+        render_com_registration(registration)
     )
     .unwrap();
     if profile.registered {
@@ -408,6 +429,108 @@ fn render_report(path: &Path, image: &PeInspection, profile: ProfileStatus) -> S
     }
     writeln!(output, "本次操作：只读").unwrap();
     output
+}
+
+fn render_com_registration(status: ComRegistrationStatus) -> String {
+    let mut locations = Vec::new();
+    if status.current_user_64 {
+        locations.push("当前用户 64 位");
+    }
+    if status.local_machine_64 {
+        locations.push("本机 64 位");
+    }
+    if status.current_user_32 {
+        locations.push("当前用户 32 位");
+    }
+    if status.local_machine_32 {
+        locations.push("本机 32 位");
+    }
+    if locations.is_empty() {
+        "未发现".to_owned()
+    } else {
+        format!("已发现（{}）", locations.join("、"))
+    }
+}
+
+#[cfg(windows)]
+fn inspect_com_registration() -> Result<ComRegistrationStatus, Box<dyn std::error::Error>> {
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    };
+    use windows::core::PCWSTR;
+
+    let mut subkey = alpha_inproc_server_registry_path()
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    subkey.push(0);
+    let subkey = PCWSTR(subkey.as_ptr());
+    Ok(ComRegistrationStatus {
+        current_user_64: registration_key_exists(HKEY_CURRENT_USER, subkey, KEY_WOW64_64KEY)?,
+        local_machine_64: registration_key_exists(HKEY_LOCAL_MACHINE, subkey, KEY_WOW64_64KEY)?,
+        current_user_32: registration_key_exists(HKEY_CURRENT_USER, subkey, KEY_WOW64_32KEY)?,
+        local_machine_32: registration_key_exists(HKEY_LOCAL_MACHINE, subkey, KEY_WOW64_32KEY)?,
+    })
+}
+
+#[cfg(windows)]
+fn alpha_inproc_server_registry_path() -> String {
+    use ziranma_core::TSF_ALPHA_CLSID;
+
+    let guid = TSF_ALPHA_CLSID;
+    format!(
+        "Software\\Classes\\CLSID\\{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-\
+         {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}\\InprocServer32",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7]
+    )
+}
+
+#[cfg(windows)]
+fn registration_key_exists(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: windows::core::PCWSTR,
+    view: windows::Win32::System::Registry::REG_SAM_FLAGS,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{HKEY, KEY_READ, RegCloseKey, RegOpenKeyExW};
+
+    struct OpenedKey(HKEY);
+    impl Drop for OpenedKey {
+        fn drop(&mut self) {
+            // SAFETY: the handle was returned by a successful RegOpenKeyExW
+            // call and is owned by this guard.
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+
+    let mut opened = HKEY::default();
+    // SAFETY: the subkey is NUL-terminated and remains live for this
+    // synchronous read-only call; the output handle points to writable storage.
+    let result = unsafe { RegOpenKeyExW(root, subkey, None, KEY_READ | view, &mut opened) };
+    if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+        return Ok(false);
+    }
+    if result != ERROR_SUCCESS {
+        return Err("cannot inspect the fixed COM registration location".into());
+    }
+    let _opened = OpenedKey(opened);
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn inspect_com_registration() -> Result<ComRegistrationStatus, Box<dyn std::error::Error>> {
+    Err("COM registration inspection requires Windows".into())
 }
 
 #[cfg(windows)]
@@ -592,12 +715,47 @@ mod tests {
         let report = render_report(
             Path::new("target/release/ziranma_core.dll"),
             &inspection,
+            ComRegistrationStatus::default(),
             ProfileStatus::default(),
         );
         assert!(report.contains("证书目录：存在（未验证签名有效性）"));
+        assert!(report.contains("COM 注册：未发现"));
         assert!(report.contains("系统语言配置：未发现"));
         assert!(report.contains("本次操作：只读"));
         assert!(!report.contains("下一步"));
+    }
+
+    #[test]
+    fn registration_report_is_bounded_and_never_echoes_registry_paths() {
+        assert_eq!(
+            render_com_registration(ComRegistrationStatus {
+                current_user_64: true,
+                local_machine_64: true,
+                current_user_32: false,
+                local_machine_32: true,
+            }),
+            "已发现（当前用户 64 位、本机 64 位、本机 32 位）"
+        );
+        assert_eq!(
+            render_com_registration(ComRegistrationStatus::default()),
+            "未发现"
+        );
+        assert!(
+            !render_com_registration(ComRegistrationStatus {
+                current_user_64: true,
+                ..Default::default()
+            })
+            .contains("Software\\Classes")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixed_clsid_registry_path_matches_the_documented_identity() {
+        assert_eq!(
+            alpha_inproc_server_registry_path(),
+            "Software\\Classes\\CLSID\\{4CC8427B-D0F5-439E-B6AF-D45EACD7E577}\\InprocServer32"
+        );
     }
 
     #[test]

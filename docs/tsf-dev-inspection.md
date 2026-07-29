@@ -1,8 +1,8 @@
 # TSF 开发检查：注册前先核对什么
 
 `tsf-devctl inspect` 是 Windows TSF Alpha 的只读检查器。它只读取一个明确
-指定的 DLL，并通过系统 TSF 枚举简体中文语言配置；没有注册、注销、启用、
-激活、文件写入或网络请求。
+指定的 DLL，检查固定 CLSID 的标准 COM 注册位置，并通过系统 TSF 枚举简体
+中文语言配置；没有注册、注销、启用、激活、文件写入或网络请求。
 
 ```powershell
 Set-Location -LiteralPath 'C:\path\to\ziranma-decoder'
@@ -12,8 +12,8 @@ cargo build --release --lib --bin tsf-devctl
   --dll .\target\release\ziranma_core.dll
 ```
 
-默认输出只保留六类事实：DLL 路径、PE 格式、COM 入口、注册入口、证书目录和
-系统语言配置。它不会在报告末尾替研究者安排下一步。
+默认输出只保留七类事实：DLL 路径、PE 格式、COM 入口、注册入口、证书目录、
+COM 注册和系统语言配置。它不会在报告末尾替研究者安排下一步。
 
 ## 固定身份
 
@@ -36,10 +36,16 @@ cargo build --release --lib --bin tsf-devctl
 - 必须存在两个 COM 加载入口；发现注册/注销入口会使检查失败；
 - “证书目录存在”只表示 PE 安全目录非空，不代表证书可信、未过期或签名验证
   成功；候选数据包的 Ed25519 验签与 PE/Authenticode 是相互独立的边界；
+- “COM 注册”只读检查固定 CLSID 的
+  `HKCU\Software\Classes\CLSID\…\InprocServer32` 与
+  `HKLM\Software\Classes\CLSID\…\InprocServer32`，分别查看 64 位和 32 位注册
+  视图。报告只显示命中的作用域与位数，不读取或回显默认值，不扫描其他 CLSID；
+  因此它能发现固定身份的孤立服务器键，但不声称其中的服务器路径正确或可加载；
 - “系统语言配置”来自 `ITfInputProcessorProfileMgr::EnumProfiles(0x0804)`，只
   查找上表中的确切 CLSID 与配置 GUID；它不扫描其他语言，也不读取私人数据；
-- 此检查尚未读取标准 COM 类注册位置。因此“语言配置未发现”不能证明系统里
-  绝对没有同 CLSID 的孤立 COM 残留；真正安装工具出现前还要补这一项只读核对。
+- “COM 注册：未发现”与“系统语言配置：未发现”同时出现时，表示上述四个标准
+  COM 视图和固定 zh-CN 配置中都没有这个 Alpha 身份；它不对其他 GUID 或非标准
+  注册位置作推断。
 
 ## 为什么现在仍不注册
 
