@@ -32,12 +32,13 @@ use windows::Win32::Foundation::{
     E_UNEXPECTED, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, S_FALSE, S_OK, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateRoundRectRgn,
-    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL,
-    FW_SEMIBOLD, FillRect, FillRgn, FrameRect, GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, FillRgn,
+    FrameRect, GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -107,6 +108,8 @@ const TSF_DEVELOPMENT_LEXICON: &str = include_str!("../tests/fixtures/public/dem
 const TSF_DEVELOPMENT_MANIFEST: &str =
     include_str!("../tests/fixtures/public/demo_candidate_manifest.zcm");
 const TSF_TECHNICAL_OVERLAY: &str = include_str!("../data/public/ziranma-technical-overlay-v1.tsv");
+const TSF_CONVERSATION_OVERLAY: &str =
+    include_str!("../data/public/ziranma-conversation-overlay-v1.tsv");
 const CANDIDATE_PAGE_SIZE: usize = 7;
 const CANDIDATE_INITIAL_LIMIT: usize = CANDIDATE_PAGE_SIZE * 2;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
@@ -196,7 +199,7 @@ impl CandidateProvider for SnapshotCandidateProvider {
         match view {
             InteractiveCandidateView::Primary => {
                 self.snapshot.candidate_texts(code, limit).map(|base| {
-                    let mut candidates = technical_overlay_decoder()
+                    let mut candidates = project_overlay_decoder()
                         .decode_exact_full_code(code, limit)
                         .map(|candidates| {
                             candidates
@@ -225,13 +228,16 @@ impl CandidateProvider for SnapshotCandidateProvider {
     }
 }
 
-fn technical_overlay_decoder() -> &'static Decoder {
+fn project_overlay_decoder() -> &'static Decoder {
     static DECODER: OnceLock<Decoder> = OnceLock::new();
     DECODER.get_or_init(|| {
-        Decoder::new(
+        let mut entries = parse_lexicon_tsv(TSF_CONVERSATION_OVERLAY)
+            .expect("the project-owned conversation overlay must remain valid");
+        entries.extend(
             parse_lexicon_tsv(TSF_TECHNICAL_OVERLAY)
                 .expect("the project-owned technical overlay must remain valid"),
-        )
+        );
+        Decoder::new(entries)
     })
 }
 
@@ -1260,11 +1266,28 @@ struct CandidatePopupPaintState {
     original_window_proc: isize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidatePopupPlacement {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl CandidatePopupPlacement {
+    fn size_differs_from(self, previous: Option<Self>) -> bool {
+        previous
+            .is_none_or(|previous| previous.width != self.width || previous.height != self.height)
+    }
+}
+
 #[derive(Default)]
 struct CandidatePopup {
     hwnd: Option<HWND>,
     owner: Option<HWND>,
     anchor: Option<RECT>,
+    placement: Option<CandidatePopupPlacement>,
+    visible: bool,
     paint: Box<CandidatePopupPaintState>,
 }
 
@@ -1375,24 +1398,42 @@ impl CandidatePopup {
             y = y.clamp(work.top, max_y);
         }
 
-        let corner = popup_scale(dpi, 12);
-        // SAFETY: the region uses popup-local coordinates. On success Windows
-        // owns it; on failure this method retains cleanup responsibility.
-        let region = unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner) };
-        if !region.is_invalid() {
-            // SAFETY: the popup belongs to this controller.
-            if unsafe { SetWindowRgn(hwnd, Some(region), true) } == 0 {
-                // SAFETY: ownership did not transfer after failure.
-                unsafe {
-                    let _ = DeleteObject(HGDIOBJ(region.0));
+        let placement = CandidatePopupPlacement {
+            x,
+            y,
+            width,
+            height,
+        };
+        if placement.size_differs_from(self.placement) {
+            let corner = popup_scale(dpi, 12);
+            // SAFETY: the region uses popup-local coordinates. On success
+            // Windows owns it; on failure this method retains cleanup
+            // responsibility. Content-only updates reuse the existing region
+            // so Windows does not erase and reshape the popup for every key.
+            let region = unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner) };
+            if !region.is_invalid() {
+                // SAFETY: the popup belongs to this controller. The explicit
+                // invalidation below redraws the completed frame once.
+                if unsafe { SetWindowRgn(hwnd, Some(region), false) } == 0 {
+                    // SAFETY: ownership did not transfer after failure.
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(region.0));
+                    }
                 }
             }
         }
-        let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_SHOWWINDOW.0);
-        // SAFETY: the popup belongs to this controller. NOACTIVATE preserves
-        // the editor's keyboard focus while TOPMOST keeps the short-lived list
-        // above its owner.
-        unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, width, height, flags) }?;
+        if self.placement != Some(placement) || !self.visible {
+            let flags = SET_WINDOW_POS_FLAGS(
+                SWP_NOACTIVATE.0 | if self.visible { 0 } else { SWP_SHOWWINDOW.0 },
+            );
+            // SAFETY: the popup belongs to this controller. NOACTIVATE
+            // preserves the editor's keyboard focus while TOPMOST keeps the
+            // short-lived list above its owner. Stable content-only updates
+            // skip this call entirely.
+            unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, width, height, flags) }?;
+            self.placement = Some(placement);
+            self.visible = true;
+        }
         // SAFETY: the stable paint state and final client size are now ready.
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1412,11 +1453,15 @@ impl CandidatePopup {
         let Some(hwnd) = self.hwnd else {
             return;
         };
+        if self.visible == visible {
+            return;
+        }
         // SAFETY: this process owns the popup handle. ShowWindow does not
         // transfer ownership and SW_SHOWNOACTIVATE preserves editor focus.
         unsafe {
             let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
+        self.visible = visible;
     }
 
     fn hide(&mut self) {
@@ -1433,6 +1478,8 @@ impl CandidatePopup {
         self.paint.original_window_proc = 0;
         self.owner = None;
         self.anchor = None;
+        self.placement = None;
+        self.visible = false;
     }
 }
 
@@ -1715,8 +1762,8 @@ unsafe extern "system" fn candidate_popup_window_proc(
 unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: standard WM_PAINT lifecycle for this popup.
-    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
-    if hdc.is_invalid() {
+    let paint_dc = unsafe { BeginPaint(hwnd, &mut paint) };
+    if paint_dc.is_invalid() {
         return;
     }
     let mut client = RECT::default();
@@ -1727,6 +1774,33 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
             let _ = EndPaint(hwnd, &paint);
         }
         return;
+    }
+
+    // Paint a complete frame off-screen and copy it to the popup once. This
+    // avoids exposing the background-only interval between FillRect and the
+    // candidate labels while fast composition updates are arriving.
+    let client_width = client.right.saturating_sub(client.left);
+    let client_height = client.bottom.saturating_sub(client.top);
+    let mut buffer_dc = HDC::default();
+    let mut buffer_bitmap = HBITMAP::default();
+    let mut previous_bitmap = HGDIOBJ::default();
+    let mut hdc = paint_dc;
+    if client_width > 0 && client_height > 0 {
+        // SAFETY: paint_dc is valid for this WM_PAINT operation.
+        buffer_dc = unsafe { CreateCompatibleDC(Some(paint_dc)) };
+        if !buffer_dc.is_invalid() {
+            // SAFETY: dimensions come from this popup's bounded client area.
+            buffer_bitmap =
+                unsafe { CreateCompatibleBitmap(paint_dc, client_width, client_height) };
+            if !buffer_bitmap.is_invalid() {
+                // SAFETY: the bitmap and compatible DC remain live until the
+                // frame has been copied and the original object restored.
+                previous_bitmap = unsafe { SelectObject(buffer_dc, HGDIOBJ(buffer_bitmap.0)) };
+                if !previous_bitmap.is_invalid() {
+                    hdc = buffer_dc;
+                }
+            }
+        }
     }
 
     let scale = |logical: i32| popup_scale(state.dpi, logical);
@@ -1997,6 +2071,36 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
         // SAFETY: the background brush is no longer used.
         unsafe {
             let _ = DeleteObject(HGDIOBJ(background_brush.0));
+        }
+    }
+    if hdc == buffer_dc && !buffer_dc.is_invalid() {
+        // SAFETY: both DCs and the selected bitmap remain valid. One BitBlt
+        // publishes the complete frame without an intermediate blank state.
+        unsafe {
+            let _ = BitBlt(
+                paint_dc,
+                0,
+                0,
+                client_width,
+                client_height,
+                Some(buffer_dc),
+                0,
+                0,
+                SRCCOPY,
+            );
+            let _ = SelectObject(buffer_dc, previous_bitmap);
+        }
+    }
+    if !buffer_bitmap.is_invalid() {
+        // SAFETY: the bitmap is no longer selected into the compatible DC.
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(buffer_bitmap.0));
+        }
+    }
+    if !buffer_dc.is_invalid() {
+        // SAFETY: the compatible DC is local to this paint operation.
+        unsafe {
+            let _ = DeleteDC(buffer_dc);
         }
     }
     // SAFETY: balances BeginPaint.
@@ -4799,6 +4903,13 @@ mod tests {
             provider.candidates("zzzzzzzz", 1, InteractiveCandidateView::Primary),
             ["zzzzzzzz"]
         );
+        assert_eq!(
+            provider
+                .candidates("wuwa", 7, InteractiveCandidateView::Primary)
+                .first()
+                .map(String::as_str),
+            Some("呜哇")
+        );
     }
 
     #[test]
@@ -6059,8 +6170,8 @@ mod tests {
     }
 
     #[test]
-    fn technical_overlay_supplies_missing_exact_hardware_terms() {
-        let candidates = technical_overlay_decoder()
+    fn project_overlays_supply_conversation_and_hardware_terms() {
+        let candidates = project_overlay_decoder()
             .decode_exact_full_code("siyn", 7)
             .unwrap();
         assert_eq!(
@@ -6068,6 +6179,42 @@ mod tests {
             Some("丝印")
         );
         assert!(candidates.iter().any(|candidate| candidate.text == "丝印"));
+
+        let conversation = project_overlay_decoder()
+            .decode_exact_full_code("wuwa", 7)
+            .unwrap();
+        assert_eq!(
+            conversation
+                .first()
+                .map(|candidate| candidate.text.as_str()),
+            Some("呜哇")
+        );
+    }
+
+    #[test]
+    fn stable_popup_content_update_reuses_geometry_and_region() {
+        let placement = CandidatePopupPlacement {
+            x: 100,
+            y: 200,
+            width: 480,
+            height: 56,
+        };
+        assert!(placement.size_differs_from(None));
+        assert!(!placement.size_differs_from(Some(placement)));
+        assert!(
+            !CandidatePopupPlacement {
+                x: 120,
+                ..placement
+            }
+            .size_differs_from(Some(placement))
+        );
+        assert!(
+            CandidatePopupPlacement {
+                width: 500,
+                ..placement
+            }
+            .size_differs_from(Some(placement))
+        );
     }
 
     #[test]
