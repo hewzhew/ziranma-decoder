@@ -178,6 +178,9 @@ impl TypingLabSession {
         match self.composition.apply(input) {
             CompositionEffect::Continue => TypingLabEffect::Continue,
             CompositionEffect::Confirm => TypingLabEffect::Confirm,
+            CompositionEffect::CommitRaw | CompositionEffect::Punctuation(_) => {
+                TypingLabEffect::Continue
+            }
             CompositionEffect::Select(rank) => TypingLabEffect::Select(rank),
             CompositionEffect::PreviousPage => TypingLabEffect::PreviousPage,
             CompositionEffect::NextPage => TypingLabEffect::NextPage,

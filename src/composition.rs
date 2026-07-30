@@ -12,11 +12,29 @@ use crate::SentenceCandidate;
 
 const MAX_COMPOSITION_KEYS: usize = 64;
 const MAX_SESSION_SELECTIONS: usize = 128;
+const MAX_SESSION_SELECTION_TEXT_CHARACTERS: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositionPunctuation {
+    Comma,
+    Period,
+}
+
+impl CompositionPunctuation {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Comma => "，",
+            Self::Period => "。",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompositionInput {
     Letters(String),
     Confirm,
+    CommitRaw,
+    Punctuation(CompositionPunctuation),
     Select(usize),
     Backspace,
     PreviousPage,
@@ -31,6 +49,8 @@ pub enum CompositionInput {
 pub enum CompositionEffect {
     Continue,
     Confirm,
+    CommitRaw,
+    Punctuation(CompositionPunctuation),
     Select(usize),
     PreviousPage,
     NextPage,
@@ -56,40 +76,65 @@ pub struct CompositionSession {
 /// persistent personal model described in `docs/personal-model.md`.
 #[derive(Default)]
 pub struct SessionSelectionMemory {
-    selections: VecDeque<(String, SentenceCandidate)>,
+    selections: VecDeque<SessionSelection>,
+}
+
+struct SessionSelection {
+    code: String,
+    text: String,
+    candidate: Option<SentenceCandidate>,
 }
 
 impl SessionSelectionMemory {
     pub fn remember(&mut self, code: &str, candidate: &SentenceCandidate) {
-        if code.is_empty() || candidate.text.is_empty() {
+        self.remember_entry(code, &candidate.text, Some(candidate.clone()));
+    }
+
+    pub fn remember_text(&mut self, code: &str, text: &str) {
+        self.remember_entry(code, text, None);
+    }
+
+    fn remember_entry(&mut self, code: &str, text: &str, candidate: Option<SentenceCandidate>) {
+        if code.is_empty()
+            || code.len() > MAX_COMPOSITION_KEYS
+            || !code.as_bytes().iter().all(u8::is_ascii_lowercase)
+            || text.is_empty()
+            || text.chars().count() > MAX_SESSION_SELECTION_TEXT_CHARACTERS
+        {
             return;
         }
         if let Some(index) = self
             .selections
             .iter()
-            .position(|(remembered_code, _)| remembered_code == code)
+            .position(|selection| selection.code == code)
         {
             self.selections.remove(index);
         }
-        self.selections
-            .push_front((code.to_owned(), candidate.clone()));
+        self.selections.push_front(SessionSelection {
+            code: code.to_owned(),
+            text: text.to_owned(),
+            candidate,
+        });
         self.selections.truncate(MAX_SESSION_SELECTIONS);
     }
 
     pub fn promote(&self, code: &str, candidates: &mut Vec<SentenceCandidate>) -> bool {
-        let Some((_, preferred_candidate)) = self
+        let Some(preferred) = self
             .selections
             .iter()
-            .find(|(remembered_code, _)| remembered_code == code)
+            .find(|selection| selection.code == code)
         else {
             return false;
         };
         let Some(index) = candidates
             .iter()
-            .position(|candidate| candidate.text == preferred_candidate.text)
+            .position(|candidate| candidate.text == preferred.text)
         else {
+            let Some(candidate) = preferred.candidate.as_ref() else {
+                return false;
+            };
             let original_len = candidates.len();
-            candidates.insert(0, preferred_candidate.clone());
+            candidates.insert(0, candidate.clone());
             candidates.truncate(original_len.max(1));
             return true;
         };
@@ -99,6 +144,35 @@ impl SessionSelectionMemory {
         let candidate = candidates.remove(index);
         candidates.insert(0, candidate);
         true
+    }
+
+    pub fn promote_texts(&self, code: &str, candidates: &mut Vec<String>) -> bool {
+        let Some(preferred) = self
+            .selections
+            .iter()
+            .find(|selection| selection.code == code)
+        else {
+            return false;
+        };
+        let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate == &preferred.text)
+        else {
+            let original_len = candidates.len();
+            candidates.insert(0, preferred.text.clone());
+            candidates.truncate(original_len.max(1));
+            return true;
+        };
+        if index == 0 {
+            return true;
+        }
+        let candidate = candidates.remove(index);
+        candidates.insert(0, candidate);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.selections.clear();
     }
 }
 
@@ -224,6 +298,13 @@ impl CompositionSession {
                 return CompositionEffect::Confirm;
             }
             CompositionInput::Confirm => return CompositionEffect::PassThrough,
+            CompositionInput::CommitRaw if !self.phonetic.is_empty() => {
+                return CompositionEffect::CommitRaw;
+            }
+            CompositionInput::CommitRaw => return CompositionEffect::PassThrough,
+            CompositionInput::Punctuation(punctuation) => {
+                return CompositionEffect::Punctuation(punctuation);
+            }
             CompositionInput::Select(rank) if !self.phonetic.is_empty() => {
                 return CompositionEffect::Select(rank);
             }
@@ -311,10 +392,37 @@ mod tests {
     }
 
     #[test]
+    fn raw_commit_and_chinese_punctuation_have_distinct_semantics() {
+        let mut session = CompositionSession::default();
+        assert_eq!(
+            session.apply(CompositionInput::CommitRaw),
+            CompositionEffect::PassThrough
+        );
+        assert_eq!(
+            session.apply(CompositionInput::Punctuation(CompositionPunctuation::Comma)),
+            CompositionEffect::Punctuation(CompositionPunctuation::Comma)
+        );
+
+        session.apply(CompositionInput::Letters("ju".to_owned()));
+        assert_eq!(
+            session.apply(CompositionInput::CommitRaw),
+            CompositionEffect::CommitRaw
+        );
+        assert_eq!(session.phonetic(), "ju");
+        assert_eq!(
+            session.apply(CompositionInput::Punctuation(
+                CompositionPunctuation::Period
+            )),
+            CompositionEffect::Punctuation(CompositionPunctuation::Period)
+        );
+    }
+
+    #[test]
     fn idle_controls_are_returned_to_the_host() {
         let mut session = CompositionSession::default();
         for input in [
             CompositionInput::Confirm,
+            CompositionInput::CommitRaw,
             CompositionInput::Select(1),
             CompositionInput::Backspace,
             CompositionInput::PreviousPage,
@@ -329,5 +437,24 @@ mod tests {
                 "an idle composition must not swallow ordinary host controls"
             );
         }
+    }
+
+    #[test]
+    fn session_text_selection_memory_is_bounded_to_valid_explicit_values() {
+        let mut memory = SessionSelectionMemory::default();
+        memory.remember_text("ab", "乙");
+
+        let mut visible = vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()];
+        assert!(memory.promote_texts("ab", &mut visible));
+        assert_eq!(visible, ["乙", "甲", "丙"]);
+
+        let mut shallow = vec!["甲".to_owned()];
+        assert!(memory.promote_texts("ab", &mut shallow));
+        assert_eq!(shallow, ["乙"]);
+
+        memory.remember_text("AB", "无效");
+        assert!(!memory.promote_texts("AB", &mut visible));
+        memory.clear();
+        assert!(!memory.promote_texts("ab", &mut visible));
     }
 }

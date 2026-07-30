@@ -14,6 +14,13 @@ use std::error::Error;
 use std::fmt;
 
 mod abbreviation;
+mod adaptive_comparison;
+mod adaptive_coverage;
+mod adaptive_evaluation;
+mod adaptive_memory;
+mod adaptive_merge;
+mod adaptive_ranking;
+mod adaptive_scenarios;
 mod candidate_lab;
 mod candidate_package;
 mod candidate_provenance;
@@ -29,6 +36,7 @@ mod correction_episode;
 mod evaluation;
 mod event_capsule;
 mod language_model;
+mod native_feedback;
 mod private_session;
 mod protocol_audit;
 mod public_corpus;
@@ -53,6 +61,45 @@ pub use tsf_alpha::{
 pub use abbreviation::{
     AbbreviationAuditError, AbbreviationCodebookAudit, ImmediateAmbiguityWitness,
     audit_abbreviation_codebook,
+};
+pub use adaptive_comparison::{
+    ADAPTIVE_COMPARISON_PROFILE_COUNT, ADAPTIVE_COMPARISON_PROFILES, AdaptiveComparisonDelta,
+    AdaptiveComparisonError, AdaptiveComparisonOutcome, AdaptiveComparisonParameters,
+    AdaptiveComparisonProfile, AdaptiveComparisonReport,
+    compare_public_synthetic_adaptive_profiles,
+};
+pub use adaptive_coverage::{
+    AdaptiveCoverageCandidate, AdaptiveCoverageConfig, AdaptiveCoverageError,
+    AdaptiveCoverageReport, AdaptiveCoverageSource, AdaptiveCoverageSummary,
+    MAX_ADAPTIVE_COVERAGE_CANDIDATES, MAX_ADAPTIVE_COVERAGE_PUBLIC_TEXTS,
+    retrieve_personal_coverage,
+};
+pub use adaptive_evaluation::{
+    AdaptiveEvaluationError, AdaptiveEvaluationErrorKind, AdaptiveEvaluationEvent,
+    AdaptiveEvaluationReport, MAX_ADAPTIVE_EVALUATION_EVENTS, evaluate_adaptive_closed_loop,
+};
+pub use adaptive_memory::{
+    ConfirmedSelectionEvidence, ConfirmedSelectionTier, ConfirmedSelectionTierCounts,
+    DEFAULT_MAX_CONFIRMED_SELECTIONS, DEFAULT_MAX_LONG_CONFIRMED_SELECTIONS,
+    DEFAULT_MAX_MEDIUM_CONFIRMED_SELECTIONS, DEFAULT_MAX_PENDING_SELECTIONS,
+    DEFAULT_MAX_RECENT_CONFIRMED_SELECTIONS, MAX_CONFIRMED_SELECTION_LIMIT,
+    MAX_PENDING_SELECTION_LIMIT, PendingConfirmationOutcome, PendingEditOutcome,
+    PendingForgetOutcome, PendingObservationOutcome, PendingSelectionEdit, PendingSelectionError,
+    PendingSelectionLimits, PendingSelectionMemory,
+};
+pub use adaptive_merge::{
+    AdaptiveMergeConfig, AdaptiveMergeError, AdaptiveMergeReport, AdaptiveMergeSummary,
+    AdaptiveMergedCandidate, AdaptiveMergedCandidateSource, MAX_ADAPTIVE_COVERAGE_PROBABILITY,
+    MAX_ADAPTIVE_MERGED_CANDIDATES, merge_adaptive_candidates,
+};
+pub use adaptive_ranking::{
+    AdaptiveCandidateScore, AdaptiveRankingCandidate, AdaptiveRankingConfig, AdaptiveRankingError,
+    AdaptiveRankingReport, MAX_ADAPTIVE_RANKING_CANDIDATES, rank_visible_candidates,
+};
+pub use adaptive_scenarios::{
+    ADAPTIVE_SYNTHETIC_SCENARIO_COUNT, ADAPTIVE_SYNTHETIC_SCENARIOS, AdaptiveSyntheticScenario,
+    AdaptiveSyntheticScenarioOutcome, AdaptiveSyntheticSuiteError, AdaptiveSyntheticSuiteReport,
+    evaluate_public_synthetic_adaptive_scenarios,
 };
 pub use candidate_lab::{
     CandidateLabCandidate, CandidateLabError, CandidateLabLane, CandidateLabReport,
@@ -96,7 +143,8 @@ pub use capsule_replay::{
 };
 pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
 pub use composition::{
-    CompositionEffect, CompositionInput, CompositionSession, SessionSelectionMemory,
+    CompositionEffect, CompositionInput, CompositionPunctuation, CompositionSession,
+    SessionSelectionMemory,
 };
 #[cfg(windows)]
 pub use continuous_capture::WindowsUserDataProtector;
@@ -134,6 +182,14 @@ pub use language_model::{
     BigramLanguageModel, BigramLanguageModelStats, BigramScore, CharacterBigramLanguageModel,
     CharacterBigramLanguageModelStats, CharacterLanguageModelError, CharacterSequenceScore,
     LanguageModelParseError,
+};
+pub use native_feedback::{
+    DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS, DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES,
+    NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
+    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackLifecycle,
+    NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
+    NativeFeedbackStartResult, NativeFeedbackStopReason, NativeFeedbackStopResult,
+    NativeFeedbackSummary, NativeSelectionSource,
 };
 pub use private_session::{
     ProtectedSessionError, ProtectedSessionErrorKind, ProtectedSessionReader,
@@ -669,6 +725,78 @@ impl Decoder {
         candidates.sort_by(candidate_order);
         candidates.truncate(top_k);
         Ok((candidates, stats))
+    }
+
+    /// Returns exact lexicon entries whose complete code is the observed
+    /// input.
+    ///
+    /// Interactive hosts use this bounded view before the more permissive
+    /// sentence decoder so a complete code cannot disappear behind numerous
+    /// high-frequency abbreviation paths. For the unambiguous `ju` / `qu` /
+    /// `xu` / `yu` pinyin spelling convention, an observed second-key `u`
+    /// also follows the canonical Ziranma `v` edge without consuming the
+    /// decoder's error budget.
+    pub(crate) fn decode_exact_full_code(
+        &self,
+        observed: &str,
+        top_k: usize,
+    ) -> Result<Vec<Candidate>, KeySequenceError> {
+        let observed = KeySequence::new(observed)?;
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if observed.as_str().len() % 2 != 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut nodes = vec![0_usize];
+        for chunk in observed.as_str().as_bytes().chunks_exact(2) {
+            let exact = [chunk[0], chunk[1]];
+            let umlaut_alias = (chunk[1] == b'u' && matches!(chunk[0], b'j' | b'q' | b'x' | b'y'))
+                .then_some([chunk[0], b'v']);
+            let mut next = Vec::new();
+            for node in nodes {
+                if let Some(edge) = self.trie.nodes[node]
+                    .children
+                    .iter()
+                    .find(|edge| edge.code == exact)
+                {
+                    next.push(edge.child);
+                }
+                if let Some(alias) = umlaut_alias.as_ref()
+                    && let Some(edge) = self.trie.nodes[node]
+                        .children
+                        .iter()
+                        .find(|edge| edge.code == *alias)
+                {
+                    next.push(edge.child);
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            if next.is_empty() {
+                return Ok(Vec::new());
+            }
+            nodes = next;
+        }
+
+        let mut candidates = nodes
+            .into_iter()
+            .flat_map(|node| self.trie.nodes[node].terminals.iter().copied())
+            .map(|entry_index| {
+                self.make_candidate(
+                    &self.lexicon[entry_index],
+                    Spelling {
+                        code: observed.clone(),
+                        abbreviated_syllables: Vec::new(),
+                    },
+                    Correction::Exact,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(candidate_order);
+        candidates.truncate(top_k);
+        Ok(candidates)
     }
 
     /// Jointly infers word boundaries, mixed abbreviations, and at most one
@@ -2955,6 +3083,10 @@ fn spelling_is_anchored_suffix(candidate: &Candidate) -> bool {
     )
 }
 
+pub(crate) fn spelling_is_complete_or_anchored_suffix(candidate: &Candidate) -> bool {
+    candidate.spelling.abbreviated_syllables.is_empty() || spelling_is_anchored_suffix(candidate)
+}
+
 fn spelling_indices_are_anchored_suffix(abbreviated: &[usize], syllable_count: usize) -> bool {
     let Some(&first_abbreviated) = abbreviated.first() else {
         return false;
@@ -3810,7 +3942,7 @@ name: test
                 for (exact_reachable, error_reachable) in
                     [(true, false), (false, true), (true, true)]
                 {
-                    for top_k in [1, 5, 10] {
+                    for top_k in [1, 5, 10, 25, 50] {
                         let full = decoder.segment_transitions(
                             observed,
                             start,
@@ -3913,7 +4045,7 @@ name: test
         cases.extend(["ajjp", "zrmurf", "zrnurf"].into_iter().map(str::to_owned));
 
         for observed in cases {
-            for top_k in [1, 5, 10] {
+            for top_k in [1, 5, 10, 25, 50] {
                 assert_eq!(
                     decoder.decode_sentence(&observed, top_k).unwrap(),
                     exhaustive_sentence_reference(&decoder, &observed, top_k),
@@ -3926,7 +4058,7 @@ name: test
         let model = BigramLanguageModel::from_tsv(BIGRAM_FIXTURE, &lexicon).unwrap();
         let decoder = Decoder::new(lexicon).with_bigram_model(model);
         for observed in ["ajjp", "zrmurf", "zrnurf"] {
-            for top_k in [1, 5, 10] {
+            for top_k in [1, 5, 10, 25, 50] {
                 assert_eq!(
                     decoder.decode_sentence(observed, top_k).unwrap(),
                     exhaustive_sentence_reference(&decoder, observed, top_k),
