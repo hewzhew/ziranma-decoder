@@ -25,8 +25,9 @@ cargo build --release --lib --bin tsf-devctl
 - 键盘 TIP 类别；
 - 默认不启用、不激活，也不设为默认输入法。
 
-微软拼音和现有默认输入法不会被修改。注册、启用、激活和设为默认仍是四个
-不同边界；当前工具实现注册和当前用户启用，但没有激活或设置默认的命令。
+微软拼音和现有默认输入法不会被修改。注册、当前用户启用、用户主动选择和
+设为默认仍是不同边界；当前工具没有把 Alpha 设为默认或请求进程、桌面范围
+激活的命令。
 
 ## 当前用户启用
 
@@ -39,9 +40,15 @@ cargo build --release --lib --bin tsf-devctl
 ```
 
 这个命令先依据本地安装记录复核不可变 DLL、COM 注册、文本服务身份、语言
-配置和键盘类别，再只调用 Windows 的当前用户配置启用接口。完成后必须复查
-为“已启用、未活动”。工具不调用 TSF 激活或默认配置接口；是否通过输入法
-切换器选中 Alpha，仍由用户单独决定。
+配置和键盘类别。它先调用旧 `EnableLanguageProfile` 作为兼容通知，再始终调用
+现代 `ITfInputProcessorProfileMgr::ActivateProfile`；只有后者使用
+`TF_IPPMF_ENABLEPROFILE` 写入当前用户持久状态的结果才算成功。调用不包含
+设为默认、进程范围或桌面会话范围标志；是否通过输入法切换器选中 Alpha，仍由
+用户单独决定。
+
+现代调用可能只在执行命令的短生命周期辅助线程内暂时激活配置，所以同一进程
+只验证注册完整和启用位。换代脚本会等该进程退出后再运行独立检查，确认状态为
+“已启用、未活动”并保持稳定；旧接口单独返回 `S_OK` 不再被当成持久证据。
 
 测试前后都可以运行禁用命令：
 
@@ -133,7 +140,9 @@ Windows 能识别这个默认关闭的开发文本服务，不表示它适合日
 官方依据：
 
 - <https://learn.microsoft.com/en-us/windows/win32/tsf/text-service-registration>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nn-msctf-itfinputprocessorprofilemgr>
 - <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-registerprofile>
+- <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile>
 - <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofiles-enablelanguageprofile>
 - <https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcategorymgr-registercategory>
 - <https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editors>

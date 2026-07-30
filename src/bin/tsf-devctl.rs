@@ -5,8 +5,18 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
+    Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+};
 
 const MAX_DLL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXPORT_NAMES: usize = 4_096;
@@ -25,6 +35,9 @@ const INSTALL_ROOT: &str = ".local/tsf-alpha";
 const RECEIPT_FILE: &str = "install-v1.txt";
 const INSTALLED_DLL_FILE: &str = "ziranma_core.dll";
 const PROFILE_DESCRIPTION: &str = "Ziranma Decoder Alpha";
+const TSF_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(5);
+const TSF_PROPAGATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TSF_ENABLE_STABILITY_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -34,6 +47,7 @@ enum Options {
     UnregisterMachine,
     EnableCurrentUser,
     DisableCurrentUser,
+    VerifyCurrentUserEnabled,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -60,6 +74,13 @@ struct ComRegistrationStatus {
     local_machine_64: bool,
     current_user_32: bool,
     local_machine_32: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoadedHostStatus {
+    scan_available: bool,
+    matching_version: u32,
+    other_versions: u32,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -97,9 +118,7 @@ impl ProfileTransitionAction {
     fn failure_message(self) -> &'static str {
         match self {
             Self::Enable => "cannot enable the current-user TSF alpha profile",
-            Self::VerifyEnabled => {
-                "the current-user TSF alpha profile did not verify as enabled and inactive"
-            }
+            Self::VerifyEnabled => "the current-user TSF alpha profile did not verify as enabled",
             Self::Disable => "cannot disable the current-user TSF alpha profile",
             Self::VerifyDisabled => {
                 "the current-user TSF alpha profile did not verify as disabled and inactive"
@@ -225,6 +244,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Options::UnregisterMachine => unregister_machine()?,
         Options::EnableCurrentUser => enable_current_user()?,
         Options::DisableCurrentUser => disable_current_user()?,
+        Options::VerifyCurrentUserEnabled => verify_current_user_enabled()?,
     }
     Ok(())
 }
@@ -268,6 +288,12 @@ fn parse_options(
         "disable-current-user" => {
             parse_confirmation_only(arguments, "disable-current-user", DISABLE_CONFIRMATION_FLAG)?;
             Ok(Options::DisableCurrentUser)
+        }
+        "verify-current-user-enabled" => {
+            if arguments.next().is_some() {
+                return Err("verify-current-user-enabled does not accept arguments".into());
+            }
+            Ok(Options::VerifyCurrentUserEnabled)
         }
         _ => Err("unknown tsf-devctl command; value was suppressed".into()),
     }
@@ -344,10 +370,11 @@ fn print_usage() {
         "       cargo run --release --bin tsf-devctl -- disable-current-user \
          --confirm-disable-current-user-development-alpha"
     );
+    eprintln!("       cargo run --release --bin tsf-devctl -- verify-current-user-enabled");
     eprintln!(
         "Machine registration is 64-bit, requires elevation, and is disabled by default. \
-         Current-user enable/disable never activates the alpha or makes it the default input \
-         method."
+         Current-user enable/disable never makes the alpha the default input method or requests \
+         process/session-wide activation."
     );
 }
 
@@ -357,7 +384,11 @@ fn inspect(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     validate_alpha_dll(&image)?;
     let registration = inspect_com_registration()?;
     let profile = inspect_system_profile()?;
-    print!("{}", render_report(path, &image, registration, profile));
+    let loaded_hosts = inspect_loaded_hosts(&hex_sha256(&bytes));
+    print!(
+        "{}",
+        render_report(path, &image, registration, profile, loaded_hosts)
+    );
     Ok(())
 }
 
@@ -369,7 +400,7 @@ fn register_machine(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if receipt_path.try_exists()? {
         return Err("a TSF alpha installation receipt already exists".into());
     }
-    require_unregistered_state()?;
+    wait_for_unregistered_state()?;
 
     let digest = hex_sha256(&bytes);
     let installed_dll = prepare_immutable_dll(&install_root, &digest, &bytes)?;
@@ -438,8 +469,9 @@ fn enable_current_user() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut backend = create_registration_backend()?;
     enable_profile_transaction(&mut backend)?;
+    drop(backend);
     println!("TSF Alpha 已为当前用户启用");
-    println!("状态：尚未激活；需要时可由输入法切换器主动选择");
+    println!("状态：未设为默认；未请求进程或桌面范围激活");
     println!("微软拼音与默认输入法：未改动");
     Ok(())
 }
@@ -457,6 +489,31 @@ fn disable_current_user() -> Result<(), Box<dyn std::error::Error>> {
     disable_profile_transaction(&mut backend)?;
     println!("TSF Alpha 已为当前用户禁用");
     println!("状态：未激活；默认输入法未改动");
+    Ok(())
+}
+
+fn verify_current_user_enabled() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, installed_dll) = verified_installed_dll()?;
+    let profile = require_exact_registered_layout(&installed_dll)?;
+    if !profile_matches_toggle_state(profile, true) {
+        return Err("the current-user TSF alpha enablement is not persistent".into());
+    }
+
+    // The COM inspection above has already released its apartment. Observe
+    // only the persisted current-user value during the stability window so a
+    // profile that Windows removes while tearing down its cache cannot pass.
+    let started = Instant::now();
+    loop {
+        if current_user_profile_enable_state()? != Some(true) {
+            return Err("the current-user TSF alpha enablement is not persistent".into());
+        }
+        if started.elapsed() >= TSF_ENABLE_STABILITY_WINDOW {
+            break;
+        }
+        thread::sleep(TSF_PROPAGATION_POLL_INTERVAL);
+    }
+    println!("TSF Alpha 当前用户启用状态已验证");
+    println!("状态：尚未激活；默认输入法未改动");
     Ok(())
 }
 
@@ -1086,11 +1143,132 @@ fn validate_alpha_dll(image: &PeInspection) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn immutable_alpha_digest(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.eq_ignore_ascii_case(INSTALLED_DLL_FILE) {
+        return None;
+    }
+    let digest = path.parent()?.file_name()?.to_str()?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !path
+        .parent()?
+        .parent()?
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("builds")
+    {
+        return None;
+    }
+    if !path
+        .parent()?
+        .parent()?
+        .parent()?
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("tsf-alpha")
+    {
+        return None;
+    }
+    Some(digest.to_ascii_lowercase())
+}
+
+#[cfg(windows)]
+struct ToolhelpSnapshot(HANDLE);
+
+#[cfg(windows)]
+impl Drop for ToolhelpSnapshot {
+    fn drop(&mut self) {
+        // SAFETY: this handle came from CreateToolhelp32Snapshot and remains
+        // owned by this guard.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn loaded_alpha_digest(process_id: u32) -> Option<String> {
+    // SAFETY: the snapshot is read-only and scoped to one enumerated process.
+    let snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id) }
+            .ok()?;
+    let snapshot = ToolhelpSnapshot(snapshot);
+    let mut module = MODULEENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<MODULEENTRY32W>()).ok()?,
+        ..MODULEENTRY32W::default()
+    };
+    // SAFETY: module has the documented size and stays writable throughout
+    // enumeration.
+    if unsafe { Module32FirstW(snapshot.0, &mut module) }.is_err() {
+        return None;
+    }
+    loop {
+        let path_length = module
+            .szExePath
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(module.szExePath.len());
+        let path = PathBuf::from(String::from_utf16_lossy(&module.szExePath[..path_length]));
+        if let Some(digest) = immutable_alpha_digest(&path) {
+            return Some(digest);
+        }
+        // SAFETY: reuses the initialized writable structure for the next
+        // module. Any error ends this process's bounded enumeration.
+        if unsafe { Module32NextW(snapshot.0, &mut module) }.is_err() {
+            return None;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn inspect_loaded_hosts(expected_digest: &str) -> LoadedHostStatus {
+    // SAFETY: this creates a read-only point-in-time process snapshot.
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return LoadedHostStatus::default();
+    };
+    let snapshot = ToolhelpSnapshot(snapshot);
+    let mut process = PROCESSENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap_or(u32::MAX),
+        ..PROCESSENTRY32W::default()
+    };
+    // SAFETY: process has the documented size and remains writable during
+    // enumeration.
+    if unsafe { Process32FirstW(snapshot.0, &mut process) }.is_err() {
+        return LoadedHostStatus::default();
+    }
+
+    let mut status = LoadedHostStatus {
+        scan_available: true,
+        ..LoadedHostStatus::default()
+    };
+    loop {
+        if let Some(digest) = loaded_alpha_digest(process.th32ProcessID) {
+            if digest == expected_digest {
+                status.matching_version = status.matching_version.saturating_add(1);
+            } else {
+                status.other_versions = status.other_versions.saturating_add(1);
+            }
+        }
+        // SAFETY: reuses the initialized writable structure for the next
+        // process. ERROR_NO_MORE_FILES and process churn both end the scan.
+        if unsafe { Process32NextW(snapshot.0, &mut process) }.is_err() {
+            break;
+        }
+    }
+    status
+}
+
+#[cfg(not(windows))]
+fn inspect_loaded_hosts(_expected_digest: &str) -> LoadedHostStatus {
+    LoadedHostStatus::default()
+}
+
 fn render_report(
     path: &Path,
     image: &PeInspection,
     registration: ComRegistrationStatus,
     profile: ProfileStatus,
+    loaded_hosts: LoadedHostStatus,
 ) -> String {
     let mut output = String::new();
     writeln!(output, "TSF 开发检查").unwrap();
@@ -1158,8 +1336,22 @@ fn render_report(
         }
     )
     .unwrap();
+    writeln!(output, "宿主缓存：{}", render_loaded_hosts(loaded_hosts)).unwrap();
     writeln!(output, "本次操作：只读").unwrap();
     output
+}
+
+fn render_loaded_hosts(status: LoadedHostStatus) -> String {
+    if !status.scan_available {
+        return "无法检查".to_owned();
+    }
+    if status.matching_version == 0 && status.other_versions == 0 {
+        return "未发现正在加载 Alpha 的应用".to_owned();
+    }
+    format!(
+        "此版本 {}，其他版本 {}（仅计可见进程）",
+        status.matching_version, status.other_versions
+    )
 }
 
 fn render_com_registration(status: ComRegistrationStatus) -> String {
@@ -1207,10 +1399,27 @@ fn inspect_com_registration() -> Result<ComRegistrationStatus, Box<dyn std::erro
 fn alpha_inproc_server_registry_path() -> String {
     use ziranma_core::TSF_ALPHA_CLSID;
 
-    let guid = TSF_ALPHA_CLSID;
     format!(
-        "Software\\Classes\\CLSID\\{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-\
-         {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}\\InprocServer32",
+        "Software\\Classes\\CLSID\\{}\\InprocServer32",
+        registry_guid(TSF_ALPHA_CLSID)
+    )
+}
+
+#[cfg(windows)]
+fn alpha_language_profile_registry_path() -> String {
+    use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
+
+    format!(
+        "Software\\Microsoft\\CTF\\TIP\\{}\\LanguageProfile\\0x{TSF_ALPHA_LANGID:08X}\\{}",
+        registry_guid(TSF_ALPHA_CLSID),
+        registry_guid(TSF_ALPHA_PROFILE_GUID)
+    )
+}
+
+#[cfg(windows)]
+fn registry_guid(guid: windows::core::GUID) -> String {
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
         guid.data1,
         guid.data2,
         guid.data3,
@@ -1221,8 +1430,55 @@ fn alpha_inproc_server_registry_path() -> String {
         guid.data4[4],
         guid.data4[5],
         guid.data4[6],
-        guid.data4[7]
+        guid.data4[7],
     )
+}
+
+#[cfg(windows)]
+fn machine_profile_key_exists() -> Result<bool, Box<dyn std::error::Error>> {
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY};
+    use windows::core::PCWSTR;
+
+    let subkey = wide_nul(&alpha_language_profile_registry_path());
+    registration_key_exists(HKEY_LOCAL_MACHINE, PCWSTR(subkey.as_ptr()), KEY_WOW64_64KEY)
+}
+
+#[cfg(windows)]
+fn current_user_profile_enable_state() -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WOW64_64KEY, RegOpenKeyExW,
+    };
+    use windows::core::PCWSTR;
+
+    let profile_path = wide_nul(&alpha_language_profile_registry_path());
+    let mut profile = HKEY::default();
+    // SAFETY: the fixed path is NUL-terminated and the output is writable.
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(profile_path.as_ptr()),
+            None,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut profile,
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+        return Ok(None);
+    }
+    if result != ERROR_SUCCESS {
+        return Err("cannot inspect the fixed current-user language profile key".into());
+    }
+    let profile = OpenedRegistryKey(profile);
+    let (subkeys, values) = registry_key_counts(profile.0)?;
+    if subkeys != 0 || values != 1 {
+        return Err("the fixed current-user language profile key has an unexpected shape".into());
+    }
+    match read_registry_dword(profile.0, "Enable")? {
+        Some(0) => Ok(Some(false)),
+        Some(1) => Ok(Some(true)),
+        _ => Err("the fixed current-user profile enable value is invalid".into()),
+    }
 }
 
 #[cfg(windows)]
@@ -1287,6 +1543,17 @@ fn alpha_profile_status(
 }
 
 #[cfg(windows)]
+fn alpha_language_profile_matches(
+    profile: &windows::Win32::UI::TextServices::TF_LANGUAGEPROFILE,
+) -> bool {
+    use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
+
+    profile.langid == TSF_ALPHA_LANGID
+        && profile.clsid == TSF_ALPHA_CLSID
+        && profile.guidProfile == TSF_ALPHA_PROFILE_GUID
+}
+
+#[cfg(windows)]
 fn inspect_system_profile() -> Result<ProfileStatus, Box<dyn std::error::Error>> {
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -1347,7 +1614,9 @@ fn inspect_profile_with_managers(
     manager: &windows::Win32::UI::TextServices::ITfInputProcessorProfileMgr,
     categories: &windows::Win32::UI::TextServices::ITfCategoryMgr,
 ) -> Result<ProfileStatus, Box<dyn std::error::Error>> {
-    use windows::Win32::UI::TextServices::{GUID_TFCAT_TIP_KEYBOARD, TF_INPUTPROCESSORPROFILE};
+    use windows::Win32::UI::TextServices::{
+        GUID_TFCAT_TIP_KEYBOARD, TF_INPUTPROCESSORPROFILE, TF_LANGUAGEPROFILE,
+    };
     use windows::core::GUID;
     use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID};
 
@@ -1375,7 +1644,47 @@ fn inspect_profile_with_managers(
         }
     }
 
-    // SAFETY: enumeration is read-only and restricted to the fixed zh-CN id.
+    // The legacy enumeration is the authoritative installed-profile view. In
+    // particular, it continues to expose a freshly registered profile before
+    // that profile has been enabled for the current user.
+    let language_profiles = unsafe { text_services.EnumLanguageProfiles(TSF_ALPHA_LANGID) }?;
+    let mut enumerated_registration = false;
+    loop {
+        let mut batch = [TF_LANGUAGEPROFILE::default(); 16];
+        let mut fetched = 0_u32;
+        // SAFETY: the batch and fetched count remain writable for the call.
+        unsafe { language_profiles.Next(&mut batch, &mut fetched) }?;
+        let fetched = usize::try_from(fetched).map_err(|_| "TSF profile count overflow")?;
+        if fetched > batch.len() {
+            return Err("TSF returned more language profiles than the supplied buffer".into());
+        }
+        for profile in &batch[..fetched] {
+            if alpha_language_profile_matches(profile) {
+                if enumerated_registration {
+                    return Err("TSF returned the alpha language profile more than once".into());
+                }
+                enumerated_registration = true;
+            }
+        }
+        if fetched == 0 {
+            break;
+        }
+    }
+
+    // Some Windows builds omit disabled profiles from both COM profile
+    // enumerators after the registration process exits. The fixed machine
+    // profile key remains the authoritative disabled installation record.
+    let registered = enumerated_registration || machine_profile_key_exists()?;
+
+    let persisted_enabled = if registered {
+        current_user_profile_enable_state()?.unwrap_or(false)
+    } else {
+        false
+    };
+
+    // The modern enumeration contributes active-state evidence. Windows may
+    // omit a disabled profile here, so it must not be used as installation
+    // evidence.
     let profiles = unsafe { manager.EnumProfiles(TSF_ALPHA_LANGID) }?;
     let mut found = None;
     loop {
@@ -1400,6 +1709,10 @@ fn inspect_profile_with_managers(
         }
     }
 
+    if found.is_some() && !registered {
+        return Err("TSF exposed an enabled alpha profile without an installed profile".into());
+    }
+
     // SAFETY: enumeration is read-only and restricted to the fixed alpha
     // CLSID. The returned enumerator owns its COM reference.
     let category_items = unsafe { categories.EnumCategoriesInItem(&TSF_ALPHA_CLSID) }?;
@@ -1418,10 +1731,13 @@ fn inspect_profile_with_managers(
             break;
         }
     }
-    let mut status = found.unwrap_or_default();
-    status.text_service_registered = text_service_registered;
-    status.keyboard_category = keyboard_category;
-    Ok(status)
+    Ok(ProfileStatus {
+        text_service_registered,
+        registered,
+        enabled: persisted_enabled,
+        active: found.is_some_and(|status| status.active),
+        keyboard_category,
+    })
 }
 
 #[cfg(not(windows))]
@@ -1442,6 +1758,17 @@ fn require_unregistered_state() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+fn wait_for_unregistered_state() -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        match require_unregistered_state() {
+            Ok(()) => return Ok(()),
+            Err(error) if started.elapsed() >= TSF_PROPAGATION_TIMEOUT => return Err(error),
+            Err(_) => thread::sleep(TSF_PROPAGATION_POLL_INTERVAL),
+        }
+    }
 }
 
 fn require_exact_registered_state(dll: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1468,6 +1795,7 @@ fn require_exact_registered_layout(
         || !profile.text_service_registered
         || !profile.keyboard_category
         || !verify_machine_com_registration(dll)?
+        || !verify_machine_profile_registration(dll)?
     {
         return Err(
             "the installed TSF alpha layout does not exactly match its local installation receipt"
@@ -1478,10 +1806,13 @@ fn require_exact_registered_layout(
 }
 
 fn profile_matches_toggle_state(profile: ProfileStatus, enabled: bool) -> bool {
+    profile_matches_persisted_state(profile, enabled) && !profile.active
+}
+
+fn profile_matches_persisted_state(profile: ProfileStatus, enabled: bool) -> bool {
     profile.text_service_registered
         && profile.registered
         && profile.enabled == enabled
-        && !profile.active
         && profile.keyboard_category
 }
 
@@ -1620,7 +1951,6 @@ impl RegistrationBackend for WindowsRegistrationBackend {
     }
 
     fn register_profile(&mut self, dll: &Path) -> Result<(), RegistrationAction> {
-        use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
         use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
 
         let description = PROFILE_DESCRIPTION.encode_utf16().collect::<Vec<_>>();
@@ -1629,9 +1959,32 @@ impl RegistrationBackend for WindowsRegistrationBackend {
             .ok_or(RegistrationAction::RegisterProfile)?
             .encode_utf16()
             .collect::<Vec<_>>();
-        // SAFETY: all identities are fixed constants, description and icon
-        // path slices remain live for the synchronous call, and false keeps
-        // the new profile disabled by default.
+        // SAFETY: all identities are fixed constants and the description and
+        // icon slices remain live for the synchronous call. Using the same
+        // legacy profile family as current-user enablement keeps freshly
+        // registered disabled profiles discoverable across Windows builds.
+        unsafe {
+            self.text_services.AddLanguageProfile(
+                &TSF_ALPHA_CLSID,
+                TSF_ALPHA_LANGID,
+                &TSF_ALPHA_PROFILE_GUID,
+                &description,
+                &icon_path,
+                0,
+            )
+        }
+        .map_err(|error| {
+            eprintln!(
+                "TSF_LEGACY_PROFILE_REGISTRATION_FAILED hresult=0x{:08X}",
+                error.code().0 as u32
+            );
+            RegistrationAction::RegisterProfile
+        })?;
+
+        use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
+        // SAFETY: the modern registration makes the same fixed profile visible
+        // to the Windows 11 user-language list. It runs after the compatible
+        // language-profile registration and keeps the profile disabled.
         unsafe {
             self.profiles.RegisterProfile(
                 &TSF_ALPHA_CLSID,
@@ -1668,7 +2021,13 @@ impl RegistrationBackend for WindowsRegistrationBackend {
                 &TSF_ALPHA_CLSID,
             )
         }
-        .map_err(|_| RegistrationAction::RegisterCategory)
+        .map_err(|error| {
+            eprintln!(
+                "TSF_CATEGORY_REGISTRATION_FAILED hresult=0x{:08X}",
+                error.code().0 as u32
+            );
+            RegistrationAction::RegisterCategory
+        })
     }
 
     fn verify_registered(&mut self, dll: &Path) -> Result<(), RegistrationAction> {
@@ -1682,8 +2041,11 @@ impl RegistrationBackend for WindowsRegistrationBackend {
         };
         let exact_com = verify_machine_com_registration(dll)
             .map_err(|_| RegistrationAction::VerifyRegistered)?;
+        let exact_profile = verify_machine_profile_registration(dll)
+            .map_err(|_| RegistrationAction::VerifyRegistered)?;
         if com == expected_com
             && exact_com
+            && exact_profile
             && profile.text_service_registered
             && profile.registered
             && !profile.enabled
@@ -1692,6 +2054,17 @@ impl RegistrationBackend for WindowsRegistrationBackend {
         {
             Ok(())
         } else {
+            eprintln!(
+                "TSF_REGISTRATION_VERIFY com={} exact_com={} exact_profile={} service={} profile={} enabled={} active={} category={}",
+                com == expected_com,
+                exact_com,
+                exact_profile,
+                profile.text_service_registered,
+                profile.registered,
+                profile.enabled,
+                profile.active,
+                profile.keyboard_category,
+            );
             Err(RegistrationAction::VerifyRegistered)
         }
     }
@@ -1708,13 +2081,30 @@ impl RegistrationBackend for WindowsRegistrationBackend {
                 &TSF_ALPHA_CLSID,
             )
         }
-        .map_err(|_| RegistrationAction::UnregisterCategory)
+        .map_err(|error| {
+            eprintln!(
+                "TSF_CATEGORY_REMOVAL_FAILED hresult=0x{:08X}",
+                error.code().0 as u32
+            );
+            RegistrationAction::UnregisterCategory
+        })
     }
 
     fn unregister_profile(&mut self) -> Result<(), RegistrationAction> {
         use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
 
-        // SAFETY: removes only the exact fixed zh-CN alpha profile.
+        // SAFETY: removes only the exact fixed zh-CN alpha profile. The modern
+        // fallback also cleans installations produced by older alpha builds.
+        let legacy = unsafe {
+            self.text_services.RemoveLanguageProfile(
+                &TSF_ALPHA_CLSID,
+                TSF_ALPHA_LANGID,
+                &TSF_ALPHA_PROFILE_GUID,
+            )
+        };
+        if legacy.is_ok() {
+            return Ok(());
+        }
         unsafe {
             self.profiles.UnregisterProfile(
                 &TSF_ALPHA_CLSID,
@@ -1778,7 +2168,7 @@ impl ProfileToggleBackend for WindowsRegistrationBackend {
 #[cfg(windows)]
 impl ProfileToggleBackend for WindowsRegistrationBackend {
     fn enable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
-        set_current_user_profile_enabled(&self.text_services, true)
+        set_current_user_profile_enabled(&self.text_services, &self.profiles, true)
             .map_err(|_| ProfileTransitionAction::Enable)
     }
 
@@ -1786,7 +2176,11 @@ impl ProfileToggleBackend for WindowsRegistrationBackend {
         let profile =
             inspect_profile_with_managers(&self.text_services, &self.profiles, &self.categories)
                 .map_err(|_| ProfileTransitionAction::VerifyEnabled)?;
-        if profile_matches_toggle_state(profile, true) {
+        // ActivateProfile can transiently activate the profile on this helper
+        // thread. The command deliberately omits the process/session flags,
+        // and the replacement script performs the authoritative inactive
+        // check in a separate process after this helper exits.
+        if profile_matches_persisted_state(profile, true) {
             Ok(())
         } else {
             Err(ProfileTransitionAction::VerifyEnabled)
@@ -1794,7 +2188,7 @@ impl ProfileToggleBackend for WindowsRegistrationBackend {
     }
 
     fn disable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
-        set_current_user_profile_enabled(&self.text_services, false)
+        set_current_user_profile_enabled(&self.text_services, &self.profiles, false)
             .map_err(|_| ProfileTransitionAction::Disable)
     }
 
@@ -1813,27 +2207,77 @@ impl ProfileToggleBackend for WindowsRegistrationBackend {
 #[cfg(windows)]
 fn set_current_user_profile_enabled(
     profiles: &windows::Win32::UI::TextServices::ITfInputProcessorProfiles,
+    manager: &windows::Win32::UI::TextServices::ITfInputProcessorProfileMgr,
     enabled: bool,
 ) -> windows::core::Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
+    use windows::Win32::UI::TextServices::{
+        TF_IPPMF_DISABLEPROFILE, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_ENABLEPROFILE,
+        TF_PROFILETYPE_INPUTPROCESSOR,
+    };
     use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
 
-    // SAFETY: changes only the current user's enabled bit for the fixed alpha
-    // profile. This API neither activates the profile nor changes the default
-    // profile; those are separate TSF operations that this tool never calls.
-    unsafe {
-        profiles.EnableLanguageProfile(
-            &TSF_ALPHA_CLSID,
-            TSF_ALPHA_LANGID,
-            &TSF_ALPHA_PROFILE_GUID,
-            enabled,
-        )
-    }
-    .inspect_err(|error| {
-        eprintln!(
-            "TSF_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
-            error.code().0 as u32
-        );
-    })
+    let flag = if enabled {
+        TF_IPPMF_ENABLEPROFILE
+    } else {
+        TF_IPPMF_DISABLEPROFILE
+    } | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE;
+
+    apply_current_user_profile_state(
+        || {
+            // SAFETY: the legacy compatibility call changes only the current
+            // user's enabled bit for the fixed alpha profile.
+            unsafe {
+                profiles.EnableLanguageProfile(
+                    &TSF_ALPHA_CLSID,
+                    TSF_ALPHA_LANGID,
+                    &TSF_ALPHA_PROFILE_GUID,
+                    enabled,
+                )
+            }
+            .inspect_err(|error| {
+                eprintln!(
+                    "TSF_LEGACY_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
+                    error.code().0 as u32
+                );
+            })
+        },
+        || {
+            // SAFETY: the modern profile manager receives the same fixed
+            // identity. TF_IPPMF_ENABLEPROFILE/TF_IPPMF_DISABLEPROFILE is the
+            // documented persistent current-user operation. No default,
+            // process-wide, or session-wide flag is supplied; any activation
+            // is confined to this short-lived helper thread.
+            unsafe {
+                manager.ActivateProfile(
+                    TF_PROFILETYPE_INPUTPROCESSOR,
+                    TSF_ALPHA_LANGID,
+                    &TSF_ALPHA_CLSID,
+                    &TSF_ALPHA_PROFILE_GUID,
+                    HKL::default(),
+                    flag,
+                )
+            }
+            .inspect_err(|error| {
+                eprintln!(
+                    "TSF_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
+                    error.code().0 as u32
+                );
+            })
+        },
+    )
+}
+
+fn apply_current_user_profile_state<E>(
+    legacy: impl FnOnce() -> Result<(), E>,
+    modern: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    // EnableLanguageProfile can report success without producing durable
+    // Windows 11 state. Keep it as a compatibility notification, but always
+    // execute the Vista+ profile-manager operation and treat that result as
+    // authoritative.
+    let _ = legacy();
+    modern()
 }
 
 #[cfg(windows)]
@@ -2156,9 +2600,67 @@ fn verify_machine_com_registration(dll: &Path) -> Result<bool, Box<dyn std::erro
         && read_registry_string(child.0, Some("ThreadingModel"))?.as_deref() == Some("Apartment"))
 }
 
+#[cfg(windows)]
+fn verify_machine_profile_registration(dll: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RegOpenKeyExW,
+    };
+    use windows::core::PCWSTR;
+
+    let profile_path = wide_nul(&alpha_language_profile_registry_path());
+    let mut profile = HKEY::default();
+    // SAFETY: the fixed path is NUL-terminated and the output is writable.
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(profile_path.as_ptr()),
+            None,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut profile,
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+        return Ok(false);
+    }
+    if result != ERROR_SUCCESS {
+        return Err("cannot verify the fixed machine language profile key".into());
+    }
+    let profile = OpenedRegistryKey(profile);
+    let (subkeys, values) = registry_key_counts(profile.0)?;
+    let dll_text = dll
+        .to_str()
+        .ok_or("the immutable TSF DLL path is not valid Unicode")?;
+    let description = read_registry_string(profile.0, Some("Description"))?;
+    let description_matches = description.as_deref() == Some(PROFILE_DESCRIPTION);
+    let bounded_description = description.as_deref().is_some_and(|description| {
+        !description.is_empty() && description.encode_utf16().count() <= 128
+    });
+    let icon_matches =
+        read_registry_string(profile.0, Some("IconFile"))?.as_deref() == Some(dll_text);
+    let icon_index = read_registry_dword(profile.0, "IconIndex")?;
+    let default_enable = read_registry_dword(profile.0, "Enable")?;
+    let common = subkeys == 0 && icon_matches && icon_index == Some(0);
+    let modern_shape = values == 4 && description_matches && default_enable == Some(0);
+    let legacy_shape = values == 3 && bounded_description && default_enable.is_none();
+    let exact = common && (modern_shape || legacy_shape);
+    if !exact {
+        eprintln!(
+            "TSF_PROFILE_REGISTRY_VERIFY subkeys={subkeys} values={values} description={} icon={} icon_index={icon_index:?} default_enable={default_enable:?}",
+            description_matches, icon_matches,
+        );
+    }
+    Ok(exact)
+}
+
 #[cfg(not(windows))]
 fn verify_machine_com_registration(_dll: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     Err("machine COM registration verification requires Windows".into())
+}
+
+#[cfg(not(windows))]
+fn verify_machine_profile_registration(_dll: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    Err("machine language profile verification requires Windows".into())
 }
 
 #[cfg(windows)]
@@ -2250,7 +2752,7 @@ fn read_registry_string(
         || !(2..=32_768).contains(&byte_count)
         || !byte_count.is_multiple_of(2)
     {
-        return Err("cannot read the fixed machine COM string value".into());
+        return Err("cannot read the fixed machine registry string value".into());
     }
     let mut bytes = vec![0_u8; usize::try_from(byte_count)?];
     // SAFETY: the allocated buffer has exactly the reported writable size.
@@ -2270,7 +2772,7 @@ fn read_registry_string(
         || byte_count < 2
         || !byte_count.is_multiple_of(2)
     {
-        return Err("cannot read the fixed machine COM string value".into());
+        return Err("cannot read the fixed machine registry string value".into());
     }
     bytes.truncate(usize::try_from(byte_count)?);
     let mut utf16 = bytes
@@ -2284,6 +2786,40 @@ fn read_registry_string(
         utf16.pop();
     }
     Ok(Some(String::from_utf16(&utf16)?))
+}
+
+#[cfg(windows)]
+fn read_registry_dword(
+    key: windows::Win32::System::Registry::HKEY,
+    name: &str,
+) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::PCWSTR;
+
+    let name = wide_nul(name);
+    let mut value = 0_u32;
+    let mut byte_count = u32::try_from(std::mem::size_of::<u32>())?;
+    // SAFETY: the fixed value name is NUL-terminated and the value and size
+    // outputs are bounded writable storage for one REG_DWORD.
+    let result = unsafe {
+        RegGetValueW(
+            key,
+            PCWSTR::null(),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut byte_count),
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if result != ERROR_SUCCESS || byte_count != u32::try_from(std::mem::size_of::<u32>())? {
+        return Err("cannot read the fixed machine registry DWORD value".into());
+    }
+    Ok(Some(value))
 }
 
 #[cfg(windows)]
@@ -2393,12 +2929,19 @@ mod tests {
             .unwrap(),
             Options::DisableCurrentUser
         );
+        assert_eq!(
+            parse_options(["verify-current-user-enabled"].map(str::to_owned)).unwrap(),
+            Options::VerifyCurrentUserEnabled
+        );
         assert!(
             parse_options(["register-machine", "--dll", "alpha.dll"].map(str::to_owned)).is_err()
         );
         assert!(parse_options(["unregister-machine"].map(str::to_owned)).is_err());
         assert!(parse_options(["enable-current-user"].map(str::to_owned)).is_err());
         assert!(parse_options(["disable-current-user"].map(str::to_owned)).is_err());
+        assert!(
+            parse_options(["verify-current-user-enabled", "extra"].map(str::to_owned)).is_err()
+        );
         assert!(
             parse_options(
                 [
@@ -2460,13 +3003,41 @@ mod tests {
             &inspection,
             ComRegistrationStatus::default(),
             ProfileStatus::default(),
+            LoadedHostStatus {
+                scan_available: true,
+                matching_version: 1,
+                other_versions: 2,
+            },
         );
         assert!(report.contains("证书目录：存在（未验证签名有效性）"));
         assert!(report.contains("COM 注册：未发现"));
         assert!(report.contains("系统语言配置：未发现"));
         assert!(report.contains("键盘类别：未发现"));
+        assert!(report.contains("宿主缓存：此版本 1，其他版本 2（仅计可见进程）"));
         assert!(report.contains("本次操作：只读"));
         assert!(!report.contains("下一步"));
+    }
+
+    #[test]
+    fn loaded_host_report_is_redacted_and_version_scoped() {
+        let digest = "ab".repeat(32);
+        let path = PathBuf::from(format!(
+            r"D:\repo\.local\tsf-alpha\builds\{digest}\ziranma_core.dll"
+        ));
+        assert_eq!(immutable_alpha_digest(&path), Some(digest));
+        assert_eq!(
+            immutable_alpha_digest(Path::new(r"D:\private\builds\abab\ziranma_core.dll")),
+            None
+        );
+        assert_eq!(
+            render_loaded_hosts(LoadedHostStatus {
+                scan_available: true,
+                matching_version: 0,
+                other_versions: 0,
+            }),
+            "未发现正在加载 Alpha 的应用"
+        );
+        assert_eq!(render_loaded_hosts(LoadedHostStatus::default()), "无法检查");
     }
 
     #[test]
@@ -2500,6 +3071,10 @@ mod tests {
             alpha_inproc_server_registry_path(),
             "Software\\Classes\\CLSID\\{4CC8427B-D0F5-439E-B6AF-D45EACD7E577}\\InprocServer32"
         );
+        assert_eq!(
+            alpha_language_profile_registry_path(),
+            "Software\\Microsoft\\CTF\\TIP\\{4CC8427B-D0F5-439E-B6AF-D45EACD7E577}\\LanguageProfile\\0x00000804\\{8099D3F8-9F40-4DA5-9B01-C12DE0CD6370}"
+        );
     }
 
     #[test]
@@ -2520,7 +3095,7 @@ mod tests {
     fn system_profile_match_requires_every_fixed_identity_field() {
         use windows::Win32::UI::TextServices::{
             GUID_TFCAT_TIP_KEYBOARD, TF_INPUTPROCESSORPROFILE, TF_IPP_FLAG_ACTIVE,
-            TF_IPP_FLAG_ENABLED, TF_PROFILETYPE_INPUTPROCESSOR,
+            TF_IPP_FLAG_ENABLED, TF_LANGUAGEPROFILE, TF_PROFILETYPE_INPUTPROCESSOR,
         };
         use windows::core::GUID;
         use ziranma_core::{TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID};
@@ -2548,6 +3123,18 @@ mod tests {
         let mut wrong_profile = exact;
         wrong_profile.guidProfile = GUID::from_u128(1);
         assert_eq!(alpha_profile_status(&wrong_profile), None);
+
+        let installed = TF_LANGUAGEPROFILE {
+            clsid: TSF_ALPHA_CLSID,
+            langid: TSF_ALPHA_LANGID,
+            guidProfile: TSF_ALPHA_PROFILE_GUID,
+            catid: GUID_TFCAT_TIP_KEYBOARD,
+            fActive: false.into(),
+        };
+        assert!(alpha_language_profile_matches(&installed));
+        let mut wrong_installed = installed;
+        wrong_installed.clsid = GUID::from_u128(1);
+        assert!(!alpha_language_profile_matches(&wrong_installed));
     }
 
     #[test]
@@ -2572,6 +3159,7 @@ mod tests {
             active: true,
             ..enabled
         };
+        assert!(profile_matches_persisted_state(active, true));
         assert!(!profile_matches_toggle_state(active, true));
 
         let incomplete = ProfileStatus {
@@ -2579,6 +3167,37 @@ mod tests {
             ..disabled
         };
         assert!(!profile_matches_toggle_state(incomplete, false));
+    }
+
+    #[test]
+    fn modern_profile_state_call_is_always_executed_and_authoritative() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = apply_current_user_profile_state(
+            || {
+                calls.borrow_mut().push("legacy");
+                Ok::<(), &'static str>(())
+            },
+            || {
+                calls.borrow_mut().push("modern");
+                Err("modern failed")
+            },
+        );
+        assert_eq!(result, Err("modern failed"));
+        assert_eq!(*calls.borrow(), ["legacy", "modern"]);
+
+        calls.borrow_mut().clear();
+        let result = apply_current_user_profile_state(
+            || {
+                calls.borrow_mut().push("legacy");
+                Err("legacy failed")
+            },
+            || {
+                calls.borrow_mut().push("modern");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.borrow(), ["legacy", "modern"]);
     }
 
     #[test]
@@ -2754,7 +3373,7 @@ mod tests {
     }
 
     #[test]
-    fn current_user_enable_verifies_inactive_and_recovers_to_disabled() {
+    fn current_user_enable_verifies_requested_state_and_recovers_to_disabled() {
         let mut success = FakeProfileToggleBackend::default();
         enable_profile_transaction(&mut success).unwrap();
         assert_eq!(
