@@ -17,13 +17,52 @@ use crate::{
 pub const MAX_REPLAY_CODE_KEYS: usize = 64;
 const REPLAY_TOP_K: usize = 10;
 pub const PUBLIC_CONTEXT_REPLAY_POOL_DEPTH: usize = 50;
-const PERSONAL_CACHE_POOL_DEPTH: usize = 50;
 const PERSONAL_CACHE_MAX_PROMOTION: usize = 3;
+// A candidate below this frozen prefix cannot enter the visible Top-K:
+// even after the maximum promotion, its adjusted rank is at least K, while
+// the original first K candidates always have adjusted ranks below K.
+const PERSONAL_CACHE_POOL_DEPTH: usize = REPLAY_TOP_K + PERSONAL_CACHE_MAX_PROMOTION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersonalCacheKind {
     WordFrequency,
     OrderedWordPairs,
+    ExactCodeText,
+}
+
+#[derive(Clone, Copy)]
+enum PersonalCacheWindowMode<'a> {
+    Causal(PersonalCacheKind),
+    FrozenAndCausal {
+        kind: PersonalCacheKind,
+        frozen_state: &'a PersonalCacheReplayState,
+    },
+    FrozenCausalAndCode {
+        kind: PersonalCacheKind,
+        frozen_state: &'a PersonalCacheReplayState,
+    },
+}
+
+impl<'a> PersonalCacheWindowMode<'a> {
+    fn kind(self) -> PersonalCacheKind {
+        match self {
+            Self::Causal(kind)
+            | Self::FrozenAndCausal { kind, .. }
+            | Self::FrozenCausalAndCode { kind, .. } => kind,
+        }
+    }
+
+    fn frozen_state(self) -> Option<&'a PersonalCacheReplayState> {
+        match self {
+            Self::Causal(_) => None,
+            Self::FrozenAndCausal { frozen_state, .. }
+            | Self::FrozenCausalAndCode { frozen_state, .. } => Some(frozen_state),
+        }
+    }
+
+    fn includes_code_comparison(self) -> bool {
+        matches!(self, Self::FrozenCausalAndCode { .. })
+    }
 }
 
 impl PersonalCacheKind {
@@ -31,6 +70,7 @@ impl PersonalCacheKind {
         match self {
             Self::WordFrequency => "word_frequency",
             Self::OrderedWordPairs => "ordered_word_pairs",
+            Self::ExactCodeText => "exact_code_text",
         }
     }
 
@@ -38,6 +78,7 @@ impl PersonalCacheKind {
         match self {
             Self::WordFrequency => "window_personal_word_cache",
             Self::OrderedWordPairs => "window_personal_pair_cache",
+            Self::ExactCodeText => "window_personal_code_cache",
         }
     }
 
@@ -45,6 +86,7 @@ impl PersonalCacheKind {
         match self {
             Self::WordFrequency => "personal_word_cache",
             Self::OrderedWordPairs => "personal_word_pair_cache",
+            Self::ExactCodeText => "personal_code_cache",
         }
     }
 }
@@ -158,6 +200,9 @@ pub struct PersonalCacheReplayState {
     pair_counts: HashMap<(String, String), u64>,
     learned_word_pairs: u64,
     active_pair_spans: Vec<PersonalLearnedPairSpan>,
+    code_text_counts: HashMap<(String, String), u64>,
+    learned_code_text_tokens: u64,
+    active_code_text_spans: Vec<PersonalLearnedCodeTextSpan>,
 }
 
 struct PersonalLearnedSpan {
@@ -172,12 +217,20 @@ struct PersonalLearnedPairSpan {
     pairs: Vec<(String, String)>,
 }
 
+struct PersonalLearnedCodeTextSpan {
+    start: usize,
+    end: usize,
+    code: String,
+    text: String,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PersonalCacheEditOutcome {
     invalidated_commits: u64,
     invalidated_word_tokens: u64,
     invalidated_pair_sequences: u64,
     invalidated_word_pairs: u64,
+    invalidated_code_text_tokens: u64,
     ambiguous_position: bool,
 }
 
@@ -202,9 +255,32 @@ impl PersonalCacheReplayState {
         self.learned_word_pairs
     }
 
+    pub fn learned_code_text_types(&self) -> usize {
+        self.code_text_counts.len()
+    }
+
+    pub fn learned_code_text_tokens(&self) -> u64 {
+        self.learned_code_text_tokens
+    }
+
+    pub fn fork_for_frozen_evaluation(&self) -> Self {
+        Self {
+            word_counts: self.word_counts.clone(),
+            learned_word_tokens: self.learned_word_tokens,
+            active_document_spans: Vec::new(),
+            pair_counts: self.pair_counts.clone(),
+            learned_word_pairs: self.learned_word_pairs,
+            active_pair_spans: Vec::new(),
+            code_text_counts: self.code_text_counts.clone(),
+            learned_code_text_tokens: self.learned_code_text_tokens,
+            active_code_text_spans: Vec::new(),
+        }
+    }
+
     fn start_document(&mut self) {
         self.active_document_spans.clear();
         self.active_pair_spans.clear();
+        self.active_code_text_spans.clear();
     }
 
     fn learn_commit(&mut self, start: usize, inserted_chars: usize, words: &[String]) {
@@ -229,6 +305,29 @@ impl PersonalCacheReplayState {
             .get(&(previous.to_owned(), current.to_owned()))
             .copied()
             .unwrap_or(0)
+    }
+
+    fn code_text_count(&self, code: &str, text: &str) -> u64 {
+        self.code_text_counts
+            .get(&(code.to_owned(), text.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn learn_code_text(&mut self, start: usize, end: usize, code: String, text: String) {
+        let count = self
+            .code_text_counts
+            .entry((code.clone(), text.clone()))
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        self.learned_code_text_tokens = self.learned_code_text_tokens.saturating_add(1);
+        self.active_code_text_spans
+            .push(PersonalLearnedCodeTextSpan {
+                start,
+                end,
+                code,
+                text,
+            });
     }
 
     fn learn_pair_sequence(&mut self, start: usize, end: usize, words: &[String]) -> usize {
@@ -323,6 +422,34 @@ impl PersonalCacheReplayState {
             retained_pairs.push(span);
         }
         self.active_pair_spans = retained_pairs;
+
+        let mut retained_code_text = Vec::with_capacity(self.active_code_text_spans.len());
+        for mut span in std::mem::take(&mut self.active_code_text_spans) {
+            let overlaps = if deleted_chars > 0 {
+                span.start < edit_end && span.end > start
+            } else {
+                start > span.start && start < span.end
+            };
+            if overlaps {
+                outcome.invalidated_code_text_tokens =
+                    outcome.invalidated_code_text_tokens.saturating_add(1);
+                self.unlearn_code_text(&span.code, &span.text);
+                continue;
+            }
+            if span.start >= edit_end {
+                if inserted_chars >= deleted_chars {
+                    let shift = inserted_chars - deleted_chars;
+                    span.start = span.start.saturating_add(shift);
+                    span.end = span.end.saturating_add(shift);
+                } else {
+                    let shift = deleted_chars - inserted_chars;
+                    span.start = span.start.saturating_sub(shift);
+                    span.end = span.end.saturating_sub(shift);
+                }
+            }
+            retained_code_text.push(span);
+        }
+        self.active_code_text_spans = retained_code_text;
         outcome
     }
 
@@ -351,6 +478,21 @@ impl PersonalCacheReplayState {
             self.learned_word_pairs = self.learned_word_pairs.saturating_sub(1);
         }
     }
+
+    fn unlearn_code_text(&mut self, code: &str, text: &str) {
+        let identity = (code.to_owned(), text.to_owned());
+        let remove = self
+            .code_text_counts
+            .get_mut(&identity)
+            .is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+        if remove {
+            self.code_text_counts.remove(&identity);
+        }
+        self.learned_code_text_tokens = self.learned_code_text_tokens.saturating_sub(1);
+    }
 }
 
 impl fmt::Debug for PersonalCacheReplayState {
@@ -364,6 +506,9 @@ impl fmt::Debug for PersonalCacheReplayState {
             .field("learned_word_pair_types", &self.learned_word_pair_types())
             .field("learned_word_pairs", &self.learned_word_pairs)
             .field("active_pair_spans", &self.active_pair_spans.len())
+            .field("learned_code_text_types", &self.learned_code_text_types())
+            .field("learned_code_text_tokens", &self.learned_code_text_tokens)
+            .field("active_code_text_spans", &self.active_code_text_spans.len())
             .finish()
     }
 }
@@ -861,6 +1006,8 @@ pub struct CapsuleReplayReport {
     pub personal_cache_history_word_types: u64,
     pub personal_cache_history_word_pairs: u64,
     pub personal_cache_history_word_pair_types: u64,
+    pub personal_cache_history_code_text_tokens: u64,
+    pub personal_cache_history_code_text_types: u64,
     pub personal_cache_learning_commits: u64,
     pub personal_cache_learning_word_tokens: u64,
     pub personal_cache_retained_word_tokens: u64,
@@ -873,6 +1020,10 @@ pub struct CapsuleReplayReport {
     pub personal_cache_learned_word_pair_types: u64,
     pub personal_cache_reversed_pair_sequences: u64,
     pub personal_cache_reversed_word_pairs: u64,
+    pub personal_cache_learning_code_text_tokens: u64,
+    pub personal_cache_retained_code_text_tokens: u64,
+    pub personal_cache_learned_code_text_types: u64,
+    pub personal_cache_reversed_code_text_tokens: u64,
     pub personal_cache_revision_events_with_reversal: u64,
     pub personal_cache_revisions_not_reversed: u64,
     pub personal_cache_ambiguous_edits_not_applied: u64,
@@ -886,6 +1037,22 @@ pub struct CapsuleReplayReport {
     pub word_tail_one_short_personal_cache_effect: ContextReplayComparisonStats,
     pub word_tail_keep_singletons_personal_cache_effect: ContextReplayComparisonStats,
     pub word_head_anchored_personal_cache_effect: ContextReplayComparisonStats,
+    pub personal_frozen_cache_windows: u64,
+    pub personal_frozen_window_canonical_full: ReplayStrategyStats,
+    pub personal_frozen_window_word_tail_one_short: ReplayStrategyStats,
+    pub personal_frozen_window_word_tail_keep_singletons: ReplayStrategyStats,
+    pub personal_frozen_window_word_head_anchored: ReplayStrategyStats,
+    pub personal_frozen_window_word_tail_one_short_vs_full: PairedReplayStrategyStats,
+    pub personal_frozen_window_word_tail_keep_singletons_vs_full: PairedReplayStrategyStats,
+    pub personal_frozen_window_word_head_anchored_vs_full: PairedReplayStrategyStats,
+    pub word_tail_one_short_personal_frozen_effect: ContextReplayComparisonStats,
+    pub word_tail_keep_singletons_personal_frozen_effect: ContextReplayComparisonStats,
+    pub word_head_anchored_personal_frozen_effect: ContextReplayComparisonStats,
+    pub personal_code_cache_windows: u64,
+    pub personal_code_frozen_window_canonical_full: ReplayStrategyStats,
+    pub personal_code_causal_window_canonical_full: ReplayStrategyStats,
+    pub personal_hybrid_window_canonical_full: ReplayStrategyStats,
+    pub personal_hybrid_vs_frozen_word: RankingReplayComparisonStats,
 }
 
 impl CapsuleReplayReport {
@@ -906,7 +1073,8 @@ impl CapsuleReplayReport {
         decoder: &Decoder,
         capsule: &EventCapsuleV1,
     ) -> Result<(), KeySequenceError> {
-        self.observe_capsule_internal(decoder, None, capsule)
+        let _ = self.observe_capsule_internal(decoder, None, capsule, true)?;
+        Ok(())
     }
 
     fn observe_window_exclusion(&mut self, reason: WindowExclusionReason) {
@@ -922,14 +1090,16 @@ impl CapsuleReplayReport {
         log_frequency_total: f64,
         capsule: &EventCapsuleV1,
     ) -> Result<(), KeySequenceError> {
-        self.observe_capsule_internal(
+        let _ = self.observe_capsule_internal(
             decoder,
             Some(FrozenPublicContext::Word {
                 language_model: public_language_model,
                 log_frequency_total,
             }),
             capsule,
-        )
+            true,
+        )?;
+        Ok(())
     }
 
     pub fn observe_capsule_with_public_character_context(
@@ -938,13 +1108,15 @@ impl CapsuleReplayReport {
         public_language_model: &CharacterBigramLanguageModel,
         capsule: &EventCapsuleV1,
     ) -> Result<(), KeySequenceError> {
-        self.observe_capsule_internal(
+        let _ = self.observe_capsule_internal(
             decoder,
             Some(FrozenPublicContext::Character {
                 language_model: public_language_model,
             }),
             capsule,
-        )
+            true,
+        )?;
+        Ok(())
     }
 
     pub fn observe_capsule_with_personal_cache(
@@ -958,6 +1130,22 @@ impl CapsuleReplayReport {
             state,
             PersonalCacheKind::WordFrequency,
             capsule,
+            true,
+        )
+    }
+
+    pub fn observe_capsule_with_compact_personal_cache(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        self.observe_capsule_with_personal_cache_kind(
+            decoder,
+            state,
+            PersonalCacheKind::WordFrequency,
+            capsule,
+            false,
         )
     }
 
@@ -972,7 +1160,103 @@ impl CapsuleReplayReport {
             state,
             PersonalCacheKind::OrderedWordPairs,
             capsule,
+            true,
         )
+    }
+
+    pub fn observe_capsule_with_compact_personal_pair_cache(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        self.observe_capsule_with_personal_cache_kind(
+            decoder,
+            state,
+            PersonalCacheKind::OrderedWordPairs,
+            capsule,
+            false,
+        )
+    }
+
+    pub fn observe_capsule_with_personal_word_comparison(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        let kind = PersonalCacheKind::WordFrequency;
+        if let Some(previous) = self.personal_cache_kind {
+            assert_eq!(
+                previous, kind,
+                "a replay report cannot mix personal cache models"
+            );
+        } else {
+            self.personal_cache_kind = Some(kind);
+        }
+        let prepared_windows = self.observe_capsule_internal(decoder, None, capsule, false)?;
+        self.observe_personal_cache_windows(
+            decoder,
+            causal_state,
+            PersonalCacheWindowMode::FrozenAndCausal { kind, frozen_state },
+            capsule,
+            max_gap_ms,
+            &prepared_windows,
+        )?;
+        self.personal_cache_learned_word_types =
+            u64::try_from(causal_state.learned_word_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_tokens = causal_state.learned_word_tokens();
+        self.personal_cache_learned_word_pair_types =
+            u64::try_from(causal_state.learned_word_pair_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_pairs = causal_state.learned_word_pairs();
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(causal_state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_code_text_tokens = causal_state.learned_code_text_tokens();
+        Ok(())
+    }
+
+    pub fn observe_capsule_with_personal_code_comparison(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        let kind = PersonalCacheKind::WordFrequency;
+        if let Some(previous) = self.personal_cache_kind {
+            assert_eq!(
+                previous, kind,
+                "a replay report cannot mix personal cache models"
+            );
+        } else {
+            self.personal_cache_kind = Some(kind);
+        }
+        let prepared_windows = self.observe_capsule_internal(decoder, None, capsule, false)?;
+        self.observe_personal_cache_windows(
+            decoder,
+            causal_state,
+            PersonalCacheWindowMode::FrozenCausalAndCode { kind, frozen_state },
+            capsule,
+            max_gap_ms,
+            &prepared_windows,
+        )?;
+        self.personal_cache_learned_word_types =
+            u64::try_from(causal_state.learned_word_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_tokens = causal_state.learned_word_tokens();
+        self.personal_cache_learned_word_pair_types =
+            u64::try_from(causal_state.learned_word_pair_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_pairs = causal_state.learned_word_pairs();
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(causal_state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_code_text_tokens = causal_state.learned_code_text_tokens();
+        Ok(())
     }
 
     pub fn record_personal_cache_history(
@@ -994,6 +1278,61 @@ impl CapsuleReplayReport {
         self.personal_cache_history_word_pairs = state.learned_word_pairs();
         self.personal_cache_history_word_pair_types =
             u64::try_from(state.learned_word_pair_types()).unwrap_or(u64::MAX);
+        self.personal_cache_history_code_text_tokens = state.learned_code_text_tokens();
+        self.personal_cache_history_code_text_types =
+            u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
+    }
+
+    pub fn learn_capsule_for_personal_cache(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        self.capsules = self.capsules.saturating_add(1);
+        self.events = self
+            .events
+            .saturating_add(u64::try_from(capsule.events().len()).unwrap_or(u64::MAX));
+        self.learn_personal_cache_capsule(decoder, state, capsule, max_gap_ms, false)?;
+        self.personal_cache_learned_word_types =
+            u64::try_from(state.learned_word_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_tokens = state.learned_word_tokens();
+        self.personal_cache_learned_word_pair_types =
+            u64::try_from(state.learned_word_pair_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_pairs = state.learned_word_pairs();
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_code_text_tokens = state.learned_code_text_tokens();
+        Ok(())
+    }
+
+    pub fn learn_capsule_for_personal_code_comparison(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        self.capsules = self.capsules.saturating_add(1);
+        self.events = self
+            .events
+            .saturating_add(u64::try_from(capsule.events().len()).unwrap_or(u64::MAX));
+        self.learn_personal_cache_capsule(decoder, state, capsule, max_gap_ms, true)?;
+        self.personal_cache_learned_word_types =
+            u64::try_from(state.learned_word_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_tokens = state.learned_word_tokens();
+        self.personal_cache_learned_word_pair_types =
+            u64::try_from(state.learned_word_pair_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_pairs = state.learned_word_pairs();
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_code_text_tokens = state.learned_code_text_tokens();
+        Ok(())
     }
 
     fn observe_capsule_with_personal_cache_kind(
@@ -1002,6 +1341,7 @@ impl CapsuleReplayReport {
         state: &mut PersonalCacheReplayState,
         kind: PersonalCacheKind,
         capsule: &EventCapsuleV1,
+        collect_commit_strategies: bool,
     ) -> Result<(), PersonalCacheReplayError> {
         let Some(max_gap_ms) = self.window_gap_limit_ms else {
             return Err(PersonalCacheReplayError::MissingWindowGap);
@@ -1014,14 +1354,25 @@ impl CapsuleReplayReport {
         } else {
             self.personal_cache_kind = Some(kind);
         }
-        self.observe_capsule_internal(decoder, None, capsule)?;
-        self.observe_personal_cache_windows(decoder, state, kind, capsule, max_gap_ms)?;
+        let prepared_windows =
+            self.observe_capsule_internal(decoder, None, capsule, collect_commit_strategies)?;
+        self.observe_personal_cache_windows(
+            decoder,
+            state,
+            PersonalCacheWindowMode::Causal(kind),
+            capsule,
+            max_gap_ms,
+            &prepared_windows,
+        )?;
         self.personal_cache_learned_word_types =
             u64::try_from(state.learned_word_types()).unwrap_or(u64::MAX);
         self.personal_cache_retained_word_tokens = state.learned_word_tokens();
         self.personal_cache_learned_word_pair_types =
             u64::try_from(state.learned_word_pair_types()).unwrap_or(u64::MAX);
         self.personal_cache_retained_word_pairs = state.learned_word_pairs();
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_code_text_tokens = state.learned_code_text_tokens();
         Ok(())
     }
 
@@ -1030,7 +1381,8 @@ impl CapsuleReplayReport {
         decoder: &Decoder,
         public_context: Option<FrozenPublicContext<'_>>,
         capsule: &EventCapsuleV1,
-    ) -> Result<(), KeySequenceError> {
+        collect_commit_strategies: bool,
+    ) -> Result<HashMap<usize, WindowCommit>, KeySequenceError> {
         if let Some(context) = public_context {
             let kind = context.kind();
             if let Some(previous) = self.public_context_kind {
@@ -1088,11 +1440,13 @@ impl CapsuleReplayReport {
                         continue;
                     }
 
-                    let target = &record.change.inserted;
-                    let candidates = decoder.decode_sentence(&observed, REPLAY_TOP_K)?;
-                    let _ = self.raw_existing.observe(&observed, target, &candidates);
                     let mut commit_decode_cache = HashMap::<String, Vec<SentenceCandidate>>::new();
-                    commit_decode_cache.insert(observed.clone(), candidates);
+                    let target = &record.change.inserted;
+                    if collect_commit_strategies {
+                        let candidates = decoder.decode_sentence(&observed, REPLAY_TOP_K)?;
+                        let _ = self.raw_existing.observe(&observed, target, &candidates);
+                        commit_decode_cache.insert(observed.clone(), candidates);
+                    }
 
                     let normalized_pinyin = record.composition.replace('\'', " ");
                     let Ok(encoded) = encode_pinyin_phrase(&normalized_pinyin) else {
@@ -1108,42 +1462,48 @@ impl CapsuleReplayReport {
                             self.observed_matches_canonical.saturating_add(1);
                     }
 
-                    let canonical_candidates = decode_sentence_memoized(
-                        decoder,
-                        &mut commit_decode_cache,
-                        encoded.full_code.as_str(),
-                    )?;
-                    let _ = self.canonical_full.observe(
-                        encoded.full_code.as_str(),
-                        target,
-                        &canonical_candidates,
-                    );
-                    if let Some(code) = tail_one_short(&encoded.syllable_codes) {
-                        observe_strategy_memoized(
+                    let canonical_candidates = if collect_commit_strategies {
+                        decode_sentence_memoized(
                             decoder,
                             &mut commit_decode_cache,
-                            &code,
+                            encoded.full_code.as_str(),
+                        )?
+                    } else {
+                        decoder.decode_sentence(encoded.full_code.as_str(), REPLAY_TOP_K)?
+                    };
+                    if collect_commit_strategies {
+                        let _ = self.canonical_full.observe(
+                            encoded.full_code.as_str(),
                             target,
-                            &mut self.tail_one_short,
-                        )?;
-                    }
-                    if let Some(code) = head_anchored(&encoded.syllable_codes) {
-                        observe_strategy_memoized(
-                            decoder,
-                            &mut commit_decode_cache,
-                            &code,
-                            target,
-                            &mut self.head_anchored,
-                        )?;
-                    }
-                    if let Some(code) = all_short(&encoded.syllable_codes) {
-                        observe_strategy_memoized(
-                            decoder,
-                            &mut commit_decode_cache,
-                            &code,
-                            target,
-                            &mut self.all_short,
-                        )?;
+                            &canonical_candidates,
+                        );
+                        if let Some(code) = tail_one_short(&encoded.syllable_codes) {
+                            observe_strategy_memoized(
+                                decoder,
+                                &mut commit_decode_cache,
+                                &code,
+                                target,
+                                &mut self.tail_one_short,
+                            )?;
+                        }
+                        if let Some(code) = head_anchored(&encoded.syllable_codes) {
+                            observe_strategy_memoized(
+                                decoder,
+                                &mut commit_decode_cache,
+                                &code,
+                                target,
+                                &mut self.head_anchored,
+                            )?;
+                        }
+                        if let Some(code) = all_short(&encoded.syllable_codes) {
+                            observe_strategy_memoized(
+                                decoder,
+                                &mut commit_decode_cache,
+                                &code,
+                                target,
+                                &mut self.all_short,
+                            )?;
+                        }
                     }
                     if let Some(segmentation) = exact_target_segmentation(
                         &canonical_candidates,
@@ -1152,39 +1512,43 @@ impl CapsuleReplayReport {
                     ) {
                         self.word_boundaries_available_commits =
                             self.word_boundaries_available_commits.saturating_add(1);
-                        if let Some(code) =
-                            word_tail_one_short(&encoded.syllable_codes, &segmentation.word_lengths)
-                        {
-                            observe_strategy_memoized(
-                                decoder,
-                                &mut commit_decode_cache,
-                                &code,
-                                target,
-                                &mut self.word_tail_one_short,
-                            )?;
-                        }
-                        if let Some(code) = word_tail_keep_singletons(
-                            &encoded.syllable_codes,
-                            &segmentation.word_lengths,
-                        ) {
-                            observe_strategy_memoized(
-                                decoder,
-                                &mut commit_decode_cache,
-                                &code,
-                                target,
-                                &mut self.word_tail_keep_singletons,
-                            )?;
-                        }
-                        if let Some(code) =
-                            word_head_anchored(&encoded.syllable_codes, &segmentation.word_lengths)
-                        {
-                            observe_strategy_memoized(
-                                decoder,
-                                &mut commit_decode_cache,
-                                &code,
-                                target,
-                                &mut self.word_head_anchored,
-                            )?;
+                        if collect_commit_strategies {
+                            if let Some(code) = word_tail_one_short(
+                                &encoded.syllable_codes,
+                                &segmentation.word_lengths,
+                            ) {
+                                observe_strategy_memoized(
+                                    decoder,
+                                    &mut commit_decode_cache,
+                                    &code,
+                                    target,
+                                    &mut self.word_tail_one_short,
+                                )?;
+                            }
+                            if let Some(code) = word_tail_keep_singletons(
+                                &encoded.syllable_codes,
+                                &segmentation.word_lengths,
+                            ) {
+                                observe_strategy_memoized(
+                                    decoder,
+                                    &mut commit_decode_cache,
+                                    &code,
+                                    target,
+                                    &mut self.word_tail_keep_singletons,
+                                )?;
+                            }
+                            if let Some(code) = word_head_anchored(
+                                &encoded.syllable_codes,
+                                &segmentation.word_lengths,
+                            ) {
+                                observe_strategy_memoized(
+                                    decoder,
+                                    &mut commit_decode_cache,
+                                    &code,
+                                    target,
+                                    &mut self.word_head_anchored,
+                                )?;
+                            }
                         }
                         if self.window_gap_limit_ms.is_some() {
                             if let Some(reason) = window_document_exclusion(record) {
@@ -1229,7 +1593,7 @@ impl CapsuleReplayReport {
                 public_context,
                 capsule,
                 max_gap_ms,
-                &mut prepared_windows,
+                &prepared_windows,
             )?;
             debug_assert_eq!(
                 self.window_ineligible_commits,
@@ -1241,7 +1605,7 @@ impl CapsuleReplayReport {
                     .saturating_add(self.isolated_eligible_commits)
             );
         }
-        Ok(())
+        Ok(prepared_windows)
     }
 
     fn observe_continuous_windows(
@@ -1250,7 +1614,7 @@ impl CapsuleReplayReport {
         public_context: Option<FrozenPublicContext<'_>>,
         capsule: &EventCapsuleV1,
         max_gap_ms: u64,
-        prepared_windows: &mut HashMap<usize, WindowCommit>,
+        prepared_windows: &HashMap<usize, WindowCommit>,
     ) -> Result<(), KeySequenceError> {
         let mut run = Vec::<WindowCommit>::new();
         for (event_index, event) in capsule.events().iter().enumerate() {
@@ -1258,7 +1622,7 @@ impl CapsuleReplayReport {
                 self.finish_window(decoder, public_context, &mut run)?;
                 continue;
             };
-            let Some(commit) = prepared_windows.remove(&event_index) else {
+            let Some(commit) = prepared_windows.get(&event_index).cloned() else {
                 self.window_ineligible_commits = self.window_ineligible_commits.saturating_add(1);
                 self.finish_window(decoder, public_context, &mut run)?;
                 continue;
@@ -1280,15 +1644,16 @@ impl CapsuleReplayReport {
         &mut self,
         decoder: &Decoder,
         state: &mut PersonalCacheReplayState,
-        kind: PersonalCacheKind,
+        mode: PersonalCacheWindowMode<'_>,
         capsule: &EventCapsuleV1,
         max_gap_ms: u64,
+        prepared_windows: &HashMap<usize, WindowCommit>,
     ) -> Result<(), KeySequenceError> {
         state.start_document();
         let mut run = Vec::<WindowCommit>::new();
-        for event in capsule.events() {
+        for (event_index, event) in capsule.events().iter().enumerate() {
             let TrackerOutput::Commit(record) = &event.output else {
-                self.finish_personal_cache_window(decoder, state, kind, &mut run)?;
+                self.finish_personal_cache_window(decoder, state, mode, &mut run)?;
                 let TrackerOutput::Revision(revision) = &event.output else {
                     unreachable!("tracker output has only commit and revision variants");
                 };
@@ -1301,8 +1666,8 @@ impl CapsuleReplayReport {
                 self.observe_personal_cache_edit(outcome, true);
                 continue;
             };
-            let Some(commit) = prepare_window_commit(decoder, event.elapsed_ms, record)? else {
-                self.finish_personal_cache_window(decoder, state, kind, &mut run)?;
+            let Some(commit) = prepared_windows.get(&event_index).cloned() else {
+                self.finish_personal_cache_window(decoder, state, mode, &mut run)?;
                 let outcome = state.apply_document_delta(
                     record.document_change.start,
                     record.document_change.deleted.chars().count(),
@@ -1334,23 +1699,110 @@ impl CapsuleReplayReport {
                     && commit.document_start == previous.document_end()
             });
             if !run.is_empty() && !joins_previous {
-                self.finish_personal_cache_window(decoder, state, kind, &mut run)?;
+                self.finish_personal_cache_window(decoder, state, mode, &mut run)?;
             }
             run.push(commit);
         }
-        self.finish_personal_cache_window(decoder, state, kind, &mut run)
+        self.finish_personal_cache_window(decoder, state, mode, &mut run)
+    }
+
+    fn learn_personal_cache_capsule(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+        max_gap_ms: u64,
+        learn_code_text: bool,
+    ) -> Result<(), KeySequenceError> {
+        state.start_document();
+        let mut run = Vec::<WindowCommit>::new();
+        for event in capsule.events() {
+            let TrackerOutput::Commit(record) = &event.output else {
+                self.finish_personal_cache_learning(state, &mut run, learn_code_text);
+                let TrackerOutput::Revision(revision) = &event.output else {
+                    unreachable!("tracker output has only commit and revision variants");
+                };
+                let outcome = state.apply_document_delta(
+                    revision.change.start,
+                    revision.change.deleted.chars().count(),
+                    revision.change.inserted.chars().count(),
+                    revision.change.position_evidence,
+                );
+                self.observe_personal_cache_edit(outcome, true);
+                continue;
+            };
+            let Some(commit) = prepare_window_commit(decoder, event.elapsed_ms, record)? else {
+                self.finish_personal_cache_learning(state, &mut run, learn_code_text);
+                let outcome = state.apply_document_delta(
+                    record.document_change.start,
+                    record.document_change.deleted.chars().count(),
+                    record.document_change.inserted.chars().count(),
+                    record.document_change.position_evidence,
+                );
+                self.observe_personal_cache_edit(outcome, false);
+                if let Some(words) = prepare_personal_learning_words(decoder, record)? {
+                    self.learn_personal_words(
+                        state,
+                        record.change.start,
+                        record.change.inserted.chars().count(),
+                        &words,
+                    );
+                    self.learn_personal_pairs(
+                        state,
+                        record.change.start,
+                        record
+                            .change
+                            .start
+                            .saturating_add(record.change.inserted.chars().count()),
+                        &words,
+                    );
+                }
+                continue;
+            };
+            let joins_previous = run.last().is_some_and(|previous| {
+                commit.elapsed_ms.saturating_sub(previous.elapsed_ms) <= max_gap_ms
+                    && commit.document_start == previous.document_end()
+            });
+            if !run.is_empty() && !joins_previous {
+                self.finish_personal_cache_learning(state, &mut run, learn_code_text);
+            }
+            run.push(commit);
+        }
+        self.finish_personal_cache_learning(state, &mut run, learn_code_text);
+        Ok(())
     }
 
     fn finish_personal_cache_window(
         &mut self,
         decoder: &Decoder,
         state: &mut PersonalCacheReplayState,
-        kind: PersonalCacheKind,
+        mode: PersonalCacheWindowMode<'_>,
         run: &mut Vec<WindowCommit>,
     ) -> Result<(), KeySequenceError> {
         if run.len() >= 2 {
-            self.observe_personal_cache_window(decoder, state, kind, run)?;
+            if let Some(frozen_state) = mode.frozen_state() {
+                self.observe_personal_cache_comparison_window(
+                    decoder,
+                    frozen_state,
+                    state,
+                    mode.kind(),
+                    run,
+                    mode.includes_code_comparison(),
+                )?;
+            } else {
+                self.observe_personal_cache_window(decoder, state, mode.kind(), run)?;
+            }
         }
+        self.finish_personal_cache_learning(state, run, mode.includes_code_comparison());
+        Ok(())
+    }
+
+    fn finish_personal_cache_learning(
+        &mut self,
+        state: &mut PersonalCacheReplayState,
+        run: &mut Vec<WindowCommit>,
+        learn_code_text: bool,
+    ) {
         for commit in run.iter() {
             let outcome = state.apply_document_delta(
                 commit.document_start,
@@ -1372,9 +1824,27 @@ impl CapsuleReplayReport {
                 .flat_map(|commit| commit.words.iter().cloned())
                 .collect::<Vec<_>>();
             self.learn_personal_pairs(state, first.document_start, last.document_end(), &words);
+            if learn_code_text && run.len() >= 2 {
+                let code = run
+                    .iter()
+                    .map(|commit| commit.observed.as_str())
+                    .collect::<String>();
+                if code.len() <= MAX_REPLAY_CODE_KEYS {
+                    let text = run
+                        .iter()
+                        .map(|commit| commit.target.as_str())
+                        .collect::<String>();
+                    self.learn_personal_code_text(
+                        state,
+                        first.document_start,
+                        last.document_end(),
+                        code,
+                        text,
+                    );
+                }
+            }
         }
         run.clear();
-        Ok(())
     }
 
     fn learn_personal_words(
@@ -1411,6 +1881,20 @@ impl CapsuleReplayReport {
             .saturating_add(u64::try_from(learned_pairs).unwrap_or(u64::MAX));
     }
 
+    fn learn_personal_code_text(
+        &mut self,
+        state: &mut PersonalCacheReplayState,
+        start: usize,
+        end: usize,
+        code: String,
+        text: String,
+    ) {
+        state.learn_code_text(start, end, code, text);
+        self.personal_cache_learning_code_text_tokens = self
+            .personal_cache_learning_code_text_tokens
+            .saturating_add(1);
+    }
+
     fn observe_personal_cache_edit(
         &mut self,
         outcome: PersonalCacheEditOutcome,
@@ -1428,13 +1912,19 @@ impl CapsuleReplayReport {
         self.personal_cache_reversed_word_pairs = self
             .personal_cache_reversed_word_pairs
             .saturating_add(outcome.invalidated_word_pairs);
+        self.personal_cache_reversed_code_text_tokens = self
+            .personal_cache_reversed_code_text_tokens
+            .saturating_add(outcome.invalidated_code_text_tokens);
         if outcome.ambiguous_position {
             self.personal_cache_ambiguous_edits_not_applied = self
                 .personal_cache_ambiguous_edits_not_applied
                 .saturating_add(1);
         }
         if is_revision {
-            if outcome.invalidated_commits > 0 || outcome.invalidated_pair_sequences > 0 {
+            if outcome.invalidated_commits > 0
+                || outcome.invalidated_pair_sequences > 0
+                || outcome.invalidated_code_text_tokens > 0
+            {
                 self.personal_cache_revision_events_with_reversal = self
                     .personal_cache_revision_events_with_reversal
                     .saturating_add(1);
@@ -1477,8 +1967,7 @@ impl CapsuleReplayReport {
         let word_head_code = word_head_anchored(&syllable_codes, &word_lengths);
 
         self.personal_cache_windows = self.personal_cache_windows.saturating_add(1);
-        let baseline_rank = strategy_rank(decoder, &canonical, &target)?;
-        let personal_baseline_rank = observe_strategy_with_personal_cache(
+        let baseline_ranks = observe_strategy_with_personal_cache(
             decoder,
             state,
             kind,
@@ -1486,9 +1975,10 @@ impl CapsuleReplayReport {
             &target,
             &mut self.personal_cache_window_canonical_full,
         )?;
+        let baseline_rank = baseline_ranks.unigram;
+        let personal_baseline_rank = baseline_ranks.personal;
         if let Some(code) = &word_tail_code {
-            let unigram_rank = strategy_rank(decoder, code, &target)?;
-            let personal_rank = observe_strategy_with_personal_cache(
+            let ranks = observe_strategy_with_personal_cache(
                 decoder,
                 state,
                 kind,
@@ -1496,6 +1986,8 @@ impl CapsuleReplayReport {
                 &target,
                 &mut self.personal_cache_window_word_tail_one_short,
             )?;
+            let unigram_rank = ranks.unigram;
+            let personal_rank = ranks.personal;
             self.personal_cache_window_word_tail_one_short_vs_full
                 .observe(&canonical, code, personal_baseline_rank, personal_rank);
             self.word_tail_one_short_personal_cache_effect.observe(
@@ -1506,8 +1998,7 @@ impl CapsuleReplayReport {
             );
         }
         if let Some(code) = &word_tail_keep_singletons_code {
-            let unigram_rank = strategy_rank(decoder, code, &target)?;
-            let personal_rank = observe_strategy_with_personal_cache(
+            let ranks = observe_strategy_with_personal_cache(
                 decoder,
                 state,
                 kind,
@@ -1515,6 +2006,8 @@ impl CapsuleReplayReport {
                 &target,
                 &mut self.personal_cache_window_word_tail_keep_singletons,
             )?;
+            let unigram_rank = ranks.unigram;
+            let personal_rank = ranks.personal;
             self.personal_cache_window_word_tail_keep_singletons_vs_full
                 .observe(&canonical, code, personal_baseline_rank, personal_rank);
             self.word_tail_keep_singletons_personal_cache_effect
@@ -1526,8 +2019,7 @@ impl CapsuleReplayReport {
                 );
         }
         if let Some(code) = &word_head_code {
-            let unigram_rank = strategy_rank(decoder, code, &target)?;
-            let personal_rank = observe_strategy_with_personal_cache(
+            let ranks = observe_strategy_with_personal_cache(
                 decoder,
                 state,
                 kind,
@@ -1535,6 +2027,8 @@ impl CapsuleReplayReport {
                 &target,
                 &mut self.personal_cache_window_word_head_anchored,
             )?;
+            let unigram_rank = ranks.unigram;
+            let personal_rank = ranks.personal;
             self.personal_cache_window_word_head_anchored_vs_full
                 .observe(&canonical, code, personal_baseline_rank, personal_rank);
             self.word_head_anchored_personal_cache_effect.observe(
@@ -1542,6 +2036,207 @@ impl CapsuleReplayReport {
                 unigram_rank,
                 personal_baseline_rank,
                 personal_rank,
+            );
+        }
+        Ok(())
+    }
+
+    fn observe_personal_cache_comparison_window(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &PersonalCacheReplayState,
+        kind: PersonalCacheKind,
+        run: &[WindowCommit],
+        include_code_comparison: bool,
+    ) -> Result<(), KeySequenceError> {
+        let canonical = run
+            .iter()
+            .map(|commit| commit.canonical_full.as_str())
+            .collect::<String>();
+        if canonical.len() > MAX_REPLAY_CODE_KEYS {
+            return Ok(());
+        }
+        let target = run
+            .iter()
+            .map(|commit| commit.target.as_str())
+            .collect::<String>();
+        let syllable_codes = run
+            .iter()
+            .flat_map(|commit| commit.syllable_codes.iter().cloned())
+            .collect::<Vec<_>>();
+        let word_lengths = run
+            .iter()
+            .flat_map(|commit| commit.word_lengths.iter().copied())
+            .collect::<Vec<_>>();
+        let word_tail_code = word_tail_one_short(&syllable_codes, &word_lengths);
+        let word_tail_keep_singletons_code =
+            word_tail_keep_singletons(&syllable_codes, &word_lengths);
+        let word_head_code = word_head_anchored(&syllable_codes, &word_lengths);
+        let mut pool_cache = HashMap::<String, Vec<SentenceCandidate>>::new();
+
+        self.personal_cache_windows = self.personal_cache_windows.saturating_add(1);
+        self.personal_frozen_cache_windows = self.personal_frozen_cache_windows.saturating_add(1);
+        let baseline_pool = decode_personal_pool_memoized(decoder, &mut pool_cache, &canonical)?;
+        let causal_baseline = observe_personal_strategy_from_pool(
+            &baseline_pool,
+            causal_state,
+            kind,
+            &canonical,
+            &target,
+            &mut self.personal_cache_window_canonical_full,
+        );
+        let frozen_baseline = observe_personal_strategy_from_pool(
+            &baseline_pool,
+            frozen_state,
+            kind,
+            &canonical,
+            &target,
+            &mut self.personal_frozen_window_canonical_full,
+        );
+        debug_assert_eq!(causal_baseline.unigram, frozen_baseline.unigram);
+        let baseline_rank = causal_baseline.unigram;
+        if include_code_comparison {
+            self.personal_code_cache_windows = self.personal_code_cache_windows.saturating_add(1);
+            let code_causal = observe_personal_strategy_from_pool(
+                &baseline_pool,
+                causal_state,
+                PersonalCacheKind::ExactCodeText,
+                &canonical,
+                &target,
+                &mut self.personal_code_causal_window_canonical_full,
+            );
+            let code_frozen = observe_personal_strategy_from_pool(
+                &baseline_pool,
+                frozen_state,
+                PersonalCacheKind::ExactCodeText,
+                &canonical,
+                &target,
+                &mut self.personal_code_frozen_window_canonical_full,
+            );
+            debug_assert_eq!(code_causal.unigram, code_frozen.unigram);
+            debug_assert_eq!(code_causal.unigram, baseline_rank);
+            let hybrid = observe_personal_hybrid_strategy_from_pool(
+                &baseline_pool,
+                frozen_state,
+                causal_state,
+                &canonical,
+                &target,
+                &mut self.personal_hybrid_window_canonical_full,
+            );
+            debug_assert_eq!(hybrid.unigram, baseline_rank);
+            self.personal_hybrid_vs_frozen_word
+                .observe(frozen_baseline.personal, hybrid.personal);
+        }
+
+        if let Some(code) = &word_tail_code {
+            let pool = decode_personal_pool_memoized(decoder, &mut pool_cache, code)?;
+            let causal = observe_personal_strategy_from_pool(
+                &pool,
+                causal_state,
+                kind,
+                code,
+                &target,
+                &mut self.personal_cache_window_word_tail_one_short,
+            );
+            let frozen = observe_personal_strategy_from_pool(
+                &pool,
+                frozen_state,
+                kind,
+                code,
+                &target,
+                &mut self.personal_frozen_window_word_tail_one_short,
+            );
+            debug_assert_eq!(causal.unigram, frozen.unigram);
+            self.personal_cache_window_word_tail_one_short_vs_full
+                .observe(&canonical, code, causal_baseline.personal, causal.personal);
+            self.personal_frozen_window_word_tail_one_short_vs_full
+                .observe(&canonical, code, frozen_baseline.personal, frozen.personal);
+            self.word_tail_one_short_personal_cache_effect.observe(
+                baseline_rank,
+                causal.unigram,
+                causal_baseline.personal,
+                causal.personal,
+            );
+            self.word_tail_one_short_personal_frozen_effect.observe(
+                baseline_rank,
+                frozen.unigram,
+                frozen_baseline.personal,
+                frozen.personal,
+            );
+        }
+        if let Some(code) = &word_tail_keep_singletons_code {
+            let pool = decode_personal_pool_memoized(decoder, &mut pool_cache, code)?;
+            let causal = observe_personal_strategy_from_pool(
+                &pool,
+                causal_state,
+                kind,
+                code,
+                &target,
+                &mut self.personal_cache_window_word_tail_keep_singletons,
+            );
+            let frozen = observe_personal_strategy_from_pool(
+                &pool,
+                frozen_state,
+                kind,
+                code,
+                &target,
+                &mut self.personal_frozen_window_word_tail_keep_singletons,
+            );
+            debug_assert_eq!(causal.unigram, frozen.unigram);
+            self.personal_cache_window_word_tail_keep_singletons_vs_full
+                .observe(&canonical, code, causal_baseline.personal, causal.personal);
+            self.personal_frozen_window_word_tail_keep_singletons_vs_full
+                .observe(&canonical, code, frozen_baseline.personal, frozen.personal);
+            self.word_tail_keep_singletons_personal_cache_effect
+                .observe(
+                    baseline_rank,
+                    causal.unigram,
+                    causal_baseline.personal,
+                    causal.personal,
+                );
+            self.word_tail_keep_singletons_personal_frozen_effect
+                .observe(
+                    baseline_rank,
+                    frozen.unigram,
+                    frozen_baseline.personal,
+                    frozen.personal,
+                );
+        }
+        if let Some(code) = &word_head_code {
+            let pool = decode_personal_pool_memoized(decoder, &mut pool_cache, code)?;
+            let causal = observe_personal_strategy_from_pool(
+                &pool,
+                causal_state,
+                kind,
+                code,
+                &target,
+                &mut self.personal_cache_window_word_head_anchored,
+            );
+            let frozen = observe_personal_strategy_from_pool(
+                &pool,
+                frozen_state,
+                kind,
+                code,
+                &target,
+                &mut self.personal_frozen_window_word_head_anchored,
+            );
+            debug_assert_eq!(causal.unigram, frozen.unigram);
+            self.personal_cache_window_word_head_anchored_vs_full
+                .observe(&canonical, code, causal_baseline.personal, causal.personal);
+            self.personal_frozen_window_word_head_anchored_vs_full
+                .observe(&canonical, code, frozen_baseline.personal, frozen.personal);
+            self.word_head_anchored_personal_cache_effect.observe(
+                baseline_rank,
+                causal.unigram,
+                causal_baseline.personal,
+                causal.personal,
+            );
+            self.word_head_anchored_personal_frozen_effect.observe(
+                baseline_rank,
+                frozen.unigram,
+                frozen_baseline.personal,
+                frozen.personal,
             );
         }
         Ok(())
@@ -1599,9 +2294,17 @@ impl CapsuleReplayReport {
             run.clear();
             return Ok(());
         }
-        observe_strategy(decoder, &raw, &target, &mut self.window_raw_joined)?;
-        let baseline_rank = observe_strategy_with_rank(
+        let mut window_decode_cache = HashMap::<String, Vec<SentenceCandidate>>::new();
+        let _ = observe_strategy_with_rank_memoized(
             decoder,
+            &mut window_decode_cache,
+            &raw,
+            &target,
+            &mut self.window_raw_joined,
+        )?;
+        let baseline_rank = observe_strategy_with_rank_memoized(
+            decoder,
+            &mut window_decode_cache,
             &canonical,
             &target,
             &mut self.window_canonical_full,
@@ -1613,8 +2316,9 @@ impl CapsuleReplayReport {
 
         let mut word_tail_rank = None;
         if let Some(code) = &word_tail_code {
-            let strategy_rank = observe_strategy_with_rank(
+            let strategy_rank = observe_strategy_with_rank_memoized(
                 decoder,
+                &mut window_decode_cache,
                 code,
                 &target,
                 &mut self.window_word_tail_one_short,
@@ -1629,8 +2333,9 @@ impl CapsuleReplayReport {
         }
         let mut word_tail_keep_singletons_rank = None;
         if let Some(code) = &word_tail_keep_singletons_code {
-            let strategy_rank = observe_strategy_with_rank(
+            let strategy_rank = observe_strategy_with_rank_memoized(
                 decoder,
+                &mut window_decode_cache,
                 code,
                 &target,
                 &mut self.window_word_tail_keep_singletons,
@@ -1645,8 +2350,9 @@ impl CapsuleReplayReport {
         }
         let mut word_head_rank = None;
         if let Some(code) = &word_head_code {
-            let strategy_rank = observe_strategy_with_rank(
+            let strategy_rank = observe_strategy_with_rank_memoized(
                 decoder,
+                &mut window_decode_cache,
                 code,
                 &target,
                 &mut self.window_word_head_anchored,
@@ -1915,6 +2621,187 @@ impl CapsuleReplayReport {
         )
     }
 
+    pub fn personal_word_comparison_terminal_report(&self) -> String {
+        let mut lines = vec![
+            format!(
+                "PERSONAL_WORD_COMPARISON schema=ziranma-personal-word-comparison-v1 \
+                 contains_text=false contains_behavioral_metadata=true writes=false network=false \
+                 evaluation_learning=frozen_and_causal_online candidate_pool_depth={} \
+                 max_promotion={}",
+                PERSONAL_CACHE_POOL_DEPTH, PERSONAL_CACHE_MAX_PROMOTION
+            ),
+            format!(
+                "HISTORY capsules={} events={} learning_commits={} word_tokens={} word_types={} \
+                 repeated_word_tokens={}",
+                self.personal_cache_history_capsules,
+                self.personal_cache_history_events,
+                self.personal_cache_history_learning_commits,
+                self.personal_cache_history_word_tokens,
+                self.personal_cache_history_word_types,
+                self.personal_cache_history_word_tokens
+                    .saturating_sub(self.personal_cache_history_word_types)
+            ),
+            format!(
+                "EVALUATION capsules={} events={} gap_ms={} eligible_commits={} \
+                 ineligible_commits={} windows={} window_commits={} \
+                 frozen_windows={} causal_learning_commits={} causal_learning_word_tokens={} \
+                 causal_retained_word_tokens={} frozen_evaluation_updates=0",
+                self.capsules,
+                self.events,
+                display_optional(self.window_gap_limit_ms),
+                self.window_eligible_commits,
+                self.window_ineligible_commits,
+                self.continuous_windows,
+                self.continuous_window_commits,
+                self.personal_frozen_cache_windows,
+                self.personal_cache_learning_commits,
+                self.personal_cache_learning_word_tokens,
+                self.personal_cache_retained_word_tokens
+            ),
+            compact_strategy_line(
+                "window_unigram",
+                "canonical_full",
+                &self.window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_word_cache_frozen",
+                "canonical_full",
+                &self.personal_frozen_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_word_cache_causal",
+                "canonical_full",
+                &self.personal_cache_window_canonical_full,
+            ),
+        ];
+        lines.extend([
+            compact_context_comparison_line(
+                "personal_word_cache_frozen",
+                "word_tail_one_short",
+                &self.window_word_tail_one_short_vs_full,
+                &self.personal_frozen_window_word_tail_one_short_vs_full,
+                &self.word_tail_one_short_personal_frozen_effect,
+                &self.personal_frozen_window_word_tail_one_short,
+            ),
+            compact_context_comparison_line(
+                "personal_word_cache_causal",
+                "word_tail_one_short",
+                &self.window_word_tail_one_short_vs_full,
+                &self.personal_cache_window_word_tail_one_short_vs_full,
+                &self.word_tail_one_short_personal_cache_effect,
+                &self.personal_cache_window_word_tail_one_short,
+            ),
+            compact_context_comparison_line(
+                "personal_word_cache_frozen",
+                "word_tail_keep_singletons",
+                &self.window_word_tail_keep_singletons_vs_full,
+                &self.personal_frozen_window_word_tail_keep_singletons_vs_full,
+                &self.word_tail_keep_singletons_personal_frozen_effect,
+                &self.personal_frozen_window_word_tail_keep_singletons,
+            ),
+            compact_context_comparison_line(
+                "personal_word_cache_causal",
+                "word_tail_keep_singletons",
+                &self.window_word_tail_keep_singletons_vs_full,
+                &self.personal_cache_window_word_tail_keep_singletons_vs_full,
+                &self.word_tail_keep_singletons_personal_cache_effect,
+                &self.personal_cache_window_word_tail_keep_singletons,
+            ),
+            compact_context_comparison_line(
+                "personal_word_cache_frozen",
+                "word_head_anchored",
+                &self.window_word_head_anchored_vs_full,
+                &self.personal_frozen_window_word_head_anchored_vs_full,
+                &self.word_head_anchored_personal_frozen_effect,
+                &self.personal_frozen_window_word_head_anchored,
+            ),
+            compact_context_comparison_line(
+                "personal_word_cache_causal",
+                "word_head_anchored",
+                &self.window_word_head_anchored_vs_full,
+                &self.personal_cache_window_word_head_anchored_vs_full,
+                &self.word_head_anchored_personal_cache_effect,
+                &self.personal_cache_window_word_head_anchored,
+            ),
+        ]);
+        lines.join("\n")
+    }
+
+    pub fn personal_code_comparison_terminal_report(&self) -> String {
+        [
+            format!(
+                "PERSONAL_CODE_COMPARISON schema=ziranma-personal-code-comparison-v2 \
+                 contains_text=false contains_behavioral_metadata=true writes=false network=false \
+                 evaluation_learning=frozen_and_causal_online \
+                 code_identity=exact_observed_code_and_window_text decay=none \
+                 hybrid=frozen_word_plus_causal_exact_code \
+                 combined_promotion=bounded_sum candidate_pool_depth={} max_promotion={}",
+                PERSONAL_CACHE_POOL_DEPTH, PERSONAL_CACHE_MAX_PROMOTION
+            ),
+            format!(
+                "HISTORY capsules={} events={} word_tokens={} word_types={} \
+                 code_text_tokens={} code_text_types={} repeated_code_text_tokens={}",
+                self.personal_cache_history_capsules,
+                self.personal_cache_history_events,
+                self.personal_cache_history_word_tokens,
+                self.personal_cache_history_word_types,
+                self.personal_cache_history_code_text_tokens,
+                self.personal_cache_history_code_text_types,
+                self.personal_cache_history_code_text_tokens
+                    .saturating_sub(self.personal_cache_history_code_text_types)
+            ),
+            format!(
+                "EVALUATION capsules={} events={} gap_ms={} windows={} \
+                 code_windows={} causal_code_text_tokens={} retained_code_text_tokens={} \
+                 code_text_types={} reversed_code_text_tokens={} frozen_evaluation_updates=0",
+                self.capsules,
+                self.events,
+                display_optional(self.window_gap_limit_ms),
+                self.continuous_windows,
+                self.personal_code_cache_windows,
+                self.personal_cache_learning_code_text_tokens,
+                self.personal_cache_retained_code_text_tokens,
+                self.personal_cache_learned_code_text_types,
+                self.personal_cache_reversed_code_text_tokens
+            ),
+            compact_strategy_line(
+                "window_unigram",
+                "canonical_full",
+                &self.window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_word_cache_frozen",
+                "canonical_full",
+                &self.personal_frozen_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_word_cache_causal",
+                "canonical_full",
+                &self.personal_cache_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_code_cache_frozen",
+                "canonical_full",
+                &self.personal_code_frozen_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_code_cache_causal",
+                "canonical_full",
+                &self.personal_code_causal_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_hybrid_cache",
+                "canonical_full",
+                &self.personal_hybrid_window_canonical_full,
+            ),
+            compact_ranking_comparison_line(
+                "personal_hybrid_vs_frozen_word",
+                &self.personal_hybrid_vs_frozen_word,
+            ),
+        ]
+        .join("\n")
+    }
+
     pub fn compact_terminal_report(&self) -> String {
         let mut lines = vec![
             format!(
@@ -2143,6 +3030,7 @@ impl CapsuleReplayReport {
     }
 }
 
+#[derive(Clone)]
 struct WindowCommit {
     elapsed_ms: u64,
     document_start: usize,
@@ -2242,16 +3130,6 @@ fn prepare_personal_learning_words(
     .map(|segmentation| segmentation.words))
 }
 
-fn observe_strategy(
-    decoder: &Decoder,
-    code: &str,
-    target: &str,
-    stats: &mut ReplayStrategyStats,
-) -> Result<(), KeySequenceError> {
-    let _ = observe_strategy_with_rank(decoder, code, target, stats)?;
-    Ok(())
-}
-
 fn decode_sentence_memoized(
     decoder: &Decoder,
     cache: &mut HashMap<String, Vec<SentenceCandidate>>,
@@ -2280,8 +3158,9 @@ fn observe_strategy_memoized(
     Ok(())
 }
 
-fn observe_strategy_with_rank(
+fn observe_strategy_with_rank_memoized(
     decoder: &Decoder,
+    cache: &mut HashMap<String, Vec<SentenceCandidate>>,
     code: &str,
     target: &str,
     stats: &mut ReplayStrategyStats,
@@ -2289,23 +3168,8 @@ fn observe_strategy_with_rank(
     if code.len() > MAX_REPLAY_CODE_KEYS {
         return Ok(None);
     }
-    let candidates = decoder.decode_sentence(code, REPLAY_TOP_K)?;
+    let candidates = decode_sentence_memoized(decoder, cache, code)?;
     Ok(stats.observe(code, target, &candidates))
-}
-
-fn strategy_rank(
-    decoder: &Decoder,
-    code: &str,
-    target: &str,
-) -> Result<Option<usize>, KeySequenceError> {
-    if code.len() > MAX_REPLAY_CODE_KEYS {
-        return Ok(None);
-    }
-    let candidates = decoder.decode_sentence(code, REPLAY_TOP_K)?;
-    Ok(candidates
-        .iter()
-        .position(|candidate| candidate.text == target)
-        .map(|rank| rank + 1))
 }
 
 #[derive(Clone, Copy)]
@@ -2317,6 +3181,12 @@ struct PersonalCacheEvidence {
     prior_pair_occurrences: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PersonalStrategyRanks {
+    unigram: Option<usize>,
+    personal: Option<usize>,
+}
+
 fn observe_strategy_with_personal_cache(
     decoder: &Decoder,
     state: &PersonalCacheReplayState,
@@ -2324,16 +3194,76 @@ fn observe_strategy_with_personal_cache(
     code: &str,
     target: &str,
     stats: &mut ReplayStrategyStats,
-) -> Result<Option<usize>, KeySequenceError> {
+) -> Result<PersonalStrategyRanks, KeySequenceError> {
     if code.len() > MAX_REPLAY_CODE_KEYS {
-        return Ok(None);
+        return Ok(PersonalStrategyRanks {
+            unigram: None,
+            personal: None,
+        });
     }
     let pool = decoder.decode_sentence(code, PERSONAL_CACHE_POOL_DEPTH)?;
+    Ok(observe_personal_strategy_from_pool(
+        &pool, state, kind, code, target, stats,
+    ))
+}
+
+fn decode_personal_pool_memoized(
+    decoder: &Decoder,
+    cache: &mut HashMap<String, Vec<SentenceCandidate>>,
+    code: &str,
+) -> Result<Vec<SentenceCandidate>, KeySequenceError> {
+    if let Some(candidates) = cache.get(code) {
+        return Ok(candidates.clone());
+    }
+    let candidates = decoder.decode_sentence(code, PERSONAL_CACHE_POOL_DEPTH)?;
+    cache.insert(code.to_owned(), candidates.clone());
+    Ok(candidates)
+}
+
+fn observe_personal_strategy_from_pool(
+    pool: &[SentenceCandidate],
+    state: &PersonalCacheReplayState,
+    kind: PersonalCacheKind,
+    code: &str,
+    target: &str,
+    stats: &mut ReplayStrategyStats,
+) -> PersonalStrategyRanks {
+    observe_personal_strategy_from_pool_with_evidence(pool, code, target, stats, |candidate| {
+        personal_cache_evidence(candidate, state, kind, code)
+    })
+}
+
+fn observe_personal_hybrid_strategy_from_pool(
+    pool: &[SentenceCandidate],
+    frozen_word_state: &PersonalCacheReplayState,
+    causal_code_state: &PersonalCacheReplayState,
+    code: &str,
+    target: &str,
+    stats: &mut ReplayStrategyStats,
+) -> PersonalStrategyRanks {
+    observe_personal_strategy_from_pool_with_evidence(pool, code, target, stats, |candidate| {
+        personal_hybrid_evidence(candidate, frozen_word_state, causal_code_state, code)
+    })
+}
+
+fn observe_personal_strategy_from_pool_with_evidence(
+    pool: &[SentenceCandidate],
+    code: &str,
+    target: &str,
+    stats: &mut ReplayStrategyStats,
+    mut evidence_for: impl FnMut(&SentenceCandidate) -> PersonalCacheEvidence,
+) -> PersonalStrategyRanks {
+    let unigram = pool
+        .iter()
+        .take(REPLAY_TOP_K)
+        .position(|candidate| candidate.text == target)
+        .map(|rank| rank + 1);
     let mut scored = pool
-        .into_iter()
+        .iter()
+        .cloned()
         .enumerate()
         .map(|(baseline_rank, candidate)| {
-            let evidence = personal_cache_evidence(&candidate, state, kind);
+            let evidence = evidence_for(&candidate);
             (baseline_rank, candidate, evidence)
         })
         .collect::<Vec<_>>();
@@ -2363,14 +3293,60 @@ fn observe_strategy_with_personal_cache(
         .take(REPLAY_TOP_K)
         .map(|(_, candidate, _)| candidate)
         .collect::<Vec<_>>();
-    Ok(stats.observe(code, target, &candidates))
+    let personal = stats.observe(code, target, &candidates);
+    PersonalStrategyRanks { unigram, personal }
+}
+
+fn personal_hybrid_evidence(
+    candidate: &SentenceCandidate,
+    frozen_word_state: &PersonalCacheReplayState,
+    causal_code_state: &PersonalCacheReplayState,
+    code: &str,
+) -> PersonalCacheEvidence {
+    let word = personal_cache_evidence(
+        candidate,
+        frozen_word_state,
+        PersonalCacheKind::WordFrequency,
+        code,
+    );
+    let exact_code = personal_cache_evidence(
+        candidate,
+        causal_code_state,
+        PersonalCacheKind::ExactCodeText,
+        code,
+    );
+    PersonalCacheEvidence {
+        promotion: word
+            .promotion
+            .saturating_add(exact_code.promotion)
+            .min(PERSONAL_CACHE_MAX_PROMOTION),
+        observed_word_tokens: word
+            .observed_word_tokens
+            .saturating_add(exact_code.observed_word_tokens),
+        prior_occurrences: word
+            .prior_occurrences
+            .saturating_add(exact_code.prior_occurrences),
+        observed_word_pairs: 0,
+        prior_pair_occurrences: 0,
+    }
 }
 
 fn personal_cache_evidence(
     candidate: &SentenceCandidate,
     state: &PersonalCacheReplayState,
     kind: PersonalCacheKind,
+    code: &str,
 ) -> PersonalCacheEvidence {
+    if kind == PersonalCacheKind::ExactCodeText {
+        let prior_occurrences = state.code_text_count(code, &candidate.text);
+        return PersonalCacheEvidence {
+            promotion: personal_promotion(prior_occurrences),
+            observed_word_tokens: usize::from(prior_occurrences > 0),
+            prior_occurrences,
+            observed_word_pairs: 0,
+            prior_pair_occurrences: 0,
+        };
+    }
     let mut observed_word_tokens = 0_usize;
     let mut prior_occurrences = 0_u64;
     let mut observed_word_pairs = 0_usize;
@@ -2397,12 +3373,7 @@ fn personal_cache_evidence(
             prior_occurrences = prior_occurrences.saturating_add(count);
         }
     }
-    let word_promotion = match prior_occurrences {
-        0 => 0,
-        1 => 1,
-        2..=3 => 2,
-        _ => PERSONAL_CACHE_MAX_PROMOTION,
-    };
+    let word_promotion = personal_promotion(prior_occurrences);
     let pair_promotion = match prior_pair_occurrences {
         0 => 0,
         1 => 1,
@@ -2417,6 +3388,15 @@ fn personal_cache_evidence(
         prior_occurrences,
         observed_word_pairs,
         prior_pair_occurrences,
+    }
+}
+
+fn personal_promotion(prior_occurrences: u64) -> usize {
+    match prior_occurrences {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        _ => PERSONAL_CACHE_MAX_PROMOTION,
     }
 }
 
@@ -2889,13 +3869,16 @@ mod tests {
     use super::{
         CapsuleReplayReport, ContextReplayComparisonStats, PairedReplayStrategyStats,
         PersonalCacheKind, PersonalCacheReplayError, PersonalCacheReplayState,
-        RankingReplayComparisonStats, ReplayStrategyStats, effective_letter_code,
-        observe_strategy_with_personal_cache,
+        RankingReplayComparisonStats, ReplayStrategyStats, decode_personal_pool_memoized,
+        effective_letter_code, observe_personal_hybrid_strategy_from_pool,
+        observe_personal_strategy_from_pool, observe_strategy_with_personal_cache,
+        personal_cache_evidence, personal_hybrid_evidence,
     };
     use crate::{
         CommitRecord, DeltaPositionEvidence, EventCapsuleV1, RawKey, TextDelta, TimedTrackerOutput,
         TrackerOutput, parse_lexicon_tsv,
     };
+    use std::collections::HashMap;
 
     const LEXICON: &str = "\
 text\tpinyin\tfrequency
@@ -3539,6 +4522,382 @@ text\tpinyin\tfrequency
     }
 
     #[test]
+    fn compact_personal_path_matches_full_metrics_without_hidden_commit_lanes() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let capsule = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+            revision_event(300, 3, "", "，"),
+            commit_event(10_000, 4, "zl", "zai", "在"),
+            commit_event(10_100, 5, "mkmk", "mao'mao", "猫猫"),
+        ])
+        .unwrap();
+        let mut full_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        let mut full_state = PersonalCacheReplayState::new();
+        full_report
+            .observe_capsule_with_personal_cache(&decoder, &mut full_state, &capsule)
+            .unwrap();
+        let mut compact_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        let mut compact_state = PersonalCacheReplayState::new();
+        compact_report
+            .observe_capsule_with_compact_personal_cache(&decoder, &mut compact_state, &capsule)
+            .unwrap();
+
+        assert_eq!(
+            compact_report.compact_terminal_report(),
+            full_report.compact_terminal_report()
+        );
+        assert!(full_report.raw_existing.attempts > 0);
+        assert_eq!(compact_report.raw_existing.attempts, 0);
+        assert_eq!(format!("{compact_state:?}"), format!("{full_state:?}"));
+    }
+
+    #[test]
+    fn frozen_and_causal_word_caches_share_history_then_diverge_only_after_learning() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let first_evaluation = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+        ])
+        .unwrap();
+        let second_evaluation = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+        ])
+        .unwrap();
+        let mut causal_state = PersonalCacheReplayState::new();
+        let frozen_state = causal_state.fork_for_frozen_evaluation();
+        assert_eq!(frozen_state.word_counts, causal_state.word_counts);
+        assert_eq!(
+            frozen_state.learned_word_tokens,
+            causal_state.learned_word_tokens
+        );
+        let frozen_before = format!("{frozen_state:?}");
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+
+        report
+            .observe_capsule_with_personal_word_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &first_evaluation,
+            )
+            .unwrap();
+        assert_eq!(
+            report.personal_frozen_window_canonical_full,
+            report.personal_cache_window_canonical_full
+        );
+        assert_eq!(causal_state.learned_word_tokens(), 2);
+        report
+            .observe_capsule_with_personal_word_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &second_evaluation,
+            )
+            .unwrap();
+
+        assert_eq!(report.continuous_windows, 2);
+        assert_eq!(report.personal_cache_windows, 2);
+        assert_eq!(report.personal_frozen_cache_windows, 2);
+        assert_eq!(report.window_canonical_full.hits_at_1, 0);
+        assert_eq!(report.personal_frozen_window_canonical_full.hits_at_1, 0);
+        assert_eq!(report.personal_cache_window_canonical_full.hits_at_1, 1);
+        assert_eq!(
+            report.personal_frozen_window_canonical_full.attempts,
+            report.personal_cache_window_canonical_full.attempts
+        );
+        assert_eq!(format!("{frozen_state:?}"), frozen_before);
+        assert_eq!(frozen_state.learned_word_tokens(), 0);
+        assert_eq!(causal_state.learned_word_tokens(), 4);
+
+        let compact = report.personal_word_comparison_terminal_report();
+        assert!(compact.contains("evaluation_learning=frozen_and_causal_online"));
+        assert!(compact.contains("scope=window_unigram name=canonical_full"));
+        assert!(compact.contains("scope=window_personal_word_cache_frozen name=canonical_full"));
+        assert!(compact.contains("scope=window_personal_word_cache_causal name=canonical_full"));
+        assert!(compact.contains("frozen_evaluation_updates=0"));
+        assert!(!compact.contains("在"));
+        assert!(!compact.contains("猫"));
+        assert!(!compact.contains("zai"));
+        assert!(!compact.contains("mao"));
+    }
+
+    #[test]
+    fn frozen_word_cache_copies_counts_but_not_history_document_spans() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let history = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+        ])
+        .unwrap();
+        let mut history_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        let mut causal_state = PersonalCacheReplayState::new();
+        history_report
+            .learn_capsule_for_personal_cache(&decoder, &mut causal_state, &history)
+            .unwrap();
+        assert!(!causal_state.active_document_spans.is_empty());
+        assert!(!causal_state.active_pair_spans.is_empty());
+
+        let frozen_state = causal_state.fork_for_frozen_evaluation();
+
+        assert_eq!(frozen_state.word_counts, causal_state.word_counts);
+        assert_eq!(frozen_state.pair_counts, causal_state.pair_counts);
+        assert_eq!(
+            frozen_state.learned_word_tokens,
+            causal_state.learned_word_tokens
+        );
+        assert_eq!(
+            frozen_state.learned_word_pairs,
+            causal_state.learned_word_pairs
+        );
+        assert!(frozen_state.active_document_spans.is_empty());
+        assert!(frozen_state.active_pair_spans.is_empty());
+    }
+
+    #[test]
+    fn exact_code_text_evidence_cannot_promote_the_same_candidate_under_another_code() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("zlmkmk", super::PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        let mut state = PersonalCacheReplayState::new();
+        for _ in 0..4 {
+            state.learn_code_text(0, 3, "zlmkmk".to_owned(), "在猫猫".to_owned());
+        }
+        let mut matching_stats = ReplayStrategyStats::default();
+        let matching = observe_personal_strategy_from_pool(
+            &pool,
+            &state,
+            PersonalCacheKind::ExactCodeText,
+            "zlmkmk",
+            "在猫猫",
+            &mut matching_stats,
+        );
+        let mut other_stats = ReplayStrategyStats::default();
+        let other = observe_personal_strategy_from_pool(
+            &pool,
+            &state,
+            PersonalCacheKind::ExactCodeText,
+            "unrelated",
+            "在猫猫",
+            &mut other_stats,
+        );
+
+        assert_eq!(matching.personal, Some(1));
+        assert_eq!(other.personal, other.unigram);
+        assert_ne!(matching.personal, other.personal);
+        assert_eq!(state.learned_code_text_types(), 1);
+        assert_eq!(state.learned_code_text_tokens(), 4);
+    }
+
+    #[test]
+    fn hybrid_personal_evidence_shares_one_promotion_budget() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("zlmkmk", super::PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        let candidate = pool
+            .iter()
+            .find(|candidate| candidate.text == "在猫猫")
+            .unwrap();
+        let mut frozen_word_state = PersonalCacheReplayState::new();
+        let mut causal_code_state = PersonalCacheReplayState::new();
+        for index in 0..4 {
+            frozen_word_state.learn_commit(index, 3, &["在".to_owned(), "猫猫".to_owned()]);
+            causal_code_state.learn_code_text(
+                index,
+                index + 3,
+                "zlmkmk".to_owned(),
+                "在猫猫".to_owned(),
+            );
+        }
+
+        let word = personal_cache_evidence(
+            candidate,
+            &frozen_word_state,
+            PersonalCacheKind::WordFrequency,
+            "zlmkmk",
+        );
+        let exact = personal_cache_evidence(
+            candidate,
+            &causal_code_state,
+            PersonalCacheKind::ExactCodeText,
+            "zlmkmk",
+        );
+        let hybrid =
+            personal_hybrid_evidence(candidate, &frozen_word_state, &causal_code_state, "zlmkmk");
+
+        assert_eq!(word.promotion, super::PERSONAL_CACHE_MAX_PROMOTION);
+        assert_eq!(exact.promotion, super::PERSONAL_CACHE_MAX_PROMOTION);
+        assert_eq!(hybrid.promotion, super::PERSONAL_CACHE_MAX_PROMOTION);
+    }
+
+    #[test]
+    fn hybrid_without_exact_code_evidence_matches_frozen_word_ranking() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("zlmkmk", super::PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        let mut frozen_word_state = PersonalCacheReplayState::new();
+        frozen_word_state.learn_commit(0, 3, &["在".to_owned(), "猫猫".to_owned()]);
+        let causal_code_state = PersonalCacheReplayState::new();
+        let mut word_stats = ReplayStrategyStats::default();
+        let word = observe_personal_strategy_from_pool(
+            &pool,
+            &frozen_word_state,
+            PersonalCacheKind::WordFrequency,
+            "zlmkmk",
+            "在猫猫",
+            &mut word_stats,
+        );
+        let mut hybrid_stats = ReplayStrategyStats::default();
+        let hybrid = observe_personal_hybrid_strategy_from_pool(
+            &pool,
+            &frozen_word_state,
+            &causal_code_state,
+            "zlmkmk",
+            "在猫猫",
+            &mut hybrid_stats,
+        );
+
+        assert_eq!(hybrid, word);
+        assert_eq!(hybrid_stats, word_stats);
+    }
+
+    #[test]
+    fn hybrid_without_word_evidence_matches_exact_code_ranking() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("zlmkmk", super::PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        let frozen_word_state = PersonalCacheReplayState::new();
+        let mut causal_code_state = PersonalCacheReplayState::new();
+        causal_code_state.learn_code_text(0, 3, "zlmkmk".to_owned(), "在猫猫".to_owned());
+        let mut exact_stats = ReplayStrategyStats::default();
+        let exact = observe_personal_strategy_from_pool(
+            &pool,
+            &causal_code_state,
+            PersonalCacheKind::ExactCodeText,
+            "zlmkmk",
+            "在猫猫",
+            &mut exact_stats,
+        );
+        let mut hybrid_stats = ReplayStrategyStats::default();
+        let hybrid = observe_personal_hybrid_strategy_from_pool(
+            &pool,
+            &frozen_word_state,
+            &causal_code_state,
+            "zlmkmk",
+            "在猫猫",
+            &mut hybrid_stats,
+        );
+
+        assert_eq!(hybrid, exact);
+        assert_eq!(hybrid_stats, exact_stats);
+    }
+
+    #[test]
+    fn code_comparison_shares_history_and_reverses_an_edited_online_window() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let history = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+        ])
+        .unwrap();
+        let evaluation = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+            revision_event(300, 0, "在", ""),
+        ])
+        .unwrap();
+        let mut causal_state = PersonalCacheReplayState::new();
+        let mut history_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        history_report
+            .learn_capsule_for_personal_code_comparison(&decoder, &mut causal_state, &history)
+            .unwrap();
+        assert_eq!(causal_state.learned_code_text_types(), 1);
+        assert_eq!(causal_state.learned_code_text_tokens(), 1);
+        let frozen_state = causal_state.fork_for_frozen_evaluation();
+        let frozen_before = format!("{frozen_state:?}");
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        report.record_personal_cache_history(&history_report, &causal_state);
+
+        report
+            .observe_capsule_with_personal_code_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &evaluation,
+            )
+            .unwrap();
+
+        assert_eq!(report.personal_code_cache_windows, 1);
+        assert_eq!(
+            report.personal_code_frozen_window_canonical_full.attempts,
+            1
+        );
+        assert_eq!(
+            report.personal_code_causal_window_canonical_full.attempts,
+            1
+        );
+        assert_eq!(report.personal_hybrid_window_canonical_full.attempts, 1);
+        assert_eq!(report.personal_hybrid_vs_frozen_word.comparisons, 1);
+        assert_eq!(report.personal_cache_history_code_text_tokens, 1);
+        assert_eq!(report.personal_cache_history_code_text_types, 1);
+        assert_eq!(report.personal_cache_learning_code_text_tokens, 1);
+        assert_eq!(report.personal_cache_reversed_code_text_tokens, 1);
+        assert_eq!(causal_state.learned_code_text_tokens(), 1);
+        assert_eq!(format!("{frozen_state:?}"), frozen_before);
+
+        let compact = report.personal_code_comparison_terminal_report();
+        assert!(compact.contains("code_identity=exact_observed_code_and_window_text"));
+        assert!(compact.contains("decay=none"));
+        assert!(compact.contains("combined_promotion=bounded_sum"));
+        assert!(compact.contains("scope=window_personal_code_cache_frozen"));
+        assert!(compact.contains("scope=window_personal_code_cache_causal"));
+        assert!(compact.contains("scope=window_personal_hybrid_cache"));
+        assert!(compact.contains("context=personal_hybrid_vs_frozen_word"));
+        assert!(!compact.contains("在"));
+        assert!(!compact.contains("猫"));
+        assert!(!compact.contains("zai"));
+        assert!(!compact.contains("mao"));
+    }
+
+    #[test]
+    fn shared_personal_pool_matches_the_independent_word_cache_path() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let mut state = PersonalCacheReplayState::new();
+        state.learn_commit(0, 1, &["在".to_owned()]);
+        state.learn_commit(1, 2, &["猫猫".to_owned()]);
+        let mut cache = HashMap::new();
+        let pool = decode_personal_pool_memoized(&decoder, &mut cache, "zlmkmk").unwrap();
+        let mut shared_stats = ReplayStrategyStats::default();
+        let shared = observe_personal_strategy_from_pool(
+            &pool,
+            &state,
+            PersonalCacheKind::WordFrequency,
+            "zlmkmk",
+            "在猫猫",
+            &mut shared_stats,
+        );
+        let mut independent_stats = ReplayStrategyStats::default();
+        let independent = observe_strategy_with_personal_cache(
+            &decoder,
+            &state,
+            PersonalCacheKind::WordFrequency,
+            "zlmkmk",
+            "在猫猫",
+            &mut independent_stats,
+        )
+        .unwrap();
+
+        assert_eq!(shared, independent);
+        assert_eq!(shared_stats, independent_stats);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
     fn ordered_word_pair_evidence_adds_signal_without_raising_the_promotion_cap() {
         let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
         let mut state = PersonalCacheReplayState::new();
@@ -3570,11 +4929,36 @@ text\tpinyin\tfrequency
             &mut pair_stats,
         )
         .unwrap();
+        let ordinary_rank = decoder
+            .decode_sentence("zlmkmk", super::REPLAY_TOP_K)
+            .unwrap()
+            .iter()
+            .position(|candidate| candidate.text == "在猫猫")
+            .map(|rank| rank + 1);
 
-        assert_eq!(word_rank, Some(3));
-        assert_eq!(pair_rank, Some(2));
-        assert!(pair_rank < word_rank);
+        assert_eq!(word_rank.unigram, ordinary_rank);
+        assert_eq!(word_rank.unigram, pair_rank.unigram);
+        assert_eq!(word_rank.personal, Some(3));
+        assert_eq!(pair_rank.personal, Some(2));
+        assert!(pair_rank.personal < word_rank.personal);
         assert_eq!(pair_stats.hits_at_5, 1);
+    }
+
+    #[test]
+    fn bounded_personal_promotion_has_an_exact_candidate_pool_depth() {
+        assert_eq!(
+            super::PERSONAL_CACHE_POOL_DEPTH,
+            super::REPLAY_TOP_K + super::PERSONAL_CACHE_MAX_PROMOTION
+        );
+        let best_omitted_adjusted_rank =
+            super::PERSONAL_CACHE_POOL_DEPTH - super::PERSONAL_CACHE_MAX_PROMOTION;
+        assert_eq!(best_omitted_adjusted_rank, super::REPLAY_TOP_K);
+        for baseline_rank in 0..super::REPLAY_TOP_K {
+            assert!(
+                baseline_rank < best_omitted_adjusted_rank,
+                "the original Top-K must remain ahead of every omitted candidate"
+            );
+        }
     }
 
     #[test]
@@ -3661,6 +5045,72 @@ text\tpinyin\tfrequency
         assert!(!compact.contains("猫"));
         assert!(!compact.contains("zai"));
         assert!(!compact.contains("mao"));
+    }
+
+    #[test]
+    fn training_only_history_preserves_learning_and_retraction_state() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let history = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+            revision_event(300, 0, "在", ""),
+            revision_event(400, 1, "猫", ""),
+        ])
+        .unwrap();
+        let mut full_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        let mut full_state = PersonalCacheReplayState::new();
+        full_report
+            .observe_capsule_with_personal_pair_cache(&decoder, &mut full_state, &history)
+            .unwrap();
+        let mut training_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        let mut training_state = PersonalCacheReplayState::new();
+        training_report
+            .learn_capsule_for_personal_cache(&decoder, &mut training_state, &history)
+            .unwrap();
+
+        assert_eq!(training_report.capsules, full_report.capsules);
+        assert_eq!(training_report.events, full_report.events);
+        assert_eq!(
+            training_report.personal_cache_learning_commits,
+            full_report.personal_cache_learning_commits
+        );
+        assert_eq!(
+            training_report.personal_cache_learning_word_tokens,
+            full_report.personal_cache_learning_word_tokens
+        );
+        assert_eq!(
+            training_report.personal_cache_reversed_commits,
+            full_report.personal_cache_reversed_commits
+        );
+        assert_eq!(
+            training_report.personal_cache_reversed_word_tokens,
+            full_report.personal_cache_reversed_word_tokens
+        );
+        assert_eq!(
+            training_report.personal_cache_learning_pair_sequences,
+            full_report.personal_cache_learning_pair_sequences
+        );
+        assert_eq!(
+            training_report.personal_cache_learning_word_pairs,
+            full_report.personal_cache_learning_word_pairs
+        );
+        assert_eq!(
+            training_report.personal_cache_reversed_pair_sequences,
+            full_report.personal_cache_reversed_pair_sequences
+        );
+        assert_eq!(
+            training_report.personal_cache_reversed_word_pairs,
+            full_report.personal_cache_reversed_word_pairs
+        );
+        assert_eq!(
+            training_report.personal_cache_revision_events_with_reversal,
+            full_report.personal_cache_revision_events_with_reversal
+        );
+        assert_eq!(
+            training_report.personal_cache_revisions_not_reversed,
+            full_report.personal_cache_revisions_not_reversed
+        );
+        assert_eq!(format!("{training_state:?}"), format!("{full_state:?}"));
     }
 
     #[test]
