@@ -61,8 +61,10 @@ cargo run --release --bin candidatectl -- inspect `
 ## 确定性生成
 
 `candidatectl build` 只接受显式 `--public`、一个普通 UTF-8 TSV、完整公开来源
-声明和一个尚不存在的输出目录。它先检查源文件字节是否等于操作者显式提供的
-SHA-256，再严格解析词典，生成清单与来源侧车，最后从新目录完整回读三份材料：
+声明和一个尚不存在的输出目录。`build-rime` 接受同样的来源声明，但把一个
+固定版本的 Rime 词典 YAML 先经仓库内的严格解析器转换成规范 TSV。两条命令都
+先检查源文件精确字节是否等于操作者显式提供的 SHA-256，再生成清单与来源
+侧车，最后从新目录完整回读三份材料：
 
 ```powershell
 cargo run --release --bin candidatectl -- build `
@@ -73,6 +75,22 @@ cargo run --release --bin candidatectl -- build `
   --source-license MPL-2.0 `
   --source-url https://github.com/hewzhew/ziranma-decoder `
   --source-sha256 b7b65f5b9e826fdb4075089f26c4051575fa6a7b197be0d1da8d6ff8d714e100 `
+  --public
+```
+
+Rime 导入不会扫描配方、用户目录或相邻词典，也不会执行 YAML 指令；输入必须
+是操作者明确点名的普通文件。输出顺序与规范频率由同一个解析器确定，因此同一
+源字节、版本和来源声明会得到同一候选载荷：
+
+```powershell
+cargo run --release --bin candidatectl -- build-rime `
+  --source .local/sources/pinyin_simp.dict.yaml `
+  --output .local/candidate-rime-v1 `
+  --revision rime-pinyin-simp-<PIN>-tsf-v1 `
+  --source-id rime-pinyin-simp `
+  --source-license Apache-2.0 `
+  --source-url https://github.com/rime/rime-pinyin-simp `
+  --source-sha256 <固定源文件的 SHA-256> `
   --public
 ```
 
@@ -213,8 +231,17 @@ cargo run --release --bin candidatectl -- adopt `
 - 精确的载荷字节数、FNV-1a 64 位指纹和解析后词条数。
 
 载荷与描述符中较大的字节数不得超过 16 MiB，标注词条数必须位于
-1～131,072。字节数、指纹或实际词条数任一不符都会拒绝；候选接口只接受
-第 1～10 名。
+1～131,072。字节数、指纹或实际词条数任一不符都会拒绝；候选接口最多接受
+第 1～50 名。交互宿主应先请求两页所需的浅层结果，再随用户翻页逐步扩大，
+不应在每次组合更新时固定计算 Top-50。交互快照先列出任意长度的完整、零纠错、
+不简写词典项，再追加连续句子解码结果并按文字去重；因此准确完整码不会被大量
+高频自由简写路径挤出可见边界。例如 `cj` 同时可以解释为完整的 `can` 与
+`c + j` 简拼，前者先显示，后者仍保留。无歧义的 `ju` / `qu` / `xu` / `yu`
+拼音写法还允许第二键 `u` 沿用规范自然码的 `v` 词条，不占用纠错预算。
+这个交互合并不改变研究解码器的原始句子评分。交互宿主还可以显式请求单独的
+相邻换序恢复视图；该视图
+不并入普通候选顺序。它在最多 16 键内逐一尝试一处相邻交换，只保留不需要
+第二次纠错、完全由词典解释且使用完整双拼或锚定尾简的候选。
 
 清单内的 FNV-1a 只用于普通损坏检测，不承担安全含义。外部包的内部目录标识
 截取自三份精确材料的 SHA-256，完整 SHA-256 同时写入预检凭据；这可以绑定

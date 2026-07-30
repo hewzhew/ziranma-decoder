@@ -27,7 +27,7 @@ use ziranma_core::{
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
     candidate_package_authentication_sha256, candidate_package_storage_id,
-    candidate_preflight_receipt_body, candidate_sha256_hex, parse_lexicon_tsv,
+    candidate_preflight_receipt_body, candidate_sha256_hex, parse_lexicon_tsv, parse_rime_lexicon,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -39,6 +39,12 @@ enum Options {
         provenance: PathBuf,
     },
     Build {
+        source: PathBuf,
+        output: PathBuf,
+        revision: String,
+        declaration: PublicSourceDeclaration,
+    },
+    BuildRime {
         source: PathBuf,
         output: PathBuf,
         revision: String,
@@ -130,6 +136,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             revision,
             declaration,
         } => build_public_package(&source, &output, &revision, &declaration)?,
+        Options::BuildRime {
+            source,
+            output,
+            revision,
+            declaration,
+        } => build_rime_public_package(&source, &output, &revision, &declaration)?,
         Options::Preflight { package } => preflight(&package)?,
         Options::Verify {
             package,
@@ -184,7 +196,8 @@ fn parse_options(
 
     match command.as_str() {
         "inspect" => parse_inspect(arguments),
-        "build" => parse_build(arguments),
+        "build" => parse_build(arguments, false),
+        "build-rime" => parse_build(arguments, true),
         "preflight" => Ok(Options::Preflight {
             package: parse_package_only(arguments, "preflight")?,
         }),
@@ -271,6 +284,7 @@ fn parse_inspect(
 
 fn parse_build(
     mut arguments: impl Iterator<Item = String>,
+    rime: bool,
 ) -> Result<Options, Box<dyn std::error::Error>> {
     let mut source = None;
     let mut output = None;
@@ -310,16 +324,29 @@ fn parse_build(
             "build requires explicit --public; private package building is unavailable".into(),
         );
     }
-    Ok(Options::Build {
-        source: source.ok_or("build requires exactly one --source path")?,
-        output: output.ok_or("build requires exactly one --output path")?,
-        revision: revision.ok_or("build requires exactly one --revision value")?,
-        declaration: PublicSourceDeclaration {
-            id: source_id.ok_or("build requires exactly one --source-id value")?,
-            license: source_license.ok_or("build requires exactly one --source-license value")?,
-            url: source_url.ok_or("build requires exactly one --source-url value")?,
-            sha256: source_sha256.ok_or("build requires exactly one --source-sha256 value")?,
-        },
+    let source = source.ok_or("build requires exactly one --source path")?;
+    let output = output.ok_or("build requires exactly one --output path")?;
+    let revision = revision.ok_or("build requires exactly one --revision value")?;
+    let declaration = PublicSourceDeclaration {
+        id: source_id.ok_or("build requires exactly one --source-id value")?,
+        license: source_license.ok_or("build requires exactly one --source-license value")?,
+        url: source_url.ok_or("build requires exactly one --source-url value")?,
+        sha256: source_sha256.ok_or("build requires exactly one --source-sha256 value")?,
+    };
+    Ok(if rime {
+        Options::BuildRime {
+            source,
+            output,
+            revision,
+            declaration,
+        }
+    } else {
+        Options::Build {
+            source,
+            output,
+            revision,
+            declaration,
+        }
     })
 }
 
@@ -542,6 +569,9 @@ fn print_usage() {
     eprintln!(
         "  build --source <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
+    eprintln!(
+        "  build-rime --source <RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
+    );
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!("  verify --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
@@ -588,7 +618,6 @@ fn build_public_package(
     revision: &str,
     declaration: &PublicSourceDeclaration,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    ensure_path_absent(output, "package output")?;
     let payload = read_explicit_text(
         source,
         "public lexicon source",
@@ -597,7 +626,43 @@ fn build_public_package(
     if candidate_sha256_hex(payload.as_bytes()) != declaration.sha256 {
         return Err("public lexicon source SHA-256 does not match the explicit pin".into());
     }
-    let manifest = CandidatePackageManifest::from_payload(revision, false, &payload)?;
+    write_public_package(output, revision, declaration, &payload)
+}
+
+fn build_rime_public_package(
+    source: &Path,
+    output: &Path,
+    revision: &str,
+    declaration: &PublicSourceDeclaration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        source,
+        "public Rime lexicon source",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    if candidate_sha256_hex(source_text.as_bytes()) != declaration.sha256 {
+        return Err("public Rime source SHA-256 does not match the explicit pin".into());
+    }
+    let imported = parse_rime_lexicon(&source_text)?;
+    let mut payload = String::from("text\tpinyin\tfrequency\n");
+    for entry in imported.entries {
+        writeln!(
+            payload,
+            "{}\t{}\t{}",
+            entry.text, entry.pinyin, entry.frequency
+        )?;
+    }
+    write_public_package(output, revision, declaration, &payload)
+}
+
+fn write_public_package(
+    output: &Path,
+    revision: &str,
+    declaration: &PublicSourceDeclaration,
+    payload: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    ensure_path_absent(output, "package output")?;
+    let manifest = CandidatePackageManifest::from_payload(revision, false, payload)?;
     let manifest_text = manifest.render();
     let provenance_text = CandidatePackageProvenance::from_materials(
         &declaration.id,
@@ -605,7 +670,7 @@ fn build_public_package(
         &declaration.url,
         &declaration.sha256,
         &manifest_text,
-        &payload,
+        payload,
     )?
     .render();
 
@@ -1283,6 +1348,7 @@ mod tests {
 
     const MANIFEST: &str = include_str!("../../tests/fixtures/public/demo_candidate_manifest.zcm");
     const LEXICON: &str = include_str!("../../tests/fixtures/public/demo_lexicon.tsv");
+    const RIME_LEXICON: &str = "---\nname: test\n...\n亲\tqin\t6778\n清\tqing\t6000\n請\tqing\t0\n";
     const PROVENANCE: &str =
         include_str!("../../tests/fixtures/public/demo_candidate_provenance.zcp");
 
@@ -1378,6 +1444,28 @@ mod tests {
             }
         );
         assert!(parse_options(["build".to_owned()]).is_err());
+        assert!(matches!(
+            parse_options([
+                "build-rime".to_owned(),
+                "--revision".to_owned(),
+                "rime-v1".to_owned(),
+                "--public".to_owned(),
+                "--source".to_owned(),
+                "pinyin.dict.yaml".to_owned(),
+                "--output".to_owned(),
+                "package".to_owned(),
+                "--source-id".to_owned(),
+                "rime-pinyin-simp".to_owned(),
+                "--source-license".to_owned(),
+                "Apache-2.0".to_owned(),
+                "--source-url".to_owned(),
+                "https://github.com/rime/rime-pinyin-simp".to_owned(),
+                "--source-sha256".to_owned(),
+                candidate_sha256_hex(RIME_LEXICON.as_bytes()),
+            ])
+            .unwrap(),
+            Options::BuildRime { .. }
+        ));
         assert_eq!(
             parse_options([
                 "inspect".to_owned(),
@@ -1523,6 +1611,38 @@ mod tests {
         );
         let error = parse_options(["secret-command".to_owned()]).unwrap_err();
         assert!(!error.to_string().contains("secret-command"));
+    }
+
+    #[test]
+    fn rime_build_pins_source_and_emits_a_canonical_candidate_payload() {
+        let root = temporary_test_root();
+        let source = root.join("pinyin.dict.yaml");
+        let package = root.join("package");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, RIME_LEXICON).unwrap();
+        let declaration = PublicSourceDeclaration {
+            id: "rime-pinyin-simp".to_owned(),
+            license: "Apache-2.0".to_owned(),
+            url: "https://github.com/rime/rime-pinyin-simp".to_owned(),
+            sha256: candidate_sha256_hex(RIME_LEXICON.as_bytes()),
+        };
+
+        build_rime_public_package(&source, &package, "rime-v1", &declaration).unwrap();
+        let loaded = load_public_package_directory(&package).unwrap();
+        assert_eq!(loaded.provenance.source_sha256(), declaration.sha256);
+        assert_eq!(
+            loaded
+                .snapshot
+                .candidate_texts("qn", 10)
+                .unwrap()
+                .first()
+                .map(String::as_str),
+            Some("亲")
+        );
+        assert!(loaded.payload_text.starts_with("text\tpinyin\tfrequency\n"));
+        assert!(loaded.payload_text.contains("請\tqing\t1\n"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

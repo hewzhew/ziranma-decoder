@@ -3,10 +3,14 @@
 //! This layer validates already-available bytes. It deliberately performs no
 //! file discovery, persistence, decryption, learning, or network access.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
-use crate::{Decoder, KeySequenceError, parse_lexicon_tsv};
+use crate::{
+    Decoder, KeySequence, KeySequenceError, parse_lexicon_tsv,
+    spelling_is_complete_or_anchored_suffix,
+};
 
 /// First read-only candidate snapshot schema.
 pub const CANDIDATE_SNAPSHOT_SCHEMA_V1: &str = "ziranma-candidate-snapshot-v1";
@@ -15,8 +19,12 @@ pub const MAX_CANDIDATE_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum entries accepted before constructing the decoder index.
 pub const MAX_CANDIDATE_SNAPSHOT_ENTRIES: usize = 131_072;
 /// Maximum candidate rank exposed by the interactive snapshot interface.
-pub const MAX_CANDIDATE_SNAPSHOT_RANK: usize = 10;
+///
+/// Interactive hosts may reveal this bounded frontier lazily; they should not
+/// request all ranks on every composition update.
+pub const MAX_CANDIDATE_SNAPSHOT_RANK: usize = 50;
 const MAX_CANDIDATE_SNAPSHOT_REVISION_BYTES: usize = 64;
+const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
 
 /// Metadata and payload supplied explicitly to the snapshot validator.
 #[derive(Clone, Copy, Debug)]
@@ -148,14 +156,10 @@ impl CandidateSnapshot {
         if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&rank) {
             return Ok(None);
         }
-        let candidates = self.decoder.decode_sentence(code, rank)?;
-        let Some(candidate) = candidates.get(rank - 1) else {
-            return Ok(None);
-        };
-        if candidate.unresolved_key_count == 0 {
-            return Ok(Some(candidate.text.clone()));
-        }
-        Ok((rank == 1).then(|| code.to_owned()))
+        let mut candidates = self.interactive_candidate_texts(code, rank)?;
+        Ok((candidates.len() == rank)
+            .then(|| candidates.pop())
+            .flatten())
     }
 
     /// Returns one contiguous candidate page for an interactive host.
@@ -173,12 +177,35 @@ impl CandidateSnapshot {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let candidates = self.decoder.decode_sentence(code, limit)?;
-        let mut visible = Vec::with_capacity(candidates.len());
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            if candidate.unresolved_key_count == 0 {
+        self.interactive_candidate_texts(code, limit)
+    }
+
+    fn interactive_candidate_texts(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KeySequenceError> {
+        let exact = self.decoder.decode_exact_full_code(code, limit)?;
+        let sentence_limit = limit
+            .saturating_add(exact.len())
+            .min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        let candidates = self.decoder.decode_sentence(code, sentence_limit)?;
+        let mut visible = Vec::with_capacity(limit);
+        let mut seen = HashSet::new();
+        for candidate in exact {
+            if seen.insert(candidate.text.clone()) {
                 visible.push(candidate.text);
-            } else if index == 0 {
+            }
+        }
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if visible.len() == limit {
+                break;
+            }
+            if candidate.unresolved_key_count == 0 {
+                if seen.insert(candidate.text.clone()) {
+                    visible.push(candidate.text);
+                }
+            } else if index == 0 && visible.is_empty() {
                 visible.push(code.to_owned());
                 break;
             } else {
@@ -186,6 +213,69 @@ impl CandidateSnapshot {
             }
         }
         Ok(visible)
+    }
+
+    /// Returns the explicitly requested adjacent-transposition recovery view.
+    ///
+    /// This does not merge corrected candidates into the conservative primary
+    /// ordering. Interactive hosts can expose it behind a deliberate action
+    /// such as Shift+Tab. Only fully resolved snapshot candidates that need no
+    /// second correction are returned.
+    pub fn transposition_recovery_texts(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KeySequenceError> {
+        let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        if limit == 0 {
+            KeySequence::new(code)?;
+            return Ok(Vec::new());
+        }
+        let observed = KeySequence::new(code)?;
+        let code = observed.as_str();
+        if code.len() < 2 || code.len() > MAX_TRANSPOSITION_RECOVERY_KEYS {
+            return Ok(Vec::new());
+        }
+        let primary = self.decoder.decode_sentence(code, limit)?;
+        let primary_texts = primary
+            .iter()
+            .map(|candidate| candidate.text.as_str())
+            .collect::<HashSet<_>>();
+        let mut recovered = Vec::new();
+        let original = code.as_bytes();
+        for swap_start in 0..original.len() - 1 {
+            if original[swap_start] == original[swap_start + 1] {
+                continue;
+            }
+            let mut swapped = original.to_vec();
+            swapped.swap(swap_start, swap_start + 1);
+            let swapped = std::str::from_utf8(&swapped)
+                .expect("a validated lowercase ASCII key sequence remains UTF-8 after swapping");
+            for candidate in self.decoder.decode_sentence(swapped, limit)? {
+                if candidate.used_error
+                    || candidate.unresolved_key_count != 0
+                    || !candidate
+                        .segments
+                        .iter()
+                        .all(|segment| spelling_is_complete_or_anchored_suffix(&segment.candidate))
+                    || primary_texts.contains(candidate.text.as_str())
+                {
+                    continue;
+                }
+                recovered.push((candidate.total_score, swap_start, candidate.text));
+            }
+        }
+        recovered.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        let mut seen = HashSet::new();
+        recovered.retain(|(_, _, text)| seen.insert(text.clone()));
+        recovered.truncate(limit);
+        Ok(recovered.into_iter().map(|(_, _, text)| text).collect())
     }
 }
 
@@ -315,7 +405,7 @@ mod tests {
             Some("你好")
         );
         assert_eq!(snapshot.candidate_text("nihk", 0).unwrap(), None);
-        assert_eq!(snapshot.candidate_text("nihk", 11).unwrap(), None);
+        assert_eq!(snapshot.candidate_text("nihk", 51).unwrap(), None);
         assert_eq!(
             snapshot.candidate_text("zzzzzzzz", 1).unwrap().as_deref(),
             Some("zzzzzzzz")
@@ -327,6 +417,166 @@ mod tests {
         assert_eq!(
             snapshot.candidate_texts("zzzzzzzz", 5).unwrap(),
             ["zzzzzzzz"]
+        );
+    }
+
+    #[test]
+    fn interactive_snapshot_exposes_at_most_fifty_ranked_candidates() {
+        let mut lexicon = String::from("text\tpinyin\tfrequency\n");
+        for index in 0..60 {
+            use std::fmt::Write as _;
+            writeln!(lexicon, "候选{index}\tqin\t{}", 1_000 - index).unwrap();
+        }
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "fifty-candidate-test-v1",
+            contains_private_text: false,
+            lexicon_tsv: &lexicon,
+            expected_payload_bytes: lexicon.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+            expected_entry_count: 60,
+        })
+        .unwrap();
+
+        let candidates = snapshot.candidate_texts("qn", usize::MAX).unwrap();
+        assert_eq!(candidates.len(), MAX_CANDIDATE_SNAPSHOT_RANK);
+        assert!(
+            snapshot
+                .candidate_text("qn", MAX_CANDIDATE_SNAPSHOT_RANK)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            snapshot
+                .candidate_text("qn", MAX_CANDIDATE_SNAPSHOT_RANK + 1)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn interactive_two_key_full_syllable_precedes_initial_abbreviations() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+参加\tcan jia\t100000\n\
+惨\tcan\t100\n\
+残\tcan\t90\n\
+测试\tce shi\t80000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "short-full-code-priority-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 4,
+        })
+        .unwrap();
+
+        assert_eq!(
+            snapshot.candidate_texts("cj", 3).unwrap(),
+            ["惨", "残", "参加"]
+        );
+        assert_eq!(
+            snapshot.candidate_text("cj", 1).unwrap().as_deref(),
+            Some("惨")
+        );
+        assert_eq!(
+            snapshot.candidate_texts("ceui", 1).unwrap(),
+            ["测试"],
+            "longer input keeps the ordinary sentence ranking"
+        );
+    }
+
+    #[test]
+    fn exact_full_code_survives_more_than_fifty_abbreviation_paths() {
+        let mut lexicon = String::from("text\tpinyin\tfrequency\n句\tju\t1\n");
+        for index in 0..60 {
+            use std::fmt::Write as _;
+            writeln!(lexicon, "即时词{index}\tji shi\t{}", 100_000 - index).unwrap();
+        }
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "exact-full-code-frontier-v1",
+            contains_private_text: false,
+            lexicon_tsv: &lexicon,
+            expected_payload_bytes: lexicon.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+            expected_entry_count: 61,
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.candidate_texts("ju", 1).unwrap(), ["句"]);
+    }
+
+    #[test]
+    fn exact_multi_syllable_word_precedes_a_longer_free_abbreviation() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+属于\tshu yu\t10\n\
+属于是\tshu yu shi\t100000\n\
+属于说\tshu yu shuo\t90000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "exact-multi-syllable-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 3,
+        })
+        .unwrap();
+
+        assert_eq!(
+            snapshot.candidate_texts("uuyu", 3).unwrap(),
+            ["属于", "属于是", "属于说"]
+        );
+    }
+
+    #[test]
+    fn pinned_public_dictionary_accepts_standard_u_spelling_for_umlaut_syllables() {
+        let imported = crate::parse_rime_lexicon(include_str!(
+            "../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml"
+        ))
+        .unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        let ju = decoder.decode_exact_full_code("ju", 7).unwrap();
+        assert!(ju.iter().any(|candidate| candidate.text == "句"));
+        let uuyu = decoder.decode_exact_full_code("uuyu", 3).unwrap();
+        assert_eq!(
+            uuyu.first().map(|candidate| candidate.text.as_str()),
+            Some("属于")
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_exposes_a_full_code_adjacent_transposition() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+看看\tkan kan\t1000\n\
+考\tkao\t900\n\
+见\tjian\t800\n\
+测试\tce shi\t700\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-transposition-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 4,
+        })
+        .unwrap();
+
+        let primary = snapshot.candidate_texts("kkjjceui", 1).unwrap();
+        assert_ne!(primary.first().map(String::as_str), Some("看看测试"));
+        let recovery = snapshot
+            .transposition_recovery_texts("kkjjceui", 1)
+            .unwrap();
+        assert_eq!(recovery.first().map(String::as_str), Some("看看测试"));
+        assert!(
+            snapshot
+                .transposition_recovery_texts("kkjjceui", 0)
+                .unwrap()
+                .is_empty()
         );
     }
 
