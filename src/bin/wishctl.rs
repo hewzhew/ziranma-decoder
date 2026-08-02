@@ -1,0 +1,414 @@
+use std::env;
+use std::error::Error;
+use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use ziranma_core::WindowsUserDataProtector;
+use ziranma_core::{
+    DataProtector, NativeCancellationSource, NativeCandidateView, NativeFeedbackEvent,
+    NativeSelectionSource, WishCategory, WishFeedbackError, WishNote, list_wish_packages,
+    load_wish_note, load_wish_snapshot, move_wish_to_trash, save_wish_note,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WishSelector {
+    Exact(String),
+    Latest,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum Command {
+    Status,
+    List,
+    Show {
+        selector: WishSelector,
+        show_private_text: bool,
+    },
+    Annotate {
+        selector: WishSelector,
+        category: WishCategory,
+        text: String,
+    },
+    Trash {
+        id: String,
+        confirmed: bool,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct Options {
+    root: PathBuf,
+    command: Command,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("许愿管理失败：{error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn run() -> Result<(), Box<dyn Error>> {
+    Err("许愿包的当前用户加密目前只支持 Windows".into())
+}
+
+#[cfg(windows)]
+fn run() -> Result<(), Box<dyn Error>> {
+    let options = parse_options(env::args().skip(1))?;
+    let protector = WindowsUserDataProtector;
+    match options.command {
+        Command::Status => status(&options.root),
+        Command::List => list(&options.root),
+        Command::Show {
+            selector,
+            show_private_text,
+        } => show(&options.root, &protector, &selector, show_private_text),
+        Command::Annotate {
+            selector,
+            category,
+            text,
+        } => annotate(&options.root, &protector, &selector, category, &text),
+        Command::Trash { id, confirmed } => trash(&options.root, &id, confirmed),
+    }
+}
+
+fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options, Box<dyn Error>> {
+    let mut arguments = arguments.into_iter();
+    let command_name = arguments.next().ok_or_else(usage)?;
+    let mut root = None;
+    let mut id = None;
+    let mut latest = false;
+    let mut category = None;
+    let mut text = None;
+    let mut show_private_text = false;
+    let mut confirm_trash = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_value(&mut root, arguments.next(), "--root")?,
+            "--id" => set_value(&mut id, arguments.next(), "--id")?,
+            "--latest" if !latest => latest = true,
+            "--category" => set_value(&mut category, arguments.next(), "--category")?,
+            "--text" => set_value(&mut text, arguments.next(), "--text")?,
+            "--confirm-show-private-text" if !show_private_text => show_private_text = true,
+            "--confirm-move-to-trash" if !confirm_trash => confirm_trash = true,
+            _ => return Err(format!("无法识别或重复的参数：{argument}\n{}", usage()).into()),
+        }
+    }
+    let root = PathBuf::from(root.ok_or("缺少 --root")?);
+    let selector = || -> Result<WishSelector, Box<dyn Error>> {
+        match (id.clone(), latest) {
+            (Some(id), false) => Ok(WishSelector::Exact(id)),
+            (None, true) => Ok(WishSelector::Latest),
+            _ => Err("请只选择一个许愿包：--id <编号> 或 --latest".into()),
+        }
+    };
+    let command = match command_name.as_str() {
+        "status"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::Status
+        }
+        "list"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::List
+        }
+        "show" if category.is_none() && text.is_none() && !confirm_trash => Command::Show {
+            selector: selector()?,
+            show_private_text,
+        },
+        "annotate" if !show_private_text && !confirm_trash => Command::Annotate {
+            selector: selector()?,
+            category: WishCategory::parse_slug(&category.ok_or("annotate 缺少 --category")?)
+                .ok_or("未知类别；可用 candidates/ranking/display/latency/input-mode/compatibility/other")?,
+            text: text.ok_or("annotate 缺少 --text")?,
+        },
+        "trash"
+            if !latest && category.is_none() && text.is_none() && !show_private_text =>
+        {
+            Command::Trash {
+                id: id.ok_or("trash 缺少 --id")?,
+                confirmed: confirm_trash,
+            }
+        }
+        _ => return Err(usage().into()),
+    };
+    Ok(Options { root, command })
+}
+
+fn set_value(
+    destination: &mut Option<String>,
+    value: Option<String>,
+    option: &str,
+) -> Result<(), Box<dyn Error>> {
+    if destination.is_some() {
+        return Err(format!("参数重复：{option}").into());
+    }
+    let value = value.ok_or_else(|| format!("{option} 缺少值"))?;
+    if value.is_empty() {
+        return Err(format!("{option} 的值不能为空").into());
+    }
+    *destination = Some(value);
+    Ok(())
+}
+
+fn usage() -> String {
+    "用法：\n  wishctl status --root <目录>\n  wishctl list --root <目录>\n  wishctl show --root <目录> (--id <编号> | --latest) --confirm-show-private-text\n  wishctl annotate --root <目录> (--id <编号> | --latest) --category <类别> --text <说明>\n  wishctl trash --root <目录> --id <编号> --confirm-move-to-trash"
+        .to_owned()
+}
+
+fn status(root: &Path) -> Result<(), Box<dyn Error>> {
+    let packages = list_wish_packages(root)?;
+    println!("本地许愿：{} 条", packages.len());
+    if let Some(latest) = packages.first() {
+        println!("  最近一条：{}", latest.id());
+    }
+    println!("  内容：Windows 当前用户加密");
+    println!("  网络：未连接");
+    Ok(())
+}
+
+fn list(root: &Path) -> Result<(), Box<dyn Error>> {
+    let packages = list_wish_packages(root)?;
+    if packages.is_empty() {
+        println!("还没有本地许愿。");
+        return Ok(());
+    }
+    println!("本地许愿 · {} 条（最近在前）", packages.len());
+    for package in packages {
+        println!(
+            "{} · {} 字节（加密）",
+            package.id(),
+            package.protected_bytes()
+        );
+    }
+    println!("未解密原文，未联网。");
+    Ok(())
+}
+
+fn resolve_selector(root: &Path, selector: &WishSelector) -> Result<String, Box<dyn Error>> {
+    match selector {
+        WishSelector::Exact(id) => Ok(id.clone()),
+        WishSelector::Latest => list_wish_packages(root)?
+            .first()
+            .map(|package| package.id().to_owned())
+            .ok_or_else(|| "还没有可以选择的本地许愿".into()),
+    }
+}
+
+fn show(
+    root: &Path,
+    protector: &dyn DataProtector,
+    selector: &WishSelector,
+    show_private_text: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !show_private_text {
+        return Err("show 会在当前终端显示私人输入；请显式加入 --confirm-show-private-text".into());
+    }
+    let id = resolve_selector(root, selector)?;
+    let snapshot = load_wish_snapshot(root, &id, protector)?;
+    println!(
+        "许愿 {id} · 最近 {} ms · {} 条事件",
+        snapshot.lookback_ms(),
+        snapshot.events().len()
+    );
+    println!(
+        "来源 {} 条；窗口前省略 {}，无时间省略 {}，容量省略 {}；完整：{}",
+        snapshot.source_events(),
+        snapshot.omitted_before_window(),
+        snapshot.omitted_untimed(),
+        snapshot.omitted_by_event_limit(),
+        if snapshot.source_complete() {
+            "是"
+        } else {
+            "否"
+        }
+    );
+    for event in snapshot.events() {
+        print!("-{} ms  ", event.milliseconds_before_marker());
+        print_event(event.event());
+    }
+    match load_wish_note(root, &id, protector) {
+        Ok(note) => {
+            println!("说明 [{}]", note.category().slug());
+            println!("{}", note.text());
+        }
+        Err(WishFeedbackError::NoteUnavailable) => println!("说明：尚未添加"),
+        Err(error) => return Err(error.into()),
+    }
+    println!("原文只显示在当前终端；未写模型，未联网。");
+    Ok(())
+}
+
+fn print_event(event: &NativeFeedbackEvent) {
+    match event {
+        NativeFeedbackEvent::CandidatesPresented {
+            code,
+            view,
+            page_start,
+            candidates,
+            may_have_more,
+        } => {
+            let candidates = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, text)| format!("{} {text}", page_start + index + 1))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!(
+                "候选  {code} [{}] → {candidates}{}",
+                view_label(*view),
+                if *may_have_more { " · …" } else { "" }
+            );
+        }
+        NativeFeedbackEvent::CandidateCommitted {
+            code,
+            text,
+            view,
+            source,
+            absolute_rank,
+            visible_rank,
+        } => println!(
+            "上屏  {code} → “{text}” [{}；{}；总第 {absolute_rank}，页内第 {visible_rank}]",
+            view_label(*view),
+            selection_label(*source)
+        ),
+        NativeFeedbackEvent::RawCodeCommitted { code } => println!("原码  {code}"),
+        NativeFeedbackEvent::CompositionCancelled { code, source } => {
+            println!("取消  {code} [{}]", cancellation_label(*source));
+        }
+        NativeFeedbackEvent::CandidatePopupTiming {
+            first_frame_ms,
+            fully_visible_ms,
+            initial_show,
+        } => println!(
+            "候选窗  首帧 {first_frame_ms} ms，完全显示 {fully_visible_ms} ms{}",
+            if *initial_show {
+                "（首次出现）"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+fn view_label(view: NativeCandidateView) -> &'static str {
+    match view {
+        NativeCandidateView::Ordinary => "普通",
+        NativeCandidateView::TranspositionRecovery => "纠序",
+        NativeCandidateView::Shape => "找字",
+    }
+}
+
+fn selection_label(source: NativeSelectionSource) -> &'static str {
+    match source {
+        NativeSelectionSource::FirstCandidate => "首选",
+        NativeSelectionSource::Numeric => "数字选择",
+        NativeSelectionSource::Punctuation => "标点选择",
+    }
+}
+
+fn cancellation_label(source: NativeCancellationSource) -> &'static str {
+    match source {
+        NativeCancellationSource::Backspace => "退格",
+        NativeCancellationSource::Escape => "Esc",
+        NativeCancellationSource::FocusLoss => "失去焦点",
+        NativeCancellationSource::HostTermination => "宿主结束",
+    }
+}
+
+fn annotate(
+    root: &Path,
+    protector: &dyn DataProtector,
+    selector: &WishSelector,
+    category: WishCategory,
+    text: &str,
+) -> Result<(), Box<dyn Error>> {
+    let id = resolve_selector(root, selector)?;
+    let note = WishNote::new(&id, category, text)?;
+    save_wish_note(root, &note, protector)?;
+    println!("已为 {id} 添加加密说明 [{}]。", category.slug());
+    println!("未联网，未写模型。");
+    Ok(())
+}
+
+fn trash(root: &Path, id: &str, confirmed: bool) -> Result<(), Box<dyn Error>> {
+    if !confirmed {
+        return Err("移动会让这条许愿离开当前列表；请显式加入 --confirm-move-to-trash".into());
+    }
+    move_wish_to_trash(root, id)?;
+    println!("已移入本地 trash：{id}");
+    println!("文件仍可恢复，没有联网。");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsing_requires_one_selector_and_explicit_private_show() {
+        let options = parse_options([
+            "show".to_owned(),
+            "--root".to_owned(),
+            "wishes".to_owned(),
+            "--latest".to_owned(),
+            "--confirm-show-private-text".to_owned(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            options.command,
+            Command::Show {
+                selector: WishSelector::Latest,
+                show_private_text: true
+            }
+        ));
+        assert!(
+            parse_options(["show".to_owned(), "--root".to_owned(), "wishes".to_owned(),]).is_err()
+        );
+    }
+
+    #[test]
+    fn annotation_category_and_trash_confirmation_are_strict() {
+        let annotate = parse_options([
+            "annotate".to_owned(),
+            "--root".to_owned(),
+            "wishes".to_owned(),
+            "--latest".to_owned(),
+            "--category".to_owned(),
+            "display".to_owned(),
+            "--text".to_owned(),
+            "边角不圆润".to_owned(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            annotate.command,
+            Command::Annotate {
+                category: WishCategory::Display,
+                ..
+            }
+        ));
+        assert!(
+            parse_options([
+                "trash".to_owned(),
+                "--root".to_owned(),
+                "wishes".to_owned(),
+                "--id".to_owned(),
+                "wish-invalid".to_owned(),
+            ])
+            .is_ok(),
+            "exact id validation belongs to the storage boundary"
+        );
+    }
+}

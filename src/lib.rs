@@ -54,6 +54,7 @@ mod stroke_data;
 mod tracker;
 #[cfg(windows)]
 mod tsf_alpha;
+mod wish_feedback;
 
 #[cfg(windows)]
 pub use tsf_alpha::{
@@ -210,9 +211,12 @@ pub use language_model::{
 };
 pub use native_feedback::{
     DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS, DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES,
+    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+    FrozenNativeFeedbackEvent, FrozenNativeFeedbackSnapshot, MAX_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS,
     NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
-    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackLifecycle,
+    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
+    NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError, NativeFeedbackLifecycle,
     NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
     NativeFeedbackStartResult, NativeFeedbackStopReason, NativeFeedbackStopResult,
     NativeFeedbackSummary, NativeSelectionSource,
@@ -271,6 +275,12 @@ pub use stroke_data::{
 pub use tracker::{
     CommitRecord, DeltaPositionEvidence, LocalInputTracker, RawKey, RevisionRecord, TextDelta,
     TextSelection, TrackerOutput, single_span_delta, single_span_delta_with_selection,
+};
+pub use wish_feedback::{
+    MAX_WISH_NOTE_BYTES, MAX_WISH_PACKAGE_BYTES, WISH_NOTE_FILE_SUFFIX, WISH_PACKAGE_FILE_SUFFIX,
+    WISH_SCHEMA_V1, WishCategory, WishFeedbackError, WishNote, WishPackageInfo, WishSaveReceipt,
+    WishSnapshot, list_wish_packages, load_wish_note, load_wish_snapshot, move_wish_to_trash,
+    save_wish_note, save_wish_snapshot,
 };
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;

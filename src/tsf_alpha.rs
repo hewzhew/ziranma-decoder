@@ -20,15 +20,17 @@ use std::time::Instant;
 use crate::{
     CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
     CandidateRuntimeError, CandidateSnapshot, CompositionEffect, CompositionInput,
-    CompositionPunctuation, CompositionSession, Decoder, ExplicitAliasSnapshot,
+    CompositionPunctuation, CompositionSession, DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder, ExplicitAliasSnapshot,
     MAX_CANDIDATE_SNAPSHOT_RANK, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS,
     NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
-    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackLifecycle,
-    NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
-    NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
-    NativeSelectionSource, SessionSelectionMemory, WindowsUserDataProtector,
-    load_current_candidate_snapshot, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, parse_lexicon_tsv,
+    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
+    NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle, NativeFeedbackLimits,
+    NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
+    NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource, SessionSelectionMemory,
+    WindowsUserDataProtector, WishSnapshot, load_current_candidate_snapshot,
+    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, parse_lexicon_tsv,
+    save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -556,7 +558,7 @@ fn module_candidate_runtime_root() -> std::result::Result<PathBuf, CandidateProv
     Ok(parent.join(CANDIDATE_RUNTIME_DIRECTORY))
 }
 
-fn explicit_alias_root_for_module(module_path: &Path) -> Option<PathBuf> {
+fn installed_user_data_root_for_module(module_path: &Path, leaf: &str) -> Option<PathBuf> {
     let build = module_path.parent()?;
     let builds = build.parent()?;
     let tsf_alpha = builds.parent()?;
@@ -568,7 +570,23 @@ fn explicit_alias_root_for_module(module_path: &Path) -> Option<PathBuf> {
     {
         return None;
     }
-    Some(tsf_alpha.join("user-data").join("aliases"))
+    if leaf.is_empty()
+        || !leaf
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || *byte == b'-')
+    {
+        return None;
+    }
+    Some(tsf_alpha.join("user-data").join(leaf))
+}
+
+fn explicit_alias_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, "aliases")
+}
+
+fn wish_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, "wishes")
 }
 
 fn class_factory_candidate_provider() -> CandidateProviderLoadResult {
@@ -3581,6 +3599,7 @@ impl NativeFeedbackContextCache {
 const FEEDBACK_MENU_START: u32 = 1;
 const FEEDBACK_MENU_STOP: u32 = 2;
 const FEEDBACK_MENU_CLEAR: u32 = 3;
+const FEEDBACK_MENU_WISH: u32 = 4;
 const FEEDBACK_MENU_STATUS: u32 = 100;
 const FEEDBACK_MENU_TIMING_BUCKETS: u32 = 102;
 const FEEDBACK_MENU_TIMING_COUNTS: u32 = 103;
@@ -3658,6 +3677,18 @@ struct NativeFeedbackLanguageBarState {
     input_mode: Rc<Cell<InputMode>>,
     sink: RefCell<Option<ITfLangBarItemSink>>,
     shown: Cell<bool>,
+    wish_root: Option<PathBuf>,
+    wish_save_status: Cell<WishSaveStatus>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum WishSaveStatus {
+    #[default]
+    Never,
+    Saved {
+        events: usize,
+    },
+    Failed,
 }
 
 impl NativeFeedbackLanguageBarState {
@@ -3666,12 +3697,26 @@ impl NativeFeedbackLanguageBarState {
         feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
         input_mode: Rc<Cell<InputMode>>,
     ) -> Self {
+        let wish_root = module_path()
+            .ok()
+            .and_then(|module| wish_root_for_module(&module));
+        Self::with_wish_root(feedback, feedback_context, input_mode, wish_root)
+    }
+
+    fn with_wish_root(
+        feedback: Arc<Mutex<NativeFeedbackSession>>,
+        feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
+        input_mode: Rc<Cell<InputMode>>,
+        wish_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             feedback,
             feedback_context,
             input_mode,
             sink: RefCell::new(None),
             shown: Cell::new(true),
+            wish_root,
+            wish_save_status: Cell::new(WishSaveStatus::Never),
         }
     }
 
@@ -3705,7 +3750,54 @@ impl NativeFeedbackLanguageBarState {
         }
     }
 
+    fn menu(&self) -> Result<Vec<(u32, u32, String)>> {
+        Ok(feedback_language_bar_menu(
+            self.summary()?,
+            self.wish_save_status.get(),
+            self.wish_root.is_some(),
+        ))
+    }
+
+    fn save_recent_wish(&self) -> bool {
+        let Some(root) = self.wish_root.as_deref() else {
+            self.wish_save_status.set(WishSaveStatus::Failed);
+            self.notify();
+            return false;
+        };
+        let frozen = self.feedback.lock().ok().and_then(|feedback| {
+            let marker_ms = native_feedback_monotonic_ms();
+            feedback
+                .freeze_recent(
+                    NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                    marker_ms,
+                    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+                    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+                )
+                .ok()
+        });
+        let saved_events = frozen
+            .and_then(|frozen| WishSnapshot::from_frozen(&frozen).ok())
+            .and_then(|snapshot| {
+                let event_count = snapshot.events().len();
+                if event_count == 0 {
+                    return None;
+                }
+                save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector)
+                    .ok()
+                    .map(|_| event_count)
+            });
+        self.wish_save_status.set(match saved_events {
+            Some(events) => WishSaveStatus::Saved { events },
+            None => WishSaveStatus::Failed,
+        });
+        self.notify();
+        saved_events.is_some()
+    }
+
     fn perform_feedback_action(&self, action: u32) -> Result<bool> {
+        if action == FEEDBACK_MENU_WISH {
+            return Ok(self.save_recent_wish());
+        }
         let changed = {
             let mut feedback = self
                 .feedback
@@ -3726,6 +3818,9 @@ impl NativeFeedbackLanguageBarState {
             }
         };
         if changed {
+            if action == FEEDBACK_MENU_CLEAR || action == FEEDBACK_MENU_START {
+                self.wish_save_status.set(WishSaveStatus::Never);
+            }
             self.clear_context_cache();
             self.notify();
         }
@@ -3782,12 +3877,29 @@ fn feedback_half_pair_gap_bucket_labels() -> String {
     labels.join(" / ")
 }
 
-fn feedback_language_bar_menu(summary: NativeFeedbackSummary) -> Vec<(u32, u32, String)> {
+fn feedback_language_bar_menu(
+    summary: NativeFeedbackSummary,
+    wish_status: WishSaveStatus,
+    wish_storage_available: bool,
+) -> Vec<(u32, u32, String)> {
     let mut items = match summary.lifecycle {
         NativeFeedbackLifecycle::Disabled => {
             vec![(FEEDBACK_MENU_START, 0, "开始反馈（仅内存）".to_owned())]
         }
         NativeFeedbackLifecycle::Recording => vec![
+            (
+                FEEDBACK_MENU_WISH,
+                if wish_storage_available && summary.events != 0 {
+                    0
+                } else {
+                    TF_LBMENUF_GRAYED
+                },
+                if wish_storage_available {
+                    "向猫猫许愿（保存近 30 秒）".to_owned()
+                } else {
+                    "向猫猫许愿（仅安装版可用）".to_owned()
+                },
+            ),
             (FEEDBACK_MENU_STOP, 0, "停止反馈".to_owned()),
             (
                 FEEDBACK_MENU_STATUS,
@@ -3809,6 +3921,19 @@ fn feedback_language_bar_menu(summary: NativeFeedbackSummary) -> Vec<(u32, u32, 
         ],
     };
     if summary.enabled {
+        match wish_status {
+            WishSaveStatus::Never => {}
+            WishSaveStatus::Saved { events } => items.push((
+                FEEDBACK_MENU_STATUS + 4,
+                TF_LBMENUF_CHECKED | TF_LBMENUF_GRAYED,
+                format!("许愿已加密保存（{events} 条）"),
+            )),
+            WishSaveStatus::Failed => items.push((
+                FEEDBACK_MENU_STATUS + 4,
+                TF_LBMENUF_GRAYED,
+                "上次许愿保存失败；反馈仍在记录".to_owned(),
+            )),
+        }
         items.push((
             FEEDBACK_MENU_TIMING_BUCKETS,
             TF_LBMENUF_GRAYED,
@@ -3832,7 +3957,7 @@ fn feedback_language_bar_menu(summary: NativeFeedbackSummary) -> Vec<(u32, u32, 
     items.push((
         FEEDBACK_MENU_STATUS + 1,
         TF_LBMENUF_GRAYED,
-        "不写文件；关闭当前应用即清除".to_owned(),
+        "反馈默认仅内存；许愿才写当前用户加密文件；不联网".to_owned(),
     ));
     items
 }
@@ -3902,7 +4027,7 @@ impl Drop for NativeFeedbackPopupMenu {
 
 fn show_native_feedback_popup(state: &NativeFeedbackLanguageBarState, point: &POINT) -> Result<()> {
     let menu = NativeFeedbackPopupMenu::create()?;
-    for (id, flags, label) in feedback_language_bar_menu(state.summary()?) {
+    for (id, flags, label) in state.menu()? {
         menu.append(id, flags, &label)?;
     }
     if let Some(command) = menu.track(point) {
@@ -4002,7 +4127,7 @@ impl ITfLangBarItemButton_Impl for NativeFeedbackLanguageBarItem_Impl {
 
     fn InitMenu(&self, menu: Ref<ITfMenu>) -> Result<()> {
         let menu = menu.cloned().ok_or_else(|| lifecycle_error(E_POINTER))?;
-        for (id, flags, label) in feedback_language_bar_menu(self.state.summary()?) {
+        for (id, flags, label) in self.state.menu()? {
             let label = label.encode_utf16().collect::<Vec<_>>();
             // SAFETY: label is a bounded live UTF-16 slice. None of these
             // entries is a submenu, so the submenu output is intentionally
@@ -5310,7 +5435,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_builds_share_one_explicit_alias_root() {
+    fn installed_builds_share_stable_user_data_roots() {
         let digest = "1".repeat(64);
         let module = PathBuf::from(format!(
             r"D:\repo\.local\tsf-alpha\builds\{digest}\ziranma_core.dll"
@@ -5318,6 +5443,10 @@ mod tests {
         assert_eq!(
             explicit_alias_root_for_module(&module),
             Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\aliases"))
+        );
+        assert_eq!(
+            wish_root_for_module(&module),
+            Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\wishes"))
         );
         assert_eq!(
             explicit_alias_root_for_module(Path::new(r"D:\repo\target\release\ziranma_core.dll")),
@@ -6657,44 +6786,65 @@ mod tests {
 
     #[test]
     fn feedback_language_bar_menu_uses_plain_lifecycle_actions() {
-        let disabled = feedback_language_bar_menu(NativeFeedbackSummary::default());
+        let disabled = feedback_language_bar_menu(
+            NativeFeedbackSummary::default(),
+            WishSaveStatus::Never,
+            true,
+        );
         assert_eq!(disabled[0].0, FEEDBACK_MENU_START);
         assert_eq!(disabled[0].2, "开始反馈（仅内存）");
-        assert_eq!(disabled.last().unwrap().2, "不写文件；关闭当前应用即清除");
-
-        let recording = feedback_language_bar_menu(NativeFeedbackSummary {
-            lifecycle: NativeFeedbackLifecycle::Recording,
-            enabled: true,
-            accepting: true,
-            complete: true,
-            events: 7,
-            ..NativeFeedbackSummary::default()
-        });
-        assert_eq!(recording[0].0, FEEDBACK_MENU_STOP);
-        assert_eq!(recording[0].2, "停止反馈");
-        assert_eq!(recording[1].2, "记录中（7 条）");
-        assert_ne!(recording[1].1 & TF_LBMENUF_CHECKED, 0);
-        assert_eq!(recording[2].0, FEEDBACK_MENU_TIMING_BUCKETS);
         assert_eq!(
-            recording[2].2,
-            "双拼间隔（ms）：<8 / 8–15 / 16–23 / 24–31 / 32–47 / 48–63 / 64–95 / 96–159 / ≥160"
+            disabled.last().unwrap().2,
+            "反馈默认仅内存；许愿才写当前用户加密文件；不联网"
         );
-        assert_eq!(recording[3].0, FEEDBACK_MENU_TIMING_COUNTS);
+
+        let recording = feedback_language_bar_menu(
+            NativeFeedbackSummary {
+                lifecycle: NativeFeedbackLifecycle::Recording,
+                enabled: true,
+                accepting: true,
+                complete: true,
+                events: 7,
+                ..NativeFeedbackSummary::default()
+            },
+            WishSaveStatus::Never,
+            true,
+        );
+        assert_eq!(recording[0].0, FEEDBACK_MENU_WISH);
+        assert_eq!(recording[0].2, "向猫猫许愿（保存近 30 秒）");
+        assert_eq!(recording[0].1 & TF_LBMENUF_GRAYED, 0);
+        assert_eq!(recording[1].0, FEEDBACK_MENU_STOP);
+        assert_eq!(recording[1].2, "停止反馈");
+        assert_eq!(recording[2].2, "记录中（7 条）");
+        assert_ne!(recording[2].1 & TF_LBMENUF_CHECKED, 0);
+        assert_eq!(recording[3].0, FEEDBACK_MENU_TIMING_BUCKETS);
         assert_eq!(
             recording[3].2,
+            "双拼间隔（ms）：<8 / 8–15 / 16–23 / 24–31 / 32–47 / 48–63 / 64–95 / 96–159 / ≥160"
+        );
+        assert_eq!(recording[4].0, FEEDBACK_MENU_TIMING_COUNTS);
+        assert_eq!(
+            recording[4].2,
             "计数：0 / 0 / 0 / 0 / 0 / 0 / 0 / 0 / 0（共 0 个）"
         );
-        assert_eq!(recording.last().unwrap().2, "不写文件；关闭当前应用即清除");
+        assert_eq!(
+            recording.last().unwrap().2,
+            "反馈默认仅内存；许愿才写当前用户加密文件；不联网"
+        );
 
-        let stopped = feedback_language_bar_menu(NativeFeedbackSummary {
-            lifecycle: NativeFeedbackLifecycle::Stopped,
-            enabled: true,
-            complete: false,
-            events: 9,
-            half_pair_gap_samples: 3,
-            half_pair_gap_histogram: [0, 1, 0, 2, 0, 0, 0, 0, 0],
-            ..NativeFeedbackSummary::default()
-        });
+        let stopped = feedback_language_bar_menu(
+            NativeFeedbackSummary {
+                lifecycle: NativeFeedbackLifecycle::Stopped,
+                enabled: true,
+                complete: false,
+                events: 9,
+                half_pair_gap_samples: 3,
+                half_pair_gap_histogram: [0, 1, 0, 2, 0, 0, 0, 0, 0],
+                ..NativeFeedbackSummary::default()
+            },
+            WishSaveStatus::Never,
+            true,
+        );
         assert_eq!(stopped[0].0, FEEDBACK_MENU_CLEAR);
         assert_eq!(stopped[0].2, "清除本轮");
         assert_eq!(stopped[1].2, "已停止且不完整（9 条）");
@@ -6715,6 +6865,98 @@ mod tests {
             feedback_native_menu_flags(TF_LBMENUF_SEPARATOR),
             MF_SEPARATOR
         );
+    }
+
+    #[test]
+    fn explicit_wish_action_saves_a_recent_dpapi_snapshot_and_keeps_recording() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-wish-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
+        let mode = Rc::new(Cell::new(InputMode::Chinese));
+        let state = NativeFeedbackLanguageBarState::with_wish_root(
+            Arc::clone(&feedback),
+            context,
+            mode,
+            Some(root.clone()),
+        );
+        assert!(state.perform_feedback_action(FEEDBACK_MENU_START).unwrap());
+        let now = native_feedback_monotonic_ms();
+        feedback.lock().unwrap().record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::CandidatesPresented {
+                code: "aa".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                page_start: 0,
+                candidates: vec!["甲".to_owned()],
+                may_have_more: false,
+            },
+            now,
+        );
+
+        assert!(state.perform_feedback_action(FEEDBACK_MENU_WISH).unwrap());
+        assert!(matches!(
+            state.wish_save_status.get(),
+            WishSaveStatus::Saved { events: 1 }
+        ));
+        assert_eq!(
+            feedback.lock().unwrap().summary().lifecycle,
+            NativeFeedbackLifecycle::Recording
+        );
+        let packages = crate::list_wish_packages(&root).unwrap();
+        assert_eq!(packages.len(), 1);
+        let loaded =
+            crate::load_wish_snapshot(&root, packages[0].id(), &WindowsUserDataProtector).unwrap();
+        assert_eq!(loaded.events().len(), 1);
+        assert!(
+            state
+                .menu()
+                .unwrap()
+                .iter()
+                .any(|(_, _, label)| { label == "许愿已加密保存（1 条）" })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wish_storage_failure_never_stops_the_live_feedback_session() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-wish-invalid-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&root, b"not a directory").unwrap();
+        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let state = NativeFeedbackLanguageBarState::with_wish_root(
+            Arc::clone(&feedback),
+            Arc::new(Mutex::new(NativeFeedbackContextCache::default())),
+            Rc::new(Cell::new(InputMode::Chinese)),
+            Some(root.clone()),
+        );
+        assert!(state.perform_feedback_action(FEEDBACK_MENU_START).unwrap());
+        feedback.lock().unwrap().record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "aa".to_owned(),
+            },
+            native_feedback_monotonic_ms(),
+        );
+
+        assert!(!state.perform_feedback_action(FEEDBACK_MENU_WISH).unwrap());
+        assert!(matches!(
+            state.wish_save_status.get(),
+            WishSaveStatus::Failed
+        ));
+        assert_eq!(
+            feedback.lock().unwrap().summary().lifecycle,
+            NativeFeedbackLifecycle::Recording
+        );
+        fs::remove_file(root).unwrap();
     }
 
     #[test]
@@ -6742,7 +6984,9 @@ mod tests {
             },
         ] {
             let menu = NativeFeedbackPopupMenu::create().expect("native popup menu");
-            for (id, flags, label) in feedback_language_bar_menu(summary) {
+            for (id, flags, label) in
+                feedback_language_bar_menu(summary, WishSaveStatus::Never, true)
+            {
                 menu.append(id, flags, &label)
                     .expect("redacted lifecycle menu item");
             }

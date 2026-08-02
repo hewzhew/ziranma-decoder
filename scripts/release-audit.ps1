@@ -331,10 +331,14 @@ $requiredFiles = @(
     'docs/open-source-boundary-audit.md',
     'docs/tsf-alpha.md',
     'docs/tsf-dev-inspection.md',
+    'docs/wish-feedback.md',
     'scripts/release-audit.ps1',
     'src/bin/tsf-devctl.rs',
+    'src/bin/wishctl.rs',
     'src/candidate_lab_cli.rs',
-    'src/tsf_alpha.rs'
+    'src/tsf_alpha.rs',
+    'src/wish_feedback.rs',
+    'wish-ime.cmd'
 )
 foreach ($requiredFile in $requiredFiles) {
     Assert-RequiredFile -RelativePath $requiredFile -CandidateSet $candidateSet

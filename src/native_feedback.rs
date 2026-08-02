@@ -12,6 +12,9 @@ const MAX_FEEDBACK_POPUP_TIMING_MS: u32 = 60_000;
 
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS: usize = 4_096;
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS: u64 = 30_000;
+pub const DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS: usize = 1_024;
+pub const MAX_NATIVE_FEEDBACK_WISH_LOOKBACK_MS: u64 = 5 * 60_000;
 pub const NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS: [u64; 8] =
     [8, 16, 24, 32, 48, 64, 96, 160];
 pub const NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS: usize =
@@ -45,6 +48,23 @@ pub struct NativeFeedbackAuthorization {
 
 impl NativeFeedbackAuthorization {
     pub fn explicit_memory_only() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Deliberate acknowledgement that private in-memory feedback may be copied
+/// into a short-lived snapshot for current-user protected storage.
+///
+/// This is separate from `NativeFeedbackAuthorization`: starting an in-memory
+/// session does not silently grant permission to freeze or persist it.
+#[derive(Clone, Copy)]
+#[must_use]
+pub struct NativeFeedbackFreezeAuthorization {
+    _private: (),
+}
+
+impl NativeFeedbackFreezeAuthorization {
+    pub fn explicit_private_snapshot() -> Self {
         Self { _private: () }
     }
 }
@@ -121,7 +141,7 @@ pub enum NativeFeedbackEvent {
 }
 
 impl NativeFeedbackEvent {
-    fn validate_and_measure(&self) -> Option<usize> {
+    pub(crate) fn validate_and_measure(&self) -> Option<usize> {
         match self {
             Self::CandidatesPresented {
                 code,
@@ -233,6 +253,80 @@ pub enum NativeFeedbackRecordResult {
     Stopped(NativeFeedbackStopReason),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeFeedbackFreezeError {
+    Disabled,
+    NotAccepting,
+    InvalidLookback,
+    InvalidEventLimit,
+    FutureTimestamp,
+}
+
+/// One private event frozen relative to the explicit feedback marker.
+///
+/// Neither this type nor its containing snapshot implements `Debug`, so real
+/// codes and candidate text cannot leak through routine diagnostics.
+#[derive(Clone, Eq, PartialEq)]
+pub struct FrozenNativeFeedbackEvent {
+    milliseconds_before_marker: u32,
+    event: NativeFeedbackEvent,
+}
+
+impl FrozenNativeFeedbackEvent {
+    pub fn milliseconds_before_marker(&self) -> u32 {
+        self.milliseconds_before_marker
+    }
+
+    pub fn event(&self) -> &NativeFeedbackEvent {
+        &self.event
+    }
+}
+
+/// A bounded, read-only copy of recent private feedback.
+///
+/// The marker's absolute monotonic value is intentionally not retained. Only
+/// per-event age is exposed to storage code.
+#[derive(Clone, Eq, PartialEq)]
+pub struct FrozenNativeFeedbackSnapshot {
+    lookback_ms: u32,
+    source_complete: bool,
+    source_events: usize,
+    omitted_before_window: usize,
+    omitted_untimed: usize,
+    omitted_by_event_limit: usize,
+    events: Vec<FrozenNativeFeedbackEvent>,
+}
+
+impl FrozenNativeFeedbackSnapshot {
+    pub fn lookback_ms(&self) -> u32 {
+        self.lookback_ms
+    }
+
+    pub fn source_complete(&self) -> bool {
+        self.source_complete
+    }
+
+    pub fn source_events(&self) -> usize {
+        self.source_events
+    }
+
+    pub fn omitted_before_window(&self) -> usize {
+        self.omitted_before_window
+    }
+
+    pub fn omitted_untimed(&self) -> usize {
+        self.omitted_untimed
+    }
+
+    pub fn omitted_by_event_limit(&self) -> usize {
+        self.omitted_by_event_limit
+    }
+
+    pub fn events(&self) -> &[FrozenNativeFeedbackEvent] {
+        &self.events
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeFeedbackSummary {
     pub lifecycle: NativeFeedbackLifecycle,
@@ -274,6 +368,7 @@ pub struct NativeFeedbackSession {
     half_pair_gap_histogram: [usize; NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS],
     pending_half_pair_timing: Option<PendingHalfPairTiming>,
     events: Vec<NativeFeedbackEvent>,
+    event_monotonic_ms: Vec<Option<u64>>,
 }
 
 impl NativeFeedbackSession {
@@ -300,6 +395,7 @@ impl NativeFeedbackSession {
         self.half_pair_gap_histogram = [0; NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS];
         self.pending_half_pair_timing = None;
         self.events.clear();
+        self.event_monotonic_ms.clear();
         NativeFeedbackStartResult::Started
     }
 
@@ -336,8 +432,10 @@ impl NativeFeedbackSession {
 
     /// Records an event together with a host-supplied monotonic timestamp.
     ///
-    /// The timestamp is used only to update an aggregate odd-to-even
-    /// double-pinyin gap histogram. Individual timestamps are never retained.
+    /// The timestamp updates the aggregate odd-to-even double-pinyin gap
+    /// histogram and is retained only while this explicitly started private
+    /// session remains in memory. A frozen snapshot converts it to age relative
+    /// to an explicit marker and never exposes the absolute value.
     pub fn record_at(
         &mut self,
         context: NativeFeedbackContext,
@@ -382,8 +480,78 @@ impl NativeFeedbackSession {
         }
         self.observe_half_pair_gap(&event, monotonic_ms);
         self.events.push(event);
+        self.event_monotonic_ms.push(monotonic_ms);
         self.private_bytes = next_private_bytes;
         NativeFeedbackRecordResult::Recorded
+    }
+
+    /// Copies only events in the bounded interval ending at `marker_ms`.
+    ///
+    /// Untimed events are deliberately omitted instead of being guessed into
+    /// the recent window. If more than `max_events` qualify, the newest events
+    /// are retained and the omission is reported. This operation never changes
+    /// the session lifecycle or its stored events.
+    pub fn freeze_recent(
+        &self,
+        _authorization: NativeFeedbackFreezeAuthorization,
+        marker_ms: u64,
+        lookback_ms: u64,
+        max_events: usize,
+    ) -> Result<FrozenNativeFeedbackSnapshot, NativeFeedbackFreezeError> {
+        if !self.enabled {
+            return Err(NativeFeedbackFreezeError::Disabled);
+        }
+        if !self.accepting {
+            return Err(NativeFeedbackFreezeError::NotAccepting);
+        }
+        if !(1..=MAX_NATIVE_FEEDBACK_WISH_LOOKBACK_MS).contains(&lookback_ms) {
+            return Err(NativeFeedbackFreezeError::InvalidLookback);
+        }
+        if max_events == 0 || max_events > DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS {
+            return Err(NativeFeedbackFreezeError::InvalidEventLimit);
+        }
+        if self.events.len() != self.event_monotonic_ms.len() {
+            return Err(NativeFeedbackFreezeError::InvalidEventLimit);
+        }
+
+        let window_start = marker_ms.saturating_sub(lookback_ms);
+        let mut omitted_before_window = 0_usize;
+        let mut omitted_untimed = 0_usize;
+        let mut qualifying = Vec::new();
+        for (event, timestamp) in self.events.iter().zip(&self.event_monotonic_ms) {
+            let Some(timestamp) = timestamp else {
+                omitted_untimed = omitted_untimed.saturating_add(1);
+                continue;
+            };
+            if *timestamp > marker_ms {
+                return Err(NativeFeedbackFreezeError::FutureTimestamp);
+            }
+            if *timestamp < window_start {
+                omitted_before_window = omitted_before_window.saturating_add(1);
+                continue;
+            }
+            let age = marker_ms - *timestamp;
+            let milliseconds_before_marker =
+                u32::try_from(age).map_err(|_| NativeFeedbackFreezeError::InvalidLookback)?;
+            qualifying.push(FrozenNativeFeedbackEvent {
+                milliseconds_before_marker,
+                event: event.clone(),
+            });
+        }
+        let omitted_by_event_limit = qualifying.len().saturating_sub(max_events);
+        if omitted_by_event_limit != 0 {
+            qualifying.drain(..omitted_by_event_limit);
+        }
+        Ok(FrozenNativeFeedbackSnapshot {
+            lookback_ms: u32::try_from(lookback_ms)
+                .map_err(|_| NativeFeedbackFreezeError::InvalidLookback)?,
+            source_complete: self.complete,
+            source_events: self.events.len(),
+            omitted_before_window,
+            omitted_untimed,
+            omitted_by_event_limit,
+            events: qualifying,
+        })
     }
 
     pub fn summary(&self) -> NativeFeedbackSummary {
@@ -1064,5 +1232,109 @@ mod tests {
         assert!(!debug.contains("privatecode"));
         assert!(!debug.contains("仅供合成测试"));
         assert!(debug.contains("half_pair_gap_histogram"));
+    }
+
+    #[test]
+    fn recent_freeze_keeps_only_the_requested_timed_window() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record_at(
+            &mut session,
+            timed_page("a", NativeCandidateView::Ordinary, 0),
+            1_000,
+        );
+        record_at(
+            &mut session,
+            timed_page("ab", NativeCandidateView::Ordinary, 0),
+            40_000,
+        );
+        record_at(
+            &mut session,
+            timed_page("abc", NativeCandidateView::Ordinary, 0),
+            69_999,
+        );
+
+        let before = session.summary();
+        let frozen = session
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                70_000,
+                DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+                DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+            )
+            .unwrap();
+        assert_eq!(frozen.lookback_ms(), 30_000);
+        assert_eq!(frozen.source_events(), 3);
+        assert!(frozen.source_complete());
+        assert_eq!(frozen.omitted_before_window(), 1);
+        assert_eq!(frozen.omitted_untimed(), 0);
+        assert_eq!(frozen.omitted_by_event_limit(), 0);
+        assert_eq!(frozen.events().len(), 2);
+        assert_eq!(frozen.events()[0].milliseconds_before_marker(), 30_000);
+        assert_eq!(frozen.events()[1].milliseconds_before_marker(), 1);
+        assert_eq!(
+            session.summary(),
+            before,
+            "freezing must not mutate lifecycle"
+        );
+    }
+
+    #[test]
+    fn recent_freeze_omits_untimed_events_and_keeps_newest_when_bounded() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record(&mut session, page());
+        for (index, code) in ["a", "ab", "abc"].into_iter().enumerate() {
+            record_at(
+                &mut session,
+                timed_page(code, NativeCandidateView::Ordinary, 0),
+                100 + u64::try_from(index).unwrap(),
+            );
+        }
+
+        let frozen = session
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                102,
+                30_000,
+                2,
+            )
+            .unwrap();
+        assert_eq!(frozen.omitted_untimed(), 1);
+        assert_eq!(frozen.omitted_by_event_limit(), 1);
+        assert_eq!(frozen.events().len(), 2);
+        assert_eq!(frozen.events()[0].milliseconds_before_marker(), 1);
+        assert_eq!(frozen.events()[1].milliseconds_before_marker(), 0);
+    }
+
+    #[test]
+    fn recent_freeze_requires_a_live_session_and_valid_bounds() {
+        let session = NativeFeedbackSession::default();
+        let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
+        assert!(matches!(
+            session.freeze_recent(authorization, 0, 30_000, 10),
+            Err(NativeFeedbackFreezeError::Disabled)
+        ));
+
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record_at(&mut session, page(), 20);
+        assert!(matches!(
+            session.freeze_recent(authorization, 19, 30_000, 10),
+            Err(NativeFeedbackFreezeError::FutureTimestamp)
+        ));
+        assert!(matches!(
+            session.freeze_recent(authorization, 20, 0, 10),
+            Err(NativeFeedbackFreezeError::InvalidLookback)
+        ));
+        assert!(matches!(
+            session.freeze_recent(authorization, 20, 30_000, 0),
+            Err(NativeFeedbackFreezeError::InvalidEventLimit)
+        ));
+        session.stop();
+        assert!(matches!(
+            session.freeze_recent(authorization, 20, 30_000, 10),
+            Err(NativeFeedbackFreezeError::NotAccepting)
+        ));
     }
 }
