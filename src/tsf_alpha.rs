@@ -15,30 +15,36 @@ use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak as SyncWeak};
+use std::time::Instant;
 
 use crate::{
     CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
     CandidateRuntimeError, CandidateSnapshot, CompositionEffect, CompositionInput,
-    CompositionPunctuation, CompositionSession, Decoder, MAX_CANDIDATE_SNAPSHOT_RANK,
+    CompositionPunctuation, CompositionSession, Decoder, ExplicitAliasSnapshot,
+    MAX_CANDIDATE_SNAPSHOT_RANK, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS,
     NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
     NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackLifecycle,
     NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
     NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
-    NativeSelectionSource, SessionSelectionMemory, load_current_candidate_snapshot,
-    parse_lexicon_tsv,
+    NativeSelectionSource, SessionSelectionMemory, WindowsUserDataProtector,
+    load_current_candidate_snapshot, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, parse_lexicon_tsv,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
-    E_UNEXPECTED, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, S_FALSE, S_OK, WPARAM,
+    E_UNEXPECTED, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, S_FALSE, S_OK, SIZE, WPARAM,
+};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CombineRgn, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, FillRgn,
-    FrameRect, GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect,
+    GetMonitorInfoW, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect,
     MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
+    RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -53,9 +59,9 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_1, VK_7, VK_A, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU,
-    VK_NEXT, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RWIN,
-    VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
+    GetKeyState, VK_0, VK_1, VK_6, VK_9, VK_A, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LWIN,
+    VK_MENU, VK_NEXT, VK_OEM_2, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
+    VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
 };
 use windows::Win32::UI::TextServices::{
     CLSID_TF_ThreadMgr, GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
@@ -73,17 +79,20 @@ use windows::Win32::UI::TextServices::{
     TF_AE_NONE, TF_ANCHOR_END, TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR,
     TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
     TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION,
-    TF_LANGBARITEMINFO, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STATUS_DISABLED, TF_LBI_STATUS_HIDDEN,
-    TF_LBI_STYLE_BTN_MENU, TF_LBI_STYLE_SHOWNINTRAY, TF_LBI_STYLE_TEXTCOLORICON, TF_LBI_TEXT,
-    TF_LBI_TOOLTIP, TF_LBMENUF_CHECKED, TF_LBMENUF_GRAYED, TF_POPF_ALL, TF_SELECTION,
+    TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STATUS,
+    TF_LBI_STATUS_DISABLED, TF_LBI_STATUS_HIDDEN, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU,
+    TF_LBI_STYLE_SHOWNINTRAY, TF_LBI_STYLE_TEXTCOLORICON, TF_LBI_TEXT, TF_LBI_TOOLTIP,
+    TF_LBMENUF_CHECKED, TF_LBMENUF_GRAYED, TF_LBMENUF_SEPARATOR, TF_POPF_ALL, TF_SELECTION,
     TF_SELECTIONSTYLE, TF_TF_MOVESTART, TfLBIClick,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateIcon, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
-    GWLP_WNDPROC, GetClientRect, GetWindowLongPtrW, HICON, HWND_TOPMOST, SET_WINDOW_POS_FLAGS,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT, WNDPROC,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetForegroundWindow,
+    GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT,
+    WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -110,8 +119,7 @@ const TSF_DEVELOPMENT_MANIFEST: &str =
 const TSF_TECHNICAL_OVERLAY: &str = include_str!("../data/public/ziranma-technical-overlay-v1.tsv");
 const TSF_CONVERSATION_OVERLAY: &str =
     include_str!("../data/public/ziranma-conversation-overlay-v1.tsv");
-const CANDIDATE_PAGE_SIZE: usize = 7;
-const CANDIDATE_INITIAL_LIMIT: usize = CANDIDATE_PAGE_SIZE * 2;
+const CANDIDATE_PAGE_SIZE: usize = 6;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
 const CANDIDATE_UI_GUID: GUID = GUID::from_u128(0xb9fdad61_3f19_4d6c_86f7_72e9d3064f84);
@@ -127,6 +135,12 @@ trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, bounded candidate page without learning or
     /// I/O. Implementations should decode once rather than once per rank.
     fn candidates(&self, code: &str, limit: usize, view: InteractiveCandidateView) -> Vec<String>;
+
+    /// Checks a small version pointer only at a new-composition boundary.
+    /// Invalid updates retain the last known-good in-memory snapshot.
+    fn refresh_at_safe_boundary(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Default)]
@@ -174,14 +188,20 @@ impl CandidateCache {
     }
 }
 
-fn candidate_request_limit(page_start: usize) -> usize {
+fn candidate_visible_limit(page_start: usize) -> usize {
+    page_start
+        .saturating_add(CANDIDATE_PAGE_SIZE)
+        .clamp(CANDIDATE_PAGE_SIZE, CANDIDATE_LIMIT)
+}
+
+fn candidate_next_page_limit(page_start: usize) -> usize {
     page_start
         .saturating_add(CANDIDATE_PAGE_SIZE.saturating_mul(2))
-        .clamp(CANDIDATE_INITIAL_LIMIT, CANDIDATE_LIMIT)
+        .clamp(CANDIDATE_PAGE_SIZE.saturating_mul(2), CANDIDATE_LIMIT)
 }
 
 type CandidateProviderLoadResult =
-    std::result::Result<Arc<dyn CandidateProvider>, CandidateProviderLoadError>;
+    std::result::Result<CandidateProviderBlueprint, CandidateProviderLoadError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CandidateProviderLoadError {
@@ -192,39 +212,144 @@ enum CandidateProviderLoadError {
 
 struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
+    aliases: Option<ExplicitAliasRuntime>,
+}
+
+impl SnapshotCandidateProvider {
+    fn new(snapshot: Arc<CandidateSnapshot>, alias_root: Option<PathBuf>) -> Self {
+        Self {
+            snapshot,
+            aliases: alias_root.map(ExplicitAliasRuntime::new),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CandidateProviderBlueprint {
+    snapshot: Arc<CandidateSnapshot>,
+    alias_root: Option<PathBuf>,
+}
+
+impl CandidateProviderBlueprint {
+    fn build(&self) -> Arc<dyn CandidateProvider> {
+        Arc::new(SnapshotCandidateProvider::new(
+            Arc::clone(&self.snapshot),
+            self.alias_root.clone(),
+        ))
+    }
+}
+
+struct ExplicitAliasRuntime {
+    root: PathBuf,
+    state: Mutex<ExplicitAliasRuntimeState>,
+}
+
+struct ExplicitAliasRuntimeState {
+    package_id: Option<String>,
+    snapshot: Arc<ExplicitAliasSnapshot>,
+}
+
+impl ExplicitAliasRuntime {
+    fn new(root: PathBuf) -> Self {
+        let runtime = Self {
+            root,
+            state: Mutex::new(ExplicitAliasRuntimeState {
+                package_id: None,
+                snapshot: Arc::new(ExplicitAliasSnapshot::default()),
+            }),
+        };
+        let _ = runtime.refresh();
+        runtime
+    }
+
+    fn refresh(&self) -> bool {
+        let next_id = match load_explicit_alias_slot_state(&self.root) {
+            Ok(Some(state)) => state.current().map(str::to_owned),
+            Ok(None) => None,
+            Err(_) => return false,
+        };
+        if self
+            .state
+            .lock()
+            .map(|state| state.package_id == next_id)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let next_snapshot = match next_id.as_deref() {
+            Some(_) => {
+                match load_current_explicit_alias_snapshot(&self.root, &WindowsUserDataProtector) {
+                    Ok(Some(loaded)) if Some(loaded.package_id()) == next_id.as_deref() => {
+                        loaded.into_snapshot()
+                    }
+                    _ => return false,
+                }
+            }
+            None => Arc::new(ExplicitAliasSnapshot::default()),
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.package_id == next_id {
+            return false;
+        }
+        state.package_id = next_id;
+        state.snapshot = next_snapshot;
+        true
+    }
+
+    fn text(&self, code: &str) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.snapshot.get(code).map(str::to_owned))
+    }
 }
 
 impl CandidateProvider for SnapshotCandidateProvider {
     fn candidates(&self, code: &str, limit: usize, view: InteractiveCandidateView) -> Vec<String> {
         match view {
             InteractiveCandidateView::Primary => {
-                self.snapshot.candidate_texts(code, limit).map(|base| {
-                    let mut candidates = project_overlay_decoder()
-                        .decode_exact_full_code(code, limit)
-                        .map(|candidates| {
-                            candidates
-                                .into_iter()
-                                .map(|candidate| candidate.text)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    let mut seen = candidates.iter().cloned().collect::<HashSet<_>>();
-                    for candidate in base {
-                        if seen.insert(candidate.clone()) {
-                            candidates.push(candidate);
-                        }
-                        if candidates.len() == limit {
-                            break;
-                        }
+                let mut candidates = Vec::new();
+                let mut seen = HashSet::new();
+                if let Some(alias) = self.aliases.as_ref().and_then(|aliases| aliases.text(code)) {
+                    seen.insert(alias.clone());
+                    candidates.push(alias);
+                }
+                for candidate in project_overlay_decoder()
+                    .decode_exact_full_code(code, limit)
+                    .unwrap_or_default()
+                {
+                    if seen.insert(candidate.text.clone()) {
+                        candidates.push(candidate.text);
                     }
-                    candidates
-                })
+                }
+                for candidate in self
+                    .snapshot
+                    .candidate_texts(code, limit)
+                    .unwrap_or_default()
+                {
+                    if seen.insert(candidate.clone()) {
+                        candidates.push(candidate);
+                    }
+                    if candidates.len() == limit {
+                        break;
+                    }
+                }
+                candidates.truncate(limit);
+                candidates
             }
-            InteractiveCandidateView::TranspositionRecovery => {
-                self.snapshot.transposition_recovery_texts(code, limit)
-            }
+            InteractiveCandidateView::TranspositionRecovery => self
+                .snapshot
+                .transposition_recovery_texts(code, limit)
+                .unwrap_or_default(),
         }
-        .unwrap_or_default()
+    }
+
+    fn refresh_at_safe_boundary(&self) -> bool {
+        self.aliases
+            .as_ref()
+            .is_some_and(ExplicitAliasRuntime::refresh)
     }
 }
 
@@ -357,9 +482,9 @@ fn native_candidate_view(view: InteractiveCandidateView, shape_mode: bool) -> Na
     }
 }
 
-fn development_candidate_provider() -> CandidateProviderLoadResult {
-    static PROVIDER: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
-    PROVIDER
+fn development_candidate_blueprint() -> CandidateProviderLoadResult {
+    static BLUEPRINT: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
+    BLUEPRINT
         .get_or_init(|| {
             let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST)
                 .map_err(CandidateProviderLoadError::Embedded)?;
@@ -368,21 +493,37 @@ fn development_candidate_provider() -> CandidateProviderLoadResult {
                     .load_snapshot(TSF_DEVELOPMENT_LEXICON)
                     .map_err(CandidateProviderLoadError::Embedded)?,
             );
-            Ok(Arc::new(SnapshotCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
+            Ok(CandidateProviderBlueprint {
+                snapshot,
+                alias_root: None,
+            })
         })
         .clone()
 }
 
-fn candidate_provider_for_root(root: &Path) -> CandidateProviderLoadResult {
+#[cfg(test)]
+fn development_candidate_provider()
+-> std::result::Result<Arc<dyn CandidateProvider>, CandidateProviderLoadError> {
+    development_candidate_blueprint().map(|blueprint| blueprint.build())
+}
+
+fn candidate_provider_for_root(
+    root: &Path,
+    alias_root: Option<PathBuf>,
+) -> CandidateProviderLoadResult {
     match load_current_candidate_snapshot(root).map_err(CandidateProviderLoadError::Runtime)? {
-        Some(snapshot) => {
-            Ok(Arc::new(SnapshotCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>)
-        }
-        None => development_candidate_provider(),
+        Some(snapshot) => Ok(CandidateProviderBlueprint {
+            snapshot,
+            alias_root,
+        }),
+        None => development_candidate_blueprint().map(|mut blueprint| {
+            blueprint.alias_root = alias_root;
+            blueprint
+        }),
     }
 }
 
-fn module_candidate_runtime_root() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
+fn module_path() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
     let mut module = HMODULE::default();
     let address = DllGetClassObject as *const () as *const u16;
     // SAFETY: FROM_ADDRESS treats the non-null value as an address within the
@@ -404,16 +545,36 @@ fn module_candidate_runtime_root() -> std::result::Result<PathBuf, CandidateProv
     if length == 0 || length >= buffer.len() {
         return Err(CandidateProviderLoadError::ModuleLocation);
     }
-    let module_path = PathBuf::from(OsString::from_wide(&buffer[..length]));
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..length])))
+}
+
+fn module_candidate_runtime_root() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
+    let module_path = module_path()?;
     let parent = module_path
         .parent()
         .ok_or(CandidateProviderLoadError::ModuleLocation)?;
     Ok(parent.join(CANDIDATE_RUNTIME_DIRECTORY))
 }
 
+fn explicit_alias_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    let build = module_path.parent()?;
+    let builds = build.parent()?;
+    let tsf_alpha = builds.parent()?;
+    let digest = build.file_name()?.to_str()?;
+    if builds.file_name()?.to_str()? != "builds"
+        || tsf_alpha.file_name()?.to_str()? != "tsf-alpha"
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(tsf_alpha.join("user-data").join("aliases"))
+}
+
 fn class_factory_candidate_provider() -> CandidateProviderLoadResult {
     let root = module_candidate_runtime_root()?;
-    candidate_provider_for_root(&root)
+    let alias_root = explicit_alias_root_for_module(&module_path()?);
+    candidate_provider_for_root(&root, alias_root)
 }
 
 const MAX_TSF_PREFLIGHT_CODE_KEYS: usize = 64;
@@ -686,9 +847,14 @@ fn run_candidate_preflight(
     expected_text: &str,
 ) -> std::result::Result<(), TsfCandidatePreflightError> {
     let _apartment = PreflightApartment::enter()?;
-    let provider = Arc::new(SnapshotCandidateProvider { snapshot }) as Arc<dyn CandidateProvider>;
-    let factory: IClassFactory =
-        TsfClassFactory::counted_with_options(Ok(provider), KeyAdviceMode::SyntheticHost).into();
+    let factory: IClassFactory = TsfClassFactory::counted_with_options(
+        Ok(CandidateProviderBlueprint {
+            snapshot,
+            alias_root: None,
+        }),
+        KeyAdviceMode::SyntheticHost,
+    )
+    .into();
     // SAFETY: aggregation is disabled and the local factory implements this interface.
     let service: ITfTextInputProcessorEx = unsafe { factory.CreateInstance(None::<&IUnknown>) }
         .map_err(|_| TsfCandidatePreflightError::ServiceActivation)?;
@@ -916,6 +1082,15 @@ fn decode_virtual_key(
         key if key == VK_OEM_PERIOD.0 && !modifiers.shift => Some(CompositionInput::Punctuation(
             CompositionPunctuation::Period,
         )),
+        key if key == VK_9.0 && modifiers.shift => Some(CompositionInput::Punctuation(
+            CompositionPunctuation::LeftParenthesis,
+        )),
+        key if key == VK_0.0 && modifiers.shift => Some(CompositionInput::Punctuation(
+            CompositionPunctuation::RightParenthesis,
+        )),
+        key if key == VK_OEM_2.0 && modifiers.shift => Some(CompositionInput::Punctuation(
+            CompositionPunctuation::QuestionMark,
+        )),
         key if key == VK_ESCAPE.0 => Some(CompositionInput::Escape),
         key if key == VK_PRIOR.0 || key == VK_OEM_MINUS.0 => Some(CompositionInput::PreviousPage),
         key if key == VK_NEXT.0 || key == VK_OEM_PLUS.0 => Some(CompositionInput::NextPage),
@@ -925,7 +1100,7 @@ fn decode_virtual_key(
                     .to_string(),
             ))
         }
-        key if (VK_1.0..=VK_7.0).contains(&key) => {
+        key if (VK_1.0..=VK_6.0).contains(&key) => {
             Some(CompositionInput::Select(usize::from(key - VK_1.0) + 1))
         }
         _ => None,
@@ -1057,7 +1232,7 @@ impl TsfClassFactory {
     #[cfg(test)]
     fn counted_for_process_test() -> Self {
         Self::counted_with_options(
-            development_candidate_provider(),
+            development_candidate_blueprint(),
             KeyAdviceMode::SyntheticHost,
         )
     }
@@ -1092,7 +1267,7 @@ impl IClassFactory_Impl for TsfClassFactory_Impl {
             .as_ref()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
         let service: ITfTextInputProcessorEx = TsfTextService::counted_with_options(
-            Some(Arc::clone(candidate_provider)),
+            Some(candidate_provider.build()),
             self.key_advice_mode,
         )
         .into();
@@ -1175,15 +1350,53 @@ fn popup_scale(dpi: u32, logical: i32) -> i32 {
     .unwrap_or(i32::MAX)
 }
 
-const POPUP_OUTER_PADDING_LOGICAL: i32 = 8;
+const POPUP_OUTER_PADDING_LOGICAL: i32 = 5;
 const POPUP_ROW_HEIGHT_LOGICAL: i32 = 36;
-const POPUP_TEXT_PADDING_LOGICAL: i32 = 10;
-const POPUP_SELECTED_TEXT_INSET_LOGICAL: i32 = 16;
-const POPUP_RANK_WIDTH_LOGICAL: i32 = 18;
-const POPUP_RANK_GAP_LOGICAL: i32 = 5;
+const POPUP_TEXT_PADDING_LOGICAL: i32 = 7;
+const POPUP_SELECTED_TEXT_INSET_LOGICAL: i32 = 13;
+const POPUP_RANK_WIDTH_LOGICAL: i32 = 16;
+const POPUP_RANK_GAP_LOGICAL: i32 = 4;
 const POPUP_METADATA_BASELINE_OFFSET_LOGICAL: i32 = 2;
-const POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL: i32 = 50;
-const POPUP_FOOTER_CONTENT_INSET_LOGICAL: i32 = 12;
+const POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL: i32 = 42;
+const POPUP_FOOTER_CONTENT_INSET_LOGICAL: i32 = 10;
+const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 640;
+const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 54;
+const POPUP_CORNER_DIAMETER_LOGICAL: i32 = 16;
+const POPUP_BORDER_WIDTH_LOGICAL: i32 = 1;
+
+fn candidate_popup_corner_diameter(dpi: u32) -> i32 {
+    popup_scale(dpi, POPUP_CORNER_DIAMETER_LOGICAL)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidatePopupBorderGeometry {
+    outer: RECT,
+    inner: RECT,
+    outer_corner_diameter: i32,
+    inner_corner_diameter: i32,
+}
+
+fn candidate_popup_border_geometry(client: RECT, dpi: u32) -> Option<CandidatePopupBorderGeometry> {
+    let border_width = popup_scale(dpi, POPUP_BORDER_WIDTH_LOGICAL).max(1);
+    let inner = RECT {
+        left: client.left.saturating_add(border_width),
+        top: client.top.saturating_add(border_width),
+        right: client.right.saturating_sub(border_width),
+        bottom: client.bottom.saturating_sub(border_width),
+    };
+    if inner.right <= inner.left || inner.bottom <= inner.top {
+        return None;
+    }
+    let outer_corner_diameter = candidate_popup_corner_diameter(dpi);
+    Some(CandidatePopupBorderGeometry {
+        outer: client,
+        inner,
+        outer_corner_diameter,
+        inner_corner_diameter: outer_corner_diameter
+            .saturating_sub(border_width.saturating_mul(2))
+            .max(1),
+    })
+}
 
 fn horizontal_candidate_logical_width(candidate: &str) -> i32 {
     let text_width = candidate
@@ -1192,7 +1405,7 @@ fn horizontal_candidate_logical_width(candidate: &str) -> i32 {
         .fold(0_i32, |width, character| {
             width.saturating_add(if character.is_ascii() { 9 } else { 18 })
         })
-        .clamp(18, 180);
+        .clamp(18, 144);
     POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL.saturating_add(text_width)
 }
 
@@ -1201,11 +1414,54 @@ fn candidate_popup_footer_logical_width(display: &CandidateDisplay) -> i32 {
         display.view() == InteractiveCandidateView::TranspositionRecovery,
         display.page_starts().len() > 1,
     ) {
-        (true, true) => 116,
-        (true, false) => 64,
-        (false, true) => 68,
+        (true, true) => 108,
+        (true, false) => 60,
+        (false, true) => 62,
         (false, false) => 0,
     }
+}
+
+fn horizontal_candidate_widths(display: &CandidateDisplay, dpi: u32, popup_width: i32) -> Vec<i32> {
+    let footer_width = popup_scale(dpi, candidate_popup_footer_logical_width(display));
+    let padding = popup_scale(dpi, POPUP_OUTER_PADDING_LOGICAL);
+    let budget = popup_width
+        .saturating_sub(padding.saturating_mul(2))
+        .saturating_sub(footer_width)
+        .max(0);
+    let mut widths = display
+        .visible()
+        .iter()
+        .map(|candidate| popup_scale(dpi, horizontal_candidate_logical_width(candidate)))
+        .collect::<Vec<_>>();
+    let minimums = widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            if index == 0 {
+                *width
+            } else {
+                popup_scale(dpi, POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    while widths.iter().copied().sum::<i32>() > budget {
+        let flexible = widths
+            .iter()
+            .zip(&minimums)
+            .filter(|(width, minimum)| width > minimum)
+            .count();
+        if flexible == 0 {
+            break;
+        }
+        let excess = widths.iter().copied().sum::<i32>().saturating_sub(budget);
+        let share = excess.saturating_add(i32::try_from(flexible).unwrap_or(i32::MAX) - 1)
+            / i32::try_from(flexible).unwrap_or(1);
+        for (width, minimum) in widths.iter_mut().zip(&minimums) {
+            *width = (*width).saturating_sub(share).max(*minimum);
+        }
+    }
+    widths
 }
 
 fn candidate_popup_metrics(
@@ -1216,24 +1472,44 @@ fn candidate_popup_metrics(
     let footer_needed = display.page_starts().len() > 1
         || display.view() == InteractiveCandidateView::TranspositionRecovery;
     let footer_width = popup_scale(dpi, candidate_popup_footer_logical_width(display));
+    let outer_width = popup_scale(dpi, POPUP_OUTER_PADDING_LOGICAL.saturating_mul(2));
     let horizontal_content_width =
         display
             .visible()
             .iter()
-            .fold(popup_scale(dpi, 16), |width, candidate| {
+            .fold(outer_width, |width, candidate| {
                 width.saturating_add(popup_scale(
                     dpi,
                     horizontal_candidate_logical_width(candidate),
                 ))
             });
-    let horizontal_width = horizontal_content_width
+    let desired_horizontal_width = horizontal_content_width
         .saturating_add(footer_width)
-        .max(popup_scale(dpi, 320));
-    let horizontal_limit = popup_scale(dpi, 1040).min(available_width.max(1));
-    if horizontal_width <= horizontal_limit {
+        .max(popup_scale(dpi, 280));
+    let horizontal_limit = popup_scale(dpi, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL)
+        .min(available_width.max(1).saturating_mul(4) / 5);
+    let minimum_candidate_width =
+        display
+            .visible()
+            .iter()
+            .enumerate()
+            .fold(0_i32, |width, (index, candidate)| {
+                width.saturating_add(popup_scale(
+                    dpi,
+                    if index == 0 {
+                        horizontal_candidate_logical_width(candidate)
+                    } else {
+                        POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL
+                    },
+                ))
+            });
+    let minimum_horizontal_width = outer_width
+        .saturating_add(minimum_candidate_width)
+        .saturating_add(footer_width);
+    if minimum_horizontal_width <= horizontal_limit {
         return CandidatePopupMetrics {
             layout: CandidatePopupLayout::Horizontal,
-            width: horizontal_width,
+            width: desired_horizontal_width.min(horizontal_limit),
             height: popup_scale(
                 dpi,
                 POPUP_OUTER_PADDING_LOGICAL
@@ -1258,12 +1534,102 @@ fn candidate_popup_metrics(
     }
 }
 
+#[derive(Debug)]
+struct PendingCandidatePopupTiming {
+    started_at: Instant,
+    context: NativeFeedbackContext,
+    initial_show: bool,
+}
+
 #[derive(Default)]
 struct CandidatePopupPaintState {
     display: CandidateDisplay,
     dpi: u32,
     layout: CandidatePopupLayout,
     original_window_proc: isize,
+    native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+    native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
+    pending_timing: Option<PendingCandidatePopupTiming>,
+    corner_strategy: CandidatePopupCornerStrategy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CandidatePopupCornerStrategy {
+    SystemDwm,
+    #[default]
+    RegionFallback,
+}
+
+impl CandidatePopupCornerStrategy {
+    fn uses_custom_region(self) -> bool {
+        self == Self::RegionFallback
+    }
+}
+
+fn configure_candidate_popup_corners(hwnd: HWND) -> CandidatePopupCornerStrategy {
+    let preference = DWMWCP_ROUND;
+    let border = popup_color(POPUP_BORDER_RGB).0;
+    // Windows 11 can composite an anti-aliased corner and border for a custom
+    // top-level popup. Earlier systems reject either attribute, in which case
+    // the existing deterministic GDI region remains the compatibility path.
+    let corner_result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            std::ptr::from_ref(&preference).cast(),
+            u32::try_from(std::mem::size_of_val(&preference)).unwrap_or(u32::MAX),
+        )
+    };
+    let border_result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            std::ptr::from_ref(&border).cast(),
+            u32::try_from(std::mem::size_of_val(&border)).unwrap_or(u32::MAX),
+        )
+    };
+    if corner_result.is_ok() && border_result.is_ok() {
+        CandidatePopupCornerStrategy::SystemDwm
+    } else {
+        CandidatePopupCornerStrategy::RegionFallback
+    }
+}
+
+impl CandidatePopupPaintState {
+    fn complete_pending_timing(&mut self) {
+        let Some(pending) = self.pending_timing.take() else {
+            return;
+        };
+        let elapsed_ms = pending
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        let Some(feedback) = self.native_feedback.upgrade() else {
+            return;
+        };
+        let Ok(mut feedback) = feedback.lock() else {
+            return;
+        };
+        if !feedback.is_accepting() {
+            return;
+        }
+        let result = feedback.record_at(
+            pending.context,
+            NativeFeedbackEvent::CandidatePopupTiming {
+                first_frame_ms: elapsed_ms,
+                fully_visible_ms: elapsed_ms,
+                initial_show: pending.initial_show,
+            },
+            native_feedback_monotonic_ms(),
+        );
+        drop(feedback);
+        if matches!(result, NativeFeedbackRecordResult::Stopped(_))
+            && let Some(state) = self.native_feedback_language_bar_state.upgrade()
+        {
+            state.notify();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1288,11 +1654,28 @@ struct CandidatePopup {
     anchor: Option<RECT>,
     placement: Option<CandidatePopupPlacement>,
     visible: bool,
+    feedback_context: NativeFeedbackContext,
     paint: Box<CandidatePopupPaintState>,
 }
 
 impl CandidatePopup {
-    fn show(&mut self, owner: HWND, anchor: RECT, display: &CandidateDisplay) -> Result<()> {
+    fn attach_feedback(
+        &mut self,
+        native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+        native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
+    ) {
+        self.paint.native_feedback = native_feedback;
+        self.paint.native_feedback_language_bar_state = native_feedback_language_bar_state;
+    }
+
+    fn show(
+        &mut self,
+        owner: HWND,
+        anchor: RECT,
+        display: &CandidateDisplay,
+        feedback_context: NativeFeedbackContext,
+    ) -> Result<()> {
+        let timing_started_at = Instant::now();
         if display.visible().is_empty() {
             self.hide();
             return Ok(());
@@ -1309,6 +1692,7 @@ impl CandidatePopup {
         };
         self.paint.display = display.clone();
         self.paint.dpi = dpi;
+        self.feedback_context = feedback_context;
 
         // SAFETY: the anchor is initialized screen geometry from TSF.
         let monitor = unsafe { MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST) };
@@ -1376,6 +1760,7 @@ impl CandidatePopup {
                     return Err(Error::from_thread());
                 }
                 self.paint.original_window_proc = original;
+                self.paint.corner_strategy = configure_candidate_popup_corners(created);
                 self.hwnd = Some(created);
                 self.owner = Some(owner);
                 created
@@ -1384,7 +1769,7 @@ impl CandidatePopup {
 
         let width = metrics.width;
         let height = metrics.height;
-        let gap = popup_scale(dpi, 6);
+        let gap = popup_scale(dpi, 4);
         let mut x = anchor.left;
         let mut y = anchor.bottom.saturating_add(gap);
 
@@ -1404,8 +1789,10 @@ impl CandidatePopup {
             width,
             height,
         };
-        if placement.size_differs_from(self.placement) {
-            let corner = popup_scale(dpi, 12);
+        if self.paint.corner_strategy.uses_custom_region()
+            && placement.size_differs_from(self.placement)
+        {
+            let corner = candidate_popup_corner_diameter(dpi);
             // SAFETY: the region uses popup-local coordinates. On success
             // Windows owns it; on failure this method retains cleanup
             // responsibility. Content-only updates reuse the existing region
@@ -1422,7 +1809,8 @@ impl CandidatePopup {
                 }
             }
         }
-        if self.placement != Some(placement) || !self.visible {
+        let was_visible = self.visible;
+        if self.placement != Some(placement) || !was_visible {
             let flags = SET_WINDOW_POS_FLAGS(
                 SWP_NOACTIVATE.0 | if self.visible { 0 } else { SWP_SHOWWINDOW.0 },
             );
@@ -1434,6 +1822,11 @@ impl CandidatePopup {
             self.placement = Some(placement);
             self.visible = true;
         }
+        self.paint.pending_timing = Some(PendingCandidatePopupTiming {
+            started_at: timing_started_at,
+            context: feedback_context,
+            initial_show: !was_visible,
+        });
         // SAFETY: the stable paint state and final client size are now ready.
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1442,11 +1835,15 @@ impl CandidatePopup {
         Ok(())
     }
 
-    fn update(&mut self, display: &CandidateDisplay) -> Result<()> {
+    fn update(
+        &mut self,
+        display: &CandidateDisplay,
+        feedback_context: NativeFeedbackContext,
+    ) -> Result<()> {
         let (Some(owner), Some(anchor)) = (self.owner, self.anchor) else {
             return Ok(());
         };
-        self.show(owner, anchor, display)
+        self.show(owner, anchor, display, feedback_context)
     }
 
     fn set_visible(&mut self, visible: bool) {
@@ -1456,12 +1853,27 @@ impl CandidatePopup {
         if self.visible == visible {
             return;
         }
-        // SAFETY: this process owns the popup handle. ShowWindow does not
-        // transfer ownership and SW_SHOWNOACTIVATE preserves editor focus.
-        unsafe {
-            let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        if visible {
+            let (Some(owner), Some(anchor)) = (self.owner, self.anchor) else {
+                return;
+            };
+            let display = self.paint.display.clone();
+            // show() owns placement and nonactivating visibility changes.
+            if self
+                .show(owner, anchor, &display, self.feedback_context)
+                .is_err()
+            {
+                self.destroy();
+            }
+            return;
         }
-        self.visible = visible;
+        self.visible = false;
+        self.paint.pending_timing = None;
+        // SAFETY: candidate dismissal is immediate so committed text is never
+        // covered by a fading stale list.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
     }
 
     fn hide(&mut self) {
@@ -1497,7 +1909,7 @@ const POPUP_BACKGROUND_RGB: (u8, u8, u8) = (31, 32, 35);
 const POPUP_SELECTED_BACKGROUND_RGB: (u8, u8, u8) = (44, 47, 53);
 const POPUP_SELECTED_TEXT_RGB: (u8, u8, u8) = (250, 251, 253);
 const POPUP_CANDIDATE_TEXT_RGB: (u8, u8, u8) = (218, 223, 230);
-const POPUP_SELECTED_RANK_RGB: (u8, u8, u8) = (118, 201, 242);
+const POPUP_SELECTED_RANK_RGB: (u8, u8, u8) = (198, 205, 215);
 const POPUP_RANK_RGB: (u8, u8, u8) = (143, 151, 164);
 const POPUP_PAGE_RGB: (u8, u8, u8) = (130, 139, 153);
 const POPUP_SELECTION_ACCENT_RGB: (u8, u8, u8) = (72, 180, 232);
@@ -1626,12 +2038,8 @@ unsafe fn paint_candidate_label(
             let _ = SelectObject(hdc, HGDIOBJ(font.0));
         }
     }
-    let mut text = candidate
-        .chars()
-        .take(CANDIDATE_DISPLAY_MAX_CHARS)
-        .collect::<String>()
-        .encode_utf16()
-        .collect::<Vec<_>>();
+    let mut text =
+        unsafe { candidate_popup_text(hdc, candidate, content.right.saturating_sub(content.left)) };
     // SAFETY: the paint DC and bounded candidate rectangle are valid.
     unsafe {
         let _ = SetTextColor(
@@ -1649,6 +2057,55 @@ unsafe fn paint_candidate_label(
             DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
     }
+}
+
+unsafe fn candidate_popup_text(hdc: HDC, candidate: &str, maximum_width: i32) -> Vec<u16> {
+    candidate_text_for_width(candidate, maximum_width, |text| {
+        let encoded = text.encode_utf16().collect::<Vec<_>>();
+        let mut size = SIZE::default();
+        // SAFETY: encoded and size remain valid for this read-only font
+        // measurement on the current paint DC.
+        unsafe { GetTextExtentPoint32W(hdc, &encoded, &mut size).as_bool() }.then_some(size.cx)
+    })
+    .encode_utf16()
+    .collect()
+}
+
+fn candidate_text_for_width(
+    candidate: &str,
+    maximum_width: i32,
+    mut measure: impl FnMut(&str) -> Option<i32>,
+) -> String {
+    let characters = candidate
+        .chars()
+        .take(CANDIDATE_DISPLAY_MAX_CHARS)
+        .collect::<Vec<_>>();
+    let full = characters.iter().collect::<String>();
+    let Some(full_width) = measure(&full) else {
+        return full;
+    };
+    if characters.is_empty() || full_width <= maximum_width {
+        return full;
+    }
+
+    let mut lower = 0;
+    let mut upper = characters.len();
+    while lower < upper {
+        let middle = lower + (upper - lower).div_ceil(2);
+        let mut trial = characters[..middle].iter().collect::<String>();
+        trial.push('…');
+        let Some(trial_width) = measure(&trial) else {
+            return full;
+        };
+        if trial_width <= maximum_width {
+            lower = middle;
+        } else {
+            upper = middle - 1;
+        }
+    }
+    let mut clipped = characters[..lower].iter().collect::<String>();
+    clipped.push('…');
+    clipped
 }
 
 unsafe fn fill_rounded_popup_rect(hdc: HDC, rectangle: RECT, radius: i32, color: COLORREF) {
@@ -1685,19 +2142,65 @@ unsafe fn fill_rounded_popup_rect(hdc: HDC, rectangle: RECT, radius: i32, color:
     }
 }
 
+unsafe fn paint_rounded_popup_border(hdc: HDC, client: RECT, dpi: u32, color: COLORREF) {
+    let Some(geometry) = candidate_popup_border_geometry(client, dpi) else {
+        return;
+    };
+    // Build a one-DPI-scaled-pixel ring from two rounded regions. Its outer
+    // curve uses the exact same corner diameter as the window region, unlike
+    // FrameRect's square joins at the four clipped corners.
+    let outer = unsafe {
+        CreateRoundRectRgn(
+            geometry.outer.left,
+            geometry.outer.top,
+            geometry.outer.right.saturating_add(1),
+            geometry.outer.bottom.saturating_add(1),
+            geometry.outer_corner_diameter,
+            geometry.outer_corner_diameter,
+        )
+    };
+    let inner = unsafe {
+        CreateRoundRectRgn(
+            geometry.inner.left,
+            geometry.inner.top,
+            geometry.inner.right.saturating_add(1),
+            geometry.inner.bottom.saturating_add(1),
+            geometry.inner_corner_diameter,
+            geometry.inner_corner_diameter,
+        )
+    };
+    let brush = unsafe { CreateSolidBrush(color) };
+    if !outer.is_invalid() && !inner.is_invalid() && !brush.is_invalid() {
+        // SAFETY: all three objects are local to this paint call. GDI permits
+        // the destination region to alias a source region for CombineRgn.
+        unsafe {
+            if CombineRgn(Some(outer), Some(outer), Some(inner), RGN_DIFF) != RGN_ERROR {
+                let _ = FillRgn(hdc, outer, brush);
+            }
+        }
+    }
+    for object in [HGDIOBJ(brush.0), HGDIOBJ(inner.0), HGDIOBJ(outer.0)] {
+        if !object.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(object);
+            }
+        }
+    }
+}
+
 fn candidate_selection_rects(item: RECT, dpi: u32) -> (RECT, RECT) {
     let scale = |logical: i32| popup_scale(dpi, logical);
     let selected = RECT {
         left: item.left.saturating_add(scale(1)),
-        top: item.top.saturating_add(scale(3)),
+        top: item.top.saturating_add(scale(4)),
         right: item.right.saturating_sub(scale(5)),
-        bottom: item.bottom.saturating_sub(scale(3)),
+        bottom: item.bottom.saturating_sub(scale(4)),
     };
     let accent = RECT {
         left: selected.left.saturating_add(scale(5)),
-        top: selected.top.saturating_add(scale(6)),
+        top: selected.top.saturating_add(scale(7)),
         right: selected.left.saturating_add(scale(8)),
-        bottom: selected.bottom.saturating_sub(scale(6)),
+        bottom: selected.bottom.saturating_sub(scale(7)),
     };
     (selected, accent)
 }
@@ -1712,7 +2215,7 @@ unsafe fn paint_candidate_selection(
     let scale = |logical: i32| popup_scale(dpi, logical);
     let (selected, accent) = candidate_selection_rects(item, dpi);
     unsafe {
-        fill_rounded_popup_rect(hdc, selected, scale(8), selected_background);
+        fill_rounded_popup_rect(hdc, selected, scale(6), selected_background);
     }
     unsafe {
         fill_rounded_popup_rect(hdc, accent, scale(4), selection_accent);
@@ -1731,13 +2234,12 @@ unsafe extern "system" fn candidate_popup_window_proc(
         unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CandidatePopupPaintState;
     if message == WM_PAINT && !state_pointer.is_null() {
         // SAFETY: the boxed state outlives this window.
-        unsafe { paint_candidate_popup(hwnd, &*state_pointer) };
+        unsafe { paint_candidate_popup(hwnd, &mut *state_pointer) };
         return LRESULT(0);
     }
     if message == WM_ERASEBKGND && !state_pointer.is_null() {
         return LRESULT(1);
     }
-
     let original = if state_pointer.is_null() {
         0
     } else {
@@ -1759,7 +2261,7 @@ unsafe extern "system" fn candidate_popup_window_proc(
     unsafe { CallWindowProcW(original, hwnd, message, wparam, lparam) }
 }
 
-unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
+unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState) {
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: standard WM_PAINT lifecycle for this popup.
     let paint_dc = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -1847,8 +2349,10 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
     match state.layout {
         CandidatePopupLayout::Horizontal => {
             let mut left = padding;
-            for (index, candidate) in state.display.visible().iter().enumerate() {
-                let width = scale(horizontal_candidate_logical_width(candidate));
+            let widths = horizontal_candidate_widths(&state.display, state.dpi, client.right);
+            for ((index, candidate), width) in
+                state.display.visible().iter().enumerate().zip(widths)
+            {
                 let mut item = RECT {
                     left,
                     top: padding,
@@ -2045,12 +2549,11 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
         }
     }
 
-    let border_brush = unsafe { CreateSolidBrush(border) };
-    if !border_brush.is_invalid() {
-        // SAFETY: paint DC and client rectangle are valid.
+    if state.corner_strategy.uses_custom_region() {
+        // SAFETY: the compatibility border is bounded to this popup's paint
+        // DC and shares its corner geometry with the fallback window region.
         unsafe {
-            let _ = FrameRect(hdc, &client, border_brush);
-            let _ = DeleteObject(HGDIOBJ(border_brush.0));
+            paint_rounded_popup_border(hdc, client, state.dpi, border);
         }
     }
     if !previous_font.is_invalid() {
@@ -2107,6 +2610,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &CandidatePopupPaintState) {
     unsafe {
         let _ = EndPaint(hwnd, &paint);
     }
+    state.complete_pending_timing();
 }
 
 #[implement(ITfCandidateListUIElement)]
@@ -2325,6 +2829,16 @@ impl CandidateUiController {
         }
     }
 
+    fn attach_feedback(
+        &mut self,
+        native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+        native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
+    ) {
+        if let Ok(mut popup) = self.popup.try_borrow_mut() {
+            popup.attach_feedback(native_feedback, native_feedback_language_bar_state);
+        }
+    }
+
     #[cfg(test)]
     fn new_headless() -> Self {
         let mut controller = Self::new(true);
@@ -2344,6 +2858,7 @@ impl CandidateUiController {
         range: &ITfRange,
         ec: u32,
         display: CandidateDisplay,
+        feedback_context: NativeFeedbackContext,
     ) -> bool {
         if !self.enabled || display.candidates.is_empty() {
             self.end();
@@ -2433,17 +2948,28 @@ impl CandidateUiController {
             .unwrap_or(false);
         let show_popup =
             candidate_popup_should_show(self.show_native, element_visible, clipped.as_bool());
-        if let Ok(mut popup) = self.popup.try_borrow_mut() {
-            if show_popup {
-                let _ = popup.show(owner, anchor, &display);
-            } else {
+        let popup_ready = match self.popup.try_borrow_mut() {
+            Ok(mut popup) if show_popup => popup
+                .show(owner, anchor, &display, feedback_context)
+                .is_ok(),
+            Ok(mut popup) => {
                 popup.hide();
+                true
             }
+            Err(_) => false,
+        };
+        if !popup_ready {
+            self.end();
+            return false;
         }
         true
     }
 
-    fn update_contents(&mut self, display: CandidateDisplay) -> bool {
+    fn update_contents(
+        &mut self,
+        display: CandidateDisplay,
+        feedback_context: NativeFeedbackContext,
+    ) -> bool {
         if !self.enabled || display.candidates.is_empty() {
             self.end();
             return false;
@@ -2473,12 +2999,19 @@ impl CandidateUiController {
             .try_borrow()
             .map(|state| state.shown)
             .unwrap_or(false);
-        if let Ok(mut popup) = self.popup.try_borrow_mut() {
-            if self.show_native && element_visible {
-                let _ = popup.update(&display);
-            } else {
-                popup.hide();
+        let popup_ready = match self.popup.try_borrow_mut() {
+            Ok(mut popup) if self.show_native && element_visible => {
+                popup.update(&display, feedback_context).is_ok()
             }
+            Ok(mut popup) => {
+                popup.hide();
+                true
+            }
+            Err(_) => false,
+        };
+        if !popup_ready {
+            self.end();
+            return false;
         }
         true
     }
@@ -2658,12 +3191,13 @@ impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
             && let Ok(mut native_feedback) = native_feedback.lock()
             && native_feedback.is_accepting()
         {
-            let record_result = native_feedback.record(
+            let record_result = native_feedback.record_at(
                 feedback_context,
                 NativeFeedbackEvent::CompositionCancelled {
                     code,
                     source: NativeCancellationSource::HostTermination,
                 },
+                native_feedback_monotonic_ms(),
             );
             drop(native_feedback);
             if matches!(record_result, NativeFeedbackRecordResult::Stopped(_))
@@ -2950,7 +3484,7 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
                     (self.active_composition()?, self.candidate_display.clone())
                     && let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut()
                 {
-                    candidate_ui.show(&self.context, &active.range, ec, display)
+                    candidate_ui.show(&self.context, &active.range, ec, display, feedback_context)
                 } else {
                     false
                 }
@@ -2976,7 +3510,8 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
                 && let Ok(mut feedback) = self.native_feedback.lock()
                 && feedback.is_accepting()
             {
-                let record_result = feedback.record(feedback_context, event);
+                let record_result =
+                    feedback.record_at(feedback_context, event, native_feedback_monotonic_ms());
                 drop(feedback);
                 if matches!(record_result, NativeFeedbackRecordResult::Stopped(_)) {
                     self.native_feedback_language_bar_state.notify();
@@ -3047,6 +3582,8 @@ const FEEDBACK_MENU_START: u32 = 1;
 const FEEDBACK_MENU_STOP: u32 = 2;
 const FEEDBACK_MENU_CLEAR: u32 = 3;
 const FEEDBACK_MENU_STATUS: u32 = 100;
+const FEEDBACK_MENU_TIMING_BUCKETS: u32 = 102;
+const FEEDBACK_MENU_TIMING_COUNTS: u32 = 103;
 const LANGUAGE_BAR_SINK_COOKIE: u32 = 1;
 const LANGUAGE_BAR_ICON_SIZE: i32 = 16;
 const LANGUAGE_BAR_ICON_ROW_BYTES: usize = 2;
@@ -3232,6 +3769,19 @@ fn feedback_language_bar_tooltip(mode: InputMode, summary: NativeFeedbackSummary
     }
 }
 
+fn feedback_half_pair_gap_bucket_labels() -> String {
+    let bounds = NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS;
+    let mut labels = Vec::with_capacity(bounds.len() + 1);
+    labels.push(format!("<{}", bounds[0]));
+    labels.extend(
+        bounds
+            .windows(2)
+            .map(|pair| format!("{}–{}", pair[0], pair[1] - 1)),
+    );
+    labels.push(format!("≥{}", bounds[bounds.len() - 1]));
+    labels.join(" / ")
+}
+
 fn feedback_language_bar_menu(summary: NativeFeedbackSummary) -> Vec<(u32, u32, String)> {
     let mut items = match summary.lifecycle {
         NativeFeedbackLifecycle::Disabled => {
@@ -3258,6 +3808,27 @@ fn feedback_language_bar_menu(summary: NativeFeedbackSummary) -> Vec<(u32, u32, 
             ),
         ],
     };
+    if summary.enabled {
+        items.push((
+            FEEDBACK_MENU_TIMING_BUCKETS,
+            TF_LBMENUF_GRAYED,
+            format!("双拼间隔（ms）：{}", feedback_half_pair_gap_bucket_labels()),
+        ));
+        items.push((
+            FEEDBACK_MENU_TIMING_COUNTS,
+            TF_LBMENUF_GRAYED,
+            format!(
+                "计数：{}（共 {} 个）",
+                summary
+                    .half_pair_gap_histogram
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+                summary.half_pair_gap_samples
+            ),
+        ));
+    }
     items.push((
         FEEDBACK_MENU_STATUS + 1,
         TF_LBMENUF_GRAYED,
@@ -3266,15 +3837,95 @@ fn feedback_language_bar_menu(summary: NativeFeedbackSummary) -> Vec<(u32, u32, 
     items
 }
 
+fn feedback_native_menu_flags(flags: u32) -> MENU_ITEM_FLAGS {
+    let mut native = if flags & TF_LBMENUF_SEPARATOR != 0 {
+        MF_SEPARATOR
+    } else {
+        MF_STRING
+    };
+    if flags & TF_LBMENUF_GRAYED != 0 {
+        native |= MF_GRAYED;
+    }
+    if flags & TF_LBMENUF_CHECKED != 0 {
+        native |= MF_CHECKED;
+    }
+    native
+}
+
+struct NativeFeedbackPopupMenu(HMENU);
+
+impl NativeFeedbackPopupMenu {
+    fn create() -> Result<Self> {
+        // SAFETY: the returned owned menu is destroyed by Drop.
+        unsafe { CreatePopupMenu() }.map(Self)
+    }
+
+    fn append(&self, id: u32, flags: u32, label: &str) -> Result<()> {
+        let native_flags = feedback_native_menu_flags(flags);
+        let label = label
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: the owned menu remains valid and the null-terminated label
+        // stays live for the complete AppendMenuW call.
+        unsafe {
+            AppendMenuW(
+                self.0,
+                native_flags,
+                usize::try_from(id).map_err(|_| lifecycle_error(E_INVALIDARG))?,
+                PCWSTR(label.as_ptr()),
+            )
+        }
+    }
+
+    fn track(&self, point: &POINT) -> Option<u32> {
+        // SAFETY: this reads only the current foreground window selected by
+        // Windows for the user's language-bar click.
+        let owner = unsafe { GetForegroundWindow() };
+        if owner.is_invalid() {
+            return None;
+        }
+        let flags = (TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON).0;
+        // SAFETY: the owned menu and foreground owner remain live while the
+        // modal native popup tracks this explicit click.
+        let command = unsafe { TrackPopupMenuEx(self.0, flags, point.x, point.y, owner, None) }.0;
+        u32::try_from(command).ok().filter(|command| *command != 0)
+    }
+}
+
+impl Drop for NativeFeedbackPopupMenu {
+    fn drop(&mut self) {
+        // SAFETY: this is the unique owned handle returned by CreatePopupMenu.
+        let _ = unsafe { DestroyMenu(self.0) };
+    }
+}
+
+fn show_native_feedback_popup(state: &NativeFeedbackLanguageBarState, point: &POINT) -> Result<()> {
+    let menu = NativeFeedbackPopupMenu::create()?;
+    for (id, flags, label) in feedback_language_bar_menu(state.summary()?) {
+        menu.append(id, flags, &label)?;
+    }
+    if let Some(command) = menu.track(point) {
+        state.perform_feedback_action(command)?;
+    }
+    Ok(())
+}
+
 #[implement(ITfLangBarItemButton, ITfSource)]
 struct NativeFeedbackLanguageBarItem {
     state: Rc<NativeFeedbackLanguageBarState>,
+    guid_item: GUID,
 }
 
 impl NativeFeedbackLanguageBarItem {
+    #[cfg(test)]
     fn counted(state: Rc<NativeFeedbackLanguageBarState>) -> Self {
+        Self::counted_with_guid(state, GUID_LBI_INPUTMODE)
+    }
+
+    fn counted_with_guid(state: Rc<NativeFeedbackLanguageBarState>, guid_item: GUID) -> Self {
         object_created();
-        Self { state }
+        Self { state, guid_item }
     }
 }
 
@@ -3292,8 +3943,11 @@ impl ITfLangBarItem_Impl for NativeFeedbackLanguageBarItem_Impl {
         }
         let mut value = TF_LANGBARITEMINFO {
             clsidService: TSF_ALPHA_CLSID,
-            guidItem: GUID_LBI_INPUTMODE,
-            dwStyle: TF_LBI_STYLE_BTN_MENU | TF_LBI_STYLE_SHOWNINTRAY | TF_LBI_STYLE_TEXTCOLORICON,
+            guidItem: self.guid_item,
+            dwStyle: TF_LBI_STYLE_BTN_BUTTON
+                | TF_LBI_STYLE_BTN_MENU
+                | TF_LBI_STYLE_SHOWNINTRAY
+                | TF_LBI_STYLE_TEXTCOLORICON,
             ulSort: 0,
             ..TF_LANGBARITEMINFO::default()
         };
@@ -3339,8 +3993,11 @@ impl ITfLangBarItem_Impl for NativeFeedbackLanguageBarItem_Impl {
 }
 
 impl ITfLangBarItemButton_Impl for NativeFeedbackLanguageBarItem_Impl {
-    fn OnClick(&self, _click: TfLBIClick, _point: &POINT, _area: *const RECT) -> Result<()> {
-        Ok(())
+    fn OnClick(&self, click: TfLBIClick, point: &POINT, _area: *const RECT) -> Result<()> {
+        if click != TF_LBI_CLK_LEFT && click != TF_LBI_CLK_RIGHT {
+            return Ok(());
+        }
+        show_native_feedback_popup(&self.state, point)
     }
 
     fn InitMenu(&self, menu: Ref<ITfMenu>) -> Result<()> {
@@ -3422,6 +4079,7 @@ impl ITfSource_Impl for NativeFeedbackLanguageBarItem_Impl {
 struct NativeFeedbackLanguageBarController {
     enabled: bool,
     state: Rc<NativeFeedbackLanguageBarState>,
+    guid_item: GUID,
     manager: Option<ITfLangBarItemMgr>,
     item: Option<ITfLangBarItem>,
 }
@@ -3431,9 +4089,21 @@ impl NativeFeedbackLanguageBarController {
         Self {
             enabled,
             state,
+            guid_item: GUID_LBI_INPUTMODE,
             manager: None,
             item: None,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_guid(
+        enabled: bool,
+        state: Rc<NativeFeedbackLanguageBarState>,
+        guid_item: GUID,
+    ) -> Self {
+        let mut controller = Self::new(enabled, state);
+        controller.guid_item = guid_item;
+        controller
     }
 
     fn activate(&mut self, thread_manager: &ITfThreadMgr) -> Result<()> {
@@ -3444,8 +4114,11 @@ impl NativeFeedbackLanguageBarController {
             return Err(lifecycle_error(E_UNEXPECTED));
         }
         let manager: ITfLangBarItemMgr = thread_manager.cast()?;
-        let button: ITfLangBarItemButton =
-            NativeFeedbackLanguageBarItem::counted(Rc::clone(&self.state)).into();
+        let button: ITfLangBarItemButton = NativeFeedbackLanguageBarItem::counted_with_guid(
+            Rc::clone(&self.state),
+            self.guid_item,
+        )
+        .into();
         let item: ITfLangBarItem = button.cast()?;
         self.state.shown.set(true);
         self.state.disconnect_sink();
@@ -3484,13 +4157,19 @@ impl Drop for NativeFeedbackLanguageBarController {
     }
 }
 
-fn native_feedback_event_code(event: &NativeFeedbackEvent) -> &str {
+fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
     match event {
         NativeFeedbackEvent::CandidatesPresented { code, .. }
         | NativeFeedbackEvent::CandidateCommitted { code, .. }
         | NativeFeedbackEvent::RawCodeCommitted { code }
-        | NativeFeedbackEvent::CompositionCancelled { code, .. } => code,
+        | NativeFeedbackEvent::CompositionCancelled { code, .. } => Some(code),
+        NativeFeedbackEvent::CandidatePopupTiming { .. } => None,
     }
+}
+
+fn native_feedback_monotonic_ms() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn classify_input_scopes(scopes: &[InputScope]) -> NativeFeedbackContext {
@@ -3656,6 +4335,12 @@ impl TsfTextService {
             Arc::clone(&native_feedback_context),
             Rc::clone(&input_mode),
         ));
+        let mut candidate_ui =
+            CandidateUiController::new(matches!(key_advice_mode, KeyAdviceMode::Foreground));
+        candidate_ui.attach_feedback(
+            Arc::downgrade(&native_feedback),
+            Rc::downgrade(&native_feedback_language_bar_state),
+        );
         Self {
             activation: Mutex::new(ActivationState::default()),
             composition: Rc::new(RefCell::new(CompositionSession::default())),
@@ -3663,10 +4348,7 @@ impl TsfTextService {
             candidate_provider,
             candidate_cache: RefCell::new(CandidateCache::default()),
             selection_memory: RefCell::new(SessionSelectionMemory::default()),
-            candidate_ui: Rc::new(RefCell::new(CandidateUiController::new(matches!(
-                key_advice_mode,
-                KeyAdviceMode::Foreground
-            )))),
+            candidate_ui: Rc::new(RefCell::new(candidate_ui)),
             edit_telemetry: Arc::new(Mutex::new(EditSessionTelemetry::default())),
             native_feedback,
             native_feedback_context,
@@ -4076,10 +4758,15 @@ impl TsfTextService_Impl {
                 | CompositionInput::NextPage
         );
         let existing_batch = if needs_existing_candidates && !session.phonetic().is_empty() {
+            let limit = if matches!(&input, CompositionInput::NextPage) {
+                candidate_next_page_limit(session.candidate_page_start())
+            } else {
+                candidate_visible_limit(session.candidate_page_start())
+            };
             self.load_candidate_batch(
                 provider.as_ref(),
                 session.phonetic(),
-                candidate_request_limit(session.candidate_page_start()),
+                limit,
                 if session.recovery_mode() {
                     InteractiveCandidateView::TranspositionRecovery
                 } else {
@@ -4187,7 +4874,7 @@ impl TsfTextService_Impl {
                 self.load_candidate_batch(
                     provider.as_ref(),
                     plan.after.phonetic(),
-                    candidate_request_limit(plan.after.candidate_page_start()),
+                    candidate_visible_limit(plan.after.candidate_page_start()),
                     if plan.after.recovery_mode() {
                         InteractiveCandidateView::TranspositionRecovery
                     } else {
@@ -4220,6 +4907,22 @@ impl TsfTextService_Impl {
         let Some(context) = context.cloned() else {
             return Ok(false.into());
         };
+        if self.input_mode.get() == InputMode::Chinese
+            && !self.has_active_logical_composition()?
+            && u16::try_from(wparam.0)
+                .ok()
+                .and_then(|vkey| decode_virtual_key(vkey, modifiers, self.input_mode.get()))
+                .is_some_and(|input| matches!(input, CompositionInput::Letters(_)))
+            && self
+                .candidate_provider
+                .as_ref()
+                .is_some_and(|provider| provider.refresh_at_safe_boundary())
+        {
+            *self
+                .candidate_cache
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))? = CandidateCache::default();
+        }
         let Some(plan) = self.plan_key(wparam, modifiers)? else {
             return Ok(false.into());
         };
@@ -4272,25 +4975,31 @@ impl TsfTextService_Impl {
             memory.remember_text(&selection.code, &selection.text);
         }
         if ui_only && let Some(display) = candidate_display {
+            let feedback_context = feedback_after_success
+                .as_ref()
+                .and_then(native_feedback_event_code)
+                .map(|code| {
+                    self.native_feedback_context
+                        .lock()
+                        .map(|cache| cache.context_for(code))
+                        .unwrap_or(NativeFeedbackContext::Unknown)
+                })
+                .unwrap_or(NativeFeedbackContext::Unknown);
             let presented = self
                 .candidate_ui
                 .try_borrow_mut()
-                .map(|mut candidate_ui| candidate_ui.update_contents(display))
+                .map(|mut candidate_ui| candidate_ui.update_contents(display, feedback_context))
                 .unwrap_or(false);
-            if presented && let Some(event) = feedback_after_success {
-                let context = self
-                    .native_feedback_context
-                    .lock()
-                    .map(|cache| cache.context_for(native_feedback_event_code(&event)))
-                    .unwrap_or(NativeFeedbackContext::Unknown);
-                if let Ok(mut feedback) = self.native_feedback.lock()
-                    && feedback.is_accepting()
-                {
-                    let record_result = feedback.record(context, event);
-                    drop(feedback);
-                    if matches!(record_result, NativeFeedbackRecordResult::Stopped(_)) {
-                        self.native_feedback_language_bar_state.notify();
-                    }
+            if presented
+                && let Some(event) = feedback_after_success
+                && let Ok(mut feedback) = self.native_feedback.lock()
+                && feedback.is_accepting()
+            {
+                let record_result =
+                    feedback.record_at(feedback_context, event, native_feedback_monotonic_ms());
+                drop(feedback);
+                if matches!(record_result, NativeFeedbackRecordResult::Stopped(_)) {
+                    self.native_feedback_language_bar_state.notify();
                 }
             }
         }
@@ -4601,6 +5310,68 @@ mod tests {
     }
 
     #[test]
+    fn installed_builds_share_one_explicit_alias_root() {
+        let digest = "1".repeat(64);
+        let module = PathBuf::from(format!(
+            r"D:\repo\.local\tsf-alpha\builds\{digest}\ziranma_core.dll"
+        ));
+        assert_eq!(
+            explicit_alias_root_for_module(&module),
+            Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\aliases"))
+        );
+        assert_eq!(
+            explicit_alias_root_for_module(Path::new(r"D:\repo\target\release\ziranma_core.dll")),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_alias_runtime_refreshes_only_valid_promoted_packages() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-alias-runtime-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join(crate::EXPLICIT_ALIAS_PACKAGES_DIRECTORY)).unwrap();
+
+        let install = |text: &str| {
+            let mut snapshot = ExplicitAliasSnapshot::default();
+            snapshot.set("aa", text).unwrap();
+            let package =
+                crate::protect_explicit_alias_snapshot(&snapshot, &WindowsUserDataProtector)
+                    .unwrap();
+            let package_id = crate::explicit_alias_package_id(&package);
+            let directory = root
+                .join(crate::EXPLICIT_ALIAS_PACKAGES_DIRECTORY)
+                .join(&package_id);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join(crate::EXPLICIT_ALIAS_PACKAGE_FILE), package).unwrap();
+            package_id
+        };
+
+        let first = install("甲");
+        let mut slots = crate::ExplicitAliasSlotState::default();
+        slots.adopt(&first).unwrap();
+        fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), slots.render()).unwrap();
+        let runtime = ExplicitAliasRuntime::new(root.clone());
+        assert_eq!(runtime.text("aa").as_deref(), Some("甲"));
+
+        let second = install("乙");
+        slots.stage(&second).unwrap();
+        slots.promote().unwrap();
+        fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), slots.render()).unwrap();
+        assert_eq!(runtime.text("aa").as_deref(), Some("甲"));
+        assert!(runtime.refresh());
+        assert_eq!(runtime.text("aa").as_deref(), Some("乙"));
+
+        fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), "broken\n").unwrap();
+        assert!(!runtime.refresh());
+        assert_eq!(runtime.text("aa").as_deref(), Some("乙"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn present_invalid_runtime_root_never_falls_back_to_embedded_data() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -4609,7 +5380,7 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
-        let result = candidate_provider_for_root(&root);
+        let result = candidate_provider_for_root(&root, None);
         fs::remove_dir(&root).unwrap();
         assert!(matches!(
             result,
@@ -4903,13 +5674,21 @@ mod tests {
             provider.candidates("zzzzzzzz", 1, InteractiveCandidateView::Primary),
             ["zzzzzzzz"]
         );
-        assert_eq!(
-            provider
-                .candidates("wuwa", 7, InteractiveCandidateView::Primary)
-                .first()
-                .map(String::as_str),
-            Some("呜哇")
-        );
+        for (code, expected) in [
+            ("wuwa", "呜哇"),
+            ("yidair", "一大串"),
+            ("duuuyu", "独属于"),
+            ("bugfub", "不跟手"),
+        ] {
+            assert_eq!(
+                provider
+                    .candidates(code, 7, InteractiveCandidateView::Primary)
+                    .first()
+                    .map(String::as_str),
+                Some(expected),
+                "an exact project overlay entry must precede snapshot fallbacks for {code}"
+            );
+        }
     }
 
     #[test]
@@ -5744,11 +6523,11 @@ mod tests {
             Some(CompositionInput::NextPage)
         );
         assert_eq!(
-            decode_virtual_key(VK_7.0, KeyModifiers::default(), InputMode::Chinese),
-            Some(CompositionInput::Select(7))
+            decode_virtual_key(VK_6.0, KeyModifiers::default(), InputMode::Chinese),
+            Some(CompositionInput::Select(6))
         );
         assert_eq!(
-            decode_virtual_key(VK_7.0 + 1, KeyModifiers::default(), InputMode::Chinese),
+            decode_virtual_key(VK_6.0 + 1, KeyModifiers::default(), InputMode::Chinese),
             None
         );
         assert_eq!(
@@ -5763,6 +6542,28 @@ mod tests {
             decode_virtual_key(VK_OEM_PERIOD.0, KeyModifiers::default(), InputMode::Chinese),
             Some(CompositionInput::Punctuation(
                 CompositionPunctuation::Period
+            ))
+        );
+        let shifted = KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(
+            decode_virtual_key(VK_9.0, shifted, InputMode::Chinese),
+            Some(CompositionInput::Punctuation(
+                CompositionPunctuation::LeftParenthesis
+            ))
+        );
+        assert_eq!(
+            decode_virtual_key(VK_0.0, shifted, InputMode::Chinese),
+            Some(CompositionInput::Punctuation(
+                CompositionPunctuation::RightParenthesis
+            ))
+        );
+        assert_eq!(
+            decode_virtual_key(VK_OEM_2.0, shifted, InputMode::Chinese),
+            Some(CompositionInput::Punctuation(
+                CompositionPunctuation::QuestionMark
             ))
         );
         assert_eq!(
@@ -5873,17 +6674,79 @@ mod tests {
         assert_eq!(recording[0].2, "停止反馈");
         assert_eq!(recording[1].2, "记录中（7 条）");
         assert_ne!(recording[1].1 & TF_LBMENUF_CHECKED, 0);
+        assert_eq!(recording[2].0, FEEDBACK_MENU_TIMING_BUCKETS);
+        assert_eq!(
+            recording[2].2,
+            "双拼间隔（ms）：<8 / 8–15 / 16–23 / 24–31 / 32–47 / 48–63 / 64–95 / 96–159 / ≥160"
+        );
+        assert_eq!(recording[3].0, FEEDBACK_MENU_TIMING_COUNTS);
+        assert_eq!(
+            recording[3].2,
+            "计数：0 / 0 / 0 / 0 / 0 / 0 / 0 / 0 / 0（共 0 个）"
+        );
+        assert_eq!(recording.last().unwrap().2, "不写文件；关闭当前应用即清除");
 
         let stopped = feedback_language_bar_menu(NativeFeedbackSummary {
             lifecycle: NativeFeedbackLifecycle::Stopped,
             enabled: true,
             complete: false,
             events: 9,
+            half_pair_gap_samples: 3,
+            half_pair_gap_histogram: [0, 1, 0, 2, 0, 0, 0, 0, 0],
             ..NativeFeedbackSummary::default()
         });
         assert_eq!(stopped[0].0, FEEDBACK_MENU_CLEAR);
         assert_eq!(stopped[0].2, "清除本轮");
         assert_eq!(stopped[1].2, "已停止且不完整（9 条）");
+        assert_eq!(
+            stopped[3].2,
+            "计数：0 / 1 / 0 / 2 / 0 / 0 / 0 / 0 / 0（共 3 个）"
+        );
+    }
+
+    #[test]
+    fn feedback_menu_flags_map_to_native_popup_semantics() {
+        assert_eq!(feedback_native_menu_flags(0), MF_STRING);
+        assert_eq!(
+            feedback_native_menu_flags(TF_LBMENUF_GRAYED | TF_LBMENUF_CHECKED),
+            MF_STRING | MF_GRAYED | MF_CHECKED
+        );
+        assert_eq!(
+            feedback_native_menu_flags(TF_LBMENUF_SEPARATOR),
+            MF_SEPARATOR
+        );
+    }
+
+    #[test]
+    fn native_feedback_popup_accepts_every_redacted_lifecycle_menu() {
+        for summary in [
+            NativeFeedbackSummary::default(),
+            NativeFeedbackSummary {
+                lifecycle: NativeFeedbackLifecycle::Recording,
+                enabled: true,
+                accepting: true,
+                complete: true,
+                events: 17,
+                half_pair_gap_samples: 2,
+                half_pair_gap_histogram: [0, 1, 0, 1, 0, 0, 0, 0, 0],
+                ..NativeFeedbackSummary::default()
+            },
+            NativeFeedbackSummary {
+                lifecycle: NativeFeedbackLifecycle::Stopped,
+                enabled: true,
+                complete: true,
+                events: 17,
+                half_pair_gap_samples: 2,
+                half_pair_gap_histogram: [0, 1, 0, 1, 0, 0, 0, 0, 0],
+                ..NativeFeedbackSummary::default()
+            },
+        ] {
+            let menu = NativeFeedbackPopupMenu::create().expect("native popup menu");
+            for (id, flags, label) in feedback_language_bar_menu(summary) {
+                menu.append(id, flags, &label)
+                    .expect("redacted lifecycle menu item");
+            }
+        }
     }
 
     #[test]
@@ -5937,10 +6800,18 @@ mod tests {
         unsafe { item.GetInfo(&mut info) }.unwrap();
         assert_eq!(info.clsidService, TSF_ALPHA_CLSID);
         assert_eq!(info.guidItem, GUID_LBI_INPUTMODE);
+        assert_ne!(info.dwStyle & TF_LBI_STYLE_BTN_BUTTON, 0);
         assert_ne!(info.dwStyle & TF_LBI_STYLE_BTN_MENU, 0);
         assert_ne!(info.dwStyle & TF_LBI_STYLE_SHOWNINTRAY, 0);
         assert_ne!(info.dwStyle & TF_LBI_STYLE_TEXTCOLORICON, 0);
         assert_eq!(unsafe { button.GetText() }.unwrap().to_string(), "中");
+        let point = POINT::default();
+        unsafe { button.OnClick(TfLBIClick(99), point, ptr::null()) }.unwrap();
+        assert_eq!(
+            feedback.lock().unwrap().summary().lifecycle,
+            NativeFeedbackLifecycle::Disabled,
+            "unsupported clicks must not start feedback or open a popup"
+        );
         let icon = unsafe { button.GetIcon() }.unwrap();
         assert!(!icon.is_invalid());
         unsafe {
@@ -6033,7 +6904,14 @@ mod tests {
             context,
             mode,
         ));
-        let mut controller = NativeFeedbackLanguageBarController::new(true, Rc::clone(&state));
+        // A live installed Alpha can already own the production language-bar
+        // identity while this unit test runs. Use a process-local test identity
+        // so the lifecycle assertion does not compete with the user's IME.
+        let mut controller = NativeFeedbackLanguageBarController::new_with_guid(
+            true,
+            Rc::clone(&state),
+            GUID::from_u128(0x30f8d9c8_f67c_42dc_911e_3b354b0fcd60),
+        );
 
         let thread_manager: ITfThreadMgr = unsafe {
             CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
@@ -6100,12 +6978,12 @@ mod tests {
         let candidates = (1..=9)
             .map(|index| format!("候选{index}"))
             .collect::<Vec<_>>();
-        let display = CandidateDisplay::from_candidates(candidates, 7);
-        assert_eq!(display.visible(), ["候选8", "候选9"]);
-        assert_eq!(display.page_starts(), [0, 7]);
+        let display = CandidateDisplay::from_candidates(candidates, 6);
+        assert_eq!(display.visible(), ["候选7", "候选8", "候选9"]);
+        assert_eq!(display.page_starts(), [0, 6]);
         assert_eq!(display.current_page(), 1);
-        assert_eq!(display.selected_index(), 7);
-        assert_eq!(display.native_text(), "1  候选8\n2  候选9");
+        assert_eq!(display.selected_index(), 6);
+        assert_eq!(display.native_text(), "1  候选7\n2  候选8\n3  候选9");
 
         let long = "甲".repeat(CANDIDATE_DISPLAY_MAX_CHARS + 1);
         let clipped = CandidateDisplay::from_candidates(vec![long], 0).native_text();
@@ -6119,16 +6997,16 @@ mod tests {
         session.apply(CompositionInput::Letters("nihk".to_owned()));
         let next = plan_session_input(&session, CompositionInput::NextPage, None, 9).unwrap();
         assert!(next.edit.is_none());
-        assert_eq!(next.after.candidate_page_start(), 7);
+        assert_eq!(next.after.candidate_page_start(), 6);
 
         let third = plan_session_input(&next.after, CompositionInput::NextPage, None, 22).unwrap();
         assert!(third.edit.is_none());
-        assert_eq!(third.after.candidate_page_start(), 14);
+        assert_eq!(third.after.candidate_page_start(), 12);
 
         let previous =
             plan_session_input(&third.after, CompositionInput::PreviousPage, None, 22).unwrap();
         assert!(previous.edit.is_none());
-        assert_eq!(previous.after.candidate_page_start(), 7);
+        assert_eq!(previous.after.candidate_page_start(), 6);
     }
 
     #[test]
@@ -6167,28 +7045,53 @@ mod tests {
             idle.edit,
             Some(PendingDocumentEdit::Insert(ref text)) if text == "。"
         ));
+
+        for (punctuation, expected) in [
+            (CompositionPunctuation::LeftParenthesis, "（"),
+            (CompositionPunctuation::RightParenthesis, "）"),
+            (CompositionPunctuation::QuestionMark, "？"),
+        ] {
+            let idle = plan_session_input(
+                &CompositionSession::default(),
+                CompositionInput::Punctuation(punctuation),
+                None,
+                0,
+            )
+            .unwrap();
+            assert!(matches!(
+                idle.edit,
+                Some(PendingDocumentEdit::Insert(ref text)) if text == expected
+            ));
+        }
     }
 
     #[test]
     fn project_overlays_supply_conversation_and_hardware_terms() {
-        let candidates = project_overlay_decoder()
-            .decode_exact_full_code("siyn", 7)
-            .unwrap();
-        assert_eq!(
-            candidates.first().map(|candidate| candidate.text.as_str()),
-            Some("丝印")
-        );
-        assert!(candidates.iter().any(|candidate| candidate.text == "丝印"));
-
-        let conversation = project_overlay_decoder()
-            .decode_exact_full_code("wuwa", 7)
-            .unwrap();
-        assert_eq!(
-            conversation
-                .first()
-                .map(|candidate| candidate.text.as_str()),
-            Some("呜哇")
-        );
+        for (code, expected) in [
+            ("siyn", "丝印"),
+            ("udpn", "双拼"),
+            ("oumu", "欧姆"),
+            ("wlqr", "外圈"),
+            ("wuwa", "呜哇"),
+            ("yidair", "一大串"),
+            ("duuuyu", "独属于"),
+            ("bugfub", "不跟手"),
+            ("drjuzi", "短句子"),
+            ("jmru", "渐入"),
+            ("jmrujmiu", "渐入渐出"),
+            ("gdmn", "光敏"),
+            ("gdmnxy", "光敏性"),
+            ("vijcjuxy", "直角矩形"),
+        ] {
+            let candidates = project_overlay_decoder()
+                .decode_exact_full_code(code, 7)
+                .unwrap();
+            assert_eq!(
+                candidates.first().map(|candidate| candidate.text.as_str()),
+                Some(expected),
+                "project overlay must prioritize the complete code {code}"
+            );
+        }
     }
 
     #[test]
@@ -6236,14 +7139,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(next_page.edit.is_none());
-        assert_eq!(next_page.after.candidate_page_start(), 7);
+        assert_eq!(next_page.after.candidate_page_start(), 6);
         assert!(matches!(
             next_page.feedback_after_success.as_ref(),
             Some(NativeFeedbackEvent::CandidatesPresented {
-                page_start: 7,
+                page_start: 6,
                 candidates,
                 ..
-            }) if candidates.first().is_some_and(|candidate| candidate == "候选8")
+            }) if candidates.first().is_some_and(|candidate| candidate == "候选7")
         ));
         *service.composition.borrow_mut() = next_page.after;
 
@@ -6256,10 +7159,10 @@ mod tests {
             Some(NativeFeedbackEvent::CandidateCommitted {
                 text,
                 source: NativeSelectionSource::Numeric,
-                absolute_rank: 9,
+                absolute_rank: 8,
                 visible_rank: 2,
                 ..
-            }) if text == "候选9"
+            }) if text == "候选8"
         ));
     }
 
@@ -6397,7 +7300,7 @@ mod tests {
         ));
         assert!(
             service
-                .plan_key(WPARAM(usize::from(VK_7.0)), KeyModifiers::default())
+                .plan_key(WPARAM(usize::from(VK_6.0 + 1)), KeyModifiers::default())
                 .unwrap()
                 .is_none(),
             "an unavailable rank must not create a commit or feedback event"
@@ -6434,40 +7337,50 @@ mod tests {
         let first = cache.load(
             &provider,
             "mkmvfhk",
-            candidate_request_limit(0),
+            candidate_visible_limit(0),
             InteractiveCandidateView::Primary,
         );
-        assert_eq!(first.candidates.len(), 14);
+        assert_eq!(first.candidates.len(), 6);
         assert!(first.may_have_more);
         assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
 
         let repeated = cache.load(
             &provider,
             "mkmvfhk",
-            candidate_request_limit(0),
+            candidate_visible_limit(0),
             InteractiveCandidateView::Primary,
         );
-        assert_eq!(repeated.candidates.len(), 14);
+        assert_eq!(repeated.candidates.len(), 6);
         assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+
+        let second_page = cache.load(
+            &provider,
+            "mkmvfhk",
+            candidate_next_page_limit(0),
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(second_page.candidates.len(), 12);
+        assert!(second_page.may_have_more);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
 
         let third_page = cache.load(
             &provider,
             "mkmvfhk",
-            candidate_request_limit(7),
+            candidate_next_page_limit(6),
             InteractiveCandidateView::Primary,
         );
-        assert_eq!(third_page.candidates.len(), 21);
+        assert_eq!(third_page.candidates.len(), 18);
         assert!(third_page.may_have_more);
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
 
         let previous_page = cache.load(
             &provider,
             "mkmvfhk",
-            candidate_request_limit(0),
+            candidate_visible_limit(0),
             InteractiveCandidateView::Primary,
         );
-        assert_eq!(previous_page.candidates.len(), 21);
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(previous_page.candidates.len(), 18);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
 
         let bounded_end = cache.load(
             &provider,
@@ -6477,7 +7390,7 @@ mod tests {
         );
         assert_eq!(bounded_end.candidates.len(), 30);
         assert!(!bounded_end.may_have_more);
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
         let exhausted = cache.load(
             &provider,
             "mkmvfhk",
@@ -6485,28 +7398,31 @@ mod tests {
             InteractiveCandidateView::Primary,
         );
         assert_eq!(exhausted.candidates.len(), 30);
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
 
         let recovery = cache.load(
             &provider,
             "mkmvfhk",
-            candidate_request_limit(0),
+            candidate_visible_limit(0),
             InteractiveCandidateView::TranspositionRecovery,
         );
         assert_eq!(
             recovery.view,
             InteractiveCandidateView::TranspositionRecovery
         );
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 5);
     }
 
     #[test]
-    fn candidate_request_depth_grows_by_one_page_and_stays_bounded() {
-        assert_eq!(candidate_request_limit(0), 14);
-        assert_eq!(candidate_request_limit(7), 21);
-        assert_eq!(candidate_request_limit(14), 28);
-        assert_eq!(candidate_request_limit(42), CANDIDATE_LIMIT);
-        assert_eq!(candidate_request_limit(usize::MAX), CANDIDATE_LIMIT);
+    fn candidate_request_depth_is_visible_first_and_expands_on_navigation() {
+        assert_eq!(candidate_visible_limit(0), 6);
+        assert_eq!(candidate_visible_limit(6), 12);
+        assert_eq!(candidate_visible_limit(42), 48);
+        assert_eq!(candidate_visible_limit(usize::MAX), CANDIDATE_LIMIT);
+        assert_eq!(candidate_next_page_limit(0), 12);
+        assert_eq!(candidate_next_page_limit(6), 18);
+        assert_eq!(candidate_next_page_limit(42), CANDIDATE_LIMIT);
+        assert_eq!(candidate_next_page_limit(usize::MAX), CANDIDATE_LIMIT);
     }
 
     #[test]
@@ -6518,7 +7434,7 @@ mod tests {
                 (1..=9)
                     .map(|index| format!("候选{index}"))
                     .collect::<Vec<_>>(),
-                7,
+                6,
             )),
             document_manager: None,
             shown: true,
@@ -6527,16 +7443,16 @@ mod tests {
         let element: ITfCandidateListUIElement =
             CandidateListElement::counted(state, Rc::downgrade(&popup)).into();
         assert_eq!(unsafe { element.GetCount() }.unwrap(), 9);
-        assert_eq!(unsafe { element.GetSelection() }.unwrap(), 7);
+        assert_eq!(unsafe { element.GetSelection() }.unwrap(), 6);
         assert_eq!(
-            unsafe { element.GetString(7) }.unwrap().to_string(),
-            "候选8"
+            unsafe { element.GetString(6) }.unwrap().to_string(),
+            "候选7"
         );
         assert!(unsafe { element.GetString(9) }.is_err());
         let mut starts = [u32::MAX; 2];
         let mut page_count = 0;
         unsafe { element.GetPageIndex(&mut starts, &mut page_count) }.unwrap();
-        assert_eq!(starts, [0, 7]);
+        assert_eq!(starts, [0, 6]);
         assert_eq!(page_count, 2);
         assert_eq!(unsafe { element.GetCurrentPage() }.unwrap(), 1);
         unsafe { element.SetPageIndex(&starts) }.unwrap();
@@ -6564,9 +7480,78 @@ mod tests {
         );
         let metrics = candidate_popup_metrics(&display, 96, 1920);
         assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
-        assert_eq!(metrics.height, 52);
-        assert!(metrics.width >= 320);
-        assert!(metrics.width <= 1040);
+        assert_eq!(metrics.height, 46);
+        assert!(metrics.width >= 280);
+        assert!(metrics.width <= POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+    }
+
+    #[test]
+    fn candidate_popup_border_tracks_window_rounding_at_common_dpis() {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 480,
+            bottom: 46,
+        };
+        for (dpi, expected_border, expected_corner) in [(96, 1, 16), (144, 2, 24), (192, 2, 32)] {
+            let geometry = candidate_popup_border_geometry(client, dpi).unwrap();
+            assert_eq!(geometry.outer.left, 0);
+            assert_eq!(geometry.outer.top, 0);
+            assert_eq!(geometry.outer.right, 480);
+            assert_eq!(geometry.outer.bottom, 46);
+            assert_eq!(geometry.inner.left, expected_border);
+            assert_eq!(geometry.inner.top, expected_border);
+            assert_eq!(geometry.inner.right, 480 - expected_border);
+            assert_eq!(geometry.inner.bottom, 46 - expected_border);
+            assert_eq!(geometry.outer_corner_diameter, expected_corner);
+            assert_eq!(
+                geometry.inner_corner_diameter,
+                expected_corner - expected_border * 2
+            );
+        }
+    }
+
+    #[test]
+    fn system_composited_corners_never_stack_a_binary_window_region() {
+        assert!(!CandidatePopupCornerStrategy::SystemDwm.uses_custom_region());
+        assert!(CandidatePopupCornerStrategy::RegionFallback.uses_custom_region());
+    }
+
+    #[test]
+    fn six_common_length_candidates_fit_while_the_selected_text_stays_complete() {
+        let display = CandidateDisplay::from_candidates(
+            [
+                "第一项",
+                "第二项",
+                "第三候选",
+                "第四候选",
+                "第五候选",
+                "第六候选",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            0,
+        );
+        assert_eq!(display.visible().len(), CANDIDATE_PAGE_SIZE);
+        let metrics = candidate_popup_metrics(&display, 96, 1920);
+        assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
+        assert_eq!(metrics.width, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+
+        let widths = horizontal_candidate_widths(&display, 96, metrics.width);
+        for (index, (candidate, width)) in display.visible().iter().zip(widths).enumerate() {
+            let left_inset = if index == 0 {
+                POPUP_SELECTED_TEXT_INSET_LOGICAL
+            } else {
+                POPUP_TEXT_PADDING_LOGICAL
+            };
+            let text_width = width
+                - left_inset
+                - POPUP_RANK_WIDTH_LOGICAL
+                - POPUP_RANK_GAP_LOGICAL
+                - POPUP_TEXT_PADDING_LOGICAL;
+            assert!(text_width >= i32::try_from(candidate.chars().count()).unwrap() * 18);
+        }
     }
 
     #[test]
@@ -6611,10 +7596,10 @@ mod tests {
         let (rank, text) = candidate_label_rects(content, 96);
 
         assert_eq!(rank.left, 10);
-        assert_eq!(rank.right, 28);
+        assert_eq!(rank.right, 26);
         assert_eq!(rank.top, 10);
         assert_eq!(rank.bottom, 46);
-        assert_eq!(text.left, 33);
+        assert_eq!(text.left, 30);
         assert_eq!(text.top, 8);
         assert_eq!(text.bottom, 44);
     }
@@ -6630,13 +7615,22 @@ mod tests {
         let (selected, accent) = candidate_selection_rects(item, 96);
 
         assert_eq!(selected.left, 1);
-        assert_eq!(selected.top, 3);
+        assert_eq!(selected.top, 4);
         assert_eq!(selected.right, 95);
-        assert_eq!(selected.bottom, 33);
+        assert_eq!(selected.bottom, 32);
         assert_eq!(accent.left, 6);
-        assert_eq!(accent.top, 9);
+        assert_eq!(accent.top, 11);
         assert_eq!(accent.right, 9);
-        assert_eq!(accent.bottom, 27);
+        assert_eq!(accent.bottom, 25);
+    }
+
+    #[test]
+    fn candidate_popup_uses_one_ellipsis_and_never_elides_when_measurement_fails() {
+        let width = |text: &str| Some(i32::try_from(text.chars().count()).unwrap() * 10);
+        assert_eq!(candidate_text_for_width("省略号", 30, width), "省略号");
+        assert_eq!(candidate_text_for_width("省略号", 20, width), "省…");
+        assert_eq!(candidate_text_for_width("省略号", 10, width), "…");
+        assert_eq!(candidate_text_for_width("省略号", 20, |_| None), "省略号");
     }
 
     #[test]
@@ -6660,9 +7654,9 @@ mod tests {
             0,
         );
 
-        assert_eq!(candidate_popup_footer_logical_width(&ordinary), 68);
-        assert_eq!(candidate_popup_footer_logical_width(&recovery), 116);
-        assert_eq!(candidate_popup_footer_logical_width(&recovery_one_page), 64);
+        assert_eq!(candidate_popup_footer_logical_width(&ordinary), 62);
+        assert_eq!(candidate_popup_footer_logical_width(&recovery), 108);
+        assert_eq!(candidate_popup_footer_logical_width(&recovery_one_page), 60);
     }
 
     #[test]
@@ -6685,7 +7679,26 @@ mod tests {
             0,
         );
         let wide_screen = candidate_popup_metrics(&long, 96, 1920);
-        assert_eq!(wide_screen.layout, CandidatePopupLayout::Vertical);
-        assert_eq!(wide_screen.width, 360);
+        assert_eq!(wide_screen.layout, CandidatePopupLayout::Horizontal);
+        assert_eq!(wide_screen.width, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+        let widths = horizontal_candidate_widths(&long, 96, wide_screen.width);
+        assert!(
+            widths.iter().copied().sum::<i32>()
+                <= wide_screen.width - POPUP_OUTER_PADDING_LOGICAL * 2
+        );
+        assert_eq!(
+            widths[0],
+            horizontal_candidate_logical_width(&long.visible()[0])
+        );
+        assert!(
+            widths[1..]
+                .iter()
+                .all(|width| *width >= POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL)
+        );
+        assert!(
+            widths
+                .iter()
+                .any(|width| *width < horizontal_candidate_logical_width(&long.visible()[0]))
+        );
     }
 }

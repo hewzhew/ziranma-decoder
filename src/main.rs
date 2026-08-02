@@ -10,21 +10,29 @@ use std::thread;
 use std::time::Instant;
 
 use ziranma_core::{
-    BigramLanguageModel, Candidate, CandidateSource, CharacterBigramLanguageModel,
-    CharacterShapeIndex, Decoder, KeySequenceError, MAX_SHAPE_LAB_VISIBLE,
-    ProtocolContextLaneReport, ProtocolIndexStats, ProtocolStrategyReport, SentenceCandidate,
+    BigramLanguageModel, COLLISION_GATED_TAIL_PROFILES, Candidate, CandidateSource,
+    CharacterBigramLanguageModel, CharacterShapeIndex, CollisionGatedTailReport, Correction,
+    Decoder, DoublePinyinTrajectoryReport, FrozenContextProbe, FrozenHybridContextMetrics,
+    HALF_PAIR_PAINT_PROFILES, HALF_PAIR_SYNTHETIC_CADENCES, HYBRID_CONTEXT_PROFILES,
+    HalfPairPaintAuditReport, KeySequenceError, MAX_SHAPE_LAB_VISIBLE, ProtocolContextLaneReport,
+    ProtocolIndexStats, ProtocolStrategyReport, SEGMENTATION_CONTEXT_PROFILES, SentenceCandidate,
     ShapeLab, analyze_candidate_lab, audit_abbreviation_codebook, audit_anchored_tail_failures,
-    audit_continuous_composition, audit_public_protocol_context, audit_public_protocols,
-    audit_shape_refinement_course, encode_pinyin_phrase, evaluate_character_context_oracle,
-    evaluate_context_oracle, evaluate_continuous_composition, evaluate_labeled_recall,
-    evaluate_labeled_rejection_shadow, evaluate_oov_cases, evaluate_rejection_shadow,
-    evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv, parse_rime_lexicon,
-    parse_stroke_sequence_tsv, parse_ud_conllu, select_public_bigram_training_sequences,
+    audit_collision_gated_tail_protocols, audit_continuous_composition,
+    audit_double_pinyin_key_trajectories, audit_frozen_hybrid_context,
+    audit_half_pair_paint_profiles, audit_public_protocol_context, audit_public_protocols,
+    audit_shape_refinement_course, audit_terminal_collision_gated_tail_protocols,
+    encode_pinyin_phrase, evaluate_character_context_oracle, evaluate_context_oracle,
+    evaluate_continuous_composition, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
+    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
+    parse_lexicon_tsv, parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
+    rerank_frozen_sentence_pool, rerank_frozen_sentence_pool_hybrid,
+    rerank_frozen_sentence_pool_hybrid_with_variants, select_public_bigram_training_sequences,
     select_public_calibration_cases, select_public_continuous_composition_cases,
     select_public_protocol_audit_cases, select_shape_course_tasks,
 };
 
 mod benchmark;
+mod candidate_context_cli;
 mod candidate_lab_cli;
 mod shape_course_cli;
 mod shape_lab_cli;
@@ -35,6 +43,10 @@ mod windows_shape_keys;
 mod windows_typing_keys;
 
 use benchmark::{LatencySummary, run_decoder_benchmark};
+use candidate_context_cli::{
+    CANDIDATE_CONTEXT_LAB_USAGE, CandidateContextLabRuntime, parse_candidate_context_lab_arguments,
+    render_candidate_context_lab,
+};
 use candidate_lab_cli::{CANDIDATE_LAB_USAGE, parse_candidate_lab_arguments, render_candidate_lab};
 use shape_course_cli::{
     SHAPE_COURSE_USAGE, ShapeCourseAttempt, ShapeCourseAttemptEffect, ShapeCourseProgress,
@@ -108,14 +120,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         "public-sentence" => run_public_sentence(&arguments[1..]),
         "public-compose" => run_public_compose(&arguments[1..]),
         "candidate-lab" => run_candidate_lab(&arguments[1..]),
+        "candidate-context-lab" => run_candidate_context_lab(&arguments[1..]),
         "typing-lab" => run_typing_lab(&arguments[1..]),
         "shape-lab" => run_shape_lab(&arguments[1..]),
         "shape-course" => run_shape_course(&arguments[1..]),
         "public-compose-evaluate" => run_public_compose_evaluate(&arguments[1..]),
         "public-compose-audit" => run_public_compose_audit(&arguments[1..]),
         "public-protocol-audit" => run_public_protocol_audit(&arguments[1..]),
+        "public-double-pinyin-gate-audit" => run_public_double_pinyin_gate_audit(&arguments[1..]),
+        "public-double-pinyin-trajectory-audit" => {
+            run_public_double_pinyin_trajectory_audit(&arguments[1..])
+        }
+        "public-double-pinyin-paint-audit" => run_public_double_pinyin_paint_audit(&arguments[1..]),
         "public-protocol-failure-audit" => run_public_protocol_failure_audit(&arguments[1..]),
         "public-protocol-context-audit" => run_public_protocol_context_audit(&arguments[1..]),
+        "public-context-hybrid-audit" => run_public_context_hybrid_audit(&arguments[1..]),
         "public-shape-audit" => run_public_shape_audit(&arguments[1..]),
         "sentence-stats" => run_sentence_stats(&arguments[1..]),
         // Preserve the first milestone's convenient `cargo run -- nihk` form.
@@ -988,6 +1007,43 @@ fn run_candidate_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_candidate_context_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
+        println!("{CANDIDATE_CONTEXT_LAB_USAGE}");
+        return Ok(());
+    }
+
+    let options = parse_candidate_context_lab_arguments(arguments)?;
+    let preparation_started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let training = select_public_bigram_training_sequences(&corpus, &imported.entries);
+    let language_model =
+        BigramLanguageModel::from_token_sequences(&training.sequences, &imported.entries)?;
+    let model_stats = language_model.stats();
+    let decoder = Decoder::new(imported.entries);
+    let preparation_millis = preparation_started.elapsed().as_secs_f64() * 1000.0;
+
+    let ranking_started = Instant::now();
+    let pool = decoder.decode_sentence(&options.observed, options.pool_depth)?;
+    let report = rerank_frozen_sentence_pool(&pool, &language_model);
+    let ranking_millis = ranking_started.elapsed().as_secs_f64() * 1000.0;
+    let output = render_candidate_context_lab(
+        &report,
+        &options,
+        CandidateContextLabRuntime {
+            training_sequences: training.stats.training_sequences,
+            training_words: training.stats.training_words,
+            observed_pair_types: model_stats.observed_pair_types,
+            observed_pair_instances: model_stats.observed_pair_instances,
+            preparation_millis,
+            ranking_millis,
+        },
+    );
+    print!("{output}");
+    Ok(())
+}
+
 fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if arguments.len() == 1 && matches!(arguments[0].as_str(), "-h" | "--help") {
         println!("{TYPING_LAB_USAGE}");
@@ -1823,6 +1879,188 @@ fn run_public_protocol_audit(arguments: &[String]) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+fn run_public_double_pinyin_gate_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-double-pinyin-gate-audit 不接受额外参数".into());
+    }
+
+    const DEV_LIMIT: usize = 128;
+    const TEST_LIMIT: usize = 128;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let test_corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let dev_selection =
+        select_public_protocol_audit_cases(&train_corpus, &imported.entries, DEV_LIMIT);
+    let test_selection =
+        select_public_protocol_audit_cases(&test_corpus, &imported.entries, TEST_LIMIT);
+    let every_word_dev = audit_collision_gated_tail_protocols(
+        &imported.entries,
+        &dev_selection.probes,
+        &COLLISION_GATED_TAIL_PROFILES,
+    );
+    let every_word_test = audit_collision_gated_tail_protocols(
+        &imported.entries,
+        &test_selection.probes,
+        &COLLISION_GATED_TAIL_PROFILES,
+    );
+    let terminal_dev = audit_terminal_collision_gated_tail_protocols(
+        &imported.entries,
+        &dev_selection.probes,
+        &COLLISION_GATED_TAIL_PROFILES,
+    );
+    let terminal_test = audit_terminal_collision_gated_tail_protocols(
+        &imported.entries,
+        &test_selection.probes,
+        &COLLISION_GATED_TAIL_PROFILES,
+    );
+
+    println!("公开双拼碰撞门审计：只决定多音节词的最后一个韵母键是否省略");
+    println!("门槛只读取固定 Rime 词典中“省一键后同码词数”；不读取答案排名，不训练权重");
+    println!(
+        "样本：UD train 的固定 held-out dev {} 条；独立 UD test 位置子集 {} 条",
+        dev_selection.probes.len(),
+        test_selection.probes.len()
+    );
+    println!();
+    println!("每词省键：每个多音节词都可独立通过碰撞门");
+    println!("词典结构与样本输入负担：");
+    print_collision_gate_structure(&every_word_dev, &every_word_test);
+    println!("配对排名（得/失均相对同一条完整双拼）：");
+    println!(
+        "门槛        dev Top1/5/10  dev 得/失1  dev 入/出10   test Top1/5/10  test 得/失1  test 入/出10"
+    );
+    for (dev_row, test_row) in every_word_dev.iter().zip(&every_word_test) {
+        print_collision_gate_accuracy(dev_row, test_row);
+    }
+    println!();
+    println!("句尾省键：中间词只走完整双拼，只有组合末词可通过碰撞门");
+    println!("以下索引碰撞只描述句尾快捷边；中间词始终使用完整码索引。");
+    println!("句尾快捷边结构与样本输入负担：");
+    print_collision_gate_structure(&terminal_dev, &terminal_test);
+    println!("配对排名（得/失均相对同一条完整双拼）：");
+    println!(
+        "门槛        dev Top1/5/10  dev 得/失1  dev 入/出10   test Top1/5/10  test 得/失1  test 入/出10"
+    );
+    for (dev_row, test_row) in terminal_dev.iter().zip(&terminal_test) {
+        print_collision_gate_accuracy(dev_row, test_row);
+    }
+    println!(
+        "口径：每个被门槛允许的多音节词恰好少一个字母；句尾方案最多省一个。“多候选”只统计最终完整输入的候选负担，不冒充逐键稳定性。"
+    );
+    println!(
+        "本次审计耗时：{:.1} ms（当前机器单次 release 观察；不读取私人记录、不写文件）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn run_public_double_pinyin_trajectory_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-double-pinyin-trajectory-audit 不接受额外参数".into());
+    }
+
+    const DEV_LIMIT: usize = 64;
+    const TEST_LIMIT: usize = 64;
+    const VISIBLE_LIMIT: usize = 10;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let test_corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let dev_selection =
+        select_public_protocol_audit_cases(&train_corpus, &imported.entries, DEV_LIMIT);
+    let test_selection =
+        select_public_protocol_audit_cases(&test_corpus, &imported.entries, TEST_LIMIT);
+    let decoder = Decoder::new(imported.entries);
+    let dev = audit_double_pinyin_key_trajectories(&decoder, &dev_selection.probes, VISIBLE_LIMIT)?;
+    let test =
+        audit_double_pinyin_key_trajectories(&decoder, &test_selection.probes, VISIBLE_LIMIT)?;
+
+    println!("公开双拼逐键轨迹审计：真实交互候选排序，只读，不学习");
+    println!(
+        "样本：UD train held-out dev {} 条；独立 UD test 位置子集 {} 条；每栏观察前 {} 项",
+        dev.requested_probes, test.requested_probes, VISIBLE_LIMIT
+    );
+    println!("目标前缀按‘一个汉字对应一个完整双拼音节’对齐；不满足者单独排除。");
+    println!();
+    println!("奇偶状态的目标前缀排名：");
+    println!("轨道          步数   Top-1/5/10       平均可见候选");
+    print_double_pinyin_trajectory_lane("dev 声母键", &dev, true);
+    print_double_pinyin_trajectory_lane("dev 韵母键", &dev, false);
+    print_double_pinyin_trajectory_lane("test 声母键", &test, true);
+    print_double_pinyin_trajectory_lane("test 韵母键", &test, false);
+    println!();
+    println!("补入韵母键前后的同一目标：");
+    println!(
+        "数据        双边可见/失去/获得/双缺    排名升/稳/降       首选不变/变化（变为/离开目标）"
+    );
+    print_double_pinyin_trajectory_transition("dev", &dev);
+    print_double_pinyin_trajectory_transition("test", &test);
+    println!();
+    println!("可见列表与批量复用：");
+    print_double_pinyin_trajectory_work("dev", &dev);
+    print_double_pinyin_trajectory_work("test", &test);
+    println!(
+        "口径：‘同文保留’只问声母键列表里的完全相同文字是否仍出现在随后韵母键列表中；它不把合理的候选细化直接判成错误。"
+    );
+    println!(
+        "本次审计耗时：{:.1} ms（当前机器单次 release 批量观察；不读取私人记录、不写文件）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn run_public_double_pinyin_paint_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-double-pinyin-paint-audit 不接受额外参数".into());
+    }
+
+    const DEV_LIMIT: usize = 64;
+    const TEST_LIMIT: usize = 64;
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let test_corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let dev_selection =
+        select_public_protocol_audit_cases(&train_corpus, &imported.entries, DEV_LIMIT);
+    let test_selection =
+        select_public_protocol_audit_cases(&test_corpus, &imported.entries, TEST_LIMIT);
+    let selected_probes = dev_selection.probes.len() + test_selection.probes.len();
+    let syllables = dev_selection
+        .probes
+        .iter()
+        .chain(&test_selection.probes)
+        .filter(|probe| {
+            probe.full_observed.as_str().len() == probe.expected_text.chars().count() * 2
+        })
+        .map(|probe| probe.full_observed.as_str().len() / 2)
+        .sum();
+    let reports = audit_half_pair_paint_profiles(
+        syllables,
+        &HALF_PAIR_PAINT_PROFILES,
+        &HALF_PAIR_SYNTHETIC_CADENCES,
+    );
+
+    println!("公开双拼半音节绘制合并审计：纯状态机，不连接 TSF");
+    println!(
+        "规模：沿用轨迹审计的 {} 条公开短语，共 {} 个可对齐音节；即时基线每个字母绘制一帧。",
+        selected_probes, syllables
+    );
+    println!("节奏全部是固定合成间隔，不代表宝宝或任何用户的真实速度；等待门槛也未按答案拟合。");
+    println!();
+    println!(
+        "合成节奏          等待    绘制/基线   少绘制（占基线）  声母帧显示/合并   已显示声母最长等待"
+    );
+    for report in reports {
+        print_half_pair_paint_report(&report);
+    }
+    println!();
+    println!(
+        "安全口径：所有完整韵母帧都立即绘制；只有已准备好但尚未发布的声母暂态可以被下一韵母帧覆盖。停顿、翻页和旧解码结果由状态机分别处理。"
+    );
+    println!("本命令不读取私人时序、不保存参数，也不改变当前输入法。");
+    Ok(())
+}
+
 fn run_public_protocol_failure_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let details = match arguments {
         [] => false,
@@ -1960,6 +2198,315 @@ fn run_public_protocol_context_audit(arguments: &[String]) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn run_public_context_hybrid_audit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if !arguments.is_empty() {
+        return Err("public-context-hybrid-audit 不接受额外参数".into());
+    }
+
+    const DEV_LIMIT: usize = 128;
+    const TEST_LIMIT: usize = 128;
+    const POOL_DEPTH: usize = 20;
+    let started = Instant::now();
+    let imported = parse_rime_lexicon(PUBLIC_RIME_LEXICON)?;
+    let train_corpus = parse_ud_conllu(PUBLIC_UD_TRAIN)?;
+    let test_corpus = parse_ud_conllu(PUBLIC_UD_TEST)?;
+    let selection = select_public_protocol_audit_cases(&train_corpus, &imported.entries, DEV_LIMIT);
+    let test_selection =
+        select_public_continuous_composition_cases(&test_corpus, &imported.entries, TEST_LIMIT);
+    let word_model = BigramLanguageModel::from_token_sequences(
+        &selection.fit_context_sequences,
+        &imported.entries,
+    )?;
+    let character_texts = selection
+        .fit_context_sequences
+        .iter()
+        .map(|sequence| sequence.concat())
+        .collect::<Vec<_>>();
+    let character_model = CharacterBigramLanguageModel::from_text_sequences(&character_texts)?;
+    let decoder = Decoder::new(imported.entries);
+    let dev_probes = selection
+        .probes
+        .iter()
+        .map(|probe| FrozenContextProbe {
+            id: probe.id.clone(),
+            observed: probe.full_observed.clone(),
+            expected_text: probe.expected_text.clone(),
+        })
+        .collect::<Vec<_>>();
+    let test_probes = test_selection
+        .probes
+        .iter()
+        .map(|probe| FrozenContextProbe {
+            id: probe.id.clone(),
+            observed: probe.full_observed.clone(),
+            expected_text: probe.expected_text.clone(),
+        })
+        .collect::<Vec<_>>();
+    let hybrid_audit_started = Instant::now();
+    let dev = audit_frozen_hybrid_context(
+        &decoder,
+        &dev_probes,
+        &word_model,
+        &character_model,
+        &HYBRID_CONTEXT_PROFILES,
+        POOL_DEPTH,
+    )?;
+    let test = audit_frozen_hybrid_context(
+        &decoder,
+        &test_probes,
+        &word_model,
+        &character_model,
+        &HYBRID_CONTEXT_PROFILES,
+        POOL_DEPTH,
+    )?;
+    let hybrid_audit_millis = hybrid_audit_started.elapsed().as_secs_f64() * 1000.0;
+    let segmentation_audit_started = Instant::now();
+    let segmentation_dev = audit_frozen_hybrid_context(
+        &decoder,
+        &dev_probes,
+        &word_model,
+        &character_model,
+        &SEGMENTATION_CONTEXT_PROFILES,
+        POOL_DEPTH,
+    )?;
+    let segmentation_audit_millis = segmentation_audit_started.elapsed().as_secs_f64() * 1000.0;
+    let segmentation_test = audit_frozen_hybrid_context(
+        &decoder,
+        &test_probes,
+        &word_model,
+        &character_model,
+        &SEGMENTATION_CONTEXT_PROFILES,
+        POOL_DEPTH,
+    )?;
+
+    println!("公开混合上下文对照：冻结 Top-{POOL_DEPTH}，只重排完整双拼零纠错位置");
+    println!(
+        "隔离：UD train fit {} 条上下文序列；dev {} 条用于比较配置；独立 UD test {} 条只作复核",
+        selection.stats.fit_context_sequences,
+        dev_probes.len(),
+        test_probes.len()
+    );
+    if let (Some(dev_baseline), Some(test_baseline)) = (dev.first(), test.first()) {
+        println!(
+            "原排序：dev Top-1/5/10 {}/{}/{}；test Top-1/5/10 {}/{}/{}",
+            dev_baseline.baseline_hits_at_1,
+            dev_baseline.baseline_hits_at_5,
+            dev_baseline.baseline_hits_at_10,
+            test_baseline.baseline_hits_at_1,
+            test_baseline.baseline_hits_at_5,
+            test_baseline.baseline_hits_at_10
+        );
+    }
+    println!(
+        "配置                 dev Top1/5/10  dev 得/失1  dev 入/出10   test Top1/5/10  test 得/失1  test 入/出10"
+    );
+    for (dev_row, test_row) in dev.iter().zip(&test) {
+        print_hybrid_context_metrics(dev_row, test_row);
+    }
+    println!();
+    println!("同文本分词保留对照：词对权重 0.50/1.00 × 每个候选文字 K=1/2/3/5/7 条分词路径");
+    println!(
+        "配置                 dev Top1/5/10  dev 得/失1  dev 入/出10   test Top1/5/10  test 得/失1  test 入/出10"
+    );
+    for (dev_row, test_row) in segmentation_dev.iter().zip(&segmentation_test) {
+        print_hybrid_context_metrics(dev_row, test_row);
+    }
+
+    let focused = [("ybqiui", "尤其是"), ("buuidiyige", "不是第一个")];
+    let focused_pools = focused
+        .iter()
+        .map(|(observed, expected)| {
+            let pool = decoder.decode_sentence(observed, POOL_DEPTH)?;
+            let variants = decoder.decode_sentence_segmentation_variants(
+                observed,
+                POOL_DEPTH,
+                SEGMENTATION_CONTEXT_PROFILES
+                    .iter()
+                    .map(|profile| profile.max_segmentations_per_text)
+                    .max()
+                    .unwrap_or(1),
+            )?;
+            Ok::<_, KeySequenceError>(((*observed, *expected), pool, variants))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    println!("外部探针实际保留的同文本分词（按原始 unigram 顺序）：");
+    for ((observed, expected), _, variants) in &focused_pools {
+        let matching = variants
+            .iter()
+            .filter(|candidate| {
+                candidate.text == *expected && sentence_candidate_is_full_exact(candidate)
+            })
+            .map(|candidate| {
+                candidate
+                    .segments
+                    .iter()
+                    .map(|segment| segment.candidate.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("｜")
+            })
+            .collect::<Vec<_>>();
+        println!("  {observed} → {expected}: {}", matching.join("；"));
+        if *observed == "buuidiyige" {
+            for candidate in variants.iter().filter(|candidate| {
+                candidate.text == *expected && sentence_candidate_is_full_exact(candidate)
+            }) {
+                let segmentation = candidate
+                    .segments
+                    .iter()
+                    .map(|segment| segment.candidate.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("｜");
+                let pair_evidence = candidate
+                    .segments
+                    .windows(2)
+                    .map(|segments| {
+                        let score = word_model
+                            .score(&segments[0].candidate.text, &segments[1].candidate.text);
+                        format!(
+                            "{}→{}:{}",
+                            segments[0].candidate.text,
+                            segments[1].candidate.text,
+                            score.observed_count
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let word_bonus = if pair_evidence.is_empty() {
+                    0.0
+                } else {
+                    candidate
+                        .segments
+                        .windows(2)
+                        .map(|segments| {
+                            word_model
+                                .score(&segments[0].candidate.text, &segments[1].candidate.text)
+                                .observed_count
+                        })
+                        .map(|count| (count as f64).ln_1p())
+                        .sum::<f64>()
+                        / pair_evidence.len() as f64
+                };
+                println!(
+                    "    {segmentation}: unigram {:.3}，词对 [{}]，奖励均值 {:.3}，合计 {:.3}",
+                    candidate.total_score,
+                    pair_evidence.join("，"),
+                    word_bonus,
+                    candidate.total_score + 0.50 * word_bonus
+                );
+            }
+        }
+    }
+    println!("外部结构探针（不参与配置比较）：");
+    println!("配置                 ybqiui       buuidiyige");
+    for profile in HYBRID_CONTEXT_PROFILES {
+        print!("{:<22}", profile.label);
+        for ((_, expected), pool, _) in &focused_pools {
+            let baseline_rank = pool
+                .iter()
+                .position(|candidate| candidate.text == *expected)
+                .map(|rank| rank + 1);
+            let report =
+                rerank_frozen_sentence_pool_hybrid(pool, &word_model, &character_model, profile);
+            let context_rank = report
+                .candidates
+                .iter()
+                .position(|candidate| candidate.candidate.text == *expected)
+                .map(|rank| rank + 1);
+            print!(
+                " {:>2}→{:<2}       ",
+                display_rank(baseline_rank),
+                display_rank(context_rank)
+            );
+        }
+        println!();
+    }
+    println!("有限同文本分词探针（同样不参与配置比较）：");
+    println!("配置                 ybqiui       buuidiyige    后者采用的词界");
+    for profile in SEGMENTATION_CONTEXT_PROFILES {
+        print!("{:<22}", profile.label);
+        let mut last_segmentation = String::new();
+        for ((_, expected), pool, variants) in &focused_pools {
+            let baseline_rank = pool
+                .iter()
+                .position(|candidate| candidate.text == *expected)
+                .map(|rank| rank + 1);
+            let report = rerank_frozen_sentence_pool_hybrid_with_variants(
+                pool,
+                variants,
+                &word_model,
+                &character_model,
+                profile,
+            );
+            let selected = report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.candidate.text == *expected);
+            let context_rank = selected.map(|candidate| candidate.context_rank);
+            print!(
+                " {:>2}→{:<2}       ",
+                display_rank(baseline_rank),
+                display_rank(context_rank)
+            );
+            last_segmentation = selected.map_or_else(String::new, |candidate| {
+                candidate
+                    .candidate
+                    .segments
+                    .iter()
+                    .map(|segment| segment.candidate.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("｜")
+            });
+        }
+        println!(" {last_segmentation}");
+    }
+    println!(
+        "本次对照耗时：总计 {:.1} ms；冻结池混合配置 {:.1} ms；有限分词配置 {:.1} ms（当前机器单次观察；不读取私人记录、不写文件）",
+        started.elapsed().as_secs_f64() * 1000.0,
+        hybrid_audit_millis,
+        segmentation_audit_millis
+    );
+    Ok(())
+}
+
+fn print_hybrid_context_metrics(
+    dev: &FrozenHybridContextMetrics,
+    test: &FrozenHybridContextMetrics,
+) {
+    debug_assert_eq!(dev.profile, test.profile);
+    println!(
+        "{:<22} {:>3}/{:<3}/{:<3}   {:>3}/{:<3}      {:>3}/{:<3}       {:>3}/{:<3}/{:<3}    {:>3}/{:<3}       {:>3}/{:<3}",
+        dev.profile.label,
+        dev.context_hits_at_1,
+        dev.context_hits_at_5,
+        dev.context_hits_at_10,
+        dev.gained_top_1,
+        dev.lost_top_1,
+        dev.recovered_into_top_10,
+        dev.dropped_out_of_top_10,
+        test.context_hits_at_1,
+        test.context_hits_at_5,
+        test.context_hits_at_10,
+        test.gained_top_1,
+        test.lost_top_1,
+        test.recovered_into_top_10,
+        test.dropped_out_of_top_10
+    );
+}
+
+fn display_rank(rank: Option<usize>) -> String {
+    rank.map_or_else(|| "–".to_owned(), |rank| rank.to_string())
+}
+
+fn sentence_candidate_is_full_exact(candidate: &SentenceCandidate) -> bool {
+    candidate.unresolved_key_count == 0
+        && !candidate.used_error
+        && !candidate.segments.is_empty()
+        && candidate.segments.iter().all(|segment| {
+            segment.candidate.source == CandidateSource::Lexicon
+                && segment.candidate.spelling.abbreviated_syllables.is_empty()
+                && matches!(segment.candidate.correction, Correction::Exact)
+        })
+}
+
 fn print_protocol_context_lane(label: &str, report: ProtocolContextLaneReport) {
     println!(
         "{label:<18} {:>3}/{:<3} {:>3}/{:<3}/{:<3}       {:>3}/{:<3}/{:<3}          {:>3}/{:<3}          {:>3}/{:<3}/{:<3}",
@@ -1976,6 +2523,137 @@ fn print_protocol_context_lane(label: &str, report: ProtocolContextLaneReport) {
         report.improved_ranks,
         report.unchanged_ranks,
         report.worsened_ranks
+    );
+}
+
+fn display_collision_gate(report: &CollisionGatedTailReport) -> String {
+    match report.profile.maximum_shortened_code_fanout {
+        None => "不省略".to_owned(),
+        Some(usize::MAX) => "不限".to_owned(),
+        Some(maximum) => maximum.to_string(),
+    }
+}
+
+fn print_half_pair_paint_report(report: &HalfPairPaintAuditReport) {
+    println!(
+        "{:<18} {:>3} ms  {:>4}/{:<4}   {:>4}（{:>5.1}%）      {:>4}/{:<4}             {:>3} ms",
+        report.cadence.label,
+        report.profile.delay_ms,
+        report.painted_frames,
+        report.immediate_baseline_frames,
+        report.frames_avoided(),
+        percentage(report.frames_avoided(), report.immediate_baseline_frames),
+        report.odd_frames_painted,
+        report.odd_frames_suppressed,
+        report.maximum_odd_wait_ms
+    );
+}
+
+fn print_double_pinyin_trajectory_lane(
+    label: &str,
+    report: &DoublePinyinTrajectoryReport,
+    odd: bool,
+) {
+    let lane = if odd { report.odd } else { report.even };
+    let average_visible = if lane.steps == 0 {
+        0.0
+    } else {
+        lane.visible_candidates as f64 / lane.steps as f64
+    };
+    println!(
+        "{label:<12} {:>5}   {:>3}/{:<3}/{:<3}          {:>5.2}",
+        lane.steps, lane.hits_at_1, lane.hits_at_5, lane.hits_at_10, average_visible
+    );
+}
+
+fn print_double_pinyin_trajectory_transition(label: &str, report: &DoublePinyinTrajectoryReport) {
+    println!(
+        "{label:<10} {:>3}/{:<3}/{:<3}/{:<3}             {:>3}/{:<3}/{:<3}          {:>3}/{:<3}（{:>3}/{:<3}）",
+        report.target_visible_both,
+        report.target_lost_on_rhyme,
+        report.target_gained_on_rhyme,
+        report.target_absent_both,
+        report.target_rank_improved,
+        report.target_rank_unchanged,
+        report.target_rank_worsened,
+        report.top_1_unchanged,
+        report.top_1_changed,
+        report.top_1_changed_to_target,
+        report.top_1_changed_from_target
+    );
+}
+
+fn print_double_pinyin_trajectory_work(label: &str, report: &DoublePinyinTrajectoryReport) {
+    println!(
+        "{label}：同文保留 {}/{}（{:.1}%）；解码请求/唯一前缀/缓存命中 {}/{}/{}；对齐/排除 {}/{}",
+        report.retained_visible_texts,
+        report.odd_visible_texts,
+        percentage(report.retained_visible_texts, report.odd_visible_texts),
+        report.decode_requests,
+        report.unique_prefixes,
+        report.prefix_cache_hits,
+        report.aligned_probes,
+        report.alignment_mismatches
+    );
+}
+
+fn print_collision_gate_structure(
+    dev: &[CollisionGatedTailReport],
+    test: &[CollisionGatedTailReport],
+) {
+    println!(
+        "门槛        允许扇出  碰撞码/不同码  单码最多  dev 缩词/多音节词  省字母  多候选/超10  test 缩词/多音节词  省字母  多候选/超10"
+    );
+    for (dev_row, test_row) in dev.iter().zip(test) {
+        debug_assert_eq!(dev_row.profile, test_row.profile);
+        let dev_saved = dev
+            .first()
+            .map_or(0, |full| full.strategy.input_letters)
+            .saturating_sub(dev_row.strategy.input_letters);
+        let test_saved = test
+            .first()
+            .map_or(0, |full| full.strategy.input_letters)
+            .saturating_sub(test_row.strategy.input_letters);
+        println!(
+            "{:<11} {:>8}  {:>6}/{:<7} {:>8}  {:>4}/{:<9} {:>6}  {:>4}/{:<4}    {:>4}/{:<9} {:>6}  {:>4}/{:<4}",
+            dev_row.profile.label,
+            display_collision_gate(dev_row),
+            dev_row.index.colliding_codes,
+            dev_row.index.distinct_codes,
+            dev_row.index.maximum_texts_per_code,
+            dev_row.shortened_word_instances,
+            dev_row.multisyllable_word_instances,
+            dev_saved,
+            dev_row.ambiguous_candidate_pools,
+            dev_row.candidate_pools_over_ten,
+            test_row.shortened_word_instances,
+            test_row.multisyllable_word_instances,
+            test_saved,
+            test_row.ambiguous_candidate_pools,
+            test_row.candidate_pools_over_ten
+        );
+    }
+}
+
+fn print_collision_gate_accuracy(dev: &CollisionGatedTailReport, test: &CollisionGatedTailReport) {
+    debug_assert_eq!(dev.profile, test.profile);
+    println!(
+        "{:<11} {:>3}/{:<3}/{:<3}   {:>3}/{:<3}      {:>3}/{:<3}       {:>3}/{:<3}/{:<3}    {:>3}/{:<3}       {:>3}/{:<3}",
+        dev.profile.label,
+        dev.strategy.hits_at_1,
+        dev.strategy.hits_at_5,
+        dev.strategy.hits_at_10,
+        dev.gained_top_1,
+        dev.lost_top_1,
+        dev.recovered_into_top_10,
+        dev.dropped_out_of_top_10,
+        test.strategy.hits_at_1,
+        test.strategy.hits_at_5,
+        test.strategy.hits_at_10,
+        test.gained_top_1,
+        test.lost_top_1,
+        test.recovered_into_top_10,
+        test.dropped_out_of_top_10
     );
 }
 
@@ -2248,14 +2926,19 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- public-sentence <按键串> [Top-K]
   cargo run -- public-compose <连续按键串> [每栏 Top-K]
   cargo run -- candidate-lab <连续按键串> [每栏显示数，1～10] [--expect <文字>] [--recovery] [--verbose|--json]
+  cargo run --release -- candidate-context-lab <连续全码> [--expect <文字>] [--pool <10～200>] [--limit <1～20>]
   cargo run --release -- typing-lab [--limit <1～10>]
   cargo run --release -- shape-lab <公开单字拼音> [--expect <单字>] [--prefix <hspnz...>] [--limit <1～10>] [--details]
   cargo run --release -- shape-course [--count <1～50>] [--level <easy|medium|hard|mixed>]
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
+  cargo run --release -- public-double-pinyin-gate-audit
+  cargo run --release -- public-double-pinyin-trajectory-audit
+  cargo run --release -- public-double-pinyin-paint-audit
   cargo run --release -- public-protocol-failure-audit [--details]
   cargo run --release -- public-protocol-context-audit
+  cargo run --release -- public-context-hybrid-audit
   cargo run --release -- public-shape-audit
   cargo run -- sentence-stats <按键串> [Top-K]
   cargo run -- index-stats
@@ -2280,6 +2963,7 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run -- candidate-lab mafmkm 3
   cargo run -- candidate-lab mafmkm 3 --expect 麻烦猫猫
   cargo run -- candidate-lab mafkmm 3 --recovery
+  cargo run --release -- candidate-context-lab ybqiui --expect 尤其是
   cargo run --release -- typing-lab
   cargo run --release -- shape-lab shi --expect 事
   cargo run --release -- shape-lab da --expect 龘 --prefix n
@@ -2288,8 +2972,12 @@ ziranma-decoder：自然码可解释容错解码实验
   cargo run --release -- public-compose-evaluate
   cargo run --release -- public-compose-audit
   cargo run --release -- public-protocol-audit
+  cargo run --release -- public-double-pinyin-gate-audit
+  cargo run --release -- public-double-pinyin-trajectory-audit
+  cargo run --release -- public-double-pinyin-paint-audit
   cargo run --release -- public-protocol-failure-audit --details
   cargo run --release -- public-protocol-context-audit
+  cargo run --release -- public-context-hybrid-audit
   cargo run --release -- public-shape-audit
   cargo run -- sentence-stats zrmurf
   cargo run -- index-stats

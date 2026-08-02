@@ -47,7 +47,8 @@ enum Options {
     UnregisterMachine,
     EnableCurrentUser,
     DisableCurrentUser,
-    VerifyCurrentUserEnabled,
+    CurrentUserState,
+    VerifyCurrentUserEnabled { allow_active: bool },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -244,7 +245,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Options::UnregisterMachine => unregister_machine()?,
         Options::EnableCurrentUser => enable_current_user()?,
         Options::DisableCurrentUser => disable_current_user()?,
-        Options::VerifyCurrentUserEnabled => verify_current_user_enabled()?,
+        Options::CurrentUserState => current_user_state()?,
+        Options::VerifyCurrentUserEnabled { allow_active } => {
+            verify_current_user_enabled(allow_active)?
+        }
     }
     Ok(())
 }
@@ -289,11 +293,23 @@ fn parse_options(
             parse_confirmation_only(arguments, "disable-current-user", DISABLE_CONFIRMATION_FLAG)?;
             Ok(Options::DisableCurrentUser)
         }
-        "verify-current-user-enabled" => {
+        "current-user-state" => {
             if arguments.next().is_some() {
-                return Err("verify-current-user-enabled does not accept arguments".into());
+                return Err("current-user-state does not accept arguments".into());
             }
-            Ok(Options::VerifyCurrentUserEnabled)
+            Ok(Options::CurrentUserState)
+        }
+        "verify-current-user-enabled" => {
+            let allow_active = match arguments.next().as_deref() {
+                None => false,
+                Some("--allow-active") if arguments.next().is_none() => true,
+                Some(_) => {
+                    return Err(
+                        "verify-current-user-enabled accepts only optional --allow-active".into(),
+                    );
+                }
+            };
+            Ok(Options::VerifyCurrentUserEnabled { allow_active })
         }
         _ => Err("unknown tsf-devctl command; value was suppressed".into()),
     }
@@ -370,7 +386,11 @@ fn print_usage() {
         "       cargo run --release --bin tsf-devctl -- disable-current-user \
          --confirm-disable-current-user-development-alpha"
     );
-    eprintln!("       cargo run --release --bin tsf-devctl -- verify-current-user-enabled");
+    eprintln!("       cargo run --release --bin tsf-devctl -- current-user-state");
+    eprintln!(
+        "       cargo run --release --bin tsf-devctl -- verify-current-user-enabled \
+         [--allow-active]"
+    );
     eprintln!(
         "Machine registration is 64-bit, requires elevation, and is disabled by default. \
          Current-user enable/disable never makes the alpha the default input method or requests \
@@ -492,10 +512,25 @@ fn disable_current_user() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn verify_current_user_enabled() -> Result<(), Box<dyn std::error::Error>> {
+fn current_user_state() -> Result<(), Box<dyn std::error::Error>> {
     let (_, installed_dll) = verified_installed_dll()?;
     let profile = require_exact_registered_layout(&installed_dll)?;
-    if !profile_matches_toggle_state(profile, true) {
+    println!(
+        "TSF_CURRENT_USER_STATE schema=ziranma-tsf-current-user-state-v1 enabled={} active={} writes=false",
+        profile.enabled, profile.active
+    );
+    Ok(())
+}
+
+fn verify_current_user_enabled(allow_active: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, installed_dll) = verified_installed_dll()?;
+    let profile = require_exact_registered_layout(&installed_dll)?;
+    let matches_expected_state = if allow_active {
+        profile_matches_persisted_state(profile, true)
+    } else {
+        profile_matches_toggle_state(profile, true)
+    };
+    if !matches_expected_state {
         return Err("the current-user TSF alpha enablement is not persistent".into());
     }
 
@@ -513,7 +548,11 @@ fn verify_current_user_enabled() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(TSF_PROPAGATION_POLL_INTERVAL);
     }
     println!("TSF Alpha 当前用户启用状态已验证");
-    println!("状态：尚未激活；默认输入法未改动");
+    if profile.active {
+        println!("状态：换代前已在使用，现有宿主仍可保持活动；默认输入法未改动");
+    } else {
+        println!("状态：尚未激活；默认输入法未改动");
+    }
     Ok(())
 }
 
@@ -2168,8 +2207,21 @@ impl ProfileToggleBackend for WindowsRegistrationBackend {
 #[cfg(windows)]
 impl ProfileToggleBackend for WindowsRegistrationBackend {
     fn enable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
-        set_current_user_profile_enabled(&self.text_services, &self.profiles, true)
-            .map_err(|_| ProfileTransitionAction::Enable)
+        let attempt = set_current_user_profile_enabled(&self.text_services, &self.profiles, true);
+        if attempt.is_ok() {
+            return Ok(());
+        }
+        let observed =
+            inspect_profile_with_managers(&self.text_services, &self.profiles, &self.categories)
+                .map(|profile| profile_matches_persisted_state(profile, true))
+                .unwrap_or(false);
+        reconcile_profile_toggle_result(attempt, observed).map_err(|error| {
+            eprintln!(
+                "TSF_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
+                error.code().0 as u32
+            );
+            ProfileTransitionAction::Enable
+        })
     }
 
     fn verify_profile_enabled(&mut self) -> Result<(), ProfileTransitionAction> {
@@ -2188,8 +2240,21 @@ impl ProfileToggleBackend for WindowsRegistrationBackend {
     }
 
     fn disable_profile(&mut self) -> Result<(), ProfileTransitionAction> {
-        set_current_user_profile_enabled(&self.text_services, &self.profiles, false)
-            .map_err(|_| ProfileTransitionAction::Disable)
+        let attempt = set_current_user_profile_enabled(&self.text_services, &self.profiles, false);
+        if attempt.is_ok() {
+            return Ok(());
+        }
+        let observed =
+            inspect_profile_with_managers(&self.text_services, &self.profiles, &self.categories)
+                .map(|profile| profile_matches_toggle_state(profile, false))
+                .unwrap_or(false);
+        reconcile_profile_toggle_result(attempt, observed).map_err(|error| {
+            eprintln!(
+                "TSF_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
+                error.code().0 as u32
+            );
+            ProfileTransitionAction::Disable
+        })
     }
 
     fn verify_profile_disabled(&mut self) -> Result<(), ProfileTransitionAction> {
@@ -2210,6 +2275,7 @@ fn set_current_user_profile_enabled(
     manager: &windows::Win32::UI::TextServices::ITfInputProcessorProfileMgr,
     enabled: bool,
 ) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::E_INVALIDARG;
     use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
     use windows::Win32::UI::TextServices::{
         TF_IPPMF_DISABLEPROFILE, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_ENABLEPROFILE,
@@ -2221,7 +2287,7 @@ fn set_current_user_profile_enabled(
         TF_IPPMF_ENABLEPROFILE
     } else {
         TF_IPPMF_DISABLEPROFILE
-    } | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE;
+    };
 
     apply_current_user_profile_state(
         || {
@@ -2248,22 +2314,29 @@ fn set_current_user_profile_enabled(
             // documented persistent current-user operation. No default,
             // process-wide, or session-wide flag is supplied; any activation
             // is confined to this short-lived helper thread.
-            unsafe {
-                manager.ActivateProfile(
-                    TF_PROFILETYPE_INPUTPROCESSOR,
-                    TSF_ALPHA_LANGID,
-                    &TSF_ALPHA_CLSID,
-                    &TSF_ALPHA_PROFILE_GUID,
-                    HKL::default(),
-                    flag,
-                )
-            }
-            .inspect_err(|error| {
-                eprintln!(
-                    "TSF_PROFILE_ENABLE_STATE_FAILED hresult=0x{:08X}",
-                    error.code().0 as u32
-                );
-            })
+            retry_profile_manager_state(
+                || unsafe {
+                    manager.ActivateProfile(
+                        TF_PROFILETYPE_INPUTPROCESSOR,
+                        TSF_ALPHA_LANGID,
+                        &TSF_ALPHA_CLSID,
+                        &TSF_ALPHA_PROFILE_GUID,
+                        HKL::default(),
+                        flag | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
+                    )
+                },
+                || unsafe {
+                    manager.ActivateProfile(
+                        TF_PROFILETYPE_INPUTPROCESSOR,
+                        TSF_ALPHA_LANGID,
+                        &TSF_ALPHA_CLSID,
+                        &TSF_ALPHA_PROFILE_GUID,
+                        HKL::default(),
+                        flag,
+                    )
+                },
+                |error| error.code() == E_INVALIDARG,
+            )
         },
     )
 }
@@ -2278,6 +2351,27 @@ fn apply_current_user_profile_state<E>(
     // authoritative.
     let _ = legacy();
     modern()
+}
+
+fn retry_profile_manager_state<E>(
+    primary: impl FnOnce() -> Result<(), E>,
+    compatibility: impl FnOnce() -> Result<(), E>,
+    should_retry: impl FnOnce(&E) -> bool,
+) -> Result<(), E> {
+    match primary() {
+        Err(error) if should_retry(&error) => compatibility(),
+        result => result,
+    }
+}
+
+fn reconcile_profile_toggle_result<E>(
+    attempt: Result<(), E>,
+    observed_requested_state: bool,
+) -> Result<(), E> {
+    match attempt {
+        Err(_) if observed_requested_state => Ok(()),
+        result => result,
+    }
 }
 
 #[cfg(windows)]
@@ -2930,8 +3024,19 @@ mod tests {
             Options::DisableCurrentUser
         );
         assert_eq!(
+            parse_options(["current-user-state"].map(str::to_owned)).unwrap(),
+            Options::CurrentUserState
+        );
+        assert_eq!(
             parse_options(["verify-current-user-enabled"].map(str::to_owned)).unwrap(),
-            Options::VerifyCurrentUserEnabled
+            Options::VerifyCurrentUserEnabled {
+                allow_active: false
+            }
+        );
+        assert_eq!(
+            parse_options(["verify-current-user-enabled", "--allow-active"].map(str::to_owned))
+                .unwrap(),
+            Options::VerifyCurrentUserEnabled { allow_active: true }
         );
         assert!(
             parse_options(["register-machine", "--dll", "alpha.dll"].map(str::to_owned)).is_err()
@@ -2939,6 +3044,7 @@ mod tests {
         assert!(parse_options(["unregister-machine"].map(str::to_owned)).is_err());
         assert!(parse_options(["enable-current-user"].map(str::to_owned)).is_err());
         assert!(parse_options(["disable-current-user"].map(str::to_owned)).is_err());
+        assert!(parse_options(["current-user-state", "extra"].map(str::to_owned)).is_err());
         assert!(
             parse_options(["verify-current-user-enabled", "extra"].map(str::to_owned)).is_err()
         );
@@ -3198,6 +3304,70 @@ mod tests {
         );
         assert_eq!(result, Ok(()));
         assert_eq!(*calls.borrow(), ["legacy", "modern"]);
+    }
+
+    #[test]
+    fn profile_manager_retries_only_the_optional_invalid_argument_case() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = retry_profile_manager_state(
+            || {
+                calls.borrow_mut().push("primary");
+                Err("invalid argument")
+            },
+            || {
+                calls.borrow_mut().push("compatibility");
+                Ok(())
+            },
+            |error| *error == "invalid argument",
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.borrow(), ["primary", "compatibility"]);
+
+        calls.borrow_mut().clear();
+        let result = retry_profile_manager_state(
+            || {
+                calls.borrow_mut().push("primary");
+                Err("other failure")
+            },
+            || {
+                calls.borrow_mut().push("compatibility");
+                Ok(())
+            },
+            |error| *error == "invalid argument",
+        );
+        assert_eq!(result, Err("other failure"));
+        assert_eq!(*calls.borrow(), ["primary"]);
+
+        calls.borrow_mut().clear();
+        let result = retry_profile_manager_state(
+            || {
+                calls.borrow_mut().push("primary");
+                Ok::<(), &'static str>(())
+            },
+            || {
+                calls.borrow_mut().push("compatibility");
+                Ok(())
+            },
+            |_| true,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.borrow(), ["primary"]);
+    }
+
+    #[test]
+    fn failed_toggle_is_accepted_only_after_observing_the_requested_state() {
+        assert_eq!(
+            reconcile_profile_toggle_result::<&'static str>(Err("modern failed"), true),
+            Ok(())
+        );
+        assert_eq!(
+            reconcile_profile_toggle_result(Err("modern failed"), false),
+            Err("modern failed")
+        );
+        assert_eq!(
+            reconcile_profile_toggle_result::<&'static str>(Ok(()), false),
+            Ok(())
+        );
     }
 
     #[test]

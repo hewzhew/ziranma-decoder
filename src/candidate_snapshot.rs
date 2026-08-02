@@ -185,34 +185,7 @@ impl CandidateSnapshot {
         code: &str,
         limit: usize,
     ) -> Result<Vec<String>, KeySequenceError> {
-        let exact = self.decoder.decode_exact_full_code(code, limit)?;
-        let sentence_limit = limit
-            .saturating_add(exact.len())
-            .min(MAX_CANDIDATE_SNAPSHOT_RANK);
-        let candidates = self.decoder.decode_sentence(code, sentence_limit)?;
-        let mut visible = Vec::with_capacity(limit);
-        let mut seen = HashSet::new();
-        for candidate in exact {
-            if seen.insert(candidate.text.clone()) {
-                visible.push(candidate.text);
-            }
-        }
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            if visible.len() == limit {
-                break;
-            }
-            if candidate.unresolved_key_count == 0 {
-                if seen.insert(candidate.text.clone()) {
-                    visible.push(candidate.text);
-                }
-            } else if index == 0 && visible.is_empty() {
-                visible.push(code.to_owned());
-                break;
-            } else {
-                break;
-            }
-        }
-        Ok(visible)
+        self.decoder.interactive_candidate_texts(code, limit)
     }
 
     /// Returns the explicitly requested adjacent-transposition recovery view.
@@ -277,6 +250,89 @@ impl CandidateSnapshot {
         recovered.truncate(limit);
         Ok(recovered.into_iter().map(|(_, _, text)| text).collect())
     }
+}
+
+impl Decoder {
+    /// Applies the same bounded candidate ordering used by interactive
+    /// snapshots without performing snapshot I/O or changing host behavior.
+    pub(crate) fn interactive_candidate_texts(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KeySequenceError> {
+        let exact = self.decode_exact_full_code(code, limit)?;
+        let sentence_limit = limit
+            .saturating_add(exact.len())
+            .min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        let candidates = self.decode_sentence(code, sentence_limit)?;
+        let canonical_code = canonicalize_umlaut_full_code(code);
+        let canonical_candidates = match canonical_code.as_deref() {
+            Some(canonical) => self.decode_sentence(canonical, sentence_limit)?,
+            None => Vec::new(),
+        };
+        let mut visible = Vec::with_capacity(limit);
+        let mut seen = HashSet::new();
+        for candidate in exact {
+            if seen.insert(candidate.text.clone()) {
+                visible.push(candidate.text);
+            }
+        }
+
+        // A complete two-key-per-syllable sentence is stronger interaction
+        // evidence than a freely abbreviated path. Keep the research decoder's
+        // ordinary order intact underneath this small host-facing lane.
+        for candidate in canonical_candidates.iter().chain(&candidates) {
+            if visible.len() == limit {
+                break;
+            }
+            if sentence_is_complete(candidate) && seen.insert(candidate.text.clone()) {
+                visible.push(candidate.text.clone());
+            }
+        }
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if visible.len() == limit {
+                break;
+            }
+            if candidate.unresolved_key_count == 0 {
+                if seen.insert(candidate.text.clone()) {
+                    visible.push(candidate.text);
+                }
+            } else if index == 0 && visible.is_empty() {
+                visible.push(code.to_owned());
+                break;
+            } else {
+                break;
+            }
+        }
+        Ok(visible)
+    }
+}
+
+fn canonicalize_umlaut_full_code(code: &str) -> Option<String> {
+    if !code.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = code.as_bytes().to_vec();
+    let mut changed = false;
+    for chunk in bytes.chunks_exact_mut(2) {
+        if chunk[1] == b'u' && matches!(chunk[0], b'j' | b'q' | b'x' | b'y') {
+            chunk[1] = b'v';
+            changed = true;
+        }
+    }
+    changed.then(|| {
+        String::from_utf8(bytes)
+            .expect("lowercase ASCII remains valid UTF-8 after umlaut code normalization")
+    })
+}
+
+fn sentence_is_complete(candidate: &crate::SentenceCandidate) -> bool {
+    candidate.unresolved_key_count == 0
+        && !candidate.used_error
+        && candidate
+            .segments
+            .iter()
+            .all(|segment| segment.candidate.spelling.abbreviated_syllables.is_empty())
 }
 
 /// Errors raised before an interactive host can use a snapshot.
@@ -546,6 +602,46 @@ mod tests {
             uuyu.first().map(|candidate| candidate.text.as_str()),
             Some("属于")
         );
+    }
+
+    #[test]
+    fn interactive_sentence_accepts_standard_u_spelling_across_word_boundaries() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+短\tduan\t100\n\
+句\tju\t100\n\
+子\tzi\t100\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "umlaut-sentence-boundary-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 3,
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.candidate_texts("drjuzi", 1).unwrap(), ["短句子"]);
+    }
+
+    #[test]
+    fn interactive_sentence_prefers_complete_pairs_to_free_initials() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+惨\tcan\t10\n\
+家\tjia\t10\n\
+参加今晚\tcan jia jin wan\t100000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "complete-sentence-priority-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 3,
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.candidate_texts("cjjw", 2).unwrap()[0], "惨家");
     }
 
     #[test]

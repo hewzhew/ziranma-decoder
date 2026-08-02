@@ -31,10 +31,13 @@ mod candidate_snapshot;
 mod capsule_replay;
 mod codec;
 mod composition;
+mod context_rerank;
 mod continuous_capture;
 mod correction_episode;
+mod double_pinyin_paint;
 mod evaluation;
 mod event_capsule;
+mod explicit_alias;
 mod language_model;
 mod native_feedback;
 mod private_session;
@@ -146,6 +149,13 @@ pub use composition::{
     CompositionEffect, CompositionInput, CompositionPunctuation, CompositionSession,
     SessionSelectionMemory,
 };
+pub use context_rerank::{
+    FrozenContextCandidate, FrozenContextPairEvidence, FrozenContextProbe,
+    FrozenContextRerankReport, FrozenHybridContextCandidate, FrozenHybridContextMetrics,
+    FrozenHybridContextRerankReport, HYBRID_CONTEXT_PROFILES, HybridContextProfile,
+    SEGMENTATION_CONTEXT_PROFILES, audit_frozen_hybrid_context, rerank_frozen_sentence_pool,
+    rerank_frozen_sentence_pool_hybrid, rerank_frozen_sentence_pool_hybrid_with_variants,
+};
 #[cfg(windows)]
 pub use continuous_capture::WindowsUserDataProtector;
 pub use continuous_capture::{
@@ -159,6 +169,11 @@ pub use continuous_capture::{
 pub use correction_episode::{
     CorrectionCandidate, CorrectionCandidateDetector, CorrectionCandidateForm,
     CorrectionCandidateKind, CorrectionDetectorError,
+};
+pub use double_pinyin_paint::{
+    HALF_PAIR_PAINT_PROFILES, HALF_PAIR_SYNTHETIC_CADENCES, HalfPairFrameDisposition,
+    HalfPairInputEffect, HalfPairPaint, HalfPairPaintAuditReport, HalfPairPaintCoalescer,
+    HalfPairPaintProfile, HalfPairSyntheticCadence, audit_half_pair_paint_profiles,
 };
 pub use evaluation::{
     CharacterAverageMarginRange, CharacterContextOracleReport, CompositionRecallReport,
@@ -178,6 +193,16 @@ pub use event_capsule::{
     MAX_EVENT_CAPSULE_EVENTS, MAX_EVENT_CAPSULE_KEYS_PER_EVENT,
     MAX_EVENT_CAPSULE_TEXT_BYTES_PER_FIELD, MAX_EVENT_CAPSULE_TOTAL_TEXT_BYTES, TimedTrackerOutput,
 };
+pub use explicit_alias::{
+    EXPLICIT_ALIAS_PACKAGE_FILE, EXPLICIT_ALIAS_PACKAGES_DIRECTORY, EXPLICIT_ALIAS_SCHEMA_V1,
+    EXPLICIT_ALIAS_SLOT_FILE, EXPLICIT_ALIAS_SLOT_SCHEMA_V1, ExplicitAliasError,
+    ExplicitAliasSlotState, ExplicitAliasSnapshot, LoadedExplicitAliasSnapshot,
+    MAX_EXPLICIT_ALIAS_ENTRIES, MAX_EXPLICIT_ALIAS_PACKAGE_BYTES,
+    MAX_EXPLICIT_ALIAS_PLAINTEXT_BYTES, MAX_EXPLICIT_ALIAS_SLOT_BYTES, explicit_alias_package_id,
+    load_current_explicit_alias_snapshot, load_explicit_alias_package,
+    load_explicit_alias_slot_state, protect_explicit_alias_snapshot,
+    unprotect_explicit_alias_snapshot,
+};
 pub use language_model::{
     BigramLanguageModel, BigramLanguageModelStats, BigramScore, CharacterBigramLanguageModel,
     CharacterBigramLanguageModelStats, CharacterLanguageModelError, CharacterSequenceScore,
@@ -185,6 +210,7 @@ pub use language_model::{
 };
 pub use native_feedback::{
     DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS, DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES,
+    NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS,
     NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
     NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackLifecycle,
     NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
@@ -196,10 +222,13 @@ pub use private_session::{
     ProtectedSessionSegment,
 };
 pub use protocol_audit::{
-    AnchoredTailFailureAuditReport, AnchoredTailFailureCase, ProtocolContextLaneReport,
-    ProtocolIndexStats, ProtocolStrategyReport, PublicProtocolAuditReport,
-    PublicProtocolContextAuditReport, WhitelistProtocolReport, audit_anchored_tail_failures,
-    audit_public_protocol_context, audit_public_protocols,
+    AnchoredTailFailureAuditReport, AnchoredTailFailureCase, COLLISION_GATED_TAIL_PROFILES,
+    CollisionGatedTailProfile, CollisionGatedTailReport, DoublePinyinTrajectoryLaneReport,
+    DoublePinyinTrajectoryReport, ProtocolContextLaneReport, ProtocolIndexStats,
+    ProtocolStrategyReport, PublicProtocolAuditReport, PublicProtocolContextAuditReport,
+    WhitelistProtocolReport, audit_anchored_tail_failures, audit_collision_gated_tail_protocols,
+    audit_double_pinyin_key_trajectories, audit_public_protocol_context, audit_public_protocols,
+    audit_terminal_collision_gated_tail_protocols,
 };
 pub use public_corpus::{
     ContinuousCompositionProbe, ContinuousCompositionSelection,
@@ -827,6 +856,30 @@ impl Decoder {
         Ok((candidates, search_stats))
     }
 
+    /// Returns a bounded diagnostic frontier that may contain several word
+    /// segmentations for the same output text.
+    ///
+    /// Ordinary sentence decoding keeps one best path per text. Context
+    /// experiments sometimes need to compare different word boundaries that
+    /// produce the same text, so this method retains at most
+    /// `segmentations_per_text` paths for each text while still admitting at
+    /// most `top_k` distinct texts per conservative safety lane. It does not
+    /// enable a language model or change the ordinary decoder.
+    pub fn decode_sentence_segmentation_variants(
+        &self,
+        observed: &str,
+        top_k: usize,
+        segmentations_per_text: usize,
+    ) -> Result<Vec<SentenceCandidate>, KeySequenceError> {
+        let (mut candidates, _stats) = self.decode_sentence_variant_frontier_with_stats(
+            observed,
+            top_k,
+            segmentations_per_text.max(1),
+        )?;
+        candidates.sort_by(sentence_order);
+        Ok(candidates)
+    }
+
     /// Decodes continuous input into a stable primary lane plus a small,
     /// explicitly inspectable transposition-recovery lane.
     ///
@@ -878,6 +931,15 @@ impl Decoder {
         observed: &str,
         top_k: usize,
     ) -> Result<(Vec<SentenceCandidate>, SentenceSearchStats), KeySequenceError> {
+        self.decode_sentence_variant_frontier_with_stats(observed, top_k, 1)
+    }
+
+    fn decode_sentence_variant_frontier_with_stats(
+        &self,
+        observed: &str,
+        top_k: usize,
+        segmentations_per_text: usize,
+    ) -> Result<(Vec<SentenceCandidate>, SentenceSearchStats), KeySequenceError> {
         let observed = KeySequence::new(observed)?;
         let mut search_stats = SentenceSearchStats::default();
         if top_k == 0 {
@@ -905,12 +967,16 @@ impl Decoder {
             used_error: false,
             previous_word: None,
         };
+        let ranking_config = SentenceRankingConfig {
+            top_k,
+            segmentations_per_text,
+            log_frequency_total,
+        };
         let mut memo = HashMap::new();
         let candidates = self.k_best_from_state(
             &lattice,
             initial_state,
-            top_k,
-            log_frequency_total,
+            ranking_config,
             &mut memo,
             &mut search_stats,
         );
@@ -1051,8 +1117,7 @@ impl Decoder {
         &self,
         lattice: &SentenceLattice,
         state: SentenceRankingState,
-        top_k: usize,
-        log_frequency_total: f64,
+        config: SentenceRankingConfig,
         memo: &mut HashMap<SentenceRankingState, Vec<SentenceCandidate>>,
         search_stats: &mut SentenceSearchStats,
     ) -> Vec<SentenceCandidate> {
@@ -1086,20 +1151,14 @@ impl Decoder {
         let groups = self.prepare_transition_groups(
             transitions,
             &state,
-            top_k,
-            log_frequency_total,
+            config.top_k,
+            config.log_frequency_total,
             search_stats,
         );
         let mut paths = Vec::new();
         for group in groups {
-            let suffixes = self.k_best_from_state(
-                lattice,
-                group.child_state,
-                top_k,
-                log_frequency_total,
-                memo,
-                search_stats,
-            );
+            let suffixes =
+                self.k_best_from_state(lattice, group.child_state, config, memo, search_stats);
             search_stats.path_combinations_considered += suffixes.len() * group.transitions.len();
 
             for prepared in group.transitions {
@@ -1126,30 +1185,41 @@ impl Decoder {
         }
 
         paths.sort_by(sentence_order);
-        let mut seen_text = HashSet::new();
-        paths.retain(|candidate| seen_text.insert(candidate.text.clone()));
-        let mut exact_paths = 0;
-        let mut error_paths = 0;
-        let mut anchored_transposition_paths = 0;
+        let mut seen_segmentations = HashSet::<(String, Vec<(String, KeySequence)>)>::new();
+        paths.retain(|candidate| {
+            let segmentation = candidate
+                .segments
+                .iter()
+                .map(|segment| (segment.candidate.text.clone(), segment.observed.clone()))
+                .collect::<Vec<_>>();
+            seen_segmentations.insert((candidate.text.clone(), segmentation))
+        });
+        let mut variants_by_text = HashMap::<String, usize>::new();
+        paths.retain(|candidate| {
+            let variants = variants_by_text.entry(candidate.text.clone()).or_default();
+            if *variants >= config.segmentations_per_text {
+                false
+            } else {
+                *variants += 1;
+                true
+            }
+        });
+        let mut exact_texts = HashSet::new();
+        let mut error_texts = HashSet::new();
+        let mut anchored_transposition_texts = HashSet::new();
         paths.retain(|candidate| {
             let anchored_transposition = sentence_is_anchored_transposition_recovery(candidate);
-            let retained = if anchored_transposition {
-                anchored_transposition_paths < top_k
+            if anchored_transposition {
+                retain_bounded_text(
+                    &mut anchored_transposition_texts,
+                    &candidate.text,
+                    config.top_k,
+                )
             } else if candidate.used_error {
-                error_paths < top_k
+                retain_bounded_text(&mut error_texts, &candidate.text, config.top_k)
             } else {
-                exact_paths < top_k
-            };
-            if retained {
-                if anchored_transposition {
-                    anchored_transposition_paths += 1;
-                } else if candidate.used_error {
-                    error_paths += 1;
-                } else {
-                    exact_paths += 1;
-                }
+                retain_bounded_text(&mut exact_texts, &candidate.text, config.top_k)
             }
-            retained
         });
         memo.insert(state, paths.clone());
         paths
@@ -2937,6 +3007,13 @@ struct SentenceRankingState {
     previous_word: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SentenceRankingConfig {
+    top_k: usize,
+    segmentations_per_text: usize,
+    log_frequency_total: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct SegmentTransition {
     end: usize,
@@ -3098,6 +3175,10 @@ fn spelling_indices_are_anchored_suffix(abbreviated: &[usize], syllable_count: u
             .iter()
             .copied()
             .eq(first_abbreviated..syllable_count)
+}
+
+fn retain_bounded_text(seen: &mut HashSet<String>, text: &str, top_k: usize) -> bool {
+    seen.contains(text) || (seen.len() < top_k && seen.insert(text.to_owned()))
 }
 
 fn sentence_order(left: &SentenceCandidate, right: &SentenceCandidate) -> Ordering {
@@ -4066,6 +4147,49 @@ name: test
                 );
             }
         }
+    }
+
+    #[test]
+    fn diagnostic_frontier_retains_bounded_same_text_segmentations() {
+        let lexicon = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+不是\tbu shi\t1000\n\
+第\tdi\t900\n\
+一个\tyi ge\t900\n\
+第一\tdi yi\t700\n\
+个\tge\t700\n",
+        )
+        .unwrap();
+        let decoder = Decoder::new(lexicon);
+
+        let ordinary = decoder.decode_sentence("buuidiyige", 10).unwrap();
+        assert_eq!(
+            ordinary
+                .iter()
+                .filter(|candidate| candidate.text == "不是第一个")
+                .count(),
+            1
+        );
+
+        let variants = decoder
+            .decode_sentence_segmentation_variants("buuidiyige", 10, 2)
+            .unwrap();
+        let segmentations = variants
+            .iter()
+            .filter(|candidate| candidate.text == "不是第一个")
+            .map(|candidate| {
+                candidate
+                    .segments
+                    .iter()
+                    .map(|segment| segment.candidate.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(segmentations.len(), 2);
+        assert!(segmentations.contains("不是|第|一个"));
+        assert!(segmentations.contains("不是|第一|个"));
     }
 
     fn exhaustive_sentence_reference(

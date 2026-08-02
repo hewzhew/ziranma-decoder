@@ -235,21 +235,25 @@ mod windows_controller {
         let state = read_state_if_present(&root)?;
         let active = read_active_if_present(&root)?;
         let processes = recorder_processes()?;
-        let healthy = processes.len() <= 1
+        let process_topology_healthy = processes.len() <= 1
             && processes
                 .iter()
                 .all(|process| managed_process_role(process, state.as_ref(), &root).is_some());
+        let lifecycle_consistent = active_lifecycle_consistent(active.as_ref(), &processes);
+        let healthy = process_topology_healthy && lifecycle_consistent;
         if !machine {
             return print_human_status(&root, state.as_ref(), active.as_ref(), &processes, healthy);
         }
         println!(
             "RECORDERCTL_STATUS schema={} configured={} running={} healthy={} \
+             lifecycle_consistent={} \
              network=false reads_capture_data=false writes=false path_disclosed=false \
              contains_behavioral_metadata=true",
             STATE_SCHEMA,
             state.is_some(),
             processes.len(),
-            healthy
+            healthy,
+            lifecycle_consistent
         );
         if let Some(state) = &state {
             print_slot("current", state.current.as_deref(), &root)?;
@@ -279,9 +283,12 @@ mod windows_controller {
         let candidate =
             human_slot_version(root, state.and_then(|state| state.candidate.as_deref()))?;
         let previous = human_slot_version(root, state.and_then(|state| state.previous.as_deref()))?;
-        let headline = match (healthy, processes.len()) {
-            (true, 0) => "已停止，可以安全换代或启动",
-            (true, 1) => "正常运行",
+        let unclean_last_session = processes.is_empty()
+            && active.is_some_and(|active| matches!(active.phase.as_str(), "running" | "paused"));
+        let headline = match (healthy, processes.len(), unclean_last_session) {
+            (_, 0, true) => "已停止，但上一次没有正常退出回执",
+            (true, 0, false) => "已停止，可以安全换代或启动",
+            (true, 1, false) => "正常运行",
             _ => "需要检查，暂时不要启动或换代",
         };
         println!("记录器状态：{headline}");
@@ -314,7 +321,9 @@ mod windows_controller {
                 .unwrap_or("尚无；第一次升级后会自动保留")
         );
         print_human_active(active, processes)?;
-        let next = if !healthy || processes.len() > 1 {
+        let next = if unclean_last_session {
+            "当前没有记录器进程，可以重新启动；已保存的加密分段保持不变。"
+        } else if !healthy || processes.len() > 1 {
             "先不要操作，请检查是否启动了多个或未受管理的记录器。"
         } else if processes.len() == 1 && candidate.is_some() {
             "待升级版已经准备好；想现在切换时依次运行：drain → promote → run --session-kind daily --background → status。"
@@ -330,6 +339,27 @@ mod windows_controller {
         println!("  下一步：{next}");
         println!("  隐私：未读取采集内容，未写入文件，未连接网络。");
         Ok(())
+    }
+
+    fn active_lifecycle_consistent(
+        active: Option<&ActiveState>,
+        processes: &[RecorderProcess],
+    ) -> bool {
+        match processes {
+            [] => active.is_none_or(|active| matches!(active.phase.as_str(), "stopped" | "failed")),
+            [process] => active.is_none_or(|active| {
+                if active.pid == process.pid {
+                    matches!(active.phase.as_str(), "running" | "paused")
+                } else {
+                    matches!(active.phase.as_str(), "stopped" | "failed")
+                }
+            }),
+            _ => false,
+        }
+    }
+
+    fn clean_stop_receipt_observed(active: Option<&ActiveState>, pid: u32) -> bool {
+        active.is_some_and(|active| active.pid == pid && active.phase == "stopped")
     }
 
     fn print_human_active(
@@ -727,16 +757,29 @@ mod windows_controller {
         let deadline = Instant::now() + STOP_TIMEOUT;
         while Instant::now() < deadline {
             if !process_exists(process.pid)? {
+                let active = read_active_if_present(&root)?;
+                if clean_stop_receipt_observed(active.as_ref(), process.pid) {
+                    println!(
+                        "记录器已安全停止：PID {} 已自行解绑、刷新并提交正常退出回执。",
+                        process.pid
+                    );
+                    println!(
+                        "RECORDERCTL_DRAINED pid={} role={} flushed_by_recorder=true \
+                         clean_exit_receipt=true forced_termination=false",
+                        process.pid, role
+                    );
+                    return Ok(());
+                }
+                println!("记录器进程已经退出，但没有观察到可验证的正常退出回执；未执行强制终止。");
                 println!(
-                    "记录器已安全停止：PID {} 已自行解绑、刷新并退出，没有强制终止。",
-                    process.pid
-                );
-                println!(
-                    "RECORDERCTL_DRAINED pid={} role={} flushed_by_recorder=true \
-                     forced_termination=false",
+                    "RECORDERCTL_DRAINED pid={} role={} flushed_by_recorder=false \
+                     clean_exit_receipt=false forced_termination=false",
                     process.pid, role
                 );
-                return Ok(());
+                return Err(
+                    "recorder exited without a verifiable clean-stop receipt; run status before promotion"
+                        .into(),
+                );
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -774,6 +817,7 @@ mod windows_controller {
         let destination = builds.join(&file_name);
         let temporary = builds.join(format!(".{file_name}.copying"));
         copy_new(&source, &temporary)?;
+        let mut destination_created = false;
         let result = (|| {
             let check = run_preflight(&temporary)?;
             if !check.exact_policy || check.candidates == 0 {
@@ -789,11 +833,18 @@ mod windows_controller {
                 byte_len,
             };
             fs::rename(&temporary, &destination)?;
+            destination_created = true;
             write_build_metadata(&destination, &metadata)?;
             Ok(metadata)
         })();
         if temporary.exists() {
             let _ = fs::remove_file(&temporary);
+        }
+        if result.is_err() && destination_created {
+            if let Ok(metadata_path) = build_metadata_path(&destination) {
+                let _ = fs::remove_file(metadata_path);
+            }
+            let _ = fs::remove_file(&destination);
         }
         let metadata = result?;
         Ok(InstalledBuild {
@@ -1480,7 +1531,8 @@ mod windows_controller {
     #[cfg(test)]
     mod tests {
         use super::{
-            ACTIVE_SCHEMA, ActiveState, BUILD_SCHEMA, ControllerCommand, STATE_SCHEMA, SlotState,
+            ACTIVE_SCHEMA, ActiveState, BUILD_SCHEMA, ControllerCommand, RecorderProcess,
+            STATE_SCHEMA, SlotState, active_lifecycle_consistent, clean_stop_receipt_observed,
             field_value, field_value_optional, format_duration, human_phase, human_session_age,
             human_session_status, machine_process_line, parse_active_state, parse_command,
             parse_key_value_lines, parse_state, sanitize_field, validate_slot_name,
@@ -1625,6 +1677,37 @@ mod windows_controller {
             assert!(parse_active_state(&valid.replace("phase=running", "phase=unknown")).is_err());
             assert_eq!(format_duration(12_345), "12秒");
             assert_eq!(format_duration(3_661_000), "1小时1分钟");
+        }
+
+        #[test]
+        fn lifecycle_health_requires_a_clean_terminal_receipt_or_matching_live_pid() {
+            let mut active = ActiveState {
+                pid: 42,
+                session: "1234-42".to_owned(),
+                kind: "daily".to_owned(),
+                producer_version: "v1".to_owned(),
+                capture_profile: "p1".to_owned(),
+                started_unix_ms: 1234,
+                phase: "running".to_owned(),
+                target: "connected".to_owned(),
+                saved_segments: 2,
+                saved_events: 17,
+                last_flush_unix_ms: Some(1300),
+            };
+            let matching = [RecorderProcess {
+                pid: 42,
+                path: None,
+            }];
+
+            assert!(!active_lifecycle_consistent(Some(&active), &[]));
+            assert!(active_lifecycle_consistent(Some(&active), &matching));
+            assert!(!clean_stop_receipt_observed(Some(&active), 42));
+
+            active.phase = "stopped".to_owned();
+            assert!(active_lifecycle_consistent(Some(&active), &[]));
+            assert!(!active_lifecycle_consistent(Some(&active), &matching));
+            assert!(clean_stop_receipt_observed(Some(&active), 42));
+            assert!(!clean_stop_receipt_observed(Some(&active), 7));
         }
 
         #[test]

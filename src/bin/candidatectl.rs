@@ -675,20 +675,25 @@ fn write_public_package(
     .render();
 
     fs::create_dir(output).map_err(|_| "cannot create explicitly named package output")?;
-    write_new_synced(
-        &output.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
-        payload.as_bytes(),
-    )?;
-    write_new_synced(
-        &output.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
-        manifest_text.as_bytes(),
-    )?;
-    write_new_synced(
-        &output.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
-        provenance_text.as_bytes(),
-    )?;
-
-    let loaded = load_package_directory(output)?;
+    let build_result = (|| -> Result<LoadedPackage, Box<dyn std::error::Error>> {
+        write_new_synced(
+            &output.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+            payload.as_bytes(),
+        )?;
+        write_new_synced(
+            &output.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
+            manifest_text.as_bytes(),
+        )?;
+        write_new_synced(
+            &output.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            provenance_text.as_bytes(),
+        )?;
+        load_package_directory(output)
+    })();
+    if build_result.is_err() {
+        let _ = fs::remove_dir_all(output);
+    }
+    let loaded = build_result?;
     Ok(render_build_report(
         &loaded.snapshot,
         &loaded.provenance,
@@ -1100,26 +1105,40 @@ fn install_package(
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temporary = packages.join(format!(".install-{}-{stamp}", std::process::id()));
     fs::create_dir(&temporary).map_err(|_| "cannot create temporary candidate package")?;
-    write_new_synced(
-        &temporary.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
-        loaded.payload_text.as_bytes(),
-    )?;
-    write_new_synced(
-        &temporary.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
-        loaded.manifest_text.as_bytes(),
-    )?;
-    write_new_synced(
-        &temporary.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
-        loaded.provenance_text.as_bytes(),
-    )?;
-    fs::rename(&temporary, &destination).map_err(|_| "cannot install candidate package")?;
-    let installed = load_public_package_directory(&destination)?;
-    if installed.manifest != loaded.manifest
-        || installed.payload_text != loaded.payload_text
-        || installed.provenance != loaded.provenance
-    {
-        return Err("installed candidate package failed exact verification".into());
+    let mut destination_created = false;
+    let install_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        write_new_synced(
+            &temporary.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+            loaded.payload_text.as_bytes(),
+        )?;
+        write_new_synced(
+            &temporary.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
+            loaded.manifest_text.as_bytes(),
+        )?;
+        write_new_synced(
+            &temporary.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            loaded.provenance_text.as_bytes(),
+        )?;
+        fs::rename(&temporary, &destination).map_err(|_| "cannot install candidate package")?;
+        destination_created = true;
+        let installed = load_public_package_directory(&destination)?;
+        if installed.manifest != loaded.manifest
+            || installed.payload_text != loaded.payload_text
+            || installed.provenance != loaded.provenance
+        {
+            return Err("installed candidate package failed exact verification".into());
+        }
+        Ok(())
+    })();
+    if install_result.is_err() {
+        if temporary.exists() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        if destination_created {
+            let _ = fs::remove_dir_all(&destination);
+        }
     }
+    install_result?;
     Ok(package_id)
 }
 

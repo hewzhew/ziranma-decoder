@@ -19,6 +19,7 @@
 
 # Local editor and operating-system files
 /.local/
+/tmp/
 .vscode/
 .idea/
 .DS_Store

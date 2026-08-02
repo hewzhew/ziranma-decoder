@@ -41,10 +41,11 @@ cargo build --release --lib --bin tsf-devctl
 
 这个命令先依据本地安装记录复核不可变 DLL、COM 注册、文本服务身份、语言
 配置和键盘类别。它先调用旧 `EnableLanguageProfile` 作为兼容通知，再始终调用
-现代 `ITfInputProcessorProfileMgr::ActivateProfile`；只有后者使用
-`TF_IPPMF_ENABLEPROFILE` 写入当前用户持久状态的结果才算成功。调用不包含
-设为默认、进程范围或桌面会话范围标志；是否通过输入法切换器选中 Alpha，仍由
-用户单独决定。
+现代 `ITfInputProcessorProfileMgr::ActivateProfile`。若某个 Windows 版本仅因
+`TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE` 返回 `E_INVALIDARG`，工具会去掉这个
+可选标志重试；若现代调用仍失败，则必须先从系统枚举观察到请求状态，并由后续
+复查再次确认，不能单凭旧接口的 `S_OK` 放行。调用不包含设为默认、进程范围或
+桌面会话范围标志；是否通过输入法切换器选中 Alpha，仍由用户单独决定。
 
 现代调用可能只在执行命令的短生命周期辅助线程内暂时激活配置，所以同一进程
 只验证注册完整和启用位。换代脚本会等该进程退出后再运行独立检查，确认状态为

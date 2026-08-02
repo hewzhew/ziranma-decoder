@@ -18,6 +18,9 @@ const MAX_SESSION_SELECTION_TEXT_CHARACTERS: usize = 128;
 pub enum CompositionPunctuation {
     Comma,
     Period,
+    LeftParenthesis,
+    RightParenthesis,
+    QuestionMark,
 }
 
 impl CompositionPunctuation {
@@ -25,6 +28,9 @@ impl CompositionPunctuation {
         match self {
             Self::Comma => "，",
             Self::Period => "。",
+            Self::LeftParenthesis => "（",
+            Self::RightParenthesis => "）",
+            Self::QuestionMark => "？",
         }
     }
 }

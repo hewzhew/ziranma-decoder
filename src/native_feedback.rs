@@ -8,9 +8,14 @@
 const MAX_FEEDBACK_CODE_BYTES: usize = 64;
 const MAX_FEEDBACK_CANDIDATES_PER_PAGE: usize = 7;
 const MAX_FEEDBACK_TEXT_CHARACTERS: usize = 128;
+const MAX_FEEDBACK_POPUP_TIMING_MS: u32 = 60_000;
 
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS: usize = 4_096;
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES: usize = 1024 * 1024;
+pub const NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS: [u64; 8] =
+    [8, 16, 24, 32, 48, 64, 96, 160];
+pub const NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS: usize =
+    NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS.len() + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeFeedbackLimits {
@@ -106,6 +111,13 @@ pub enum NativeFeedbackEvent {
         code: String,
         source: NativeCancellationSource,
     },
+    /// One completed candidate-popup paint. With immediate visibility the
+    /// complete frame and the fully visible frame have the same duration.
+    CandidatePopupTiming {
+        first_frame_ms: u32,
+        fully_visible_ms: u32,
+        initial_show: bool,
+    },
 }
 
 impl NativeFeedbackEvent {
@@ -147,6 +159,13 @@ impl NativeFeedbackEvent {
             }
             Self::RawCodeCommitted { code } => valid_code(code).then_some(code.len()),
             Self::CompositionCancelled { code, .. } => valid_code(code).then_some(code.len()),
+            Self::CandidatePopupTiming {
+                first_frame_ms,
+                fully_visible_ms,
+                ..
+            } => (*first_frame_ms <= *fully_visible_ms
+                && *fully_visible_ms <= MAX_FEEDBACK_POPUP_TIMING_MS)
+                .then_some(0),
         }
     }
 }
@@ -224,9 +243,17 @@ pub struct NativeFeedbackSummary {
     pub candidate_pages: usize,
     pub commits: usize,
     pub cancellations: usize,
+    pub popup_timing_samples: usize,
     pub context_suppressions: usize,
     pub private_bytes: usize,
+    pub half_pair_gap_samples: usize,
+    pub half_pair_gap_histogram: [usize; NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS],
     pub stop_reason: Option<NativeFeedbackStopReason>,
+}
+
+struct PendingHalfPairTiming {
+    code: String,
+    monotonic_ms: u64,
 }
 
 /// An explicitly started, bounded, in-memory feedback session.
@@ -243,6 +270,9 @@ pub struct NativeFeedbackSession {
     stop_reason: Option<NativeFeedbackStopReason>,
     context_suppressions: usize,
     private_bytes: usize,
+    half_pair_gap_samples: usize,
+    half_pair_gap_histogram: [usize; NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS],
+    pending_half_pair_timing: Option<PendingHalfPairTiming>,
     events: Vec<NativeFeedbackEvent>,
 }
 
@@ -266,6 +296,9 @@ impl NativeFeedbackSession {
         self.stop_reason = None;
         self.context_suppressions = 0;
         self.private_bytes = 0;
+        self.half_pair_gap_samples = 0;
+        self.half_pair_gap_histogram = [0; NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS];
+        self.pending_half_pair_timing = None;
         self.events.clear();
         NativeFeedbackStartResult::Started
     }
@@ -278,6 +311,7 @@ impl NativeFeedbackSession {
             return NativeFeedbackStopResult::AlreadyStopped;
         }
         self.accepting = false;
+        self.pending_half_pair_timing = None;
         NativeFeedbackStopResult::Stopped
     }
 
@@ -297,6 +331,28 @@ impl NativeFeedbackSession {
         context: NativeFeedbackContext,
         event: NativeFeedbackEvent,
     ) -> NativeFeedbackRecordResult {
+        self.record_inner(context, event, None)
+    }
+
+    /// Records an event together with a host-supplied monotonic timestamp.
+    ///
+    /// The timestamp is used only to update an aggregate odd-to-even
+    /// double-pinyin gap histogram. Individual timestamps are never retained.
+    pub fn record_at(
+        &mut self,
+        context: NativeFeedbackContext,
+        event: NativeFeedbackEvent,
+        monotonic_ms: u64,
+    ) -> NativeFeedbackRecordResult {
+        self.record_inner(context, event, Some(monotonic_ms))
+    }
+
+    fn record_inner(
+        &mut self,
+        context: NativeFeedbackContext,
+        event: NativeFeedbackEvent,
+        monotonic_ms: Option<u64>,
+    ) -> NativeFeedbackRecordResult {
         if !self.enabled {
             return NativeFeedbackRecordResult::Disabled;
         }
@@ -308,6 +364,7 @@ impl NativeFeedbackSession {
                 });
         }
         if context != NativeFeedbackContext::Eligible {
+            self.pending_half_pair_timing = None;
             self.context_suppressions = self.context_suppressions.saturating_add(1);
             return NativeFeedbackRecordResult::Suppressed(context);
         }
@@ -323,6 +380,7 @@ impl NativeFeedbackSession {
         if next_private_bytes > self.limits.max_private_bytes {
             return self.stop_incomplete(NativeFeedbackStopReason::PrivateByteLimit);
         }
+        self.observe_half_pair_gap(&event, monotonic_ms);
         self.events.push(event);
         self.private_bytes = next_private_bytes;
         NativeFeedbackRecordResult::Recorded
@@ -343,6 +401,8 @@ impl NativeFeedbackSession {
             events: self.events.len(),
             context_suppressions: self.context_suppressions,
             private_bytes: self.private_bytes,
+            half_pair_gap_samples: self.half_pair_gap_samples,
+            half_pair_gap_histogram: self.half_pair_gap_histogram,
             stop_reason: self.stop_reason,
             ..NativeFeedbackSummary::default()
         };
@@ -357,6 +417,9 @@ impl NativeFeedbackSession {
                 }
                 NativeFeedbackEvent::CompositionCancelled { .. } => {
                     summary.cancellations = summary.cancellations.saturating_add(1);
+                }
+                NativeFeedbackEvent::CandidatePopupTiming { .. } => {
+                    summary.popup_timing_samples = summary.popup_timing_samples.saturating_add(1);
                 }
             }
         }
@@ -375,7 +438,58 @@ impl NativeFeedbackSession {
         self.accepting = false;
         self.complete = false;
         self.stop_reason = Some(reason);
+        self.pending_half_pair_timing = None;
         NativeFeedbackRecordResult::Stopped(reason)
+    }
+
+    fn observe_half_pair_gap(&mut self, event: &NativeFeedbackEvent, monotonic_ms: Option<u64>) {
+        // Paint diagnostics are orthogonal to key-pair timing and can arrive
+        // between the odd and even double-pinyin frames.
+        if matches!(event, NativeFeedbackEvent::CandidatePopupTiming { .. }) {
+            return;
+        }
+        let (
+            NativeFeedbackEvent::CandidatesPresented {
+                code,
+                view: NativeCandidateView::Ordinary,
+                page_start: 0,
+                ..
+            },
+            Some(monotonic_ms),
+        ) = (event, monotonic_ms)
+        else {
+            self.pending_half_pair_timing = None;
+            return;
+        };
+
+        if code.len() % 2 == 1 {
+            let repeats_same_frame = self
+                .pending_half_pair_timing
+                .as_ref()
+                .is_some_and(|pending| pending.code == *code);
+            self.pending_half_pair_timing = (!repeats_same_frame).then(|| PendingHalfPairTiming {
+                code: code.clone(),
+                monotonic_ms,
+            });
+            return;
+        }
+
+        let Some(pending) = self.pending_half_pair_timing.take() else {
+            return;
+        };
+        if code.len() != pending.code.len().saturating_add(1) || !code.starts_with(&pending.code) {
+            return;
+        }
+        let Some(gap_ms) = monotonic_ms.checked_sub(pending.monotonic_ms) else {
+            return;
+        };
+        let bucket = NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS
+            .iter()
+            .position(|upper_bound| gap_ms < *upper_bound)
+            .unwrap_or(NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS - 1);
+        self.half_pair_gap_samples = self.half_pair_gap_samples.saturating_add(1);
+        self.half_pair_gap_histogram[bucket] =
+            self.half_pair_gap_histogram[bucket].saturating_add(1);
     }
 }
 
@@ -393,6 +507,16 @@ mod tests {
         }
     }
 
+    fn timed_page(code: &str, view: NativeCandidateView, page_start: usize) -> NativeFeedbackEvent {
+        NativeFeedbackEvent::CandidatesPresented {
+            code: code.to_owned(),
+            view,
+            page_start,
+            candidates: vec!["甲".to_owned(), "乙".to_owned()],
+            may_have_more: false,
+        }
+    }
+
     fn start(session: &mut NativeFeedbackSession, limits: NativeFeedbackLimits) {
         assert_eq!(
             session.start_memory(NativeFeedbackAuthorization::explicit_memory_only(), limits),
@@ -405,6 +529,14 @@ mod tests {
         event: NativeFeedbackEvent,
     ) -> NativeFeedbackRecordResult {
         session.record(NativeFeedbackContext::Eligible, event)
+    }
+
+    fn record_at(
+        session: &mut NativeFeedbackSession,
+        event: NativeFeedbackEvent,
+        monotonic_ms: u64,
+    ) -> NativeFeedbackRecordResult {
+        session.record_at(NativeFeedbackContext::Eligible, event, monotonic_ms)
     }
 
     #[test]
@@ -467,6 +599,41 @@ mod tests {
         assert_eq!(summary.cancellations, 0);
         assert!(summary.private_bytes > 0);
         assert_eq!(summary.stop_reason, None);
+    }
+
+    #[test]
+    fn popup_timing_is_bounded_diagnostic_metadata() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        assert_eq!(
+            record(
+                &mut session,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 7,
+                    fully_visible_ms: 7,
+                    initial_show: true,
+                }
+            ),
+            NativeFeedbackRecordResult::Recorded
+        );
+        let summary = session.summary();
+        assert_eq!(summary.events, 1);
+        assert_eq!(summary.popup_timing_samples, 1);
+        assert_eq!(summary.private_bytes, 0);
+
+        let mut invalid = NativeFeedbackSession::default();
+        start(&mut invalid, NativeFeedbackLimits::default());
+        assert_eq!(
+            record(
+                &mut invalid,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 8,
+                    fully_visible_ms: 7,
+                    initial_show: false,
+                }
+            ),
+            NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
+        );
     }
 
     #[test]
@@ -676,5 +843,226 @@ mod tests {
         assert!(summary.accepting);
         assert_eq!(summary.context_suppressions, 6);
         assert_eq!(summary.private_bytes, 0);
+    }
+
+    #[test]
+    fn ordinary_odd_to_even_prefix_records_one_aggregate_gap() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+
+        assert_eq!(
+            record_at(
+                &mut session,
+                timed_page("a", NativeCandidateView::Ordinary, 0),
+                100,
+            ),
+            NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(
+            record_at(
+                &mut session,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 5,
+                    fully_visible_ms: 5,
+                    initial_show: true,
+                },
+                105,
+            ),
+            NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(
+            record_at(
+                &mut session,
+                timed_page("ab", NativeCandidateView::Ordinary, 0),
+                124,
+            ),
+            NativeFeedbackRecordResult::Recorded
+        );
+
+        let summary = session.summary();
+        assert_eq!(summary.half_pair_gap_samples, 1);
+        assert_eq!(summary.half_pair_gap_histogram, [0, 0, 0, 1, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn half_pair_gap_buckets_use_the_documented_exclusive_upper_bounds() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        for (index, gap_ms) in [0, 8, 16, 24, 32, 48, 64, 96, 160].into_iter().enumerate() {
+            let base = u64::try_from(index).unwrap() * 1_000;
+            assert_eq!(
+                record_at(
+                    &mut session,
+                    timed_page("a", NativeCandidateView::Ordinary, 0),
+                    base,
+                ),
+                NativeFeedbackRecordResult::Recorded
+            );
+            assert_eq!(
+                record_at(
+                    &mut session,
+                    timed_page("ab", NativeCandidateView::Ordinary, 0),
+                    base + gap_ms,
+                ),
+                NativeFeedbackRecordResult::Recorded
+            );
+        }
+
+        let summary = session.summary();
+        assert_eq!(summary.half_pair_gap_samples, 9);
+        assert_eq!(summary.half_pair_gap_histogram, [1; 9]);
+    }
+
+    #[test]
+    fn even_to_odd_and_page_only_updates_do_not_create_gap_samples() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record_at(
+            &mut session,
+            timed_page("ab", NativeCandidateView::Ordinary, 0),
+            0,
+        );
+        record_at(
+            &mut session,
+            timed_page("abc", NativeCandidateView::Ordinary, 0),
+            10,
+        );
+        record_at(
+            &mut session,
+            timed_page("abc", NativeCandidateView::Ordinary, 6),
+            15,
+        );
+        record_at(
+            &mut session,
+            timed_page("abcd", NativeCandidateView::Ordinary, 0),
+            20,
+        );
+
+        let summary = session.summary();
+        assert_eq!(summary.half_pair_gap_samples, 0);
+        assert_eq!(summary.half_pair_gap_histogram, [0; 9]);
+    }
+
+    #[test]
+    fn commit_cancel_and_nonordinary_views_break_timing_pairs() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record_at(
+            &mut session,
+            timed_page("a", NativeCandidateView::Ordinary, 0),
+            0,
+        );
+        record_at(
+            &mut session,
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "a".to_owned(),
+                text: "甲".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 1,
+                visible_rank: 1,
+            },
+            1,
+        );
+        record_at(
+            &mut session,
+            timed_page("ab", NativeCandidateView::Ordinary, 0),
+            2,
+        );
+        record_at(
+            &mut session,
+            timed_page("abc", NativeCandidateView::Ordinary, 0),
+            3,
+        );
+        record_at(
+            &mut session,
+            NativeFeedbackEvent::CompositionCancelled {
+                code: "abc".to_owned(),
+                source: NativeCancellationSource::Escape,
+            },
+            4,
+        );
+        record_at(
+            &mut session,
+            timed_page("abcd", NativeCandidateView::Ordinary, 0),
+            5,
+        );
+        record_at(
+            &mut session,
+            timed_page("abcde", NativeCandidateView::Ordinary, 0),
+            6,
+        );
+        record_at(
+            &mut session,
+            timed_page("abcde", NativeCandidateView::Shape, 0),
+            7,
+        );
+        record_at(
+            &mut session,
+            timed_page("abcdef", NativeCandidateView::Ordinary, 0),
+            8,
+        );
+
+        assert_eq!(session.summary().half_pair_gap_samples, 0);
+    }
+
+    #[test]
+    fn nonmonotonic_time_and_suppressed_context_fail_closed() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record_at(
+            &mut session,
+            timed_page("a", NativeCandidateView::Ordinary, 0),
+            10,
+        );
+        record_at(
+            &mut session,
+            timed_page("ab", NativeCandidateView::Ordinary, 0),
+            9,
+        );
+        record_at(
+            &mut session,
+            timed_page("abc", NativeCandidateView::Ordinary, 0),
+            20,
+        );
+        assert_eq!(
+            session.record_at(
+                NativeFeedbackContext::Password,
+                timed_page("abcd", NativeCandidateView::Ordinary, 0),
+                30,
+            ),
+            NativeFeedbackRecordResult::Suppressed(NativeFeedbackContext::Password)
+        );
+        record_at(
+            &mut session,
+            timed_page("abcd", NativeCandidateView::Ordinary, 0),
+            31,
+        );
+
+        let summary = session.summary();
+        assert_eq!(summary.half_pair_gap_samples, 0);
+        assert_eq!(summary.context_suppressions, 1);
+    }
+
+    #[test]
+    fn redacted_summary_debug_contains_neither_codes_nor_candidate_text() {
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        record_at(
+            &mut session,
+            NativeFeedbackEvent::CandidatesPresented {
+                code: "privatecode".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                page_start: 0,
+                candidates: vec!["仅供合成测试".to_owned()],
+                may_have_more: false,
+            },
+            10,
+        );
+
+        let debug = format!("{:?}", session.summary());
+        assert!(!debug.contains("privatecode"));
+        assert!(!debug.contains("仅供合成测试"));
+        assert!(debug.contains("half_pair_gap_histogram"));
     }
 }

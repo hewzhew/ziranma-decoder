@@ -1,7 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::{BigramLanguageModel, LexiconEntry, PublicProtocolProbe};
+use crate::{
+    BigramLanguageModel, Decoder, KeySequenceError, LexiconEntry, MAX_CANDIDATE_SNAPSHOT_RANK,
+    PublicProtocolProbe,
+};
 
 /// Structural statistics for one fixed-spelling word index.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -91,6 +94,135 @@ pub struct PublicProtocolAuditReport {
     pub conservative_tail_index: ProtocolIndexStats,
     /// All-short index collisions after the mode fixes syllable width.
     pub explicit_abbreviation_index: ProtocolIndexStats,
+}
+
+/// One fixed gate for shortening only the final double-pinyin syllable of a
+/// multi-syllable word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollisionGatedTailProfile {
+    /// Stable report label.
+    pub label: &'static str,
+    /// Largest raw shortened-code fanout allowed; `None` keeps complete code.
+    pub maximum_shortened_code_fanout: Option<usize>,
+}
+
+/// Fixed structural sweep; thresholds are powers of two rather than values
+/// fitted on a held-out answer set.
+pub const COLLISION_GATED_TAIL_PROFILES: [CollisionGatedTailProfile; 7] = [
+    CollisionGatedTailProfile {
+        label: "full",
+        maximum_shortened_code_fanout: None,
+    },
+    CollisionGatedTailProfile {
+        label: "fanout-1",
+        maximum_shortened_code_fanout: Some(1),
+    },
+    CollisionGatedTailProfile {
+        label: "fanout-2",
+        maximum_shortened_code_fanout: Some(2),
+    },
+    CollisionGatedTailProfile {
+        label: "fanout-4",
+        maximum_shortened_code_fanout: Some(4),
+    },
+    CollisionGatedTailProfile {
+        label: "fanout-8",
+        maximum_shortened_code_fanout: Some(8),
+    },
+    CollisionGatedTailProfile {
+        label: "fanout-16",
+        maximum_shortened_code_fanout: Some(16),
+    },
+    CollisionGatedTailProfile {
+        label: "all",
+        maximum_shortened_code_fanout: Some(usize::MAX),
+    },
+];
+
+/// Paired accuracy, action cost, and candidate-load evidence for one gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollisionGatedTailReport {
+    /// Fixed gate represented by this row.
+    pub profile: CollisionGatedTailProfile,
+    /// Final mixed full/short word-index structure.
+    pub index: ProtocolIndexStats,
+    /// Ordinary Top-K and letter-cost accounting.
+    pub strategy: ProtocolStrategyReport,
+    /// Multi-syllable expected word instances eligible to save one key.
+    pub multisyllable_word_instances: usize,
+    /// Expected word instances actually shortened by this gate.
+    pub shortened_word_instances: usize,
+    /// Phrases containing at least one shortened expected word.
+    pub attempts_with_shortening: usize,
+    /// Largest raw shortened-code fanout among actually shortened words.
+    pub maximum_observed_shortened_fanout: usize,
+    /// Final candidate pools containing more than one text.
+    pub ambiguous_candidate_pools: usize,
+    /// Final candidate pools extending beyond the ten visible positions.
+    pub candidate_pools_over_ten: usize,
+    /// Expected text newly reaching or leaving first place versus full code.
+    pub gained_top_1: usize,
+    pub lost_top_1: usize,
+    /// Expected text newly entering or leaving the first ten versus full code.
+    pub recovered_into_top_10: usize,
+    pub dropped_out_of_top_10: usize,
+}
+
+/// Target visibility at either the odd initial-key state or the following
+/// even complete-syllable state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DoublePinyinTrajectoryLaneReport {
+    /// Prefix states observed in this parity lane.
+    pub steps: usize,
+    /// Target prefix ranked first, within five, or within ten.
+    pub hits_at_1: usize,
+    pub hits_at_5: usize,
+    pub hits_at_10: usize,
+    /// Visible candidate texts accumulated across the lane.
+    pub visible_candidates: usize,
+}
+
+/// Aggregate interaction evidence for each initial-key/rhyme-key pair in
+/// complete double-pinyin input.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DoublePinyinTrajectoryReport {
+    /// Public probes supplied to the audit.
+    pub requested_probes: usize,
+    /// Probes whose Han-character count matches the complete-code syllables.
+    pub aligned_probes: usize,
+    /// Probes excluded because a character-level target prefix is undefined.
+    pub alignment_mismatches: usize,
+    /// Initial-key/rhyme-key resolution pairs observed.
+    pub syllable_resolutions: usize,
+    /// Odd initial-key states.
+    pub odd: DoublePinyinTrajectoryLaneReport,
+    /// Even complete-syllable states.
+    pub even: DoublePinyinTrajectoryLaneReport,
+    /// Target prefix visible at both sides of the rhyme key.
+    pub target_visible_both: usize,
+    /// Target prefix lost or gained when the rhyme key arrives.
+    pub target_lost_on_rhyme: usize,
+    pub target_gained_on_rhyme: usize,
+    /// Target prefix absent from both visible lists.
+    pub target_absent_both: usize,
+    /// Rank movement among pairs where the target is visible on both sides.
+    pub target_rank_improved: usize,
+    pub target_rank_unchanged: usize,
+    pub target_rank_worsened: usize,
+    /// Whether the visible first candidate text survives the rhyme key.
+    pub top_1_unchanged: usize,
+    pub top_1_changed: usize,
+    /// First-candidate changes that land on or leave the target prefix.
+    pub top_1_changed_to_target: usize,
+    pub top_1_changed_from_target: usize,
+    /// Exact odd-state texts retained anywhere in the following even list.
+    pub retained_visible_texts: usize,
+    /// Odd-state visible texts forming the retention denominator.
+    pub odd_visible_texts: usize,
+    /// Candidate decode requests before and after public-prefix memoization.
+    pub decode_requests: usize,
+    pub unique_prefixes: usize,
+    pub prefix_cache_hits: usize,
 }
 
 /// One held-out anchored-tail miss with deeper and boundary-hint evidence.
@@ -268,6 +400,302 @@ pub fn audit_public_protocols(
     }
 
     report
+}
+
+/// Audits a double-pinyin-specific policy that shortens one final-syllable key
+/// only when the raw shortened word code stays below a fixed collision gate.
+///
+/// The gate reads only public lexicon structure. It does not inspect expected
+/// ranks, fit a threshold, or alter the production decoder. Every row is
+/// paired against the same complete-code result for each probe.
+pub fn audit_collision_gated_tail_protocols(
+    lexicon: &[LexiconEntry],
+    probes: &[PublicProtocolProbe],
+    profiles: &[CollisionGatedTailProfile],
+) -> Vec<CollisionGatedTailReport> {
+    audit_collision_gated_tail_protocols_at(
+        lexicon,
+        probes,
+        profiles,
+        CollisionGatePlacement::EveryWord,
+    )
+}
+
+/// Audits the same collision gates when the omitted rhyme key is allowed only
+/// at the end of the complete composition. Full double-pinyin words remain
+/// the only legal interior transitions, preserving pair synchronization.
+pub fn audit_terminal_collision_gated_tail_protocols(
+    lexicon: &[LexiconEntry],
+    probes: &[PublicProtocolProbe],
+    profiles: &[CollisionGatedTailProfile],
+) -> Vec<CollisionGatedTailReport> {
+    audit_collision_gated_tail_protocols_at(
+        lexicon,
+        probes,
+        profiles,
+        CollisionGatePlacement::CompositionFinalWord,
+    )
+}
+
+/// Audits the real interactive candidate ordering after each initial key and
+/// its completing rhyme key in public complete-code probes.
+///
+/// The expected prefix grows by one Han character per double-pinyin syllable.
+/// Probes whose character and syllable counts differ are reported and skipped
+/// rather than assigned a guessed alignment. Repeated public prefixes share a
+/// bounded in-memory cache for this batch only.
+pub fn audit_double_pinyin_key_trajectories(
+    decoder: &Decoder,
+    probes: &[PublicProtocolProbe],
+    visible_limit: usize,
+) -> Result<DoublePinyinTrajectoryReport, KeySequenceError> {
+    let visible_limit = visible_limit.clamp(1, MAX_CANDIDATE_SNAPSHOT_RANK);
+    let mut report = DoublePinyinTrajectoryReport {
+        requested_probes: probes.len(),
+        ..DoublePinyinTrajectoryReport::default()
+    };
+    let mut prefix_cache = HashMap::<String, Vec<String>>::new();
+
+    for probe in probes {
+        let code = probe.full_observed.as_str();
+        let expected_chars = probe.expected_text.chars().collect::<Vec<_>>();
+        if code.len() != expected_chars.len().saturating_mul(2) {
+            report.alignment_mismatches += 1;
+            continue;
+        }
+        report.aligned_probes += 1;
+
+        for syllable_index in 0..expected_chars.len() {
+            let odd_end = syllable_index * 2 + 1;
+            let even_end = odd_end + 1;
+            let target = expected_chars[..=syllable_index].iter().collect::<String>();
+            let odd_candidates = cached_interactive_candidates(
+                decoder,
+                &mut prefix_cache,
+                &code[..odd_end],
+                visible_limit,
+                &mut report,
+            )?;
+            let even_candidates = cached_interactive_candidates(
+                decoder,
+                &mut prefix_cache,
+                &code[..even_end],
+                visible_limit,
+                &mut report,
+            )?;
+            let odd_rank = observe_trajectory_lane(&mut report.odd, &odd_candidates, &target);
+            let even_rank = observe_trajectory_lane(&mut report.even, &even_candidates, &target);
+
+            report.syllable_resolutions += 1;
+            match (odd_rank, even_rank) {
+                (Some(odd), Some(even)) => {
+                    report.target_visible_both += 1;
+                    match even.cmp(&odd) {
+                        Ordering::Less => report.target_rank_improved += 1,
+                        Ordering::Equal => report.target_rank_unchanged += 1,
+                        Ordering::Greater => report.target_rank_worsened += 1,
+                    }
+                }
+                (Some(_), None) => report.target_lost_on_rhyme += 1,
+                (None, Some(_)) => report.target_gained_on_rhyme += 1,
+                (None, None) => report.target_absent_both += 1,
+            }
+
+            let odd_top = odd_candidates.first().map(String::as_str);
+            let even_top = even_candidates.first().map(String::as_str);
+            if odd_top == even_top {
+                report.top_1_unchanged += 1;
+            } else {
+                report.top_1_changed += 1;
+                report.top_1_changed_to_target += usize::from(even_top == Some(target.as_str()));
+                report.top_1_changed_from_target += usize::from(odd_top == Some(target.as_str()));
+            }
+
+            let even_texts = even_candidates
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            report.retained_visible_texts += odd_candidates
+                .iter()
+                .filter(|text| even_texts.contains(text.as_str()))
+                .count();
+            report.odd_visible_texts += odd_candidates.len();
+        }
+    }
+    report.unique_prefixes = prefix_cache.len();
+    debug_assert_eq!(report.odd.steps, report.syllable_resolutions);
+    debug_assert_eq!(report.even.steps, report.syllable_resolutions);
+    debug_assert_eq!(
+        report.target_visible_both
+            + report.target_lost_on_rhyme
+            + report.target_gained_on_rhyme
+            + report.target_absent_both,
+        report.syllable_resolutions
+    );
+    debug_assert_eq!(
+        report.target_rank_improved + report.target_rank_unchanged + report.target_rank_worsened,
+        report.target_visible_both
+    );
+    debug_assert_eq!(
+        report.top_1_unchanged + report.top_1_changed,
+        report.syllable_resolutions
+    );
+    debug_assert_eq!(
+        report.decode_requests,
+        report.unique_prefixes + report.prefix_cache_hits
+    );
+    Ok(report)
+}
+
+fn cached_interactive_candidates(
+    decoder: &Decoder,
+    cache: &mut HashMap<String, Vec<String>>,
+    prefix: &str,
+    visible_limit: usize,
+    report: &mut DoublePinyinTrajectoryReport,
+) -> Result<Vec<String>, KeySequenceError> {
+    report.decode_requests += 1;
+    if let Some(candidates) = cache.get(prefix) {
+        report.prefix_cache_hits += 1;
+        return Ok(candidates.clone());
+    }
+    let candidates = decoder.interactive_candidate_texts(prefix, visible_limit)?;
+    cache.insert(prefix.to_owned(), candidates.clone());
+    Ok(candidates)
+}
+
+fn observe_trajectory_lane(
+    lane: &mut DoublePinyinTrajectoryLaneReport,
+    candidates: &[String],
+    target: &str,
+) -> Option<usize> {
+    lane.steps += 1;
+    lane.visible_candidates += candidates.len();
+    let rank = candidates
+        .iter()
+        .position(|candidate| candidate == target)
+        .map(|index| index + 1);
+    lane.hits_at_1 += usize::from(rank == Some(1));
+    lane.hits_at_5 += usize::from(rank.is_some_and(|rank| rank <= 5));
+    lane.hits_at_10 += usize::from(rank.is_some_and(|rank| rank <= 10));
+    rank
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollisionGatePlacement {
+    EveryWord,
+    CompositionFinalWord,
+}
+
+fn audit_collision_gated_tail_protocols_at(
+    lexicon: &[LexiconEntry],
+    probes: &[PublicProtocolProbe],
+    profiles: &[CollisionGatedTailProfile],
+    placement: CollisionGatePlacement,
+) -> Vec<CollisionGatedTailReport> {
+    const VISIBLE_K: usize = 10;
+    const LOAD_AUDIT_K: usize = VISIBLE_K + 1;
+
+    let full_index = ProtocolIndex::new(lexicon, ProtocolCodeMode::Full);
+    let conservative_fanouts = protocol_code_fanouts(lexicon, ProtocolCodeMode::ConservativeTail);
+    let entries_by_text = best_entries_by_text(lexicon);
+
+    profiles
+        .iter()
+        .copied()
+        .map(|profile| {
+            let index = ProtocolIndex::new_with_code(lexicon, |entry| {
+                collision_gated_tail_code(entry, &conservative_fanouts, profile).0
+            });
+            let mut report = CollisionGatedTailReport {
+                profile,
+                index: index.stats,
+                strategy: ProtocolStrategyReport::default(),
+                multisyllable_word_instances: 0,
+                shortened_word_instances: 0,
+                attempts_with_shortening: 0,
+                maximum_observed_shortened_fanout: 0,
+                ambiguous_candidate_pools: 0,
+                candidate_pools_over_ten: 0,
+                gained_top_1: 0,
+                lost_top_1: 0,
+                recovered_into_top_10: 0,
+                dropped_out_of_top_10: 0,
+            };
+
+            for probe in probes {
+                let full_candidates = full_index.decode(probe.full_observed.as_str(), LOAD_AUDIT_K);
+                let full_rank = text_rank(&full_candidates, &probe.expected_text);
+                let mut observed = String::new();
+                let mut shortened_words = 0;
+                let mut multisyllable_words = 0;
+                let mut maximum_shortened_fanout = 0;
+                let mut complete_probe_mapping = true;
+                for (segment_index, segment) in probe.expected_segments.iter().enumerate() {
+                    let Some(entry) = entries_by_text.get(segment.as_str()).copied() else {
+                        complete_probe_mapping = false;
+                        break;
+                    };
+                    let gate_this_word = placement == CollisionGatePlacement::EveryWord
+                        || segment_index + 1 == probe.expected_segments.len();
+                    multisyllable_words +=
+                        usize::from(gate_this_word && entry.syllable_codes.len() >= 2);
+                    let (code, shortened, fanout) = if gate_this_word {
+                        collision_gated_tail_code(entry, &conservative_fanouts, profile)
+                    } else {
+                        (entry.code.as_str().to_owned(), false, 0)
+                    };
+                    observed.push_str(&code);
+                    shortened_words += usize::from(shortened);
+                    if shortened {
+                        maximum_shortened_fanout = maximum_shortened_fanout.max(fanout);
+                    }
+                }
+                if !complete_probe_mapping {
+                    observed = probe.full_observed.as_str().to_owned();
+                    shortened_words = 0;
+                    multisyllable_words = 0;
+                    maximum_shortened_fanout = 0;
+                }
+
+                let candidates = match placement {
+                    CollisionGatePlacement::EveryWord => index.decode(&observed, LOAD_AUDIT_K),
+                    CollisionGatePlacement::CompositionFinalWord => {
+                        full_index.decode_with_terminal_shortcuts(&index, &observed, LOAD_AUDIT_K)
+                    }
+                };
+                let rank = text_rank(&candidates, &probe.expected_text);
+                let candidate_count = candidates.len();
+                observe_strategy(
+                    &mut report.strategy,
+                    candidates,
+                    &probe.expected_text,
+                    probe.full_observed.as_str().len(),
+                    observed.len(),
+                    0,
+                );
+                report.multisyllable_word_instances += multisyllable_words;
+                report.shortened_word_instances += shortened_words;
+                report.attempts_with_shortening += usize::from(shortened_words > 0);
+                report.maximum_observed_shortened_fanout = report
+                    .maximum_observed_shortened_fanout
+                    .max(maximum_shortened_fanout);
+                report.ambiguous_candidate_pools += usize::from(candidate_count > 1);
+                report.candidate_pools_over_ten += usize::from(candidate_count > VISIBLE_K);
+                report.gained_top_1 += usize::from(full_rank != Some(1) && rank == Some(1));
+                report.lost_top_1 += usize::from(full_rank == Some(1) && rank != Some(1));
+                report.recovered_into_top_10 += usize::from(
+                    full_rank.is_none_or(|value| value > VISIBLE_K)
+                        && rank.is_some_and(|value| value <= VISIBLE_K),
+                );
+                report.dropped_out_of_top_10 += usize::from(
+                    full_rank.is_some_and(|value| value <= VISIBLE_K)
+                        && rank.is_none_or(|value| value > VISIBLE_K),
+                );
+            }
+            report
+        })
+        .collect()
 }
 
 /// Classifies strict anchored-tail misses without changing production ranking.
@@ -548,6 +976,13 @@ struct ProtocolIndex {
 
 impl ProtocolIndex {
     fn new(lexicon: &[LexiconEntry], mode: ProtocolCodeMode) -> Self {
+        Self::new_with_code(lexicon, |entry| protocol_code(entry, mode))
+    }
+
+    fn new_with_code(
+        lexicon: &[LexiconEntry],
+        code_for_entry: impl Fn(&LexiconEntry) -> String,
+    ) -> Self {
         let frequency_total = lexicon
             .iter()
             .map(|entry| entry.frequency as f64)
@@ -556,7 +991,7 @@ impl ProtocolIndex {
         let mut unique_by_code = BTreeMap::<String, BTreeMap<String, ProtocolWord>>::new();
 
         for entry in lexicon {
-            let code = protocol_code(entry, mode);
+            let code = code_for_entry(entry);
             let word = ProtocolWord {
                 text: entry.text.clone(),
                 log_probability: (entry.frequency as f64).ln() - log_frequency_total,
@@ -598,6 +1033,81 @@ impl ProtocolIndex {
         }
         let mut memo = vec![None; observed.len() + 1];
         self.decode_suffix(observed, 0, top_k, &mut memo)
+    }
+
+    fn decode_with_terminal_shortcuts(
+        &self,
+        terminal_index: &ProtocolIndex,
+        observed: &str,
+        top_k: usize,
+    ) -> Vec<ProtocolPath> {
+        if top_k == 0 || observed.is_empty() {
+            return Vec::new();
+        }
+        let mut memo = vec![None; observed.len() + 1];
+        self.decode_suffix_with_terminal_shortcuts(terminal_index, observed, 0, top_k, &mut memo)
+    }
+
+    fn decode_suffix_with_terminal_shortcuts(
+        &self,
+        terminal_index: &ProtocolIndex,
+        observed: &str,
+        start: usize,
+        top_k: usize,
+        memo: &mut [Option<Vec<ProtocolPath>>],
+    ) -> Vec<ProtocolPath> {
+        if start == observed.len() {
+            return vec![ProtocolPath {
+                text: String::new(),
+                score: 0.0,
+                segments: Vec::new(),
+                segment_log_probabilities: Vec::new(),
+            }];
+        }
+        if let Some(cached) = &memo[start] {
+            return cached.clone();
+        }
+
+        let mut paths = Vec::new();
+        for end in start + 1..=observed.len() {
+            let Some(words) = self.words_by_code.get(&observed[start..end]) else {
+                continue;
+            };
+            let suffixes = self.decode_suffix_with_terminal_shortcuts(
+                terminal_index,
+                observed,
+                end,
+                top_k,
+                memo,
+            );
+            for word in words.iter().take(top_k) {
+                for suffix in &suffixes {
+                    paths.push(prepend_protocol_word(word, suffix));
+                }
+            }
+        }
+
+        if let Some(words) = terminal_index.words_by_code.get(&observed[start..]) {
+            let empty_suffix = ProtocolPath {
+                text: String::new(),
+                score: 0.0,
+                segments: Vec::new(),
+                segment_log_probabilities: Vec::new(),
+            };
+            paths.extend(
+                words
+                    .iter()
+                    .take(top_k)
+                    .map(|word| prepend_protocol_word(word, &empty_suffix)),
+            );
+        }
+
+        paths.sort_by(protocol_path_order);
+        let mut texts = HashSet::new();
+        paths.retain(|path| texts.insert(path.text.clone()));
+        paths.truncate(top_k);
+        memo[start] = Some(paths.clone());
+        paths
     }
 
     fn decode_suffix(
@@ -695,6 +1205,22 @@ impl ProtocolIndex {
     }
 }
 
+fn prepend_protocol_word(word: &ProtocolWord, suffix: &ProtocolPath) -> ProtocolPath {
+    let mut segments = Vec::with_capacity(suffix.segments.len() + 1);
+    segments.push(word.text.clone());
+    segments.extend(suffix.segments.iter().cloned());
+    let mut segment_log_probabilities =
+        Vec::with_capacity(suffix.segment_log_probabilities.len() + 1);
+    segment_log_probabilities.push(word.log_probability);
+    segment_log_probabilities.extend(suffix.segment_log_probabilities.iter().copied());
+    ProtocolPath {
+        text: format!("{}{}", word.text, suffix.text),
+        score: word.log_probability + suffix.score,
+        segments,
+        segment_log_probabilities,
+    }
+}
+
 fn best_entries_by_text(lexicon: &[LexiconEntry]) -> BTreeMap<&str, &LexiconEntry> {
     let mut entries = BTreeMap::<&str, &LexiconEntry>::new();
     for entry in lexicon {
@@ -710,6 +1236,41 @@ fn best_entries_by_text(lexicon: &[LexiconEntry]) -> BTreeMap<&str, &LexiconEntr
         }
     }
     entries
+}
+
+fn protocol_code_fanouts(
+    lexicon: &[LexiconEntry],
+    mode: ProtocolCodeMode,
+) -> BTreeMap<String, usize> {
+    let mut texts_by_code = BTreeMap::<String, HashSet<&str>>::new();
+    for entry in lexicon {
+        texts_by_code
+            .entry(protocol_code(entry, mode))
+            .or_default()
+            .insert(entry.text.as_str());
+    }
+    texts_by_code
+        .into_iter()
+        .map(|(code, texts)| (code, texts.len()))
+        .collect()
+}
+
+fn collision_gated_tail_code(
+    entry: &LexiconEntry,
+    conservative_fanouts: &BTreeMap<String, usize>,
+    profile: CollisionGatedTailProfile,
+) -> (String, bool, usize) {
+    let shortened = protocol_code(entry, ProtocolCodeMode::ConservativeTail);
+    let fanout = conservative_fanouts.get(&shortened).copied().unwrap_or(0);
+    let allowed = entry.syllable_codes.len() >= 2
+        && profile
+            .maximum_shortened_code_fanout
+            .is_some_and(|maximum| fanout <= maximum);
+    if allowed {
+        (shortened, true, fanout)
+    } else {
+        (entry.code.as_str().to_owned(), false, fanout)
+    }
 }
 
 fn text_rank(candidates: &[ProtocolPath], expected_text: &str) -> Option<usize> {
@@ -772,10 +1333,14 @@ fn protocol_path_order(left: &ProtocolPath, right: &ProtocolPath) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProtocolCodeMode, ProtocolIndex, audit_anchored_tail_failures,
-        audit_public_protocol_context, audit_public_protocols,
+        COLLISION_GATED_TAIL_PROFILES, ProtocolCodeMode, ProtocolIndex,
+        audit_anchored_tail_failures, audit_collision_gated_tail_protocols,
+        audit_double_pinyin_key_trajectories, audit_public_protocol_context,
+        audit_public_protocols, audit_terminal_collision_gated_tail_protocols,
     };
-    use crate::{BigramLanguageModel, KeySequence, PublicProtocolProbe, parse_lexicon_tsv};
+    use crate::{
+        BigramLanguageModel, Decoder, KeySequence, PublicProtocolProbe, parse_lexicon_tsv,
+    };
 
     const LEXICON: &str = "\
 text\tpinyin\tfrequency
@@ -821,6 +1386,152 @@ text\tpinyin\tfrequency
         assert_eq!(report.whitelist.covered, 1);
         assert_eq!(report.whitelist.saved_letters, 2);
         assert_eq!(report.whitelist.net_actions_saved(), 1);
+    }
+
+    #[test]
+    fn collision_gate_shortens_only_word_codes_below_its_structural_limit() {
+        let lexicon = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+你好\tni hao\t1000\n\
+你很\tni hen\t100\n\
+世界\tshi jie\t500\n",
+        )
+        .unwrap();
+        let full_observed = ["你很", "世界"]
+            .iter()
+            .map(|text| {
+                lexicon
+                    .iter()
+                    .find(|entry| entry.text == *text)
+                    .expect("synthetic expected word exists")
+                    .code
+                    .as_str()
+            })
+            .collect::<String>();
+        let probes = [PublicProtocolProbe {
+            id: "synthetic-gate".to_owned(),
+            full_observed: KeySequence::new(full_observed.clone()).unwrap(),
+            anchored_tail_observed: KeySequence::new(full_observed.clone()).unwrap(),
+            conservative_tail_observed: KeySequence::new(full_observed.clone()).unwrap(),
+            explicit_abbreviation_observed: KeySequence::new(full_observed).unwrap(),
+            expected_text: "你很世界".to_owned(),
+            expected_segments: vec!["你很".to_owned(), "世界".to_owned()],
+            whitelist_available: false,
+        }];
+
+        let reports = audit_collision_gated_tail_protocols(
+            &lexicon,
+            &probes,
+            &COLLISION_GATED_TAIL_PROFILES[..3],
+        );
+
+        assert_eq!(reports[0].strategy.input_letters, 8);
+        assert_eq!(reports[0].strategy.hits_at_1, 1);
+        assert_eq!(reports[0].shortened_word_instances, 0);
+        assert_eq!(reports[1].strategy.input_letters, 7);
+        assert_eq!(reports[1].strategy.hits_at_1, 1);
+        assert_eq!(reports[1].shortened_word_instances, 1);
+        assert_eq!(reports[2].strategy.input_letters, 6);
+        assert_eq!(reports[2].strategy.hits_at_1, 0);
+        assert_eq!(reports[2].shortened_word_instances, 2);
+        assert_eq!(reports[2].lost_top_1, 1);
+        assert_eq!(reports[2].ambiguous_candidate_pools, 1);
+    }
+
+    #[test]
+    fn terminal_collision_gate_preserves_interior_pair_synchronization() {
+        let lexicon = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+你好\tni hao\t1000\n\
+你很\tni hen\t100\n\
+世界\tshi jie\t500\n",
+        )
+        .unwrap();
+        let full_observed = ["你很", "世界"]
+            .iter()
+            .map(|text| {
+                lexicon
+                    .iter()
+                    .find(|entry| entry.text == *text)
+                    .expect("synthetic expected word exists")
+                    .code
+                    .as_str()
+            })
+            .collect::<String>();
+        let probes = [PublicProtocolProbe {
+            id: "synthetic-terminal-gate".to_owned(),
+            full_observed: KeySequence::new(full_observed.clone()).unwrap(),
+            anchored_tail_observed: KeySequence::new(full_observed.clone()).unwrap(),
+            conservative_tail_observed: KeySequence::new(full_observed.clone()).unwrap(),
+            explicit_abbreviation_observed: KeySequence::new(full_observed).unwrap(),
+            expected_text: "你很世界".to_owned(),
+            expected_segments: vec!["你很".to_owned(), "世界".to_owned()],
+            whitelist_available: false,
+        }];
+
+        let reports = audit_terminal_collision_gated_tail_protocols(
+            &lexicon,
+            &probes,
+            &COLLISION_GATED_TAIL_PROFILES[..3],
+        );
+
+        assert_eq!(reports[2].strategy.input_letters, 7);
+        assert_eq!(reports[2].strategy.hits_at_1, 1);
+        assert_eq!(reports[2].multisyllable_word_instances, 1);
+        assert_eq!(reports[2].shortened_word_instances, 1);
+        assert_eq!(reports[2].lost_top_1, 0);
+    }
+
+    #[test]
+    fn key_trajectory_pairs_initial_and_rhyme_states_and_reuses_prefixes() {
+        let lexicon = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+呜\twu\t1000\n\
+无\twu\t100\n\
+哇\twa\t900\n\
+呜哇\twu wa\t5000\n",
+        )
+        .unwrap();
+        let full_observed = lexicon
+            .iter()
+            .find(|entry| entry.text == "呜哇")
+            .expect("synthetic expected word exists")
+            .code
+            .clone();
+        let probe = PublicProtocolProbe {
+            id: "synthetic-trajectory".to_owned(),
+            full_observed: full_observed.clone(),
+            anchored_tail_observed: full_observed.clone(),
+            conservative_tail_observed: full_observed.clone(),
+            explicit_abbreviation_observed: full_observed.clone(),
+            expected_text: "呜哇".to_owned(),
+            expected_segments: vec!["呜哇".to_owned()],
+            whitelist_available: false,
+        };
+        let mut repeated = probe.clone();
+        repeated.id = "synthetic-trajectory-repeat".to_owned();
+        let mut mismatched = probe.clone();
+        mismatched.id = "synthetic-trajectory-mismatch".to_owned();
+        mismatched.expected_text = "呜".to_owned();
+        let decoder = Decoder::new(lexicon);
+
+        let report =
+            audit_double_pinyin_key_trajectories(&decoder, &[probe, repeated, mismatched], 10)
+                .unwrap();
+
+        assert_eq!(report.requested_probes, 3);
+        assert_eq!(report.aligned_probes, 2);
+        assert_eq!(report.alignment_mismatches, 1);
+        assert_eq!(report.syllable_resolutions, 4);
+        assert_eq!(report.odd.steps, 4);
+        assert_eq!(report.even.steps, 4);
+        assert_eq!(report.odd.hits_at_1, 4);
+        assert_eq!(report.even.hits_at_1, 4);
+        assert_eq!(report.target_visible_both, 4);
+        assert_eq!(report.top_1_unchanged, 4);
+        assert_eq!(report.decode_requests, 8);
+        assert_eq!(report.unique_prefixes, 4);
+        assert_eq!(report.prefix_cache_hits, 4);
     }
 
     #[test]

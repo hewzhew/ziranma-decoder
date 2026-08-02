@@ -188,7 +188,7 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 猫猫完成 release 构建后，本地 Alpha 可从任意 PowerShell 目录一键换代：
 
 ```powershell
-D:\IME\ziranma-decoder\update-ime.cmd
+.\update-ime.cmd
 ```
 
 该入口只定位并调用仓库内既有的安全换代脚本；仍会显示 Windows 管理员确认，
@@ -196,7 +196,8 @@ D:\IME\ziranma-decoder\update-ime.cmd
 时走只读快路径，不再注销、注册或弹出管理员确认；真正的新版本仍保留完整的
 安全换代事务。`tsf-devctl inspect` 会额外汇总可见宿主正在加载的同版与旧版
 Alpha 数量，不显示进程名、窗口标题、路径或输入内容，便于判断是否只是应用
-仍缓存着换代前 DLL。
+仍缓存着换代前 DLL。换代前已经活动的 Alpha 可以由既有宿主继续使用；脚本会
+单独验证持久启用。若换代前未活动，验收仍要求更新过程不得自行激活它。
 
 TSF Alpha 的日用按键与终端实验台刻意分开：Space 确认首选，Enter 原样提交
 当前字母码；中文模式下 `,` / `.` 直接上屏 `，` / `。`，有组合时先确认首选
@@ -290,6 +291,27 @@ PE/Authenticode 签名。
 类工厂继续持有旧的不可变快照，提升后创建的新类工厂才观察到新版本。
 早期双文件包和 v1 预检凭据不会原地升级；Alpha 开发环境应重新构建包并采用
 全新的 `candidate-data` 根，避免旧格式或半迁移状态被误认为当前包。
+
+用户主动指定的精确别名与公开候选包分开保存。`alias-ime.cmd` 把它们写入
+Git 忽略的 `.local/tsf-alpha/user-data/aliases`，正文始终先经过 Windows
+当前用户 DPAPI 加密，再进入不可变包和 current / candidate / previous 三槽。
+第一条别名会直接建立 current；之后的修改先进入 candidate，确认后再提升：
+
+```powershell
+cargo build --release --bin aliasctl
+.\alias-ime.cmd set --code wua --text 呜哇
+.\alias-ime.cmd set --code wuu --text 呜呜
+.\alias-ime.cmd promote
+.\alias-ime.cmd status
+```
+
+`remove --code <码>` 同样先暂存；`unstage` 放弃暂存，`rollback` 交换 current 与
+previous。只有显式加入 `--confirm-show-private-text` 的 `list` 才会在当前终端
+显示别名正文。命令不联网、不从打字中学习，也不会把私人配置复制进安装 DLL
+目录。支持这一格式的文本服务只在“当前没有组合、即将输入第一个字母”时读取
+小型槽指针；指针改变后先完整解密校验，再为这一次新组合替换内存快照。损坏的
+更新保留该服务最后一次成功加载的版本，不会在组合中途偷换，也不需要重装
+DLL。界面或 TSF 代码变化仍需正常换代，并等待已有宿主自然释放旧 DLL。
 
 发布 DLL 的架构、COM 导出、证书目录、固定 CLSID 的标准 COM 注册位置、
 zh-CN 语言配置和键盘类别可以先用只读工具核对：
@@ -954,6 +976,8 @@ cargo run --release --bin personal-lab -- review `
 下一层才会创建可回退的 DPAPI 加密个人模型；拟议的保存内容、显式训练、
 只读评测、原子更新与删除边界见
 [加密个人模型设计](docs/personal-model.md)。
+[词汇层与个人学习边界](docs/lexicon-layers.md)进一步区分公共词典、项目领域包、
+显式别名、会话记忆和加密私人确认层，并记录公开数据的许可证与导入闸门。
 
 回放器按显式顺序一次只打开、解密并聚合一个文件；该段处理完就释放其
 原子事件，不再把整次长会话的私人正文同时留在内存里。脱敏计数报告的

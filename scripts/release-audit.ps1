@@ -164,7 +164,7 @@ foreach ($entry in $stagedEntries) {
 }
 
 $forbiddenPathPatterns = @(
-    '^(data/private|data/raw|logs|models/private|\.local)(/|$)',
+    '^(data/private|data/raw|logs|models/private|\.local|tmp)(/|$)',
     '(^|/)\.env(\.|$)',
     '(^|/)(id_rsa|id_ed25519)$',
     '\.(pem|key|pfx|p12|db|sqlite|sqlite3)$'
@@ -222,12 +222,36 @@ $textPatterns = @(
 $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $maximumScannedTextBytes = 2MB
 $scannedTextFiles = 0
+$trustedPublicSnapshotFiles = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]@(
+        'data/public/conway-stroke-data/LICENSE.txt',
+        'data/public/conway-stroke-data/SOURCE.md',
+        'data/public/conway-stroke-data/UPSTREAM_README.md',
+        'data/public/conway-stroke-data/sequence-characters.txt',
+        'data/public/rime-pinyin-simp/AUTHORS',
+        'data/public/rime-pinyin-simp/LICENSE',
+        'data/public/rime-pinyin-simp/SOURCE.md',
+        'data/public/rime-pinyin-simp/pinyin_simp.dict.yaml',
+        'data/public/ud-chinese-gsdsimp/CC-BY-SA-4.0.txt',
+        'data/public/ud-chinese-gsdsimp/LICENSE.txt',
+        'data/public/ud-chinese-gsdsimp/SOURCE.md',
+        'data/public/ud-chinese-gsdsimp/UPSTREAM_README.md',
+        'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu',
+        'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu'
+    ),
+    [System.StringComparer]::Ordinal
+)
 
 foreach ($relativePath in $candidatePaths) {
+    $forbiddenReleasePath = $false
     foreach ($pattern in $forbiddenPathPatterns) {
         if ($relativePath -match $pattern) {
             Add-Finding -Code 'forbidden-release-path' -Path $relativePath
+            $forbiddenReleasePath = $true
         }
+    }
+    if ($forbiddenReleasePath) {
+        continue
     }
 
     $fullPath = Resolve-CandidatePath -RelativePath $relativePath
@@ -244,7 +268,10 @@ foreach ($relativePath in $candidatePaths) {
         continue
     }
 
-    if ($relativePath.StartsWith('data/public/', [System.StringComparison]::Ordinal)) {
+    # Exact frozen third-party files are protected by mandatory SHA-256 values
+    # below. Project-owned public overlays and any newly added snapshot file
+    # still pass through the normal secret and personal-path checks.
+    if ($trustedPublicSnapshotFiles.Contains($relativePath)) {
         continue
     }
     if ($item.Length -gt $maximumScannedTextBytes) {
@@ -318,14 +345,28 @@ $expectedHashes = @{
         '3F3D9E0024B1921B067D6F7F88DEB4A60CBE7A78E76C64E3F1D7FC3B779B9D04'
     'data/public/conway-stroke-data/LICENSE.txt' =
         '9BA9550AD48438D0836DDAB3DA480B3B69FFA0AAC7B7878B5A0039E7AB429411'
+    'data/public/conway-stroke-data/SOURCE.md' =
+        '0FE0FEC10FF29642D95D4EC7130E577948FFBDF98837A72E5ACB3E83C74EEDB4'
     'data/public/conway-stroke-data/UPSTREAM_README.md' =
         '00BE0D69159CCBF87C97A07398878E660BD4F735031F58B8BC110B8CB6640D2C'
     'data/public/conway-stroke-data/sequence-characters.txt' =
         'E712D1AC5B67E4F12B1904AEC020F2CB3E3C36C15FB11BDD7AF671F66B41CA68'
+    'data/public/rime-pinyin-simp/AUTHORS' =
+        'F4CFF0FCBCA4668AC449C24A53BE547E162BC60CCE63FDC5D5906801A452EDC4'
+    'data/public/rime-pinyin-simp/LICENSE' =
+        'CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30'
+    'data/public/rime-pinyin-simp/SOURCE.md' =
+        'DC3CFD72CBDD7403357094A411BA2EF1DBDCF3595034726289234B11995C13BC'
     'data/public/rime-pinyin-simp/pinyin_simp.dict.yaml' =
         'E341598343A0F0F2035BB1AAFC34A7F3BB7887DEEECB3F60796262AAA2983E6B'
     'data/public/ud-chinese-gsdsimp/CC-BY-SA-4.0.txt' =
         '28A9529C7D0BB4DC51F4BF5C116A3D16EF247A052F7591466768DDF563FD1CF5'
+    'data/public/ud-chinese-gsdsimp/LICENSE.txt' =
+        '899B1804A12EBC090B96339614EEDE1B64B686721B650A71430B55B5235F7F79'
+    'data/public/ud-chinese-gsdsimp/SOURCE.md' =
+        'C3BC1A8A5305AECB00AFD939D11CB31A306C45A0D334B79B2AD730B5C745C5C0'
+    'data/public/ud-chinese-gsdsimp/UPSTREAM_README.md' =
+        '02287BDF80282151D8CA7EF3C3F7A3C3B98609F7266F145E3E3DD0A05693ABD3'
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu' =
         '3AF8046A6F32477B4D5CF3DD06BBF38682A380FE77AADE3F68DE97E51AB94900'
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu' =
@@ -349,7 +390,8 @@ foreach ($requiredIgnore in @(
     '/data/raw/',
     '/logs/',
     '/models/private/',
-    '/.local/'
+    '/.local/',
+    '/tmp/'
 )) {
     if (-not $gitignore.Contains($requiredIgnore)) {
         Add-Finding -Code 'missing-private-ignore' -Path $requiredIgnore

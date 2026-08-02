@@ -1,5 +1,11 @@
 text	pinyin	frequency
+双拼	shuang pin	1100
+渐入	jian ru	1050
+渐入渐出	jian ru jian chu	1000
+光敏	guang min	1000
+光敏性	guang min xing	1000
 丝印	si yin	1000
+欧姆	ou mu	1000
 管脚	guan jiao	900
 焊盘	han pan	900
 过孔	guo kong	900
@@ -8,6 +14,8 @@ text	pinyin	frequency
 使能	shi neng	850
 片选	pian xuan	850
 走线	zou xian	850
+外圈	wai quan	850
+直角矩形	zhi jiao ju xing	850
 网络标号	wang luo biao hao	800
 测试点	ce shi dian	800
 回流焊	hui liu han	800
