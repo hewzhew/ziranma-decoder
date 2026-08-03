@@ -54,6 +54,7 @@ mod stroke_data;
 mod tracker;
 #[cfg(windows)]
 mod tsf_alpha;
+mod wish_command;
 mod wish_feedback;
 
 #[cfg(windows)]
@@ -279,6 +280,12 @@ pub use stroke_data::{
 pub use tracker::{
     CommitRecord, DeltaPositionEvidence, LocalInputTracker, RawKey, RevisionRecord, TextDelta,
     TextSelection, TrackerOutput, single_span_delta, single_span_delta_with_selection,
+};
+#[cfg(windows)]
+pub use wish_command::{WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID};
+pub use wish_command::{
+    WishCommand, WishCommandAck, WishCommandAckStatus, WishCommandDispatchError,
+    WishCommandDispatchReceipt, dispatch_wish_command,
 };
 pub use wish_feedback::{
     MAX_WISH_NOTE_BYTES, MAX_WISH_PACKAGE_BYTES, WISH_NOTE_FILE_SUFFIX, WISH_PACKAGE_FILE_SUFFIX,

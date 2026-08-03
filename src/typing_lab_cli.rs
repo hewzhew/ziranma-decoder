@@ -185,6 +185,7 @@ impl TypingLabSession {
             CompositionEffect::PreviousPage => TypingLabEffect::PreviousPage,
             CompositionEffect::NextPage => TypingLabEffect::NextPage,
             CompositionEffect::RequestTab => TypingLabEffect::RequestTab,
+            CompositionEffect::ConfirmWish => TypingLabEffect::Continue,
             CompositionEffect::PassThrough if exit_on_pass_through => TypingLabEffect::Quit,
             CompositionEffect::PassThrough => TypingLabEffect::Continue,
         }

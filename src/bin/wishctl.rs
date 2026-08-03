@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
     DataProtector, NativeCancellationSource, NativeCandidateView, NativeFeedbackEvent,
-    NativeSelectionSource, WishCategory, WishFeedbackError, WishNote, list_wish_packages,
-    load_wish_note, load_wish_snapshot, move_wish_to_trash, save_wish_note,
+    NativeSelectionSource, WishCategory, WishCommand, WishCommandAckStatus, WishFeedbackError,
+    WishNote, dispatch_wish_command, list_wish_packages, load_wish_note, load_wish_snapshot,
+    move_wish_to_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +19,7 @@ enum WishSelector {
 
 #[derive(Clone, Eq, PartialEq)]
 enum Command {
+    Control(WishCommand),
     Status,
     List,
     Show {
@@ -37,7 +39,7 @@ enum Command {
 
 #[derive(Clone, Eq, PartialEq)]
 struct Options {
-    root: PathBuf,
+    root: Option<PathBuf>,
     command: Command,
 }
 
@@ -58,18 +60,34 @@ fn run() -> Result<(), Box<dyn Error>> {
     let options = parse_options(env::args().skip(1))?;
     let protector = WindowsUserDataProtector;
     match options.command {
-        Command::Status => status(&options.root),
-        Command::List => list(&options.root),
+        Command::Control(command) => control(command),
+        Command::Status => status(options.root.as_deref().expect("validated storage root")),
+        Command::List => list(options.root.as_deref().expect("validated storage root")),
         Command::Show {
             selector,
             show_private_text,
-        } => show(&options.root, &protector, &selector, show_private_text),
+        } => show(
+            options.root.as_deref().expect("validated storage root"),
+            &protector,
+            &selector,
+            show_private_text,
+        ),
         Command::Annotate {
             selector,
             category,
             text,
-        } => annotate(&options.root, &protector, &selector, category, &text),
-        Command::Trash { id, confirmed } => trash(&options.root, &id, confirmed),
+        } => annotate(
+            options.root.as_deref().expect("validated storage root"),
+            &protector,
+            &selector,
+            category,
+            &text,
+        ),
+        Command::Trash { id, confirmed } => trash(
+            options.root.as_deref().expect("validated storage root"),
+            &id,
+            confirmed,
+        ),
     }
 }
 
@@ -95,7 +113,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
             _ => return Err(format!("无法识别或重复的参数：{argument}\n{}", usage()).into()),
         }
     }
-    let root = PathBuf::from(root.ok_or("缺少 --root")?);
+    let root = root.map(PathBuf::from);
     let selector = || -> Result<WishSelector, Box<dyn Error>> {
         match (id.clone(), latest) {
             (Some(id), false) => Ok(WishSelector::Exact(id)),
@@ -104,6 +122,46 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
         }
     };
     let command = match command_name.as_str() {
+        "start"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::Control(WishCommand::Start)
+        }
+        "mark"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::Control(WishCommand::SaveRecent)
+        }
+        "stop"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::Control(WishCommand::Stop)
+        }
+        "clear"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::Control(WishCommand::ClearStopped)
+        }
         "status"
             if id.is_none()
                 && !latest
@@ -144,6 +202,9 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
         }
         _ => return Err(usage().into()),
     };
+    if !matches!(command, Command::Control(_)) && root.is_none() {
+        return Err("缺少 --root".into());
+    }
     Ok(Options { root, command })
 }
 
@@ -164,8 +225,40 @@ fn set_value(
 }
 
 fn usage() -> String {
-    "用法：\n  wishctl status --root <目录>\n  wishctl list --root <目录>\n  wishctl show --root <目录> (--id <编号> | --latest) --confirm-show-private-text\n  wishctl annotate --root <目录> (--id <编号> | --latest) --category <类别> --text <说明>\n  wishctl trash --root <目录> --id <编号> --confirm-move-to-trash"
+    "用法：\n  wishctl start | mark | stop | clear\n  wishctl status --root <目录>\n  wishctl list --root <目录>\n  wishctl show --root <目录> (--id <编号> | --latest) --confirm-show-private-text\n  wishctl annotate --root <目录> (--id <编号> | --latest) --category <类别> --text <说明>\n  wishctl trash --root <目录> --id <编号> --confirm-move-to-trash"
         .to_owned()
+}
+
+fn control(command: WishCommand) -> Result<(), Box<dyn Error>> {
+    let receipt = dispatch_wish_command(command)?;
+    match receipt.acknowledgement() {
+        Some(WishCommandAckStatus::Applied) => println!(
+            "{}",
+            match command {
+                WishCommand::Start => "反馈已开始；许愿前暂不保存。",
+                WishCommand::SaveRecent => "已保存最近 30 秒的本地加密快照。",
+                WishCommand::Stop => "反馈已停止；尚未保存的内存事件不会继续增长。",
+                WishCommand::ClearStopped => "已清除停止后的内存会话。",
+            }
+        ),
+        Some(WishCommandAckStatus::NoChange) => println!(
+            "{}",
+            match command {
+                WishCommand::Start => "反馈已经在记录。",
+                WishCommand::SaveRecent => "最近还没有可保存的输入法事件。",
+                WishCommand::Stop => "反馈当前没有在记录。",
+                WishCommand::ClearStopped => "当前没有可清除的已停止会话。",
+            }
+        ),
+        Some(WishCommandAckStatus::Failed) => {
+            return Err("输入法宿主收到了命令，但未能完成操作".into());
+        }
+        None => println!(
+            "命令已发出，但没有新版输入法宿主响应。请新开一个使用自然码 Alpha 的输入框后重试。"
+        ),
+    }
+    println!("未传输输入正文，未联网。");
+    Ok(())
 }
 
 fn status(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -356,6 +449,21 @@ fn trash(root: &Path, id: &str, confirmed: bool) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_commands_do_not_require_a_storage_root() {
+        for (name, expected) in [
+            ("start", WishCommand::Start),
+            ("mark", WishCommand::SaveRecent),
+            ("stop", WishCommand::Stop),
+            ("clear", WishCommand::ClearStopped),
+        ] {
+            let options = parse_options([name.to_owned()]).unwrap();
+            assert!(matches!(options.command, Command::Control(command) if command == expected));
+            assert!(options.root.is_none());
+        }
+        assert!(parse_options(["status".to_owned()]).is_err());
+    }
 
     #[test]
     fn parsing_requires_one_selector_and_explicit_private_show() {

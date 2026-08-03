@@ -18,6 +18,9 @@ const MAX_SESSION_SELECTION_TEXT_CHARACTERS: usize = 128;
 pub enum CompositionPunctuation {
     Comma,
     Period,
+    Semicolon,
+    Colon,
+    ExclamationMark,
     LeftParenthesis,
     RightParenthesis,
     QuestionMark,
@@ -28,6 +31,9 @@ impl CompositionPunctuation {
         match self {
             Self::Comma => "，",
             Self::Period => "。",
+            Self::Semicolon => "；",
+            Self::Colon => "：",
+            Self::ExclamationMark => "！",
             Self::LeftParenthesis => "（",
             Self::RightParenthesis => "）",
             Self::QuestionMark => "？",
@@ -46,6 +52,7 @@ pub enum CompositionInput {
     PreviousPage,
     NextPage,
     EnterTab,
+    EnterWish,
     EnterRecovery,
     Escape,
     Invalid,
@@ -61,6 +68,7 @@ pub enum CompositionEffect {
     PreviousPage,
     NextPage,
     RequestTab,
+    ConfirmWish,
     PassThrough,
 }
 
@@ -69,6 +77,7 @@ pub struct CompositionSession {
     phonetic: String,
     shape_pinyin: Option<String>,
     stroke_prefix: String,
+    wish_prompt: bool,
     recovery_mode: bool,
     candidate_page_start: usize,
     notice: Option<String>,
@@ -195,6 +204,10 @@ impl CompositionSession {
         self.recovery_mode
     }
 
+    pub fn wish_prompt(&self) -> bool {
+        self.wish_prompt
+    }
+
     pub fn shape_pinyin(&self) -> Option<&str> {
         self.shape_pinyin.as_deref()
     }
@@ -253,6 +266,7 @@ impl CompositionSession {
     }
 
     pub fn enter_tab(&mut self, pinyin: impl Into<String>) {
+        self.wish_prompt = false;
         self.recovery_mode = false;
         self.shape_pinyin = Some(pinyin.into());
         self.stroke_prefix.clear();
@@ -267,6 +281,7 @@ impl CompositionSession {
         self.phonetic.clear();
         self.candidate_page_start = 0;
         self.recovery_mode = false;
+        self.wish_prompt = false;
         self.leave_tab();
         self.notice = None;
     }
@@ -274,6 +289,35 @@ impl CompositionSession {
     pub fn apply(&mut self, input: CompositionInput) -> CompositionEffect {
         self.notice = None;
         match input {
+            CompositionInput::Confirm if self.wish_prompt => {
+                return CompositionEffect::ConfirmWish;
+            }
+            CompositionInput::Select(1) if self.wish_prompt => {
+                return CompositionEffect::ConfirmWish;
+            }
+            CompositionInput::Select(_) if self.wish_prompt => {
+                self.set_notice("空格或 1 确认");
+            }
+            CompositionInput::Backspace | CompositionInput::Escape | CompositionInput::EnterTab
+                if self.wish_prompt =>
+            {
+                self.wish_prompt = false;
+                self.candidate_page_start = 0;
+            }
+            CompositionInput::Letters(letters) if self.wish_prompt => {
+                self.wish_prompt = false;
+                self.append_phonetic_letters(&letters);
+            }
+            CompositionInput::CommitRaw
+            | CompositionInput::Punctuation(_)
+            | CompositionInput::PreviousPage
+            | CompositionInput::NextPage
+            | CompositionInput::EnterRecovery
+            | CompositionInput::EnterWish
+                if self.wish_prompt =>
+            {
+                self.set_notice("空格确认，退格返回");
+            }
             CompositionInput::Letters(letters) if self.tab_mode() => {
                 if letters
                     .as_bytes()
@@ -290,12 +334,7 @@ impl CompositionSession {
                 if letters.as_bytes().iter().all(u8::is_ascii_lowercase) =>
             {
                 self.recovery_mode = false;
-                let available = MAX_COMPOSITION_KEYS.saturating_sub(self.phonetic.len());
-                self.phonetic.extend(letters.chars().take(available));
-                self.candidate_page_start = 0;
-                if letters.len() > available {
-                    self.set_notice("本轮最多输入 64 个字母");
-                }
+                self.append_phonetic_letters(&letters);
             }
             CompositionInput::Letters(_) | CompositionInput::Invalid => {
                 self.set_notice("没有这个操作");
@@ -340,6 +379,12 @@ impl CompositionSession {
                 return CompositionEffect::RequestTab;
             }
             CompositionInput::EnterTab => return CompositionEffect::PassThrough,
+            CompositionInput::EnterWish if !self.phonetic.is_empty() && !self.tab_mode() => {
+                self.recovery_mode = false;
+                self.wish_prompt = true;
+                self.candidate_page_start = 0;
+            }
+            CompositionInput::EnterWish => return CompositionEffect::PassThrough,
             CompositionInput::EnterRecovery if !self.phonetic.is_empty() && !self.tab_mode() => {
                 self.recovery_mode = true;
                 self.candidate_page_start = 0;
@@ -359,6 +404,19 @@ impl CompositionSession {
     fn leave_tab(&mut self) {
         self.shape_pinyin = None;
         self.stroke_prefix.clear();
+    }
+
+    fn append_phonetic_letters(&mut self, letters: &str) {
+        if !letters.as_bytes().iter().all(u8::is_ascii_lowercase) {
+            self.set_notice("没有这个操作");
+            return;
+        }
+        let available = MAX_COMPOSITION_KEYS.saturating_sub(self.phonetic.len());
+        self.phonetic.extend(letters.chars().take(available));
+        self.candidate_page_start = 0;
+        if letters.len() > available {
+            self.set_notice("本轮最多输入 64 个字母");
+        }
     }
 }
 
@@ -398,6 +456,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_wish_prompt_requires_confirmation_and_preserves_phonetic_text() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("xuy".to_owned()));
+        assert_eq!(
+            session.apply(CompositionInput::EnterWish),
+            CompositionEffect::Continue
+        );
+        assert!(session.wish_prompt());
+        assert_eq!(session.phonetic(), "xuy");
+        assert_eq!(
+            session.apply(CompositionInput::Confirm),
+            CompositionEffect::ConfirmWish
+        );
+        assert_eq!(session.phonetic(), "xuy");
+
+        assert_eq!(
+            session.apply(CompositionInput::Backspace),
+            CompositionEffect::Continue
+        );
+        assert!(!session.wish_prompt());
+        assert_eq!(session.phonetic(), "xuy");
+        assert_eq!(
+            session.apply(CompositionInput::EnterTab),
+            CompositionEffect::RequestTab,
+            "the ordinary Tab path must remain available after leaving the prompt"
+        );
+
+        session.apply(CompositionInput::EnterWish);
+        session.apply(CompositionInput::Letters("h".to_owned()));
+        assert!(!session.wish_prompt());
+        assert_eq!(
+            session.phonetic(),
+            "xuyh",
+            "continuing to type must never lose a letter to the action prompt"
+        );
+    }
+
+    #[test]
     fn raw_commit_and_chinese_punctuation_have_distinct_semantics() {
         let mut session = CompositionSession::default();
         assert_eq!(
@@ -421,6 +517,19 @@ mod tests {
             )),
             CompositionEffect::Punctuation(CompositionPunctuation::Period)
         );
+
+        for (punctuation, expected) in [
+            (CompositionPunctuation::Comma, "，"),
+            (CompositionPunctuation::Period, "。"),
+            (CompositionPunctuation::Semicolon, "；"),
+            (CompositionPunctuation::Colon, "："),
+            (CompositionPunctuation::ExclamationMark, "！"),
+            (CompositionPunctuation::LeftParenthesis, "（"),
+            (CompositionPunctuation::RightParenthesis, "）"),
+            (CompositionPunctuation::QuestionMark, "？"),
+        ] {
+            assert_eq!(punctuation.text(), expected);
+        }
     }
 
     #[test]
@@ -434,6 +543,7 @@ mod tests {
             CompositionInput::PreviousPage,
             CompositionInput::NextPage,
             CompositionInput::EnterTab,
+            CompositionInput::EnterWish,
             CompositionInput::EnterRecovery,
             CompositionInput::Escape,
         ] {

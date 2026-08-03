@@ -28,9 +28,10 @@ use crate::{
     NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle, NativeFeedbackLimits,
     NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
     NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource, SessionSelectionMemory,
-    WindowsUserDataProtector, WishSnapshot, load_current_candidate_snapshot,
-    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, parse_lexicon_tsv,
-    save_wish_snapshot,
+    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
+    WishCommand, WishCommandAck, WishCommandAckStatus, WishSnapshot,
+    load_current_candidate_snapshot, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, parse_lexicon_tsv, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -59,10 +60,12 @@ use windows::Win32::System::LibraryLoader::{
 use windows::Win32::System::Ole::{
     CONNECT_E_ADVISELIMIT, CONNECT_E_CANNOTCONNECT, CONNECT_E_NOCONNECTION,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_0, VK_1, VK_6, VK_9, VK_A, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LWIN,
-    VK_MENU, VK_NEXT, VK_OEM_2, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
+    VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
+    VK_OEM_8, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
     VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
 };
 use windows::Win32::UI::TextServices::{
@@ -71,11 +74,12 @@ use windows::Win32::UI::TextServices::{
     IS_CHAT, IS_CHAT_WITHOUT_EMOJI, IS_CHINESE_FULLWIDTH, IS_CHINESE_HALFWIDTH, IS_DEFAULT,
     IS_NATIVE_SCRIPT, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN, IS_PASSWORD, IS_PRIVATE, IS_SEARCH,
     IS_SEARCH_INCREMENTAL, IS_TEXT, ITfCandidateListUIElement, ITfCandidateListUIElement_Impl,
-    ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
-    ITfContextComposition, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfInputScope,
-    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItem,
-    ITfLangBarItem_Impl, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
-    ITfLangBarItemSink, ITfMenu, ITfRange, ITfSource, ITfSource_Impl, ITfTextInputProcessor_Impl,
+    ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
+    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
+    ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfInputScope, ITfInsertAtSelection,
+    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItem, ITfLangBarItem_Impl,
+    ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink,
+    ITfMenu, ITfRange, ITfSource, ITfSource_Impl, ITfTextInputProcessor_Impl,
     ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
     ITfThreadMgrEventSink_Impl, ITfUIElement, ITfUIElement_Impl, ITfUIElementMgr, InputScope,
     TF_AE_NONE, TF_ANCHOR_END, TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR,
@@ -124,6 +128,7 @@ const TSF_CONVERSATION_OVERLAY: &str =
 const CANDIDATE_PAGE_SIZE: usize = 6;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
+const INLINE_WISH_TRIGGER_CODE: &str = "xuy";
 const CANDIDATE_UI_GUID: GUID = GUID::from_u128(0xb9fdad61_3f19_4d6c_86f7_72e9d3064f84);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -374,9 +379,20 @@ struct CandidateDisplay {
     page_start: usize,
     may_have_more: bool,
     view: InteractiveCandidateView,
+    action_detail: Option<String>,
 }
 
 impl CandidateDisplay {
+    fn action(label: &str, detail: &str) -> Self {
+        Self {
+            candidates: vec![label.to_owned()],
+            page_start: 0,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+            action_detail: Some(detail.to_owned()),
+        }
+    }
+
     #[cfg(test)]
     fn from_candidates(candidates: Vec<String>, requested_page_start: usize) -> Self {
         Self::from_batch(
@@ -406,6 +422,7 @@ impl CandidateDisplay {
             page_start,
             may_have_more,
             view,
+            action_detail: None,
         }
     }
 
@@ -438,6 +455,10 @@ impl CandidateDisplay {
 
     fn view(&self) -> InteractiveCandidateView {
         self.view
+    }
+
+    fn action_detail(&self) -> Option<&str> {
+        self.action_detail.as_deref()
     }
 
     fn feedback_event(&self, code: &str, shape_mode: bool) -> NativeFeedbackEvent {
@@ -481,6 +502,33 @@ fn native_candidate_view(view: InteractiveCandidateView, shape_mode: bool) -> Na
                 NativeCandidateView::TranspositionRecovery
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InlineWishAction {
+    command: WishCommand,
+    label: &'static str,
+    detail: &'static str,
+}
+
+fn inline_wish_action(summary: NativeFeedbackSummary) -> InlineWishAction {
+    match summary.lifecycle {
+        NativeFeedbackLifecycle::Disabled => InlineWishAction {
+            command: WishCommand::Start,
+            label: "开始反馈",
+            detail: "暂不保存",
+        },
+        NativeFeedbackLifecycle::Recording => InlineWishAction {
+            command: WishCommand::SaveRecent,
+            label: "向猫猫许愿",
+            detail: "近30秒",
+        },
+        NativeFeedbackLifecycle::Stopped => InlineWishAction {
+            command: WishCommand::ClearStopped,
+            label: "清除反馈",
+            detail: "已停止",
+        },
     }
 }
 
@@ -1022,6 +1070,12 @@ struct PlannedKey {
     candidate_display: Option<CandidateDisplay>,
     selection_to_remember: Option<PlannedSelection>,
     feedback_after_success: Option<NativeFeedbackEvent>,
+    action_after_success: Option<PlannedAction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedAction {
+    Wish(WishCommand),
 }
 
 struct PlannedSelection {
@@ -1075,6 +1129,27 @@ fn is_letter_key(vkey: u16) -> bool {
     (VK_A.0..=VK_Z.0).contains(&vkey)
 }
 
+fn is_host_printable_key(vkey: u16) -> bool {
+    is_letter_key(vkey)
+        || (VK_0.0..=VK_9.0).contains(&vkey)
+        || matches!(
+            vkey,
+            key if key == VK_OEM_1.0
+                || key == VK_OEM_PLUS.0
+                || key == VK_OEM_COMMA.0
+                || key == VK_OEM_MINUS.0
+                || key == VK_OEM_PERIOD.0
+                || key == VK_OEM_2.0
+                || key == VK_OEM_3.0
+                || key == VK_OEM_4.0
+                || key == VK_OEM_5.0
+                || key == VK_OEM_6.0
+                || key == VK_OEM_7.0
+                || key == VK_OEM_8.0
+                || key == VK_OEM_102.0
+        )
+}
+
 fn decode_virtual_key(
     vkey: u16,
     modifiers: KeyModifiers,
@@ -1100,6 +1175,15 @@ fn decode_virtual_key(
         key if key == VK_OEM_PERIOD.0 && !modifiers.shift => Some(CompositionInput::Punctuation(
             CompositionPunctuation::Period,
         )),
+        key if key == VK_OEM_1.0 && !modifiers.shift => Some(CompositionInput::Punctuation(
+            CompositionPunctuation::Semicolon,
+        )),
+        key if key == VK_OEM_1.0 && modifiers.shift => {
+            Some(CompositionInput::Punctuation(CompositionPunctuation::Colon))
+        }
+        key if key == VK_1.0 && modifiers.shift => Some(CompositionInput::Punctuation(
+            CompositionPunctuation::ExclamationMark,
+        )),
         key if key == VK_9.0 && modifiers.shift => Some(CompositionInput::Punctuation(
             CompositionPunctuation::LeftParenthesis,
         )),
@@ -1118,7 +1202,7 @@ fn decode_virtual_key(
                     .to_string(),
             ))
         }
-        key if (VK_1.0..=VK_6.0).contains(&key) => {
+        key if (VK_1.0..=VK_6.0).contains(&key) && !modifiers.shift => {
             Some(CompositionInput::Select(usize::from(key - VK_1.0) + 1))
         }
         _ => None,
@@ -1135,6 +1219,7 @@ fn plan_session_input(
     let mut after = before.clone();
     let effect = after.apply(input.clone());
     let edit = match (input, effect) {
+        (_, CompositionEffect::Continue) if before.wish_prompt() && after.wish_prompt() => None,
         (CompositionInput::Letters(_), CompositionEffect::Continue) => Some(
             PendingDocumentEdit::UpdatePreedit(after.phonetic().to_owned()),
         ),
@@ -1162,6 +1247,13 @@ fn plan_session_input(
             Some(PendingDocumentEdit::Commit(text))
         }
         (
+            CompositionInput::Confirm | CompositionInput::Select(1),
+            CompositionEffect::ConfirmWish,
+        ) => {
+            after.finish_commit();
+            Some(PendingDocumentEdit::Cancel)
+        }
+        (
             CompositionInput::Punctuation(punctuation),
             CompositionEffect::Punctuation(effect_punctuation),
         ) if punctuation == effect_punctuation => {
@@ -1183,9 +1275,17 @@ fn plan_session_input(
             None
         }
         (
-            CompositionInput::EnterRecovery | CompositionInput::Escape,
+            CompositionInput::EnterWish
+            | CompositionInput::EnterRecovery
+            | CompositionInput::EnterTab
+            | CompositionInput::Backspace
+            | CompositionInput::Escape,
             CompositionEffect::Continue,
-        ) if before.recovery_mode() != after.recovery_mode() => None,
+        ) if before.recovery_mode() != after.recovery_mode()
+            || before.wish_prompt() != after.wish_prompt() =>
+        {
+            None
+        }
         _ => return None,
     };
     Some(PlannedKey {
@@ -1195,6 +1295,7 @@ fn plan_session_input(
         candidate_display: None,
         selection_to_remember: None,
         feedback_after_success: None,
+        action_after_success: None,
     })
 }
 
@@ -1379,6 +1480,8 @@ const POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL: i32 = 42;
 const POPUP_FOOTER_CONTENT_INSET_LOGICAL: i32 = 10;
 const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 640;
 const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 54;
+const POPUP_ACTION_MIN_WIDTH_LOGICAL: i32 = 210;
+const POPUP_ACTION_DETAIL_GAP_LOGICAL: i32 = 12;
 const POPUP_CORNER_DIAMETER_LOGICAL: i32 = 16;
 const POPUP_BORDER_WIDTH_LOGICAL: i32 = 1;
 
@@ -1427,6 +1530,31 @@ fn horizontal_candidate_logical_width(candidate: &str) -> i32 {
     POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL.saturating_add(text_width)
 }
 
+fn estimated_popup_text_width(text: &str, ascii_width: i32, other_width: i32) -> i32 {
+    text.chars().fold(0_i32, |width, character| {
+        width.saturating_add(if character.is_ascii() {
+            ascii_width
+        } else {
+            other_width
+        })
+    })
+}
+
+fn action_popup_logical_width(label: &str, detail: &str) -> i32 {
+    let label_width = estimated_popup_text_width(label, 9, 18);
+    let detail_width = estimated_popup_text_width(detail, 7, 14);
+    POPUP_OUTER_PADDING_LOGICAL
+        .saturating_mul(2)
+        .saturating_add(POPUP_SELECTED_TEXT_INSET_LOGICAL)
+        .saturating_add(POPUP_RANK_WIDTH_LOGICAL)
+        .saturating_add(POPUP_RANK_GAP_LOGICAL)
+        .saturating_add(label_width)
+        .saturating_add(POPUP_ACTION_DETAIL_GAP_LOGICAL)
+        .saturating_add(detail_width)
+        .saturating_add(POPUP_TEXT_PADDING_LOGICAL)
+        .max(POPUP_ACTION_MIN_WIDTH_LOGICAL)
+}
+
 fn candidate_popup_footer_logical_width(display: &CandidateDisplay) -> i32 {
     match (
         display.view() == InteractiveCandidateView::TranspositionRecovery,
@@ -1446,6 +1574,9 @@ fn horizontal_candidate_widths(display: &CandidateDisplay, dpi: u32, popup_width
         .saturating_sub(padding.saturating_mul(2))
         .saturating_sub(footer_width)
         .max(0);
+    if display.action_detail().is_some() {
+        return vec![budget];
+    }
     let mut widths = display
         .visible()
         .iter()
@@ -1487,6 +1618,22 @@ fn candidate_popup_metrics(
     dpi: u32,
     available_width: i32,
 ) -> CandidatePopupMetrics {
+    if let (Some(label), Some(detail)) = (display.visible().first(), display.action_detail()) {
+        let horizontal_limit = popup_scale(dpi, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL)
+            .min(available_width.max(1).saturating_mul(4) / 5)
+            .max(1);
+        return CandidatePopupMetrics {
+            layout: CandidatePopupLayout::Horizontal,
+            width: popup_scale(dpi, action_popup_logical_width(label, detail))
+                .min(horizontal_limit),
+            height: popup_scale(
+                dpi,
+                POPUP_OUTER_PADDING_LOGICAL
+                    .saturating_mul(2)
+                    .saturating_add(POPUP_ROW_HEIGHT_LOGICAL),
+            ),
+        };
+    }
     let footer_needed = display.page_starts().len() > 1
         || display.view() == InteractiveCandidateView::TranspositionRecovery;
     let footer_width = popup_scale(dpi, candidate_popup_footer_logical_width(display));
@@ -2014,6 +2161,7 @@ unsafe fn paint_candidate_label(
     dpi: u32,
     index: usize,
     candidate: &str,
+    action_detail: Option<&str>,
     selected: bool,
     candidate_font: HFONT,
     selected_font: HFONT,
@@ -2056,6 +2204,47 @@ unsafe fn paint_candidate_label(
             let _ = SelectObject(hdc, HGDIOBJ(font.0));
         }
     }
+    let mut detail_rect = None;
+    if let Some(detail) = action_detail {
+        let encoded = detail.encode_utf16().collect::<Vec<_>>();
+        let mut detail_size = SIZE::default();
+        let detail_measured = !metadata_font.is_invalid()
+            && unsafe {
+                let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+                GetTextExtentPoint32W(hdc, &encoded, &mut detail_size).as_bool()
+            };
+        if detail_measured {
+            let gap = popup_scale(dpi, POPUP_ACTION_DETAIL_GAP_LOGICAL);
+            let label_encoded = candidate.encode_utf16().collect::<Vec<_>>();
+            let mut label_size = SIZE::default();
+            let label_measured = !font.is_invalid()
+                && unsafe {
+                    let _ = SelectObject(hdc, HGDIOBJ(font.0));
+                    GetTextExtentPoint32W(hdc, &label_encoded, &mut label_size).as_bool()
+                };
+            if label_measured
+                && label_size
+                    .cx
+                    .saturating_add(gap)
+                    .saturating_add(detail_size.cx)
+                    <= content.right.saturating_sub(content.left)
+            {
+                let detail_left = content.right.saturating_sub(detail_size.cx);
+                detail_rect = Some(RECT {
+                    left: detail_left,
+                    top: content.top,
+                    right: content.right,
+                    bottom: content.bottom,
+                });
+                content.right = detail_left.saturating_sub(gap);
+            }
+        }
+    }
+    if !font.is_invalid() {
+        unsafe {
+            let _ = SelectObject(hdc, HGDIOBJ(font.0));
+        }
+    }
     let mut text =
         unsafe { candidate_popup_text(hdc, candidate, content.right.saturating_sub(content.left)) };
     // SAFETY: the paint DC and bounded candidate rectangle are valid.
@@ -2074,6 +2263,21 @@ unsafe fn paint_candidate_label(
             &mut content,
             DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
+    }
+    if let (Some(mut detail_rect), Some(detail)) = (detail_rect, action_detail) {
+        let mut detail = detail.encode_utf16().collect::<Vec<_>>();
+        unsafe {
+            if !metadata_font.is_invalid() {
+                let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+            }
+            let _ = SetTextColor(hdc, popup_color(POPUP_RANK_RGB));
+            let _ = DrawTextW(
+                hdc,
+                &mut detail,
+                &mut detail_rect,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+        }
     }
 }
 
@@ -2405,6 +2609,9 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                         state.dpi,
                         index,
                         candidate,
+                        (index == 0)
+                            .then(|| state.display.action_detail())
+                            .flatten(),
                         index == 0,
                         candidate_font,
                         selected_font,
@@ -2453,6 +2660,9 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                         state.dpi,
                         index,
                         candidate,
+                        (index == 0)
+                            .then(|| state.display.action_detail())
+                            .flatten(),
                         index == 0,
                         candidate_font,
                         selected_font,
@@ -3826,6 +4036,30 @@ impl NativeFeedbackLanguageBarState {
         }
         Ok(changed)
     }
+
+    fn perform_wish_command(&self, command: WishCommand) -> WishCommandAckStatus {
+        let action = match command {
+            WishCommand::Start => FEEDBACK_MENU_START,
+            WishCommand::SaveRecent => {
+                let event_count = self.summary().map_or(0, |summary| summary.events);
+                if event_count == 0 {
+                    return WishCommandAckStatus::NoChange;
+                }
+                return if self.save_recent_wish() {
+                    WishCommandAckStatus::Applied
+                } else {
+                    WishCommandAckStatus::Failed
+                };
+            }
+            WishCommand::Stop => FEEDBACK_MENU_STOP,
+            WishCommand::ClearStopped => FEEDBACK_MENU_CLEAR,
+        };
+        match self.perform_feedback_action(action) {
+            Ok(true) => WishCommandAckStatus::Applied,
+            Ok(false) => WishCommandAckStatus::NoChange,
+            Err(_) => WishCommandAckStatus::Failed,
+        }
+    }
 }
 
 fn feedback_language_bar_text(mode: InputMode, summary: NativeFeedbackSummary) -> String {
@@ -3848,7 +4082,7 @@ fn feedback_language_bar_tooltip(mode: InputMode, summary: NativeFeedbackSummary
     match summary.lifecycle {
         NativeFeedbackLifecycle::Disabled => format!("自然码 Alpha · {mode} · 反馈未开始"),
         NativeFeedbackLifecycle::Recording => format!(
-            "自然码 Alpha · {mode} · 反馈记录中（仅内存，{} 条）",
+            "自然码 Alpha · {mode} · 反馈记录中（暂不保存，{} 条）",
             summary.events
         ),
         NativeFeedbackLifecycle::Stopped if summary.complete => {
@@ -3884,7 +4118,7 @@ fn feedback_language_bar_menu(
 ) -> Vec<(u32, u32, String)> {
     let mut items = match summary.lifecycle {
         NativeFeedbackLifecycle::Disabled => {
-            vec![(FEEDBACK_MENU_START, 0, "开始反馈（仅内存）".to_owned())]
+            vec![(FEEDBACK_MENU_START, 0, "开始反馈（暂不保存）".to_owned())]
         }
         NativeFeedbackLifecycle::Recording => vec![
             (
@@ -3957,7 +4191,7 @@ fn feedback_language_bar_menu(
     items.push((
         FEEDBACK_MENU_STATUS + 1,
         TF_LBMENUF_GRAYED,
-        "反馈默认仅内存；许愿才写当前用户加密文件；不联网".to_owned(),
+        "反馈默认暂不保存；许愿才写当前用户加密文件；不联网".to_owned(),
     ));
     items
 }
@@ -4282,6 +4516,238 @@ impl Drop for NativeFeedbackLanguageBarController {
     }
 }
 
+struct NativeWishCommandShared {
+    state: Weak<NativeFeedbackLanguageBarState>,
+    command_guid: GUID,
+    command_compartment: RefCell<Option<ITfCompartment>>,
+    acknowledgement_compartment: RefCell<Option<ITfCompartment>>,
+    client_id: Cell<u32>,
+    last_sequence: Cell<Option<u32>>,
+}
+
+impl NativeWishCommandShared {
+    fn new(state: Weak<NativeFeedbackLanguageBarState>, command_guid: GUID) -> Self {
+        Self {
+            state,
+            command_guid,
+            command_compartment: RefCell::new(None),
+            acknowledgement_compartment: RefCell::new(None),
+            client_id: Cell::new(0),
+            last_sequence: Cell::new(None),
+        }
+    }
+
+    fn configure(
+        &self,
+        command_compartment: ITfCompartment,
+        acknowledgement_compartment: ITfCompartment,
+        client_id: u32,
+    ) {
+        let baseline = read_wish_command(&command_compartment).map(|word| word.sequence());
+        self.command_compartment.replace(Some(command_compartment));
+        self.acknowledgement_compartment
+            .replace(Some(acknowledgement_compartment));
+        self.client_id.set(client_id);
+        self.last_sequence.set(baseline);
+    }
+
+    fn clear(&self) {
+        self.command_compartment.replace(None);
+        self.acknowledgement_compartment.replace(None);
+        self.client_id.set(0);
+        self.last_sequence.set(None);
+    }
+
+    fn accepts_guid(&self, guid: GUID) -> bool {
+        guid == self.command_guid
+    }
+
+    fn handle_change(&self) -> Result<()> {
+        let command_compartment = self
+            .command_compartment
+            .borrow()
+            .clone()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?;
+        let Some(word) = read_wish_command(&command_compartment) else {
+            return Ok(());
+        };
+        if self.last_sequence.get() == Some(word.sequence()) {
+            return Ok(());
+        }
+        self.last_sequence.set(Some(word.sequence()));
+        let status = self
+            .state
+            .upgrade()
+            .map_or(WishCommandAckStatus::Failed, |state| {
+                state.perform_wish_command(word.command())
+            });
+        self.publish_acknowledgement(
+            WishCommandAck::new(word.sequence(), status)
+                .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?,
+        )
+    }
+
+    fn publish_acknowledgement(&self, acknowledgement: WishCommandAck) -> Result<()> {
+        let compartment = self
+            .acknowledgement_compartment
+            .borrow()
+            .clone()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?;
+        let current = read_wish_acknowledgement(&compartment);
+        if current.is_some_and(|current| {
+            current.sequence() == acknowledgement.sequence()
+                && current.status() >= acknowledgement.status()
+        }) {
+            return Ok(());
+        }
+        let value = VARIANT::from(
+            i32::try_from(acknowledgement.raw())
+                .expect("wish acknowledgement words always fit in VT_I4"),
+        );
+        // SAFETY: this global compartment carries only a bounded integer ACK.
+        unsafe { compartment.SetValue(self.client_id.get(), &value) }
+    }
+}
+
+fn read_wish_command(compartment: &ITfCompartment) -> Option<crate::wish_command::WishCommandWord> {
+    // SAFETY: GetValue initializes a VARIANT owned by the returned value.
+    unsafe { compartment.GetValue() }
+        .ok()
+        .and_then(|value| i32::try_from(&value).ok())
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(crate::wish_command::WishCommandWord::parse)
+}
+
+fn read_wish_acknowledgement(compartment: &ITfCompartment) -> Option<WishCommandAck> {
+    // SAFETY: GetValue initializes a VARIANT owned by the returned value.
+    unsafe { compartment.GetValue() }
+        .ok()
+        .and_then(|value| i32::try_from(&value).ok())
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(WishCommandAck::parse)
+}
+
+#[implement(ITfCompartmentEventSink)]
+struct NativeWishCommandSink {
+    shared: Weak<NativeWishCommandShared>,
+}
+
+impl ITfCompartmentEventSink_Impl for NativeWishCommandSink_Impl {
+    fn OnChange(&self, guid: *const GUID) -> Result<()> {
+        if guid.is_null() {
+            return Err(lifecycle_error(E_POINTER));
+        }
+        // SAFETY: TSF guarantees that OnChange receives a valid GUID pointer
+        // for the duration of this synchronous callback.
+        self.shared.upgrade().map_or(Ok(()), |shared| {
+            if shared.accepts_guid(unsafe { *guid }) {
+                shared.handle_change()
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+struct NativeWishCommandController {
+    enabled: bool,
+    shared: Rc<NativeWishCommandShared>,
+    acknowledgement_guid: GUID,
+    source: Option<ITfSource>,
+    sink: Option<ITfCompartmentEventSink>,
+    cookie: Option<u32>,
+}
+
+impl NativeWishCommandController {
+    fn new(enabled: bool, state: Weak<NativeFeedbackLanguageBarState>) -> Self {
+        Self::new_with_guids(
+            enabled,
+            state,
+            WISH_COMMAND_COMPARTMENT_GUID,
+            WISH_ACK_COMPARTMENT_GUID,
+        )
+    }
+
+    fn new_with_guids(
+        enabled: bool,
+        state: Weak<NativeFeedbackLanguageBarState>,
+        command_guid: GUID,
+        acknowledgement_guid: GUID,
+    ) -> Self {
+        Self {
+            enabled,
+            shared: Rc::new(NativeWishCommandShared::new(state, command_guid)),
+            acknowledgement_guid,
+            source: None,
+            sink: None,
+            cookie: None,
+        }
+    }
+
+    fn activate(&mut self, thread_manager: &ITfThreadMgr, client_id: u32) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.source.is_some() || self.sink.is_some() || self.cookie.is_some() {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        // SAFETY: this accesses only the current user's integer-valued global
+        // TSF compartments; it does not inspect any document or input text.
+        let compartments = unsafe { thread_manager.GetGlobalCompartment() }?;
+        let command_compartment =
+            unsafe { compartments.GetCompartment(&self.shared.command_guid) }?;
+        let acknowledgement_compartment =
+            unsafe { compartments.GetCompartment(&self.acknowledgement_guid) }?;
+        let source: ITfSource = command_compartment.cast()?;
+        self.shared
+            .configure(command_compartment, acknowledgement_compartment, client_id);
+        let sink: ITfCompartmentEventSink = NativeWishCommandSink {
+            shared: Rc::downgrade(&self.shared),
+        }
+        .into();
+        // SAFETY: `source` retains the sink until the matching UnadviseSink.
+        let cookie = match unsafe { source.AdviseSink(&ITfCompartmentEventSink::IID, &sink) } {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                self.shared.clear();
+                return Err(error);
+            }
+        };
+        self.source = Some(source);
+        self.sink = Some(sink);
+        self.cookie = Some(cookie);
+        // A command published between the baseline read and AdviseSink is not
+        // stale and should be handled once.
+        if let Err(error) = self.shared.handle_change() {
+            let _ = self.deactivate();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn deactivate(&mut self) -> Result<()> {
+        let source = self.source.take();
+        let sink = self.sink.take();
+        let cookie = self.cookie.take();
+        let result = match (source, sink, cookie) {
+            (Some(source), Some(_sink), Some(cookie)) => {
+                // SAFETY: balances the successful AdviseSink above.
+                unsafe { source.UnadviseSink(cookie) }
+            }
+            (None, None, None) => Ok(()),
+            _ => Err(lifecycle_error(E_UNEXPECTED)),
+        };
+        self.shared.clear();
+        result
+    }
+}
+
+impl Drop for NativeWishCommandController {
+    fn drop(&mut self) {
+        let _ = self.deactivate();
+    }
+}
+
 fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
     match event {
         NativeFeedbackEvent::CandidatesPresented { code, .. }
@@ -4440,6 +4906,7 @@ struct TsfTextService {
     native_feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
     native_feedback_language_bar: RefCell<NativeFeedbackLanguageBarController>,
+    native_wish_commands: RefCell<NativeWishCommandController>,
     input_mode: Rc<Cell<InputMode>>,
     shift_tap_armed: Cell<bool>,
     shift_chord_pending: Cell<bool>,
@@ -4466,6 +4933,10 @@ impl TsfTextService {
             Arc::downgrade(&native_feedback),
             Rc::downgrade(&native_feedback_language_bar_state),
         );
+        let native_wish_commands = RefCell::new(NativeWishCommandController::new(
+            matches!(key_advice_mode, KeyAdviceMode::Foreground),
+            Rc::downgrade(&native_feedback_language_bar_state),
+        ));
         Self {
             activation: Mutex::new(ActivationState::default()),
             composition: Rc::new(RefCell::new(CompositionSession::default())),
@@ -4481,6 +4952,7 @@ impl TsfTextService {
                 matches!(key_advice_mode, KeyAdviceMode::Foreground),
                 Rc::clone(&native_feedback_language_bar_state),
             )),
+            native_wish_commands,
             native_feedback_language_bar_state,
             input_mode,
             shift_tap_armed: Cell::new(false),
@@ -4580,8 +5052,14 @@ impl TsfTextService_Impl {
         if self.input_mode.get() != InputMode::Chinese || !self.has_active_logical_composition()? {
             return Ok(false);
         }
-        Ok(vkey == VK_CAPITAL.0
-            || (is_letter_key(vkey) && (modifiers.shift || modifiers.caps_lock)))
+        if vkey == VK_CAPITAL.0 {
+            return Ok(true);
+        }
+        if modifiers.control || modifiers.alt || modifiers.windows {
+            return Ok(false);
+        }
+        Ok(is_host_printable_key(vkey)
+            && decode_virtual_key(vkey, modifiers, InputMode::Chinese).is_none())
     }
 
     fn commit_active_composition(&self, context: Ref<ITfContext>) -> Result<()> {
@@ -4848,6 +5326,11 @@ impl TsfTextService_Impl {
             // disabled and must not prevent the input method from activating.
             let _ = language_bar.activate(&ui_thread_manager);
         }
+        if let Ok(mut commands) = self.native_wish_commands.try_borrow_mut() {
+            // The external control surface is optional. Failure must not
+            // prevent the input method itself from activating.
+            let _ = commands.activate(&ui_thread_manager, client_id);
+        }
         Ok(())
     }
 
@@ -4858,7 +5341,7 @@ impl TsfTextService_Impl {
         let Ok(vkey) = u16::try_from(wparam.0) else {
             return Ok(None);
         };
-        let Some(input) = decode_virtual_key(vkey, modifiers, self.input_mode.get()) else {
+        let Some(mut input) = decode_virtual_key(vkey, modifiers, self.input_mode.get()) else {
             return Ok(None);
         };
         if self
@@ -4874,14 +5357,31 @@ impl TsfTextService_Impl {
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .clone();
-        let needs_existing_candidates = matches!(
-            &input,
-            CompositionInput::Confirm
-                | CompositionInput::Punctuation(_)
-                | CompositionInput::Select(_)
-                | CompositionInput::PreviousPage
-                | CompositionInput::NextPage
-        );
+        if matches!(&input, CompositionInput::EnterTab)
+            && session.phonetic() == INLINE_WISH_TRIGGER_CODE
+            && !session.tab_mode()
+            && !session.recovery_mode()
+            && !session.wish_prompt()
+        {
+            input = CompositionInput::EnterWish;
+        }
+        let wish_action = (session.wish_prompt() || matches!(&input, CompositionInput::EnterWish))
+            .then(|| {
+                inline_wish_action(
+                    self.native_feedback_language_bar_state
+                        .summary()
+                        .unwrap_or_default(),
+                )
+            });
+        let needs_existing_candidates = !session.wish_prompt()
+            && matches!(
+                &input,
+                CompositionInput::Confirm
+                    | CompositionInput::Punctuation(_)
+                    | CompositionInput::Select(_)
+                    | CompositionInput::PreviousPage
+                    | CompositionInput::NextPage
+            );
         let existing_batch = if needs_existing_candidates && !session.phonetic().is_empty() {
             let limit = if matches!(&input, CompositionInput::NextPage) {
                 candidate_next_page_limit(session.candidate_page_start())
@@ -4969,6 +5469,15 @@ impl TsfTextService_Impl {
             Some(plan) => plan,
             None => return Ok(None),
         };
+        if session.wish_prompt()
+            && matches!(
+                &input,
+                CompositionInput::Confirm | CompositionInput::Select(1)
+            )
+            && let Some(action) = wish_action
+        {
+            plan.action_after_success = Some(PlannedAction::Wish(action.command));
+        }
         plan.selection_to_remember = selection_to_remember;
         plan.feedback_after_success = selection_feedback
             .or_else(|| {
@@ -4979,18 +5488,24 @@ impl TsfTextService_Impl {
                 })
             })
             .or_else(|| {
-                matches!(&plan.edit, Some(PendingDocumentEdit::Cancel)).then(|| {
-                    NativeFeedbackEvent::CompositionCancelled {
-                        code: session.phonetic().to_owned(),
-                        source: match &input {
-                            CompositionInput::Backspace => NativeCancellationSource::Backspace,
-                            CompositionInput::Escape => NativeCancellationSource::Escape,
-                            _ => NativeCancellationSource::HostTermination,
-                        },
-                    }
+                (plan.action_after_success.is_none()
+                    && matches!(&plan.edit, Some(PendingDocumentEdit::Cancel)))
+                .then(|| NativeFeedbackEvent::CompositionCancelled {
+                    code: session.phonetic().to_owned(),
+                    source: match &input {
+                        CompositionInput::Backspace => NativeCancellationSource::Backspace,
+                        CompositionInput::Escape => NativeCancellationSource::Escape,
+                        _ => NativeCancellationSource::HostTermination,
+                    },
                 })
             });
-        if !plan.after.phonetic().is_empty() {
+        if plan.after.wish_prompt() {
+            if let Some(action) = wish_action {
+                plan.candidate_display =
+                    Some(CandidateDisplay::action(action.label, action.detail));
+            }
+            plan.feedback_after_success = None;
+        } else if !plan.after.phonetic().is_empty() {
             let batch = if plan.after.phonetic() == session.phonetic()
                 && !existing_batch.candidates.is_empty()
             {
@@ -5069,6 +5584,7 @@ impl TsfTextService_Impl {
             candidate_display,
             selection_to_remember,
             feedback_after_success,
+            action_after_success,
         } = plan;
         let ui_only = edit.is_none();
         if let Some(edit) = edit {
@@ -5098,6 +5614,11 @@ impl TsfTextService_Impl {
             && let Ok(mut memory) = self.selection_memory.try_borrow_mut()
         {
             memory.remember_text(&selection.code, &selection.text);
+        }
+        if let Some(PlannedAction::Wish(command)) = action_after_success {
+            let _ = self
+                .native_feedback_language_bar_state
+                .perform_wish_command(command);
         }
         if ui_only && let Some(display) = candidate_display {
             let feedback_context = feedback_after_success
@@ -5160,6 +5681,11 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             .try_borrow_mut()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))
             .and_then(|mut language_bar| language_bar.deactivate());
+        let wish_command_result = self
+            .native_wish_commands
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))
+            .and_then(|mut commands| commands.deactivate());
         let composition_result = match self.composition.try_borrow_mut() {
             Ok(mut composition) => {
                 composition.finish_commit();
@@ -5209,6 +5735,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         selection_memory_result?;
         feedback_context_result?;
         native_feedback_result?;
+        wish_command_result?;
         language_bar_result?;
         candidate_ui_result
     }
@@ -5303,7 +5830,7 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
         modifiers = self.observe_nonshift_key_down_modifiers(modifiers);
         if self.direct_input_needs_commit(vkey, modifiers)? {
             self.commit_active_composition(context)?;
-            // The preedit is finished, but the shifted letter or Caps Lock
+            // The preedit is finished, but the printable key or Caps Lock
             // key still belongs to the host application.
             return Ok(false.into());
         }
@@ -6219,6 +6746,84 @@ mod tests {
     }
 
     #[test]
+    fn process_test_xuy_tab_space_cancels_the_mnemonic_and_starts_feedback() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(SelectionCandidateProvider),
+        )));
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        let press = |vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+        };
+        press(VK_A.0 + 23);
+        press(VK_A.0 + 20);
+        press(VK_A.0 + 24);
+        assert_eq!(read_context_text(&context, client_id), "xuy");
+        press(VK_TAB.0);
+        assert_eq!(read_context_text(&context, client_id), "xuy");
+        press(VK_SPACE.0);
+        assert_eq!(read_context_text(&context, client_id), "");
+        assert_eq!(
+            service_object
+                .native_feedback
+                .lock()
+                .unwrap()
+                .summary()
+                .lifecycle,
+            NativeFeedbackLifecycle::Recording
+        );
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+        assert_eq!(DllCanUnloadNow(), S_OK);
+    }
+
+    #[test]
     fn process_test_routes_keys_through_real_synchronous_edit_sessions() {
         let _guard = test_lock();
         let _apartment = ComApartment::enter();
@@ -6673,10 +7278,31 @@ mod tests {
                 CompositionPunctuation::Period
             ))
         );
+        assert_eq!(
+            decode_virtual_key(VK_OEM_1.0, KeyModifiers::default(), InputMode::Chinese),
+            Some(CompositionInput::Punctuation(
+                CompositionPunctuation::Semicolon
+            ))
+        );
         let shifted = KeyModifiers {
             shift: true,
             ..KeyModifiers::default()
         };
+        assert_eq!(
+            decode_virtual_key(VK_OEM_1.0, shifted, InputMode::Chinese),
+            Some(CompositionInput::Punctuation(CompositionPunctuation::Colon))
+        );
+        assert_eq!(
+            decode_virtual_key(VK_1.0, shifted, InputMode::Chinese),
+            Some(CompositionInput::Punctuation(
+                CompositionPunctuation::ExclamationMark
+            ))
+        );
+        assert_eq!(
+            decode_virtual_key(VK_1.0 + 1, shifted, InputMode::Chinese),
+            None,
+            "shifted digits without an assigned Chinese punctuation must not select candidates"
+        );
         assert_eq!(
             decode_virtual_key(VK_9.0, shifted, InputMode::Chinese),
             Some(CompositionInput::Punctuation(
@@ -6792,10 +7418,10 @@ mod tests {
             true,
         );
         assert_eq!(disabled[0].0, FEEDBACK_MENU_START);
-        assert_eq!(disabled[0].2, "开始反馈（仅内存）");
+        assert_eq!(disabled[0].2, "开始反馈（暂不保存）");
         assert_eq!(
             disabled.last().unwrap().2,
-            "反馈默认仅内存；许愿才写当前用户加密文件；不联网"
+            "反馈默认暂不保存；许愿才写当前用户加密文件；不联网"
         );
 
         let recording = feedback_language_bar_menu(
@@ -6829,7 +7455,7 @@ mod tests {
         );
         assert_eq!(
             recording.last().unwrap().2,
-            "反馈默认仅内存；许愿才写当前用户加密文件；不联网"
+            "反馈默认暂不保存；许愿才写当前用户加密文件；不联网"
         );
 
         let stopped = feedback_language_bar_menu(
@@ -7186,7 +7812,65 @@ mod tests {
     }
 
     #[test]
-    fn modified_direct_input_finishes_only_an_active_chinese_preedit() {
+    fn wish_command_controller_applies_only_new_test_compartment_words() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let state = Rc::new(NativeFeedbackLanguageBarState::new(
+            Arc::clone(&feedback),
+            Arc::new(Mutex::new(NativeFeedbackContextCache::default())),
+            Rc::new(Cell::new(InputMode::Chinese)),
+        ));
+        let command_guid = GUID::from_u128(0xdb053ed9_3187_48ec_8e24_fa971f7a9bd7);
+        let acknowledgement_guid = GUID::from_u128(0xb679b7f3_27f5_412a_baa7_a53f6627f56b);
+        let mut controller = NativeWishCommandController::new_with_guids(
+            true,
+            Rc::downgrade(&state),
+            command_guid,
+            acknowledgement_guid,
+        );
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        controller
+            .activate(&thread_manager, client_id)
+            .expect("wish command subscription");
+        assert_eq!(
+            feedback.lock().unwrap().summary().lifecycle,
+            NativeFeedbackLifecycle::Disabled,
+            "an old baseline value must not run during activation"
+        );
+
+        let compartments = unsafe { thread_manager.GetGlobalCompartment() }.unwrap();
+        let command_compartment = unsafe { compartments.GetCompartment(&command_guid) }.unwrap();
+        let previous = read_wish_command(&command_compartment);
+        let word = crate::wish_command::WishCommandWord::next(previous, WishCommand::Start);
+        let value = VARIANT::from(i32::try_from(word.raw()).unwrap());
+        unsafe { command_compartment.SetValue(client_id, &value) }.unwrap();
+
+        assert_eq!(
+            feedback.lock().unwrap().summary().lifecycle,
+            NativeFeedbackLifecycle::Recording
+        );
+        let acknowledgement_compartment =
+            unsafe { compartments.GetCompartment(&acknowledgement_guid) }.unwrap();
+        assert_eq!(
+            read_wish_acknowledgement(&acknowledgement_compartment),
+            WishCommandAck::new(word.sequence(), WishCommandAckStatus::Applied)
+        );
+
+        controller
+            .deactivate()
+            .expect("wish command unsubscription");
+        unsafe { compartments.ClearCompartment(client_id, &command_guid) }.unwrap();
+        unsafe { compartments.ClearCompartment(client_id, &acknowledgement_guid) }.unwrap();
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+    }
+
+    #[test]
+    fn host_printable_input_finishes_only_an_active_chinese_preedit() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             FixedCandidateProvider,
@@ -7204,6 +7888,34 @@ mod tests {
         assert!(service.direct_input_needs_commit(VK_A.0, shifted).unwrap());
         assert!(
             service
+                .direct_input_needs_commit(VK_1.0 + 1, shifted)
+                .unwrap(),
+            "Shift+2 belongs to the host but must not enter a live preedit"
+        );
+        assert!(
+            service
+                .direct_input_needs_commit(VK_OEM_COMMA.0, shifted)
+                .unwrap(),
+            "an unassigned shifted OEM key must commit before host input"
+        );
+        assert!(
+            service
+                .direct_input_needs_commit(VK_6.0 + 1, KeyModifiers::default())
+                .unwrap(),
+            "a number outside the candidate shortcuts must commit before host input"
+        );
+        assert!(
+            !service.direct_input_needs_commit(VK_1.0, shifted).unwrap(),
+            "Shift+1 is handled as a Chinese exclamation mark"
+        );
+        assert!(
+            !service
+                .direct_input_needs_commit(VK_OEM_1.0, KeyModifiers::default())
+                .unwrap(),
+            "semicolon is handled by the Chinese punctuation path"
+        );
+        assert!(
+            service
                 .direct_input_needs_commit(VK_CAPITAL.0, KeyModifiers::default())
                 .unwrap()
         );
@@ -7211,6 +7923,18 @@ mod tests {
             !service
                 .direct_input_needs_commit(VK_A.0, KeyModifiers::default())
                 .unwrap()
+        );
+        assert!(
+            !service
+                .direct_input_needs_commit(
+                    VK_A.0,
+                    KeyModifiers {
+                        control: true,
+                        ..KeyModifiers::default()
+                    }
+                )
+                .unwrap(),
+            "host shortcuts must remain untouched"
         );
 
         service.input_mode.set(InputMode::English);
@@ -7291,6 +8015,9 @@ mod tests {
         ));
 
         for (punctuation, expected) in [
+            (CompositionPunctuation::Semicolon, "；"),
+            (CompositionPunctuation::Colon, "："),
+            (CompositionPunctuation::ExclamationMark, "！"),
             (CompositionPunctuation::LeftParenthesis, "（"),
             (CompositionPunctuation::RightParenthesis, "）"),
             (CompositionPunctuation::QuestionMark, "？"),
@@ -7450,6 +8177,105 @@ mod tests {
         let display = primary.candidate_display.as_ref().unwrap();
         assert_eq!(display.view(), InteractiveCandidateView::Primary);
         assert_eq!(display.visible(), ["普通候选"]);
+    }
+
+    #[test]
+    fn exact_xuy_tab_opens_an_explicit_wish_prompt_without_stealing_ordinary_tab() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        assert!(
+            service
+                .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+                .unwrap()
+                .is_none(),
+            "non-trigger Tab must retain the existing shape-assistant request path"
+        );
+
+        service.composition.borrow_mut().finish_commit();
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("xuy".to_owned()));
+        let prompt = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the exact trigger should open a confirmation prompt");
+        assert!(prompt.edit.is_none());
+        assert!(prompt.after.wish_prompt());
+        assert_eq!(prompt.after.phonetic(), "xuy");
+        assert_eq!(
+            prompt.candidate_display.as_ref().unwrap().visible(),
+            ["开始反馈"]
+        );
+        assert_eq!(
+            prompt.candidate_display.as_ref().unwrap().action_detail(),
+            Some("暂不保存")
+        );
+        assert!(prompt.feedback_after_success.is_none());
+        assert!(prompt.action_after_success.is_none());
+        *service.composition.borrow_mut() = prompt.after;
+
+        let wrong_rank = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 1)), KeyModifiers::default())
+            .unwrap()
+            .expect("an unavailable action rank must stay inside the prompt");
+        assert!(wrong_rank.after.wish_prompt());
+        assert!(wrong_rank.edit.is_none());
+        assert!(wrong_rank.action_after_success.is_none());
+
+        let confirm = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Space should explicitly confirm the visible action");
+        assert!(matches!(confirm.edit, Some(PendingDocumentEdit::Cancel)));
+        assert!(confirm.after.phonetic().is_empty());
+        assert!(!confirm.after.wish_prompt());
+        assert_eq!(
+            confirm.action_after_success,
+            Some(PlannedAction::Wish(WishCommand::Start))
+        );
+        assert!(confirm.feedback_after_success.is_none());
+    }
+
+    #[test]
+    fn recording_xuy_prompt_offers_a_bounded_snapshot_and_backspace_returns_to_text() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(SelectionCandidateProvider)),
+            NativeFeedbackLimits::default(),
+        ));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("xuy".to_owned()));
+        let prompt = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prompt.candidate_display.as_ref().unwrap().visible(),
+            ["向猫猫许愿"]
+        );
+        assert_eq!(
+            prompt.candidate_display.as_ref().unwrap().action_detail(),
+            Some("近30秒")
+        );
+        *service.composition.borrow_mut() = prompt.after;
+
+        let back = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Backspace should leave only the prompt, not delete xuy");
+        assert!(!back.after.wish_prompt());
+        assert_eq!(back.after.phonetic(), "xuy");
+        assert!(back.edit.is_none());
+        assert!(back.action_after_success.is_none());
     }
 
     #[test]
@@ -7727,6 +8553,20 @@ mod tests {
         assert_eq!(metrics.height, 46);
         assert!(metrics.width >= 280);
         assert!(metrics.width <= POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+    }
+
+    #[test]
+    fn inline_action_uses_a_compact_dedicated_row_without_ellipsis_pressure() {
+        let display = CandidateDisplay::action("向猫猫许愿", "近30秒");
+        let metrics = candidate_popup_metrics(&display, 96, 1920);
+        assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
+        assert_eq!(metrics.height, 46);
+        assert_eq!(metrics.width, POPUP_ACTION_MIN_WIDTH_LOGICAL);
+
+        let widths = horizontal_candidate_widths(&display, 96, metrics.width);
+        assert_eq!(widths, [metrics.width - POPUP_OUTER_PADDING_LOGICAL * 2]);
+        assert_eq!(display.visible(), ["向猫猫许愿"]);
+        assert_eq!(display.action_detail(), Some("近30秒"));
     }
 
     #[test]
