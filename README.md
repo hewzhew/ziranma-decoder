@@ -128,6 +128,9 @@ cargo run --release -- public-protocol-failure-audit
 # 用 fit-only 词上下文重排冻结候选池，同时检查完整码是否退化
 cargo run --release -- public-protocol-context-audit
 
+# 比较冻结候选池上的公开词/字上下文与保守首选门（只读，不接入 TSF）
+cargo run --release -- public-context-hybrid-audit
+
 # 公开同码单字课程：测一至三画能否把首屏外目标筛回 Top-10
 cargo run --release -- public-shape-audit
 

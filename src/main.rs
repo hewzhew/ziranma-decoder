@@ -10,22 +10,24 @@ use std::thread;
 use std::time::Instant;
 
 use ziranma_core::{
-    BigramLanguageModel, COLLISION_GATED_TAIL_PROFILES, Candidate, CandidateSource,
-    CharacterBigramLanguageModel, CharacterShapeIndex, CollisionGatedTailReport, Correction,
-    Decoder, DoublePinyinTrajectoryReport, FrozenContextProbe, FrozenHybridContextMetrics,
+    BigramLanguageModel, COLLISION_GATED_TAIL_PROFILES, CONSERVATIVE_TOP1_CONTEXT_PROFILES,
+    Candidate, CandidateSource, CharacterBigramLanguageModel, CharacterShapeIndex,
+    CollisionGatedTailReport, ConservativeTop1ContextMetrics, Correction, Decoder,
+    DoublePinyinTrajectoryReport, FrozenContextProbe, FrozenHybridContextMetrics,
     HALF_PAIR_PAINT_PROFILES, HALF_PAIR_SYNTHETIC_CADENCES, HYBRID_CONTEXT_PROFILES,
     HalfPairPaintAuditReport, KeySequenceError, MAX_SHAPE_LAB_VISIBLE, ProtocolContextLaneReport,
     ProtocolIndexStats, ProtocolStrategyReport, SEGMENTATION_CONTEXT_PROFILES, SentenceCandidate,
     ShapeLab, analyze_candidate_lab, audit_abbreviation_codebook, audit_anchored_tail_failures,
-    audit_collision_gated_tail_protocols, audit_continuous_composition,
-    audit_double_pinyin_key_trajectories, audit_frozen_hybrid_context,
-    audit_half_pair_paint_profiles, audit_public_protocol_context, audit_public_protocols,
-    audit_shape_refinement_course, audit_terminal_collision_gated_tail_protocols,
-    encode_pinyin_phrase, evaluate_character_context_oracle, evaluate_context_oracle,
-    evaluate_continuous_composition, evaluate_labeled_recall, evaluate_labeled_rejection_shadow,
-    evaluate_oov_cases, evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic,
-    parse_lexicon_tsv, parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
-    rerank_frozen_sentence_pool, rerank_frozen_sentence_pool_hybrid,
+    audit_collision_gated_tail_protocols, audit_conservative_top1_context,
+    audit_continuous_composition, audit_double_pinyin_key_trajectories,
+    audit_frozen_hybrid_context, audit_half_pair_paint_profiles, audit_public_protocol_context,
+    audit_public_protocols, audit_shape_refinement_course,
+    audit_terminal_collision_gated_tail_protocols, encode_pinyin_phrase,
+    evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
+    evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
+    evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
+    parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu, rerank_frozen_sentence_pool,
+    rerank_frozen_sentence_pool_conservative_top1, rerank_frozen_sentence_pool_hybrid,
     rerank_frozen_sentence_pool_hybrid_with_variants, select_public_bigram_training_sequences,
     select_public_calibration_cases, select_public_continuous_composition_cases,
     select_public_protocol_audit_cases, select_shape_course_tasks,
@@ -2278,6 +2280,22 @@ fn run_public_context_hybrid_audit(arguments: &[String]) -> Result<(), Box<dyn E
         &SEGMENTATION_CONTEXT_PROFILES,
         POOL_DEPTH,
     )?;
+    let conservative_audit_started = Instant::now();
+    let conservative_dev = audit_conservative_top1_context(
+        &decoder,
+        &dev_probes,
+        &word_model,
+        &CONSERVATIVE_TOP1_CONTEXT_PROFILES,
+        POOL_DEPTH,
+    )?;
+    let conservative_test = audit_conservative_top1_context(
+        &decoder,
+        &test_probes,
+        &word_model,
+        &CONSERVATIVE_TOP1_CONTEXT_PROFILES,
+        POOL_DEPTH,
+    )?;
+    let conservative_audit_millis = conservative_audit_started.elapsed().as_secs_f64() * 1000.0;
 
     println!("公开混合上下文对照：冻结 Top-{POOL_DEPTH}，只重排完整双拼零纠错位置");
     println!(
@@ -2310,6 +2328,12 @@ fn run_public_context_hybrid_audit(arguments: &[String]) -> Result<(), Box<dyn E
     );
     for (dev_row, test_row) in segmentation_dev.iter().zip(&segmentation_test) {
         print_hybrid_context_metrics(dev_row, test_row);
+    }
+    println!();
+    println!("保守首选门：只允许前六名中的一个完整码候选挑战首位，其余顺序不动");
+    println!("配置                     dev 首选 得/失/触发   test 首选 得/失/触发");
+    for (dev_row, test_row) in conservative_dev.iter().zip(&conservative_test) {
+        print_conservative_top1_metrics(dev_row, test_row);
     }
 
     let focused = [("ybqiui", "尤其是"), ("buuidiyige", "不是第一个")];
@@ -2458,11 +2482,36 @@ fn run_public_context_hybrid_audit(arguments: &[String]) -> Result<(), Box<dyn E
         }
         println!(" {last_segmentation}");
     }
+    println!("保守首选门外部探针（不参与配置比较）：");
+    println!("配置                     ybqiui       buuidiyige");
+    for profile in CONSERVATIVE_TOP1_CONTEXT_PROFILES {
+        print!("{:<26}", profile.label);
+        for ((_, expected), pool, variants) in &focused_pools {
+            let baseline_rank = pool
+                .iter()
+                .position(|candidate| candidate.text == *expected)
+                .map(|rank| rank + 1);
+            let report =
+                rerank_frozen_sentence_pool_conservative_top1(pool, variants, &word_model, profile);
+            let context_rank = report
+                .candidates
+                .iter()
+                .position(|candidate| candidate.candidate.text == *expected)
+                .map(|rank| rank + 1);
+            print!(
+                " {:>2}→{:<2}       ",
+                display_rank(baseline_rank),
+                display_rank(context_rank)
+            );
+        }
+        println!();
+    }
     println!(
-        "本次对照耗时：总计 {:.1} ms；冻结池混合配置 {:.1} ms；有限分词配置 {:.1} ms（当前机器单次观察；不读取私人记录、不写文件）",
+        "本次对照耗时：总计 {:.1} ms；冻结池混合配置 {:.1} ms；有限分词配置 {:.1} ms；保守首选门 {:.1} ms（当前机器单次观察；不读取私人记录、不写文件）",
         started.elapsed().as_secs_f64() * 1000.0,
         hybrid_audit_millis,
-        segmentation_audit_millis
+        segmentation_audit_millis,
+        conservative_audit_millis
     );
     Ok(())
 }
@@ -2489,6 +2538,27 @@ fn print_hybrid_context_metrics(
         test.lost_top_1,
         test.recovered_into_top_10,
         test.dropped_out_of_top_10
+    );
+}
+
+fn print_conservative_top1_metrics(
+    dev: &ConservativeTop1ContextMetrics,
+    test: &ConservativeTop1ContextMetrics,
+) {
+    debug_assert_eq!(dev.profile, test.profile);
+    println!(
+        "{:<26} {:>3}→{:<3} {:>2}/{:<2}/{:<3}      {:>3}→{:<3} {:>2}/{:<2}/{:<3}",
+        dev.profile.label,
+        dev.baseline_hits_at_1,
+        dev.context_hits_at_1,
+        dev.gained_top_1,
+        dev.lost_top_1,
+        dev.promotions,
+        test.baseline_hits_at_1,
+        test.context_hits_at_1,
+        test.gained_top_1,
+        test.lost_top_1,
+        test.promotions
     );
 }
 

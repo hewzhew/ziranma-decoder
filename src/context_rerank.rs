@@ -153,6 +153,112 @@ pub const SEGMENTATION_CONTEXT_PROFILES: [HybridContextProfile; 10] = [
     },
 ];
 
+/// Fixed gates for a production-shaped, Top-1-only public-context audit.
+///
+/// Unlike the broad hybrid sweep, these profiles may move at most one safe
+/// complete-code candidate to the first safe slot. The remaining order is
+/// stable. The profile grid is declared before the held-out audit so test
+/// answers cannot tune its thresholds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConservativeTop1ContextProfile {
+    /// Stable report label.
+    pub label: &'static str,
+    /// Number of baseline candidates allowed to challenge the first slot.
+    pub candidate_search_depth: usize,
+    /// Alternative full-code segmentations retained for the same text.
+    pub max_segmentations_per_text: usize,
+    /// Strongest public word-pair count required from a challenger.
+    pub minimum_observed_pair_count: u64,
+    /// Largest allowed unigram-score deficit from the current first slot.
+    pub maximum_unigram_deficit: f64,
+    /// Weight applied to mean `ln(1 + observed pair count)`.
+    pub word_pair_bonus_weight: f64,
+}
+
+/// Predeclared conservative Top-1 gate sweep.
+pub const CONSERVATIVE_TOP1_CONTEXT_PROFILES: [ConservativeTop1ContextProfile; 10] = [
+    ConservativeTop1ContextProfile {
+        label: "p2-d1.0-w1.0-k1",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 1,
+        minimum_observed_pair_count: 2,
+        maximum_unigram_deficit: 1.0,
+        word_pair_bonus_weight: 1.0,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p4-d1.0-w1.0-k1",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 1,
+        minimum_observed_pair_count: 4,
+        maximum_unigram_deficit: 1.0,
+        word_pair_bonus_weight: 1.0,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p8-d1.0-w1.0-k1",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 1,
+        minimum_observed_pair_count: 8,
+        maximum_unigram_deficit: 1.0,
+        word_pair_bonus_weight: 1.0,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p2-d1.5-w1.5-k1",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 1,
+        minimum_observed_pair_count: 2,
+        maximum_unigram_deficit: 1.5,
+        word_pair_bonus_weight: 1.5,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p4-d1.5-w1.5-k1",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 1,
+        minimum_observed_pair_count: 4,
+        maximum_unigram_deficit: 1.5,
+        word_pair_bonus_weight: 1.5,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p8-d1.5-w1.5-k1",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 1,
+        minimum_observed_pair_count: 8,
+        maximum_unigram_deficit: 1.5,
+        word_pair_bonus_weight: 1.5,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p2-d2.5-w2.5-k2",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 2,
+        minimum_observed_pair_count: 2,
+        maximum_unigram_deficit: 2.5,
+        word_pair_bonus_weight: 2.5,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p4-d2.5-w2.5-k2",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 2,
+        minimum_observed_pair_count: 4,
+        maximum_unigram_deficit: 2.5,
+        word_pair_bonus_weight: 2.5,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p8-d2.5-w2.5-k2",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 2,
+        minimum_observed_pair_count: 8,
+        maximum_unigram_deficit: 2.5,
+        word_pair_bonus_weight: 2.5,
+    },
+    ConservativeTop1ContextProfile {
+        label: "p4-d2.5-w3.0-k3",
+        candidate_search_depth: 6,
+        max_segmentations_per_text: 3,
+        minimum_observed_pair_count: 4,
+        maximum_unigram_deficit: 2.5,
+        word_pair_bonus_weight: 3.0,
+    },
+];
+
 /// Public word-pair evidence used while rescoring one frozen sentence path.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenContextPairEvidence {
@@ -224,6 +330,40 @@ pub struct FrozenHybridContextRerankReport {
     pub candidates: Vec<FrozenHybridContextCandidate>,
 }
 
+/// One frozen candidate annotated for the conservative Top-1 gate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConservativeTop1ContextCandidate {
+    /// One-based rank in the frozen unigram pool.
+    pub baseline_rank: usize,
+    /// One-based rank after the optional single promotion.
+    pub context_rank: usize,
+    /// Whether this path is a complete, exact lexicon candidate.
+    pub eligible: bool,
+    /// Strongest observed public word-pair count in the chosen segmentation.
+    pub strongest_pair_count: u64,
+    /// Mean `ln(1 + count)` over adjacent pairs in the chosen segmentation.
+    pub word_pair_bonus: f64,
+    /// Original unigram sentence score for the chosen segmentation.
+    pub unigram_score: f64,
+    /// Unigram score plus the profile's bounded public-pair bonus.
+    pub context_score: f64,
+    /// Candidate text and the chosen already-existing segmentation.
+    pub candidate: SentenceCandidate,
+}
+
+/// Result of a Top-1-only conservative context challenge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConservativeTop1ContextRerankReport {
+    /// Fixed gate used for this result.
+    pub profile: ConservativeTop1ContextProfile,
+    /// Number of candidates supplied by the unchanged unigram decoder.
+    pub pool_depth: usize,
+    /// Baseline rank promoted to the first safe slot, if any.
+    pub promoted_baseline_rank: Option<usize>,
+    /// Stable pool with at most one safe promotion.
+    pub candidates: Vec<ConservativeTop1ContextCandidate>,
+}
+
 /// One public or synthetic full-code probe for a frozen-pool context audit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrozenContextProbe {
@@ -262,6 +402,25 @@ pub struct FrozenHybridContextMetrics {
     pub improved_ranks: usize,
     pub unchanged_ranks: usize,
     pub worsened_ranks: usize,
+}
+
+/// Aggregate metrics for one conservative Top-1 gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConservativeTop1ContextMetrics {
+    /// Fixed profile measured by this row.
+    pub profile: ConservativeTop1ContextProfile,
+    /// Number of probes presented to both orders.
+    pub total: usize,
+    /// Expected texts present anywhere in the frozen pool.
+    pub pool_visible: usize,
+    /// Baseline and gated Top-1 hits.
+    pub baseline_hits_at_1: usize,
+    pub context_hits_at_1: usize,
+    /// Expected text newly entering or leaving rank one.
+    pub gained_top_1: usize,
+    pub lost_top_1: usize,
+    /// Number of queries on which any candidate passed every gate.
+    pub promotions: usize,
 }
 
 /// Compares fixed hybrid profiles on exactly the same frozen candidate pools.
@@ -329,6 +488,71 @@ pub fn audit_frozen_hybrid_context(
                 .position(|candidate| candidate.candidate.text == probe.expected_text)
                 .map(|rank| rank + 1);
             observe_hybrid_metrics(row, baseline_rank, context_rank);
+        }
+    }
+    Ok(metrics)
+}
+
+/// Compares fixed conservative Top-1 gates on identical frozen pools.
+pub fn audit_conservative_top1_context(
+    decoder: &Decoder,
+    probes: &[FrozenContextProbe],
+    word_language_model: &BigramLanguageModel,
+    profiles: &[ConservativeTop1ContextProfile],
+    pool_depth: usize,
+) -> Result<Vec<ConservativeTop1ContextMetrics>, KeySequenceError> {
+    let pool_depth = pool_depth.max(10);
+    let maximum_segmentations_per_text = profiles
+        .iter()
+        .map(|profile| profile.max_segmentations_per_text)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut metrics = profiles
+        .iter()
+        .copied()
+        .map(|profile| ConservativeTop1ContextMetrics {
+            profile,
+            total: probes.len(),
+            pool_visible: 0,
+            baseline_hits_at_1: 0,
+            context_hits_at_1: 0,
+            gained_top_1: 0,
+            lost_top_1: 0,
+            promotions: 0,
+        })
+        .collect::<Vec<_>>();
+
+    for probe in probes {
+        let pool = decoder.decode_sentence(probe.observed.as_str(), pool_depth)?;
+        let variants = if maximum_segmentations_per_text == 1 {
+            pool.clone()
+        } else {
+            decoder.decode_sentence_segmentation_variants(
+                probe.observed.as_str(),
+                pool_depth,
+                maximum_segmentations_per_text,
+            )?
+        };
+        let baseline_rank = sentence_text_rank(&pool, &probe.expected_text);
+        for row in &mut metrics {
+            let report = rerank_frozen_sentence_pool_conservative_top1(
+                &pool,
+                &variants,
+                word_language_model,
+                row.profile,
+            );
+            let context_rank = report
+                .candidates
+                .iter()
+                .position(|candidate| candidate.candidate.text == probe.expected_text)
+                .map(|rank| rank + 1);
+            row.pool_visible += usize::from(baseline_rank.is_some());
+            row.baseline_hits_at_1 += usize::from(baseline_rank == Some(1));
+            row.context_hits_at_1 += usize::from(context_rank == Some(1));
+            row.gained_top_1 += usize::from(baseline_rank != Some(1) && context_rank == Some(1));
+            row.lost_top_1 += usize::from(baseline_rank == Some(1) && context_rank != Some(1));
+            row.promotions += usize::from(report.promoted_baseline_rank.is_some());
         }
     }
     Ok(metrics)
@@ -491,6 +715,191 @@ pub fn rerank_frozen_sentence_pool_hybrid_with_variants(
         eligible_candidates: candidates.iter().filter(|row| row.eligible).count(),
         candidates,
     }
+}
+
+/// Lets at most one strongly supported complete-code candidate challenge Top-1.
+///
+/// The challenger must already exist near the front of the frozen unigram
+/// pool, remain within a fixed unigram deficit, and carry stronger observed
+/// public-pair evidence than the current leader. Ineligible slots never move;
+/// after the optional promotion every other eligible candidate keeps its
+/// relative order.
+pub fn rerank_frozen_sentence_pool_conservative_top1(
+    pool: &[SentenceCandidate],
+    variants: &[SentenceCandidate],
+    word_language_model: &BigramLanguageModel,
+    profile: ConservativeTop1ContextProfile,
+) -> ConservativeTop1ContextRerankReport {
+    debug_assert!(profile.candidate_search_depth > 0);
+    debug_assert!(profile.max_segmentations_per_text > 0);
+    debug_assert!(profile.maximum_unigram_deficit.is_finite());
+    debug_assert!(profile.maximum_unigram_deficit >= 0.0);
+    debug_assert!(profile.word_pair_bonus_weight.is_finite());
+    debug_assert!(profile.word_pair_bonus_weight >= 0.0);
+
+    let mut candidates = pool
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            annotate_conservative_top1_candidate(
+                index,
+                candidate,
+                variants,
+                word_language_model,
+                profile,
+            )
+        })
+        .collect::<Vec<_>>();
+    let eligible_positions = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| candidate.eligible.then_some(index))
+        .collect::<Vec<_>>();
+    let mut promoted_baseline_rank = None;
+
+    if eligible_positions.first().copied() == Some(0) {
+        let leader = &candidates[0];
+        let challenger = eligible_positions
+            .iter()
+            .copied()
+            .skip(1)
+            .filter(|&index| candidates[index].baseline_rank <= profile.candidate_search_depth)
+            .filter(|&index| {
+                let candidate = &candidates[index];
+                candidate.strongest_pair_count >= profile.minimum_observed_pair_count
+                    && candidate.word_pair_bonus > leader.word_pair_bonus
+                    && leader.unigram_score - candidate.unigram_score
+                        <= profile.maximum_unigram_deficit
+                    && candidate.context_score > leader.context_score
+            })
+            .max_by(|&left, &right| {
+                candidates[left]
+                    .context_score
+                    .total_cmp(&candidates[right].context_score)
+                    .then_with(|| {
+                        candidates[left]
+                            .strongest_pair_count
+                            .cmp(&candidates[right].strongest_pair_count)
+                    })
+                    .then_with(|| right.cmp(&left))
+            });
+
+        if let Some(challenger_position) = challenger {
+            let mut eligible_rows = eligible_positions
+                .iter()
+                .map(|&position| candidates[position].clone())
+                .collect::<Vec<_>>();
+            let challenger_index = eligible_positions
+                .iter()
+                .position(|&position| position == challenger_position)
+                .expect("challenger came from the eligible-position list");
+            let promoted = eligible_rows.remove(challenger_index);
+            promoted_baseline_rank = Some(promoted.baseline_rank);
+            eligible_rows.insert(0, promoted);
+            for (position, candidate) in eligible_positions.iter().copied().zip(eligible_rows) {
+                candidates[position] = candidate;
+            }
+        }
+    }
+
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.context_rank = index + 1;
+    }
+    ConservativeTop1ContextRerankReport {
+        profile,
+        pool_depth: pool.len(),
+        promoted_baseline_rank,
+        candidates,
+    }
+}
+
+fn annotate_conservative_top1_candidate(
+    baseline_index: usize,
+    baseline: &SentenceCandidate,
+    variants: &[SentenceCandidate],
+    word_language_model: &BigramLanguageModel,
+    profile: ConservativeTop1ContextProfile,
+) -> ConservativeTop1ContextCandidate {
+    let eligible = candidate_is_context_eligible(baseline);
+    if !eligible {
+        return ConservativeTop1ContextCandidate {
+            baseline_rank: baseline_index + 1,
+            context_rank: baseline_index + 1,
+            eligible: false,
+            strongest_pair_count: 0,
+            word_pair_bonus: 0.0,
+            unigram_score: baseline.total_score,
+            context_score: baseline.total_score,
+            candidate: baseline.clone(),
+        };
+    }
+
+    variants
+        .iter()
+        .filter(|variant| variant.text == baseline.text && candidate_is_context_eligible(variant))
+        .take(profile.max_segmentations_per_text.max(1))
+        .map(|variant| {
+            let (strongest_pair_count, word_pair_bonus) =
+                conservative_word_pair_features(variant, word_language_model);
+            ConservativeTop1ContextCandidate {
+                baseline_rank: baseline_index + 1,
+                context_rank: baseline_index + 1,
+                eligible: true,
+                strongest_pair_count,
+                word_pair_bonus,
+                unigram_score: variant.total_score,
+                context_score: variant.total_score
+                    + profile.word_pair_bonus_weight * word_pair_bonus,
+                candidate: variant.clone(),
+            }
+        })
+        .max_by(|left, right| {
+            left.context_score
+                .total_cmp(&right.context_score)
+                .then_with(|| left.strongest_pair_count.cmp(&right.strongest_pair_count))
+                .then_with(|| left.unigram_score.total_cmp(&right.unigram_score))
+        })
+        .unwrap_or_else(|| {
+            let (strongest_pair_count, word_pair_bonus) =
+                conservative_word_pair_features(baseline, word_language_model);
+            ConservativeTop1ContextCandidate {
+                baseline_rank: baseline_index + 1,
+                context_rank: baseline_index + 1,
+                eligible: true,
+                strongest_pair_count,
+                word_pair_bonus,
+                unigram_score: baseline.total_score,
+                context_score: baseline.total_score
+                    + profile.word_pair_bonus_weight * word_pair_bonus,
+                candidate: baseline.clone(),
+            }
+        })
+}
+
+fn conservative_word_pair_features(
+    candidate: &SentenceCandidate,
+    word_language_model: &BigramLanguageModel,
+) -> (u64, f64) {
+    let pair_count = candidate.segments.len().saturating_sub(1);
+    if pair_count == 0 {
+        return (0, 0.0);
+    }
+    let observed_counts = candidate
+        .segments
+        .windows(2)
+        .map(|segments| {
+            word_language_model
+                .score(&segments[0].candidate.text, &segments[1].candidate.text)
+                .observed_count
+        })
+        .collect::<Vec<_>>();
+    let strongest = observed_counts.iter().copied().max().unwrap_or(0);
+    let bonus = observed_counts
+        .into_iter()
+        .map(|count| (count as f64).ln_1p())
+        .sum::<f64>()
+        / pair_count as f64;
+    (strongest, bonus)
 }
 
 fn annotate_best_hybrid_candidate(
@@ -846,5 +1255,74 @@ mod tests {
         assert_eq!(metrics[1].context_hits_at_1, 1);
         assert_eq!(metrics[1].gained_top_1, 1);
         assert_eq!(metrics[1].lost_top_1, 0);
+    }
+
+    #[test]
+    fn conservative_gate_promotes_one_supported_challenger_and_keeps_the_tail_stable() {
+        let lexicon = parse_lexicon_tsv(LEXICON).unwrap();
+        let decoder = Decoder::new(lexicon.clone());
+        let model = BigramLanguageModel::from_tsv(CORPUS, &lexicon).unwrap();
+        let pool = decoder.decode_sentence("ybqiui", 10).unwrap();
+        let profile = ConservativeTop1ContextProfile {
+            label: "test",
+            candidate_search_depth: 6,
+            max_segmentations_per_text: 1,
+            minimum_observed_pair_count: 10,
+            maximum_unigram_deficit: 1.0,
+            word_pair_bonus_weight: 1.0,
+        };
+
+        let report = rerank_frozen_sentence_pool_conservative_top1(&pool, &pool, &model, profile);
+
+        assert_eq!(report.promoted_baseline_rank, Some(2));
+        assert_eq!(report.candidates[0].candidate.text, "尤其是");
+        assert_eq!(report.candidates[0].strongest_pair_count, 20);
+        assert_eq!(report.candidates[1].candidate.text, "有其实");
+        assert_eq!(
+            report.candidates[2..]
+                .iter()
+                .map(|candidate| candidate.candidate.text.as_str())
+                .collect::<Vec<_>>(),
+            pool[2..]
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn conservative_gate_and_audit_preserve_top_one_when_evidence_is_below_the_gate() {
+        let lexicon = parse_lexicon_tsv(LEXICON).unwrap();
+        let decoder = Decoder::new(lexicon.clone());
+        let model = BigramLanguageModel::from_tsv(CORPUS, &lexicon).unwrap();
+        let pool = decoder.decode_sentence("ybqiui", 10).unwrap();
+        let profile = ConservativeTop1ContextProfile {
+            label: "strict",
+            candidate_search_depth: 6,
+            max_segmentations_per_text: 1,
+            minimum_observed_pair_count: 21,
+            maximum_unigram_deficit: 1.0,
+            word_pair_bonus_weight: 1.0,
+        };
+
+        let report = rerank_frozen_sentence_pool_conservative_top1(&pool, &pool, &model, profile);
+        assert_eq!(report.promoted_baseline_rank, None);
+        assert_eq!(report.candidates[0].candidate.text, "有其实");
+
+        let metrics = audit_conservative_top1_context(
+            &decoder,
+            &[FrozenContextProbe {
+                id: "synthetic".to_owned(),
+                observed: KeySequence::new("ybqiui").unwrap(),
+                expected_text: "尤其是".to_owned(),
+            }],
+            &model,
+            &[profile],
+            10,
+        )
+        .unwrap();
+        assert_eq!(metrics[0].baseline_hits_at_1, 0);
+        assert_eq!(metrics[0].context_hits_at_1, 0);
+        assert_eq!(metrics[0].promotions, 0);
     }
 }

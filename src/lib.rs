@@ -151,11 +151,15 @@ pub use composition::{
     SessionSelectionMemory,
 };
 pub use context_rerank::{
-    FrozenContextCandidate, FrozenContextPairEvidence, FrozenContextProbe,
-    FrozenContextRerankReport, FrozenHybridContextCandidate, FrozenHybridContextMetrics,
-    FrozenHybridContextRerankReport, HYBRID_CONTEXT_PROFILES, HybridContextProfile,
-    SEGMENTATION_CONTEXT_PROFILES, audit_frozen_hybrid_context, rerank_frozen_sentence_pool,
-    rerank_frozen_sentence_pool_hybrid, rerank_frozen_sentence_pool_hybrid_with_variants,
+    CONSERVATIVE_TOP1_CONTEXT_PROFILES, ConservativeTop1ContextCandidate,
+    ConservativeTop1ContextMetrics, ConservativeTop1ContextProfile,
+    ConservativeTop1ContextRerankReport, FrozenContextCandidate, FrozenContextPairEvidence,
+    FrozenContextProbe, FrozenContextRerankReport, FrozenHybridContextCandidate,
+    FrozenHybridContextMetrics, FrozenHybridContextRerankReport, HYBRID_CONTEXT_PROFILES,
+    HybridContextProfile, SEGMENTATION_CONTEXT_PROFILES, audit_conservative_top1_context,
+    audit_frozen_hybrid_context, rerank_frozen_sentence_pool,
+    rerank_frozen_sentence_pool_conservative_top1, rerank_frozen_sentence_pool_hybrid,
+    rerank_frozen_sentence_pool_hybrid_with_variants,
 };
 #[cfg(windows)]
 pub use continuous_capture::WindowsUserDataProtector;
