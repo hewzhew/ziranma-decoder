@@ -313,6 +313,7 @@ $requiredFiles = @(
     'PRIVACY.md',
     'README.md',
     'THIRD_PARTY_NOTICES.md',
+    'alias-ime.cmd',
     'data/public/conway-stroke-data/LICENSE.txt',
     'data/public/conway-stroke-data/SOURCE.md',
     'data/public/conway-stroke-data/UPSTREAM_README.md',
@@ -333,10 +334,14 @@ $requiredFiles = @(
     'docs/tsf-dev-inspection.md',
     'docs/wish-feedback.md',
     'scripts/release-audit.ps1',
+    'src/bin/aliasctl.rs',
+    'src/bin/aliaspad.rs',
     'src/bin/tsf-devctl.rs',
     'src/bin/wishctl.rs',
+    'src/bin/wishpad.rs',
     'src/candidate_lab_cli.rs',
     'src/tsf_alpha.rs',
+    'src/wish_command.rs',
     'src/wish_feedback.rs',
     'wish-ime.cmd'
 )

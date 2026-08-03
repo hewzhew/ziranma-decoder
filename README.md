@@ -333,10 +333,19 @@ PE/Authenticode 签名。
 用户主动指定的精确别名与公开候选包分开保存。`alias-ime.cmd` 把它们写入
 Git 忽略的 `.local/tsf-alpha/user-data/aliases`，正文始终先经过 Windows
 当前用户 DPAPI 加密，再进入不可变包和 current / candidate / previous 三槽。
-第一条别名会直接建立 current；之后的修改先进入 candidate，确认后再提升：
+日常使用时，不带参数运行脚本会打开“固定候选”面板。填写输入码和首选文字后
+一次保存并切换，旧版本留作撤销；移除和回退也在同一面板完成。面板通过私密
+标准输入把内容交给独立管理器，码和文字不出现在子进程命令行：
 
 ```powershell
-cargo build --release --bin aliasctl
+cargo build --release --bin aliasctl --bin aliaspad
+.\alias-ime.cmd
+```
+
+需要分阶段审查时仍可使用原有 CLI：第一条别名直接建立 current，后续 `set`
+或 `remove` 只进入 candidate，确认后再提升：
+
+```powershell
 .\alias-ime.cmd set --code wua --text 呜哇
 .\alias-ime.cmd set --code wuu --text 呜呜
 .\alias-ime.cmd promote
@@ -345,11 +354,11 @@ cargo build --release --bin aliasctl
 
 `remove --code <码>` 同样先暂存；`unstage` 放弃暂存，`rollback` 交换 current 与
 previous。只有显式加入 `--confirm-show-private-text` 的 `list` 才会在当前终端
-显示别名正文。命令不联网、不从打字中学习，也不会把私人配置复制进安装 DLL
-目录。支持这一格式的文本服务只在“当前没有组合、即将输入第一个字母”时读取
-小型槽指针；指针改变后先完整解密校验，再为这一次新组合替换内存快照。损坏的
-更新保留该服务最后一次成功加载的版本，不会在组合中途偷换，也不需要重装
-DLL。界面或 TSF 代码变化仍需正常换代，并等待已有宿主自然释放旧 DLL。
+显示别名正文。面板与命令都不联网、不从打字中学习，也不会把私人配置复制进
+安装 DLL 目录。支持这一格式的文本服务只在“当前没有组合、即将输入第一个
+字母”时读取小型槽指针；指针改变后先完整解密校验，再为这一次新组合替换内存
+快照。损坏的更新保留该服务最后一次成功加载的版本，不会在组合中途偷换，也
+不需要重装 DLL。界面或 TSF 代码变化仍需正常换代，并等待已有宿主自然释放旧 DLL。
 
 发布 DLL 的架构、COM 导出、证书目录、固定 CLSID 的标准 COM 注册位置、
 zh-CN 语言配置和键盘类别可以先用只读工具核对：

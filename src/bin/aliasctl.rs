@@ -29,6 +29,8 @@ enum Command {
     List { candidate: bool, show_text: bool },
     Set { code: String, text: String },
     Remove { code: String },
+    PinPrivateStdin,
+    UnpinPrivateStdin,
     Promote,
     Rollback,
     Unstage,
@@ -62,17 +64,55 @@ fn run() -> Result<(), Box<dyn Error>> {
             candidate,
             show_text,
         } => list(&options.root, &protector, candidate, show_text),
-        Command::Set { code, text } => change(&options.root, &protector, |snapshot| {
-            snapshot.set(&code, &text)?;
-            Ok(ChangeResult::Changed)
-        }),
-        Command::Remove { code } => change(&options.root, &protector, |snapshot| {
-            Ok(if snapshot.remove(&code)?.is_some() {
-                ChangeResult::Changed
-            } else {
-                ChangeResult::Unchanged
-            })
-        }),
+        Command::Set { code, text } => change(
+            &options.root,
+            &protector,
+            |snapshot| {
+                snapshot.set(&code, &text)?;
+                Ok(ChangeResult::Changed)
+            },
+            ChangePublication::Stage,
+        ),
+        Command::Remove { code } => change(
+            &options.root,
+            &protector,
+            |snapshot| {
+                Ok(if snapshot.remove(&code)?.is_some() {
+                    ChangeResult::Changed
+                } else {
+                    ChangeResult::Unchanged
+                })
+            },
+            ChangePublication::Stage,
+        ),
+        Command::PinPrivateStdin => {
+            let (code, text) = read_private_action(std::io::stdin(), true)?;
+            let text = text.expect("pin private input always contains text");
+            change(
+                &options.root,
+                &protector,
+                |snapshot| {
+                    snapshot.set(&code, &text)?;
+                    Ok(ChangeResult::Changed)
+                },
+                ChangePublication::Apply,
+            )
+        }
+        Command::UnpinPrivateStdin => {
+            let (code, _) = read_private_action(std::io::stdin(), false)?;
+            change(
+                &options.root,
+                &protector,
+                |snapshot| {
+                    Ok(if snapshot.remove(&code)?.is_some() {
+                        ChangeResult::Changed
+                    } else {
+                        ChangeResult::Unchanged
+                    })
+                },
+                ChangePublication::Apply,
+            )
+        }
         Command::Promote => promote(&options.root, &protector),
         Command::Rollback => rollback(&options.root, &protector),
         Command::Unstage => unstage(&options.root),
@@ -87,6 +127,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
     let mut text = None;
     let mut candidate = false;
     let mut show_text = false;
+    let mut private_stdin = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--root" => set_value(&mut root, arguments.next(), "--root")?,
@@ -94,30 +135,51 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
             "--text" => set_value(&mut text, arguments.next(), "--text")?,
             "--candidate" if !candidate => candidate = true,
             "--confirm-show-private-text" if !show_text => show_text = true,
+            "--private-stdin" if !private_stdin => private_stdin = true,
             _ => return Err(format!("无法识别或重复的参数：{argument}\n{}", usage()).into()),
         }
     }
     let root = root.ok_or("缺少 --root")?;
     let command = match command.as_str() {
-        "status" if code.is_none() && text.is_none() && !candidate && !show_text => Command::Status,
-        "list" if code.is_none() && text.is_none() => Command::List {
+        "status"
+            if code.is_none() && text.is_none() && !candidate && !show_text && !private_stdin =>
+        {
+            Command::Status
+        }
+        "list" if code.is_none() && text.is_none() && !private_stdin => Command::List {
             candidate,
             show_text,
         },
-        "set" if !candidate && !show_text => Command::Set {
+        "set" if !candidate && !show_text && !private_stdin => Command::Set {
             code: code.ok_or("set 缺少 --code")?,
             text: text.ok_or("set 缺少 --text")?,
         },
-        "remove" if text.is_none() && !candidate && !show_text => Command::Remove {
-            code: code.ok_or("remove 缺少 --code")?,
-        },
-        "promote" if code.is_none() && text.is_none() && !candidate && !show_text => {
+        "remove" if text.is_none() && !candidate && !show_text && !private_stdin => {
+            Command::Remove {
+                code: code.ok_or("remove 缺少 --code")?,
+            }
+        }
+        "pin" if code.is_none() && text.is_none() && !candidate && !show_text && private_stdin => {
+            Command::PinPrivateStdin
+        }
+        "unpin"
+            if code.is_none() && text.is_none() && !candidate && !show_text && private_stdin =>
+        {
+            Command::UnpinPrivateStdin
+        }
+        "promote"
+            if code.is_none() && text.is_none() && !candidate && !show_text && !private_stdin =>
+        {
             Command::Promote
         }
-        "rollback" if code.is_none() && text.is_none() && !candidate && !show_text => {
+        "rollback"
+            if code.is_none() && text.is_none() && !candidate && !show_text && !private_stdin =>
+        {
             Command::Rollback
         }
-        "unstage" if code.is_none() && text.is_none() && !candidate && !show_text => {
+        "unstage"
+            if code.is_none() && text.is_none() && !candidate && !show_text && !private_stdin =>
+        {
             Command::Unstage
         }
         _ => return Err(usage().into()),
@@ -145,8 +207,36 @@ fn set_value(
 }
 
 fn usage() -> String {
-    "用法：\n  aliasctl status --root <目录>\n  aliasctl list --root <目录> --confirm-show-private-text [--candidate]\n  aliasctl set --root <目录> --code <小写字母码> --text <文字>\n  aliasctl remove --root <目录> --code <小写字母码>\n  aliasctl promote --root <目录>\n  aliasctl rollback --root <目录>\n  aliasctl unstage --root <目录>"
+    "用法：\n  aliasctl status --root <目录>\n  aliasctl list --root <目录> --confirm-show-private-text [--candidate]\n  aliasctl set --root <目录> --code <小写字母码> --text <文字>\n  aliasctl remove --root <目录> --code <小写字母码>\n  aliasctl pin --root <目录> --private-stdin\n  aliasctl unpin --root <目录> --private-stdin\n  aliasctl promote --root <目录>\n  aliasctl rollback --root <目录>\n  aliasctl unstage --root <目录>"
         .to_owned()
+}
+
+const MAX_PRIVATE_ACTION_BYTES: usize = 1_024;
+
+fn read_private_action(
+    input: impl Read,
+    expects_text: bool,
+) -> Result<(String, Option<String>), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    input
+        .take(u64::try_from(MAX_PRIVATE_ACTION_BYTES + 1).expect("small fixed input bound"))
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_PRIVATE_ACTION_BYTES {
+        return Err("私密输入为空或超过上限".into());
+    }
+    let input = std::str::from_utf8(&bytes).map_err(|_| "私密输入不是有效 UTF-8")?;
+    if input.contains(['\r', '\0']) || !input.ends_with('\n') {
+        return Err("私密输入格式无效".into());
+    }
+    let fields = input[..input.len() - 1].split('\n').collect::<Vec<_>>();
+    let valid_count = if expects_text { 2 } else { 1 };
+    if fields.len() != valid_count || fields.iter().any(|field| field.is_empty()) {
+        return Err("私密输入格式无效".into());
+    }
+    Ok((
+        fields[0].to_owned(),
+        expects_text.then(|| fields[1].to_owned()),
+    ))
 }
 
 fn status(root: &Path, protector: &dyn DataProtector) -> Result<(), Box<dyn Error>> {
@@ -219,10 +309,17 @@ enum ChangeResult {
     Unchanged,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangePublication {
+    Stage,
+    Apply,
+}
+
 fn change(
     root: &Path,
     protector: &dyn DataProtector,
     mutate: impl FnOnce(&mut ExplicitAliasSnapshot) -> Result<ChangeResult, Box<dyn Error>>,
+    publication: ChangePublication,
 ) -> Result<(), Box<dyn Error>> {
     let mut state = load_explicit_alias_slot_state(root)?.unwrap_or_default();
     let base_id = state.candidate().or_else(|| state.current());
@@ -247,11 +344,17 @@ fn change(
         state.adopt(&package_id)?;
     } else {
         state.stage(&package_id)?;
+        if publication == ChangePublication::Apply {
+            state.promote()?;
+        }
     }
     write_slot_state(root, &state)?;
     if first {
         println!("显式别名已启用 · {} 条", snapshot.len());
         println!("新的输入组合会自动读取这一版本。");
+    } else if publication == ChangePublication::Apply {
+        println!("首选已固定 · {} 条", snapshot.len());
+        println!("新的输入组合会自动读取这一版本；需要时可以回退。");
     } else {
         println!("显式别名已暂存 · {} 条", snapshot.len());
         println!("确认后运行 alias-ime.cmd promote；也可运行 unstage 放弃本次暂存。");
@@ -489,10 +592,15 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let root = parent.join("user-data").join("aliases");
-        change(&root, &TestProtector, |snapshot| {
-            snapshot.set("aa", "合成")?;
-            Ok(ChangeResult::Changed)
-        })
+        change(
+            &root,
+            &TestProtector,
+            |snapshot| {
+                snapshot.set("aa", "合成")?;
+                Ok(ChangeResult::Changed)
+            },
+            ChangePublication::Stage,
+        )
         .unwrap();
         let state = load_explicit_alias_slot_state(&root).unwrap().unwrap();
         let current = state.current().unwrap();
@@ -502,6 +610,65 @@ mod tests {
                 .snapshot()
                 .get("aa"),
             Some("合成")
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn private_stdin_is_bounded_exact_and_never_needs_private_arguments() {
+        assert_eq!(
+            read_private_action(&b"qnq\n\xE4\xBA\xB2\xE4\xBA\xB2\n"[..], true).unwrap(),
+            ("qnq".to_owned(), Some("亲亲".to_owned()))
+        );
+        assert_eq!(
+            read_private_action(&b"qnq\n"[..], false).unwrap(),
+            ("qnq".to_owned(), None)
+        );
+        assert!(read_private_action(&b"qnq\r\n"[..], false).is_err());
+        assert!(read_private_action(&b"qnq\nextra\n"[..], false).is_err());
+        assert!(read_private_action(&vec![b'a'; MAX_PRIVATE_ACTION_BYTES + 1][..], false).is_err());
+    }
+
+    #[test]
+    fn applied_change_replaces_current_and_keeps_one_step_rollback() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-aliasctl-apply-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = parent.join("aliases");
+        for text in ["甲", "乙"] {
+            change(
+                &root,
+                &TestProtector,
+                |snapshot| {
+                    snapshot.set("aa", text)?;
+                    Ok(ChangeResult::Changed)
+                },
+                ChangePublication::Apply,
+            )
+            .unwrap();
+        }
+        let state = load_explicit_alias_slot_state(&root).unwrap().unwrap();
+        assert!(state.candidate().is_none());
+        assert!(state.previous().is_some());
+        assert_eq!(
+            load_explicit_alias_package(&root, state.current().unwrap(), &TestProtector)
+                .unwrap()
+                .snapshot()
+                .get("aa"),
+            Some("乙")
+        );
+
+        rollback(&root, &TestProtector).unwrap();
+        let state = load_explicit_alias_slot_state(&root).unwrap().unwrap();
+        assert_eq!(
+            load_explicit_alias_package(&root, state.current().unwrap(), &TestProtector)
+                .unwrap()
+                .snapshot()
+                .get("aa"),
+            Some("甲")
         );
         fs::remove_dir_all(parent).unwrap();
     }
