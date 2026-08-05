@@ -226,32 +226,39 @@ impl SessionSelectionMemory {
         candidates: &mut Vec<String>,
         protected_prefix: usize,
     ) -> bool {
-        let Some(preferred) = self
+        self.promote_texts_after_index(code, candidates, protected_prefix)
+            .is_some()
+    }
+
+    pub(crate) fn promote_texts_after_index(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> Option<usize> {
+        let preferred = self
             .selections
             .iter()
-            .find(|selection| selection.code == code)
-        else {
-            return false;
-        };
+            .find(|selection| selection.code == code)?;
         let protected_prefix = protected_prefix.min(candidates.len());
         let Some(index) = candidates
             .iter()
             .position(|candidate| candidate == &preferred.text)
         else {
             if protected_prefix > 0 && protected_prefix == candidates.len() {
-                return false;
+                return None;
             }
             let original_len = candidates.len();
             candidates.insert(protected_prefix, preferred.text.clone());
             candidates.truncate(original_len.max(1));
-            return true;
+            return (protected_prefix < candidates.len()).then_some(protected_prefix);
         };
         if index <= protected_prefix {
-            return true;
+            return Some(index);
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        true
+        Some(protected_prefix)
     }
 
     /// Promotes the most recent session choice learned under a compatible,
@@ -260,6 +267,7 @@ impl SessionSelectionMemory {
     /// Unlike exact session recall, this never injects an absent candidate.
     /// The host owns both public-dictionary verification and suppression
     /// policy through `eligible_source`.
+    #[cfg(test)]
     pub(crate) fn promote_anchored_suffix_texts_after(
         &self,
         code: &str,
@@ -267,28 +275,39 @@ impl SessionSelectionMemory {
         protected_prefix: usize,
         mut eligible_source: impl FnMut(&str, &str) -> bool,
     ) -> bool {
-        let Some(preferred) = self.selections.iter().find(|selection| {
+        self.promote_anchored_suffix_texts_after_index(
+            code,
+            candidates,
+            protected_prefix,
+            &mut eligible_source,
+        )
+        .is_some()
+    }
+
+    pub(crate) fn promote_anchored_suffix_texts_after_index(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        mut eligible_source: impl FnMut(&str, &str) -> bool,
+    ) -> Option<usize> {
+        let preferred = self.selections.iter().find(|selection| {
             is_anchored_suffix_abbreviation(&selection.code, code)
                 && candidates
                     .iter()
                     .any(|candidate| candidate == &selection.text)
                 && eligible_source(&selection.code, &selection.text)
-        }) else {
-            return false;
-        };
+        })?;
         let protected_prefix = protected_prefix.min(candidates.len());
-        let Some(index) = candidates
+        let index = candidates
             .iter()
-            .position(|candidate| candidate == &preferred.text)
-        else {
-            return false;
-        };
+            .position(|candidate| candidate == &preferred.text)?;
         if index <= protected_prefix {
-            return true;
+            return Some(index);
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        true
+        Some(protected_prefix)
     }
 
     pub(crate) fn has_anchored_suffix_evidence(

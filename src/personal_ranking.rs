@@ -655,7 +655,7 @@ impl PersonalRankingSnapshot {
         let Some(preferred) = self.preferred_text(code) else {
             return false;
         };
-        promote_preferred_text(preferred, candidates, protected_prefix)
+        promote_preferred_text_index(preferred, candidates, protected_prefix).is_some()
     }
 
     pub fn promote_texts_after_with_suppressions(
@@ -665,10 +665,24 @@ impl PersonalRankingSnapshot {
         protected_prefix: usize,
         suppressions: &PersonalRankingSuppressionSnapshot,
     ) -> bool {
-        let Some(preferred) = self.preferred_text_with_suppressions(code, suppressions) else {
-            return false;
-        };
-        promote_preferred_text(preferred, candidates, protected_prefix)
+        self.promote_texts_after_with_suppressions_index(
+            code,
+            candidates,
+            protected_prefix,
+            suppressions,
+        )
+        .is_some()
+    }
+
+    pub(crate) fn promote_texts_after_with_suppressions_index(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+    ) -> Option<usize> {
+        let preferred = self.preferred_text_with_suppressions(code, suppressions)?;
+        promote_preferred_text_index(preferred, candidates, protected_prefix)
     }
 
     /// Promotes evidence learned under a verified complete code into one
@@ -679,6 +693,7 @@ impl PersonalRankingSnapshot {
     /// the source evidence really names a complete public-dictionary spelling;
     /// arbitrary aliases and freely segmented sentences therefore do not
     /// become code-family evidence merely because their key length is even.
+    #[cfg(test)]
     pub(crate) fn promote_anchored_suffix_texts_after_with_suppressions(
         &self,
         code: &str,
@@ -687,15 +702,31 @@ impl PersonalRankingSnapshot {
         suppressions: &PersonalRankingSuppressionSnapshot,
         mut exact_full_code_candidate: impl FnMut(&str, &str) -> bool,
     ) -> bool {
-        let Some(preferred) = self.preferred_anchored_suffix_text_where(
+        self.promote_anchored_suffix_texts_after_with_suppressions_index(
+            code,
+            candidates,
+            protected_prefix,
+            suppressions,
+            &mut exact_full_code_candidate,
+        )
+        .is_some()
+    }
+
+    pub(crate) fn promote_anchored_suffix_texts_after_with_suppressions_index(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+        mut exact_full_code_candidate: impl FnMut(&str, &str) -> bool,
+    ) -> Option<usize> {
+        let preferred = self.preferred_anchored_suffix_text_where(
             code,
             candidates,
             suppressions,
             &mut exact_full_code_candidate,
-        ) else {
-            return false;
-        };
-        promote_preferred_text(preferred, candidates, protected_prefix)
+        )?;
+        promote_preferred_text_index(preferred, candidates, protected_prefix)
     }
 
     pub(crate) fn has_anchored_suffix_evidence_with_suppressions(
@@ -809,30 +840,30 @@ impl PersonalRankingSnapshot {
     }
 }
 
-fn promote_preferred_text(
+fn promote_preferred_text_index(
     preferred: &str,
     candidates: &mut Vec<String>,
     protected_prefix: usize,
-) -> bool {
+) -> Option<usize> {
     let protected_prefix = protected_prefix.min(candidates.len());
     let Some(index) = candidates
         .iter()
         .position(|candidate| candidate == preferred)
     else {
         if protected_prefix > 0 && protected_prefix == candidates.len() {
-            return false;
+            return None;
         }
         let original_len = candidates.len();
         candidates.insert(protected_prefix, preferred.to_owned());
         candidates.truncate(original_len.max(1));
-        return true;
+        return (protected_prefix < candidates.len()).then_some(protected_prefix);
     };
     if index <= protected_prefix {
-        return true;
+        return Some(index);
     }
     let candidate = candidates.remove(index);
     candidates.insert(protected_prefix, candidate);
-    true
+    Some(protected_prefix)
 }
 
 fn recall_preferred_text_after_first_ordinary(

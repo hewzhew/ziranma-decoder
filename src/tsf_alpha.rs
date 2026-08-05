@@ -6562,13 +6562,24 @@ impl PersonalRankingRuntime {
         true
     }
 
+    #[cfg(test)]
     fn promote_texts_after(
         &self,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
     ) -> bool {
-        self.snapshot.promote_texts_after_with_suppressions(
+        self.promote_texts_after_index(code, candidates, protected_prefix)
+            .is_some()
+    }
+
+    fn promote_texts_after_index(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> Option<usize> {
+        self.snapshot.promote_texts_after_with_suppressions_index(
             code,
             candidates,
             protected_prefix,
@@ -6576,15 +6587,15 @@ impl PersonalRankingRuntime {
         )
     }
 
-    fn promote_anchored_suffix_texts_after(
+    fn promote_anchored_suffix_texts_after_index(
         &self,
         provider: &dyn CandidateProvider,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-    ) -> bool {
+    ) -> Option<usize> {
         self.snapshot
-            .promote_anchored_suffix_texts_after_with_suppressions(
+            .promote_anchored_suffix_texts_after_with_suppressions_index(
                 code,
                 candidates,
                 protected_prefix,
@@ -7030,20 +7041,24 @@ impl TsfTextService_Impl {
                 .remembered_text(code)
                 .filter(|text| !personal_ranking.is_suppressed(code, text));
             let mut personalized_texts = HashSet::new();
-            let persistent_exact =
-                personal_ranking.promote_texts_after(code, &mut batch.candidates, protected_prefix);
-            let persistent_anchored = if !persistent_exact && session_exact_text.is_none() {
-                personal_ranking.promote_anchored_suffix_texts_after(
-                    provider,
-                    code,
-                    &mut batch.candidates,
-                    protected_prefix,
-                )
-            } else {
-                false
-            };
-            let personal_discovery_index = if !persistent_exact
-                && !persistent_anchored
+            let persistent_exact_index = personal_ranking.promote_texts_after_index(
+                code,
+                &mut batch.candidates,
+                protected_prefix,
+            );
+            let persistent_anchored_index =
+                if persistent_exact_index.is_none() && session_exact_text.is_none() {
+                    personal_ranking.promote_anchored_suffix_texts_after_index(
+                        provider,
+                        code,
+                        &mut batch.candidates,
+                        protected_prefix,
+                    )
+                } else {
+                    None
+                };
+            let personal_discovery_index = if persistent_exact_index.is_none()
+                && persistent_anchored_index.is_none()
                 && session_exact_text.is_none()
                 && automatic_transposition_request.is_none()
             {
@@ -7056,28 +7071,10 @@ impl TsfTextService_Impl {
             } else {
                 None
             };
-            if persistent_exact {
-                for candidate in batch
-                    .candidates
-                    .iter()
-                    .take(protected_prefix.saturating_add(1))
-                {
-                    if !personal_ranking.is_suppressed(code, candidate)
-                        && personal_ranking.has_evidence(code, candidate)
-                    {
-                        personalized_texts.insert(candidate.clone());
-                    }
-                }
-            } else if persistent_anchored {
-                for candidate in batch
-                    .candidates
-                    .iter()
-                    .take(protected_prefix.saturating_add(1))
-                {
-                    if personal_ranking.has_anchored_suffix_evidence(provider, code, candidate) {
-                        personalized_texts.insert(candidate.clone());
-                    }
-                }
+            if let Some(index) = persistent_exact_index.or(persistent_anchored_index)
+                && let Some(candidate) = batch.candidates.get(index)
+            {
+                personalized_texts.insert(candidate.clone());
             }
             if let Some(index) = personal_discovery_index
                 && let Some(candidate) = batch.candidates.get(index)
@@ -7085,48 +7082,32 @@ impl TsfTextService_Impl {
                 personalized_texts.insert(candidate.clone());
             }
             let candidates_before_session = batch.candidates.clone();
-            let session_anchored = if !persistent_exact && session_exact_text.is_none() {
-                selection_memory.promote_anchored_suffix_texts_after(
-                    code,
-                    &mut batch.candidates,
-                    protected_prefix,
-                    |source_code, text| {
-                        !personal_ranking.is_suppressed(code, text)
-                            && !personal_ranking.is_suppressed(source_code, text)
-                            && provider.is_exact_full_code_candidate(source_code, text)
-                    },
-                )
-            } else {
-                false
-            };
-            let session_exact = session_exact_text.is_some()
-                && selection_memory.promote_texts_after(
-                    code,
-                    &mut batch.candidates,
-                    protected_prefix,
-                );
-            if session_exact {
-                if let Some(text) = session_exact_text {
-                    personalized_texts.insert(text.to_owned());
-                }
-            } else if session_anchored {
-                for candidate in batch
-                    .candidates
-                    .iter()
-                    .take(protected_prefix.saturating_add(1))
-                {
-                    if selection_memory.has_anchored_suffix_evidence(
+            let session_anchored_index =
+                if persistent_exact_index.is_none() && session_exact_text.is_none() {
+                    selection_memory.promote_anchored_suffix_texts_after_index(
                         code,
-                        candidate,
+                        &mut batch.candidates,
+                        protected_prefix,
                         |source_code, text| {
                             !personal_ranking.is_suppressed(code, text)
                                 && !personal_ranking.is_suppressed(source_code, text)
                                 && provider.is_exact_full_code_candidate(source_code, text)
                         },
-                    ) {
-                        personalized_texts.insert(candidate.clone());
-                    }
-                }
+                    )
+                } else {
+                    None
+                };
+            let session_exact_index = session_exact_text.and_then(|_| {
+                selection_memory.promote_texts_after_index(
+                    code,
+                    &mut batch.candidates,
+                    protected_prefix,
+                )
+            });
+            if let Some(index) = session_exact_index.or(session_anchored_index)
+                && let Some(candidate) = batch.candidates.get(index)
+            {
+                personalized_texts.insert(candidate.clone());
             }
             let mut session_changed = batch.candidates != candidates_before_session;
             if automatic_transposition_request.is_none()
@@ -9979,6 +9960,26 @@ mod tests {
 
         fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
             code == "jdjd" && text == "讲讲"
+        }
+    }
+
+    struct CountingCodeFamilyCandidateProvider {
+        exact_calls: AtomicUsize,
+    }
+
+    impl CandidateProvider for CountingCodeFamilyCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            CodeFamilyCandidateProvider.candidates(code, limit, view)
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            self.exact_calls.fetch_add(1, Ordering::Relaxed);
+            CodeFamilyCandidateProvider.is_exact_full_code_candidate(code, text)
         }
     }
 
@@ -14850,6 +14851,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exact.candidates, ["降价", "简单", "讲讲"]);
+    }
+
+    #[test]
+    fn inherited_personal_marker_reuses_the_single_public_verification_decision() {
+        let _guard = test_lock();
+        let persistent = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            CodeFamilyCandidateProvider,
+        ))));
+        assert!(
+            persistent
+                .personal_ranking
+                .borrow_mut()
+                .record("jdjd", "讲讲")
+        );
+        let persistent_provider = CountingCodeFamilyCandidateProvider {
+            exact_calls: AtomicUsize::new(0),
+        };
+        let candidates = persistent
+            .load_candidate_batch(
+                &persistent_provider,
+                "jdj",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(candidates.candidates, ["讲讲", "简单", "降价"]);
+        assert_eq!(candidates.personalized, [true, false, false]);
+        assert_eq!(
+            persistent_provider.exact_calls.load(Ordering::Relaxed),
+            1,
+            "the marker must reuse the promotion decision instead of verifying the same source again"
+        );
+
+        let session = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            CodeFamilyCandidateProvider,
+        ))));
+        session
+            .selection_memory
+            .borrow_mut()
+            .remember_text("jdjd", "讲讲");
+        let session_provider = CountingCodeFamilyCandidateProvider {
+            exact_calls: AtomicUsize::new(0),
+        };
+        let candidates = session
+            .load_candidate_batch(
+                &session_provider,
+                "jdj",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(candidates.candidates, ["讲讲", "简单", "降价"]);
+        assert_eq!(candidates.personalized, [true, false, false]);
+        assert_eq!(
+            session_provider.exact_calls.load(Ordering::Relaxed),
+            1,
+            "session markers must also reuse the verified promotion index"
+        );
     }
 
     #[test]
