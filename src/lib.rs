@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::OnceLock;
 
 mod abbreviation;
 mod adaptive_comparison;
@@ -22,6 +23,7 @@ mod adaptive_merge;
 mod adaptive_ranking;
 mod adaptive_scenarios;
 mod candidate_lab;
+mod candidate_layers;
 mod candidate_package;
 mod candidate_provenance;
 mod candidate_runtime;
@@ -40,9 +42,12 @@ mod event_capsule;
 mod explicit_alias;
 mod language_model;
 mod native_feedback;
+mod personal_context;
+mod personal_ranking;
 mod private_session;
 mod protocol_audit;
 mod public_corpus;
+mod public_lexicon_slice;
 mod session_summary;
 mod shape_course;
 mod shape_evaluation;
@@ -52,6 +57,7 @@ mod shape_replay;
 mod single_character_pool;
 mod stroke_data;
 mod tracker;
+mod transposition_calibration;
 #[cfg(windows)]
 mod tsf_alpha;
 mod wish_command;
@@ -110,6 +116,11 @@ pub use candidate_lab::{
     CandidateLabCandidate, CandidateLabError, CandidateLabLane, CandidateLabReport,
     MAX_CANDIDATE_LAB_TOP_K, analyze_candidate_lab,
 };
+pub use candidate_layers::{
+    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CANDIDATE_SUPPLEMENTAL_STATE_SCHEMA_V1,
+    CandidateSupplementalState, CandidateSupplementalStateError,
+    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
+};
 pub use candidate_package::{
     CANDIDATE_PACKAGE_LEXICON_TSV_V1, CANDIDATE_PACKAGE_SCHEMA_V1, CandidatePackageError,
     CandidatePackageManifest, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
@@ -123,8 +134,10 @@ pub use candidate_runtime::{
     CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGES_DIRECTORY,
     CANDIDATE_PREFLIGHT_HOST_V1, CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V2,
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_RUNTIME_DIRECTORY, CANDIDATE_SLOT_STATE_FILE,
-    CandidateRuntimeError, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, candidate_package_storage_id,
-    candidate_preflight_receipt_body, load_current_candidate_snapshot,
+    CandidateRuntimeError, CandidateRuntimeSnapshots, CandidateRuntimeSupplemental,
+    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, candidate_package_storage_id,
+    candidate_preflight_receipt_body, load_candidate_runtime_snapshots,
+    load_current_candidate_snapshot,
 };
 pub use candidate_signature::{
     CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519, CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1,
@@ -136,9 +149,12 @@ pub use candidate_slots::{
     MAX_CANDIDATE_SLOT_STATE_BYTES,
 };
 pub use candidate_snapshot::{
-    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotDescriptor,
-    CandidateSnapshotError, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
-    MAX_CANDIDATE_SNAPSHOT_RANK, candidate_payload_fingerprint,
+    AutomaticTranspositionDecision, AutomaticTranspositionKeepReason,
+    AutomaticTranspositionPromotion, CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot,
+    CandidateSnapshotDescriptor, CandidateSnapshotError, LayeredCandidateTextsError,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    SupplementalCandidateLayerConfig, SupplementalCandidateLayerError,
+    candidate_payload_fingerprint, layered_candidate_texts, merge_candidate_text_layers,
 };
 pub use capsule_replay::{
     CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
@@ -146,7 +162,10 @@ pub use capsule_replay::{
     PairedReplayStrategyStats, PersonalCacheReplayError, PersonalCacheReplayState,
     RankingReplayComparisonStats, ReplayStrategyStats, WindowExclusionStats, effective_letter_code,
 };
-pub use codec::{EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable};
+pub use codec::{
+    EncodedPinyin, PinyinEncodeError, encode_pinyin_phrase, encode_pinyin_syllable,
+    normalize_pinyin_tone_marks,
+};
 pub use composition::{
     CompositionEffect, CompositionInput, CompositionPunctuation, CompositionSession,
     SessionSelectionMemory,
@@ -173,8 +192,9 @@ pub use continuous_capture::{
     ProtectedSegmentWriter, ProtectedSegmentWriterConfig, SegmentCloseReason, SegmentWriteReceipt,
 };
 pub use correction_episode::{
-    CorrectionCandidate, CorrectionCandidateDetector, CorrectionCandidateForm,
-    CorrectionCandidateKind, CorrectionDetectorError,
+    CommitTailTrimDetector, CommitTailTrimObservation, CorrectionCandidate,
+    CorrectionCandidateDetector, CorrectionCandidateForm, CorrectionCandidateKind,
+    CorrectionDetectorError,
 };
 pub use double_pinyin_paint::{
     HALF_PAIR_PAINT_PROFILES, HALF_PAIR_SYNTHETIC_CADENCES, HalfPairFrameDisposition,
@@ -216,15 +236,41 @@ pub use language_model::{
 };
 pub use native_feedback::{
     DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS, DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES,
+    DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
     DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
     FrozenNativeFeedbackEvent, FrozenNativeFeedbackSnapshot, MAX_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS,
-    NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
+    NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateProvenance,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackAuthorization,
     NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
     NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError, NativeFeedbackLifecycle,
     NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
     NativeFeedbackStartResult, NativeFeedbackStopReason, NativeFeedbackStopResult,
     NativeFeedbackSummary, NativeSelectionSource,
+};
+pub use personal_context::{
+    MAX_PERSONAL_CONTEXT_CODE_KEYS, MAX_PERSONAL_CONTEXT_ENTRIES,
+    MAX_PERSONAL_CONTEXT_TEXT_CHARACTERS, PERSONAL_CONTEXT_REJECTION_CAP,
+    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_CONTEXT_SUPPORT_CAP, PersonalContextError,
+    PersonalContextRanking,
+};
+pub use personal_ranking::{
+    LoadedPersonalRanking, LoadedPersonalRankingSuppressions, MAX_PERSONAL_RANKING_BATCH_EVENTS,
+    MAX_PERSONAL_RANKING_BATCH_FILES, MAX_PERSONAL_RANKING_CHECKPOINT_FILES,
+    MAX_PERSONAL_RANKING_ENTRIES, MAX_PERSONAL_RANKING_SUPPRESSION_ACTION_FILES,
+    MIN_PERSONAL_RANKING_CHECKPOINT_BATCHES, PERSONAL_RANKING_BATCH_EXTENSION,
+    PERSONAL_RANKING_BATCH_SCHEMA_V1, PERSONAL_RANKING_CHECKPOINT_EXTENSION,
+    PERSONAL_RANKING_CHECKPOINT_SCHEMA_V1, PERSONAL_RANKING_SUPPRESSION_ACTION_EXTENSION,
+    PERSONAL_RANKING_SUPPRESSION_ACTION_SCHEMA_V1, PERSONAL_RANKING_SUPPRESSION_DIRECTORY,
+    PersonalRankingBatch, PersonalRankingError, PersonalRankingSelection, PersonalRankingSnapshot,
+    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
+    PersonalRankingSuppressionSnapshot, load_personal_ranking, load_personal_ranking_suppressions,
+    personal_ranking_package_file, personal_ranking_suppression_package_file,
+    protect_personal_ranking_batch, protect_personal_ranking_suppression_action,
+    refresh_personal_ranking, refresh_personal_ranking_suppressions, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action,
+    unprotect_personal_ranking_batch, unprotect_personal_ranking_suppression_action,
 };
 pub use private_session::{
     ProtectedSessionError, ProtectedSessionErrorKind, ProtectedSessionReader,
@@ -247,6 +293,13 @@ pub use public_corpus::{
     UdCorpusParseError, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_calibration_cases, select_public_continuous_composition_cases,
     select_public_protocol_audit_cases,
+};
+pub use public_lexicon_slice::{
+    MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, PublicLexiconComparison, PublicRimeSliceConfig,
+    PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats,
+    PublicSupplementalLayerAudit, PublicSupplementalLayerAuditError,
+    audit_public_supplemental_layer, compare_public_lexicons, parse_public_rime_slice,
 };
 pub use session_summary::{
     AggregatedSessionSummary, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryError,
@@ -281,6 +334,11 @@ pub use tracker::{
     CommitRecord, DeltaPositionEvidence, LocalInputTracker, RawKey, RevisionRecord, TextDelta,
     TextSelection, TrackerOutput, single_span_delta, single_span_delta_with_selection,
 };
+pub use transposition_calibration::{
+    TranspositionCalibrationConfig, TranspositionCalibrationError, TranspositionCalibrationLabel,
+    TranspositionCalibrationObservation, TranspositionCalibrationRecommendation,
+    TranspositionCalibrationSummary, TranspositionCalibrator,
+};
 #[cfg(windows)]
 pub use wish_command::{WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID};
 pub use wish_command::{
@@ -289,9 +347,10 @@ pub use wish_command::{
 };
 pub use wish_feedback::{
     MAX_WISH_NOTE_BYTES, MAX_WISH_PACKAGE_BYTES, WISH_NOTE_FILE_SUFFIX, WISH_PACKAGE_FILE_SUFFIX,
-    WISH_SCHEMA_V1, WishCategory, WishFeedbackError, WishNote, WishPackageInfo, WishSaveReceipt,
-    WishSnapshot, list_wish_packages, load_wish_note, load_wish_snapshot, move_wish_to_trash,
-    save_wish_note, save_wish_snapshot,
+    WISH_SCHEMA_V1, WISH_SCHEMA_V2, WISH_SCHEMA_V3, WISH_SCHEMA_V4, WISH_SCHEMA_V5,
+    WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishNote, WishPackageInfo,
+    WishSaveReceipt, WishSnapshot, list_wish_packages, load_wish_note, load_wish_snapshot,
+    move_wish_to_trash, save_or_replace_wish_note, save_wish_note, save_wish_snapshot,
 };
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;
@@ -3346,6 +3405,59 @@ pub struct RimeLexiconImportStats {
     pub too_many_syllable_rows: usize,
     /// Rows skipped because the same text and Ziranma code already appeared.
     pub duplicate_rows: usize,
+    /// Shadowed traditional single-character readings skipped by the pinned
+    /// simplified-Rime importer.
+    pub shadowed_traditional_single_character_rows: usize,
+}
+
+const SHADOWED_TRADITIONAL_SINGLE_CHARACTER_READINGS: &str = include_str!(
+    "../data/public/rime-pinyin-simp/shadowed-traditional-single-character-readings.txt"
+);
+
+#[derive(Debug)]
+struct ShadowedTraditionalSingleCharacterReadings {
+    characters: HashSet<char>,
+    retained_readings: HashSet<(&'static str, &'static str)>,
+}
+
+fn shadowed_traditional_single_character_readings()
+-> &'static ShadowedTraditionalSingleCharacterReadings {
+    static READINGS: OnceLock<ShadowedTraditionalSingleCharacterReadings> = OnceLock::new();
+    READINGS.get_or_init(|| {
+        let mut characters = HashSet::new();
+        let mut retained_readings = HashSet::new();
+        for line in SHADOWED_TRADITIONAL_SINGLE_CHARACTER_READINGS.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(reading) = line.strip_prefix("!keep\t") {
+                let (text, pinyin) = reading
+                    .split_once('\t')
+                    .expect("pinned retained reading must contain text and pinyin");
+                retained_readings.insert((text, pinyin));
+                continue;
+            }
+            characters.extend(line.chars().filter(|character| !character.is_whitespace()));
+        }
+        ShadowedTraditionalSingleCharacterReadings {
+            characters,
+            retained_readings,
+        }
+    })
+}
+
+fn is_shadowed_traditional_single_character_reading(text: &str, pinyin: &str) -> bool {
+    let mut characters = text.chars();
+    let Some(character) = characters.next() else {
+        return false;
+    };
+    if characters.next().is_some() {
+        return false;
+    }
+    let readings = shadowed_traditional_single_character_readings();
+    readings.characters.contains(&character)
+        && !readings.retained_readings.contains(&(text, pinyin))
 }
 
 /// Imports the standard three-column body of a Rime YAML dictionary.
@@ -3355,6 +3467,25 @@ pub struct RimeLexiconImportStats {
 /// unsupported pinyin, overlong entries, and duplicate text/code pairs are
 /// skipped and counted explicitly.
 pub fn parse_rime_lexicon(contents: &str) -> Result<RimeLexiconImport, RimeLexiconParseError> {
+    parse_rime_lexicon_with_options(contents, false)
+}
+
+/// Imports the pinned `rime-pinyin-simp` snapshot while omitting conservative,
+/// auditable traditional single-character duplicates.
+///
+/// The filter is derived from pinned Rime and OpenCC revisions. It only omits
+/// a reading when the same pinyin has a different simplified character with
+/// an equal or greater source weight. Multi-character entries are untouched.
+pub fn parse_simplified_rime_lexicon(
+    contents: &str,
+) -> Result<RimeLexiconImport, RimeLexiconParseError> {
+    parse_rime_lexicon_with_options(contents, true)
+}
+
+fn parse_rime_lexicon_with_options(
+    contents: &str,
+    omit_shadowed_traditional_single_characters: bool,
+) -> Result<RimeLexiconImport, RimeLexiconParseError> {
     let mut saw_document_start = false;
     let mut saw_data_marker = false;
     let mut entries = Vec::new();
@@ -3390,6 +3521,12 @@ pub fn parse_rime_lexicon(contents: &str) -> Result<RimeLexiconImport, RimeLexic
                 })?;
         if source_weight == 0 {
             stats.zero_weights_floored += 1;
+        }
+        if omit_shadowed_traditional_single_characters
+            && is_shadowed_traditional_single_character_reading(fields[0], fields[1])
+        {
+            stats.shadowed_traditional_single_character_rows += 1;
+            continue;
         }
 
         let encoded = match encode_pinyin_phrase(fields[1]) {
@@ -3756,7 +3893,7 @@ mod tests {
         KeySequence, LexiconEntry, SentenceCandidate, SentenceLattice, SentenceRankingState,
         SentenceSearchStats, SentenceSegment, are_qwerty_neighbors, candidate_order,
         collapse_error_layers, detect_correction, key_hypotheses, parse_lexicon_tsv,
-        parse_rime_lexicon, sentence_order, spelling_variants,
+        parse_rime_lexicon, parse_simplified_rime_lexicon, sentence_order, spelling_variants,
     };
 
     const FIXTURE: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -3804,6 +3941,61 @@ name: test
         assert!(parse_rime_lexicon("name: test\n...\n你\tni\t1\n").is_err());
         assert!(parse_rime_lexicon("---\nname: test\n你\tni\t1\n").is_err());
         assert!(parse_rime_lexicon("---\n...\n你\tni\tmany\n").is_err());
+    }
+
+    #[test]
+    fn simplified_rime_import_omits_only_pinned_shadowed_single_readings() {
+        let fixture = "---\nname: test\n...\n\
+說\tshuo\t621\n\
+说\tshuo\t338803\n\
+比如說\tbi ru shuo\t10\n\
+比如说\tbi ru shuo\t20\n\
+乾\tgan\t10\n\
+乾\tqian\t10\n\
+乾隆\tqian long\t10\n\
+乾坤\tqian kun\t10\n\
+哪吒\tna zha\t10\n";
+
+        let generic = parse_rime_lexicon(fixture).unwrap();
+        assert!(generic.entries.iter().any(|entry| entry.text == "說"));
+        assert!(
+            generic
+                .entries
+                .iter()
+                .any(|entry| entry.text == "乾" && entry.pinyin == "gan")
+        );
+
+        let simplified = parse_simplified_rime_lexicon(fixture).unwrap();
+        assert_eq!(
+            simplified
+                .entries
+                .iter()
+                .map(|entry| (entry.text.as_str(), entry.pinyin.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("说", "shuo"),
+                ("比如說", "bi ru shuo"),
+                ("比如说", "bi ru shuo"),
+                ("乾", "qian"),
+                ("乾隆", "qian long"),
+                ("乾坤", "qian kun"),
+                ("哪吒", "na zha"),
+            ]
+        );
+        assert_eq!(
+            simplified.stats.shadowed_traditional_single_character_rows,
+            2
+        );
+        assert_eq!(generic.stats.shadowed_traditional_single_character_rows, 0);
+    }
+
+    #[test]
+    fn pinned_shadowed_reading_audit_has_stable_bounds() {
+        let readings = super::shadowed_traditional_single_character_readings();
+        assert_eq!(readings.characters.len(), 2_359);
+        assert_eq!(readings.retained_readings.len(), 7);
+        assert!(readings.characters.contains(&'說'));
+        assert!(readings.retained_readings.contains(&("乾", "qian")));
     }
 
     #[test]

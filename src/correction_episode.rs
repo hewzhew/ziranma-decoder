@@ -42,6 +42,303 @@ pub struct CorrectionCandidate {
     pub form: CorrectionCandidateForm,
 }
 
+/// One structurally observed suffix trim of text inserted by the immediately
+/// preceding input-method commit.
+///
+/// The observation contains private composition and document text. Its custom
+/// `Debug` implementation therefore exposes only counts and structural
+/// metadata. A trim is evidence about an edit, not proof that the retained
+/// prefix is an intended new word.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommitTailTrimObservation {
+    source_commit_sequence: u64,
+    trim_sequence: u64,
+    commit_elapsed_ms: u64,
+    trim_elapsed_ms: u64,
+    start: usize,
+    composition: String,
+    committed_text: String,
+    retained_text: String,
+    removed_suffix: String,
+    commit_keys: Vec<RawKey>,
+    trim_keys: Vec<RawKey>,
+    keys_complete: bool,
+    position_evidence: DeltaPositionEvidence,
+}
+
+impl fmt::Debug for CommitTailTrimObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommitTailTrimObservation")
+            .field("source_commit_sequence", &self.source_commit_sequence)
+            .field("trim_sequence", &self.trim_sequence)
+            .field("gap_ms", &self.gap_ms())
+            .field("start", &self.start)
+            .field("committed_characters", &self.committed_text.chars().count())
+            .field("retained_characters", &self.retained_text.chars().count())
+            .field("removed_characters", &self.removed_suffix.chars().count())
+            .field("commit_key_actions", &self.commit_keys.len())
+            .field("trim_key_actions", &self.trim_keys.len())
+            .field("keys_complete", &self.keys_complete)
+            .field("position_evidence", &self.position_evidence)
+            .field("debug_contains_text", &false)
+            .finish()
+    }
+}
+
+impl CommitTailTrimObservation {
+    pub fn source_commit_sequence(&self) -> u64 {
+        self.source_commit_sequence
+    }
+
+    pub fn trim_sequence(&self) -> u64 {
+        self.trim_sequence
+    }
+
+    pub fn gap_ms(&self) -> u64 {
+        self.trim_elapsed_ms - self.commit_elapsed_ms
+    }
+
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    pub fn composition(&self) -> &str {
+        &self.composition
+    }
+
+    pub fn committed_text(&self) -> &str {
+        &self.committed_text
+    }
+
+    pub fn retained_text(&self) -> &str {
+        &self.retained_text
+    }
+
+    pub fn removed_suffix(&self) -> &str {
+        &self.removed_suffix
+    }
+
+    pub fn commit_keys(&self) -> &[RawKey] {
+        &self.commit_keys
+    }
+
+    pub fn trim_keys(&self) -> &[RawKey] {
+        &self.trim_keys
+    }
+
+    pub fn keys_complete(&self) -> bool {
+        self.keys_complete
+    }
+
+    pub fn position_evidence(&self) -> DeltaPositionEvidence {
+        self.position_evidence
+    }
+
+    /// Derives one conservative complete-double-pinyin prefix proposal.
+    ///
+    /// This succeeds only when the recorded key actions reduce to lowercase
+    /// letters followed by one selection key, every committed character maps
+    /// to exactly two letters, and the trim retains a non-empty proper prefix.
+    /// The result is still a proposal for review, never an automatic truth.
+    pub fn retained_full_code_identity(&self) -> Option<(String, String)> {
+        if !self.keys_complete {
+            return None;
+        }
+        let code = effective_selected_letter_code(&self.commit_keys)?;
+        let committed_characters = self.committed_text.chars().count();
+        let retained_characters = self.retained_text.chars().count();
+        if committed_characters == 0
+            || retained_characters == 0
+            || retained_characters >= committed_characters
+            || code.len() != committed_characters.checked_mul(2)?
+        {
+            return None;
+        }
+        let retained_code_bytes = retained_characters.checked_mul(2)?;
+        Some((
+            code.get(..retained_code_bytes)?.to_owned(),
+            self.retained_text.clone(),
+        ))
+    }
+}
+
+/// Groups only immediately adjacent suffix deletions with their source commit.
+///
+/// No time threshold participates in matching. Elapsed time is retained as
+/// descriptive evidence so later analysis can study cadence without turning
+/// an arbitrary notion of "fast" into an intent label.
+pub struct CommitTailTrimDetector {
+    next_sequence: u64,
+    last_elapsed_ms: Option<u64>,
+    recent_commit: Option<RecentTailCommit>,
+}
+
+struct RecentTailCommit {
+    source_sequence: u64,
+    last_sequence: u64,
+    elapsed_ms: u64,
+    start: usize,
+    composition: String,
+    original_text: String,
+    current_text: String,
+    keys: Vec<RawKey>,
+    keys_complete: bool,
+}
+
+impl fmt::Debug for CommitTailTrimDetector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommitTailTrimDetector")
+            .field("next_sequence", &self.next_sequence)
+            .field("last_elapsed_ms", &self.last_elapsed_ms)
+            .field("has_recent_commit", &self.recent_commit.is_some())
+            .field("debug_contains_text", &false)
+            .finish()
+    }
+}
+
+impl Default for CommitTailTrimDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommitTailTrimDetector {
+    pub fn new() -> Self {
+        Self {
+            next_sequence: 0,
+            last_elapsed_ms: None,
+            recent_commit: None,
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        elapsed_ms: u64,
+        output: TrackerOutput,
+    ) -> Result<Option<CommitTailTrimObservation>, CorrectionDetectorError> {
+        if let Some(previous_ms) = self.last_elapsed_ms
+            && elapsed_ms < previous_ms
+        {
+            return Err(CorrectionDetectorError::TimestampMovedBackward {
+                previous_ms,
+                current_ms: elapsed_ms,
+            });
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.last_elapsed_ms = Some(elapsed_ms);
+
+        match output {
+            TrackerOutput::Commit(record) => {
+                self.recent_commit = (!record.document_change.inserted.is_empty()
+                    && reliable_position(record.document_change.position_evidence))
+                .then(|| RecentTailCommit {
+                    source_sequence: sequence,
+                    last_sequence: sequence,
+                    elapsed_ms,
+                    start: record.document_change.start,
+                    composition: record.composition,
+                    original_text: record.document_change.inserted.clone(),
+                    current_text: record.document_change.inserted,
+                    keys: record.keys,
+                    keys_complete: record.keys_complete,
+                });
+                Ok(None)
+            }
+            TrackerOutput::Revision(record) => {
+                let Some(commit) = self.recent_commit.as_mut() else {
+                    return Ok(None);
+                };
+                let deletion = &record.change;
+                let commit_end = commit
+                    .start
+                    .saturating_add(commit.current_text.chars().count());
+                let deletion_end = deletion
+                    .start
+                    .saturating_add(deletion.deleted.chars().count());
+                if commit.last_sequence.saturating_add(1) != sequence
+                    || !deletion.inserted.is_empty()
+                    || deletion.deleted.is_empty()
+                    || !reliable_position(deletion.position_evidence)
+                    || deletion.start < commit.start
+                    || deletion_end != commit_end
+                {
+                    self.recent_commit = None;
+                    return Ok(None);
+                }
+                let retained_characters = deletion.start - commit.start;
+                let Some((retained, removed_now)) =
+                    split_at_character(&commit.current_text, retained_characters)
+                else {
+                    self.recent_commit = None;
+                    return Ok(None);
+                };
+                if removed_now != deletion.deleted {
+                    self.recent_commit = None;
+                    return Ok(None);
+                }
+                let Some((_, removed_suffix)) =
+                    split_at_character(&commit.original_text, retained_characters)
+                else {
+                    self.recent_commit = None;
+                    return Ok(None);
+                };
+                commit.current_text = retained.clone();
+                commit.last_sequence = sequence;
+                Ok(Some(CommitTailTrimObservation {
+                    source_commit_sequence: commit.source_sequence,
+                    trim_sequence: sequence,
+                    commit_elapsed_ms: commit.elapsed_ms,
+                    trim_elapsed_ms: elapsed_ms,
+                    start: commit.start,
+                    composition: commit.composition.clone(),
+                    committed_text: commit.original_text.clone(),
+                    retained_text: retained,
+                    removed_suffix,
+                    commit_keys: commit.keys.clone(),
+                    trim_keys: record.keys,
+                    keys_complete: commit.keys_complete && record.keys_complete,
+                    position_evidence: deletion.position_evidence,
+                }))
+            }
+        }
+    }
+}
+
+fn split_at_character(text: &str, character_offset: usize) -> Option<(String, String)> {
+    let byte_offset = if character_offset == text.chars().count() {
+        text.len()
+    } else {
+        text.char_indices().nth(character_offset)?.0
+    };
+    Some((
+        text.get(..byte_offset)?.to_owned(),
+        text.get(byte_offset..)?.to_owned(),
+    ))
+}
+
+fn effective_selected_letter_code(keys: &[RawKey]) -> Option<String> {
+    let mut code = String::new();
+    let mut selected = false;
+    for key in keys {
+        match key {
+            RawKey::Letter(letter) if !selected && letter.is_ascii_lowercase() => {
+                code.push(*letter);
+            }
+            RawKey::Backspace if !selected => {
+                code.pop()?;
+            }
+            RawKey::Digit(_) | RawKey::Space if !selected && !code.is_empty() => {
+                selected = true;
+            }
+            _ => return None,
+        }
+    }
+    selected.then_some(code)
+}
+
 impl CorrectionCandidate {
     pub fn gap_ms(&self) -> u64 {
         self.replacement_elapsed_ms - self.deletion_elapsed_ms
@@ -327,8 +624,8 @@ fn deletion_is_within_commit(deletion: &TextDelta, commit: &RecentCommit) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        CorrectionCandidateDetector, CorrectionCandidateForm, CorrectionCandidateKind,
-        CorrectionDetectorError,
+        CommitTailTrimDetector, CorrectionCandidateDetector, CorrectionCandidateForm,
+        CorrectionCandidateKind, CorrectionDetectorError,
     };
     use crate::{
         CommitRecord, DeltaPositionEvidence, RawKey, RevisionRecord, TextDelta, TrackerOutput,
@@ -592,5 +889,150 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(candidate.replacement_sequence, 1);
+    }
+
+    #[test]
+    fn observes_an_adjacent_commit_suffix_trim_without_a_speed_threshold() {
+        let mut detector = CommitTailTrimDetector::new();
+        let keys = "xmuufu"
+            .chars()
+            .map(RawKey::Letter)
+            .chain(std::iter::once(RawKey::Space))
+            .collect();
+        assert_eq!(
+            detector
+                .observe(100, commit(0, "xmuufu", "线束缚", keys, true))
+                .unwrap(),
+            None
+        );
+
+        let observation = detector
+            .observe(
+                900_000,
+                deletion(2, "缚", DeltaPositionEvidence::Caret, true),
+            )
+            .unwrap()
+            .expect("the structural suffix relation does not depend on speed");
+        assert_eq!(observation.source_commit_sequence(), 0);
+        assert_eq!(observation.trim_sequence(), 1);
+        assert_eq!(observation.gap_ms(), 899_900);
+        assert_eq!(observation.committed_text(), "线束缚");
+        assert_eq!(observation.retained_text(), "线束");
+        assert_eq!(observation.removed_suffix(), "缚");
+        assert_eq!(
+            observation.retained_full_code_identity(),
+            Some(("xmuu".to_owned(), "线束".to_owned()))
+        );
+        let debug = format!("{observation:?}");
+        assert!(!debug.contains("线束"));
+        assert!(!debug.contains("xmuufu"));
+        assert!(debug.contains("debug_contains_text: false"));
+    }
+
+    #[test]
+    fn consecutive_suffix_trims_stay_attached_to_the_original_commit() {
+        let mut detector = CommitTailTrimDetector::new();
+        let keys = "xmuufu"
+            .chars()
+            .map(RawKey::Letter)
+            .chain(std::iter::once(RawKey::Digit(2)))
+            .collect();
+        detector
+            .observe(10, commit(4, "xmuufu", "线束缚", keys, true))
+            .unwrap();
+        let first = detector
+            .observe(
+                20,
+                deletion(6, "缚", DeltaPositionEvidence::UniqueText, true),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.retained_text(), "线束");
+
+        let second = detector
+            .observe(30, deletion(5, "束", DeltaPositionEvidence::Caret, true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.source_commit_sequence(), 0);
+        assert_eq!(second.retained_text(), "线");
+        assert_eq!(second.removed_suffix(), "束缚");
+        assert_eq!(
+            second.retained_full_code_identity(),
+            Some(("xm".to_owned(), "线".to_owned()))
+        );
+    }
+
+    #[test]
+    fn tail_trim_rejects_middle_ambiguous_and_interrupted_edits() {
+        let mut middle = CommitTailTrimDetector::new();
+        middle
+            .observe(0, commit(0, "abc", "甲乙丙", vec![RawKey::Space], true))
+            .unwrap();
+        assert_eq!(
+            middle
+                .observe(1, deletion(1, "乙", DeltaPositionEvidence::Caret, true),)
+                .unwrap(),
+            None
+        );
+
+        let mut ambiguous = CommitTailTrimDetector::new();
+        ambiguous
+            .observe(0, commit(0, "abc", "甲乙丙", vec![RawKey::Space], true))
+            .unwrap();
+        assert_eq!(
+            ambiguous
+                .observe(1, deletion(2, "丙", DeltaPositionEvidence::Ambiguous, true),)
+                .unwrap(),
+            None
+        );
+
+        let mut interrupted = CommitTailTrimDetector::new();
+        interrupted
+            .observe(0, commit(0, "abc", "甲乙丙", vec![RawKey::Space], true))
+            .unwrap();
+        interrupted
+            .observe(
+                1,
+                TrackerOutput::Revision(RevisionRecord {
+                    keys: vec![RawKey::Letter('a')],
+                    keys_complete: true,
+                    change: TextDelta {
+                        start: 3,
+                        deleted: String::new(),
+                        inserted: "丁".to_owned(),
+                        position_evidence: DeltaPositionEvidence::Caret,
+                    },
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            interrupted
+                .observe(2, deletion(2, "丙", DeltaPositionEvidence::Caret, true),)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn trim_observation_keeps_incomplete_or_nonuniform_codes_out_of_word_proposals() {
+        let mut detector = CommitTailTrimDetector::new();
+        detector
+            .observe(
+                0,
+                commit(
+                    0,
+                    "xmuuf",
+                    "线束缚",
+                    vec![RawKey::Letter('x'), RawKey::Space],
+                    false,
+                ),
+            )
+            .unwrap();
+        let observation = detector
+            .observe(1, deletion(2, "缚", DeltaPositionEvidence::Caret, true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.retained_full_code_identity(), None);
+        assert!(!observation.keys_complete());
     }
 }

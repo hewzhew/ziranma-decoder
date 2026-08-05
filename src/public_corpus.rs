@@ -1105,7 +1105,8 @@ mod tests {
 
     use crate::{
         BigramLanguageModel, CharacterBigramLanguageModel, audit_anchored_tail_failures,
-        audit_public_protocol_context, audit_public_protocols, parse_rime_lexicon, parse_ud_conllu,
+        audit_public_protocol_context, audit_public_protocols,
+        parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_continuous_composition_cases, select_public_protocol_audit_cases,
     };
@@ -1141,7 +1142,7 @@ mod tests {
 
         let model = BigramLanguageModel::from_token_sequences(&first.sequences, &lexicon).unwrap();
         let stats = model.stats();
-        assert_eq!(stats.vocabulary_size, 64_422);
+        assert_eq!(stats.vocabulary_size, 62_071);
         assert_eq!(stats.observed_pair_types, 40_299);
         assert_eq!(stats.observed_predecessor_types, 8_890);
         assert_eq!(stats.observed_pair_instances, 49_373);
@@ -1270,7 +1271,7 @@ mod tests {
         assert_eq!(failure_report.boundary_recovered_at_1, 0);
         assert_eq!(failure_report.baseline_top_same_length, 24);
         assert_eq!(failure_report.failures_with_word_code_collision, 24);
-        assert_eq!(failure_report.maximum_expected_word_code_fanout, 312);
+        assert_eq!(failure_report.maximum_expected_word_code_fanout, 282);
         assert_eq!(failure_report.recovered_net_actions_saved, 0);
 
         let fit_model =
@@ -1286,7 +1287,7 @@ mod tests {
                 context_report.full_code.repaired_into_top_10,
                 context_report.full_code.dropped_out_of_top_10,
             ),
-            (87, 116, 120, 1, 3)
+            (87, 116, 121, 2, 3)
         );
         assert_eq!(
             (

@@ -23,6 +23,18 @@ snapshot hash, and transformation notes are retained beside the data.
 This notice applies to the vendored dictionary data. It does not imply that
 Rime, Android, or their contributors endorse this experiment.
 
+## OpenCC TSCharacters mapping
+
+The derived simplified-import audit list beside the Rime snapshot uses
+[`BYVoid/OpenCC`](https://github.com/BYVoid/OpenCC)
+`data/dictionary/TSCharacters.txt`, pinned to commit
+`6b1538b5a1ad15c9025be0306a17b95ac897fa5e`. OpenCC distributes this mapping
+under the Apache License, Version 2.0. The exact source URL, source SHA-256,
+derivation rule, retained-reading exceptions, and output counts are recorded
+in `data/public/rime-pinyin-simp/shadowed-traditional-single-character-readings.txt`.
+The mapping is not loaded at runtime and this notice does not imply OpenCC
+endorsement.
+
 ## UD Chinese GSDSimp
 
 The unchanged public CoNLL-U test snapshot under

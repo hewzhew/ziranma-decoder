@@ -12,8 +12,8 @@ use ziranma_core::{
     PHRASE_TRIM_MAX_GAP_MS, PUBLIC_CONTEXT_REPLAY_POOL_DEPTH, PairedReplayStrategyStats,
     PersonalCacheReplayState, PrivateShapeActionComparisonStats, PrivateShapeReplayAudit,
     RankingReplayComparisonStats, RawKey, ReplayStrategyStats, SegmentCloseReason, TrackerOutput,
-    parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu,
-    select_public_bigram_training_sequences,
+    parse_simplified_rime_lexicon as parse_rime_lexicon, parse_stroke_sequence_tsv,
+    parse_ud_conllu, select_public_bigram_training_sequences,
 };
 #[cfg(windows)]
 use ziranma_core::{
@@ -2169,8 +2169,9 @@ mod tests {
         CaptureSessionKind, CharacterBigramLanguageModel, CommitRecord, ContinuousSegmentMetadata,
         Decoder, DeltaPositionEvidence, EventCapsuleV1, KeySequence, PairedReplayStrategyStats,
         PersonalCacheReplayState, RankingReplayComparisonStats, RawKey, ReplayStrategyStats,
-        SegmentCloseReason, TextDelta, TimedTrackerOutput, TrackerOutput, parse_rime_lexicon,
-        parse_ud_conllu, select_public_bigram_training_sequences,
+        SegmentCloseReason, TextDelta, TimedTrackerOutput, TrackerOutput,
+        parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
+        select_public_bigram_training_sequences,
     };
     #[cfg(windows)]
     use ziranma_core::{

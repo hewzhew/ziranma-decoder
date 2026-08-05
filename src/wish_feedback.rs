@@ -12,12 +12,28 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
+#[cfg(windows)]
+use windows::core::PCWSTR;
+
 use crate::{
-    DataProtector, FrozenNativeFeedbackSnapshot, NativeCancellationSource, NativeCandidateView,
-    NativeFeedbackEvent, NativeSelectionSource, candidate_sha256_hex,
+    DataProtector, FrozenNativeFeedbackEvent, FrozenNativeFeedbackSnapshot,
+    NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateProvenance,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
+    TranspositionCalibrationLabel, TranspositionCalibrationObservation, candidate_sha256_hex,
 };
 
 pub const WISH_SCHEMA_V1: &str = "ziranma-wish-v1";
+pub const WISH_SCHEMA_V2: &str = "ziranma-wish-v2";
+pub const WISH_SCHEMA_V3: &str = "ziranma-wish-v3";
+pub const WISH_SCHEMA_V4: &str = "ziranma-wish-v4";
+pub const WISH_SCHEMA_V5: &str = "ziranma-wish-v5";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -26,7 +42,11 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-const WISH_PLAINTEXT_MAGIC: &[u8] = b"ziranma-wish-v1\0";
+const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
+const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
+const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
+const WISH_PLAINTEXT_MAGIC_V4: &[u8] = b"ziranma-wish-v4\0";
+const WISH_PLAINTEXT_MAGIC_V5: &[u8] = b"ziranma-wish-v5\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-note-dpapi-v1\0";
@@ -34,6 +54,47 @@ const WISH_ID_PREFIX: &str = "wish-";
 const WISH_ID_HEX_BYTES: usize = 64;
 const WISH_TRASH_DIRECTORY: &str = "trash";
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WishCaptureScope {
+    LegacyWindow,
+    RecentEpisodes,
+    RecentWindow,
+}
+
+impl WishCaptureScope {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::LegacyWindow => "legacy-window",
+            Self::RecentEpisodes => "recent-episodes",
+            Self::RecentWindow => "recent-window",
+        }
+    }
+
+    fn encoded(self) -> u8 {
+        match self {
+            Self::LegacyWindow => 1,
+            Self::RecentEpisodes => 2,
+            Self::RecentWindow => 3,
+        }
+    }
+
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::LegacyWindow),
+            2 => Some(Self::RecentEpisodes),
+            3 => Some(Self::RecentWindow),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WishEventRole {
+    Context,
+    Focus,
+    Trigger,
+}
 
 /// One private event loaded from or prepared for a wish package.
 ///
@@ -59,6 +120,10 @@ impl WishEvent {
 /// This type deliberately does not implement `Debug`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct WishSnapshot {
+    capture_scope: WishCaptureScope,
+    category: WishCategory,
+    focus_event_start: usize,
+    focus_event_count: usize,
     lookback_ms: u32,
     source_complete: bool,
     source_events: usize,
@@ -70,7 +135,25 @@ pub struct WishSnapshot {
 
 impl WishSnapshot {
     pub fn from_frozen(snapshot: &FrozenNativeFeedbackSnapshot) -> Result<Self, WishFeedbackError> {
+        Self::from_frozen_with_metadata(
+            snapshot,
+            WishCaptureScope::RecentWindow,
+            WishCategory::Other,
+        )
+    }
+
+    pub fn from_frozen_with_metadata(
+        snapshot: &FrozenNativeFeedbackSnapshot,
+        capture_scope: WishCaptureScope,
+        category: WishCategory,
+    ) -> Result<Self, WishFeedbackError> {
+        let (focus_event_start, focus_event_count) =
+            latest_completed_episode_range(snapshot.events());
         let value = Self {
+            capture_scope,
+            category,
+            focus_event_start,
+            focus_event_count,
             lookback_ms: snapshot.lookback_ms(),
             source_complete: snapshot.source_complete(),
             source_events: snapshot.source_events(),
@@ -88,6 +171,35 @@ impl WishSnapshot {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    pub fn capture_scope(&self) -> WishCaptureScope {
+        self.capture_scope
+    }
+
+    pub fn category(&self) -> WishCategory {
+        self.category
+    }
+
+    pub fn focus_event_range(&self) -> std::ops::Range<usize> {
+        self.focus_event_start
+            ..self
+                .focus_event_start
+                .saturating_add(self.focus_event_count)
+    }
+
+    pub fn event_role(&self, index: usize) -> Option<WishEventRole> {
+        if index >= self.events.len() {
+            return None;
+        }
+        let focus = self.focus_event_range();
+        Some(if index < focus.start {
+            WishEventRole::Context
+        } else if index < focus.end {
+            WishEventRole::Focus
+        } else {
+            WishEventRole::Trigger
+        })
     }
 
     pub fn lookback_ms(&self) -> u32 {
@@ -118,8 +230,149 @@ impl WishSnapshot {
         &self.events
     }
 
+    /// Reduces automatic-transposition candidate frames and their terminal
+    /// selection into bounded calibration observations.
+    ///
+    /// Only a visible recovery candidate followed by a commit for the same
+    /// code can become accepted or rejected. Shadow hits, cancellation,
+    /// continued typing and incomplete tails remain unknown.
+    pub fn automatic_transposition_observations(
+        &self,
+    ) -> Result<Vec<TranspositionCalibrationObservation>, WishFeedbackError> {
+        struct PendingDecision {
+            code: String,
+            decision: NativeAutomaticTranspositionDecision,
+        }
+
+        fn finish(
+            output: &mut Vec<TranspositionCalibrationObservation>,
+            pending: PendingDecision,
+            label: TranspositionCalibrationLabel,
+        ) -> Result<(), WishFeedbackError> {
+            output.push(
+                TranspositionCalibrationObservation::from_code(
+                    &pending.code,
+                    pending.decision.syllable_index(),
+                    pending.decision.pair_gap_ms(),
+                    pending.decision.cold_tier(),
+                    label,
+                )
+                .map_err(|_| WishFeedbackError::InvalidSnapshot)?,
+            );
+            Ok(())
+        }
+
+        let mut observations = Vec::new();
+        let mut pending: Option<PendingDecision> = None;
+        for event in &self.events {
+            match event.event() {
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code,
+                    automatic_transposition: Some(decision),
+                    ..
+                } => {
+                    if decision.syllable_count() != 1 {
+                        if let Some(previous) = pending.take() {
+                            finish(
+                                &mut observations,
+                                previous,
+                                TranspositionCalibrationLabel::Unknown,
+                            )?;
+                        }
+                        continue;
+                    }
+                    if pending.as_ref().is_some_and(|pending| {
+                        pending.code == *code && pending.decision == *decision
+                    }) {
+                        continue;
+                    }
+                    if let Some(previous) = pending.take() {
+                        finish(
+                            &mut observations,
+                            previous,
+                            TranspositionCalibrationLabel::Unknown,
+                        )?;
+                    }
+                    pending = Some(PendingDecision {
+                        code: code.clone(),
+                        decision: decision.clone(),
+                    });
+                }
+                NativeFeedbackEvent::CandidatesPresented { code, .. }
+                | NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code,
+                    automatic_transposition: None,
+                    ..
+                } => {
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.code != *code)
+                        && let Some(previous) = pending.take()
+                    {
+                        finish(
+                            &mut observations,
+                            previous,
+                            TranspositionCalibrationLabel::Unknown,
+                        )?;
+                    }
+                }
+                NativeFeedbackEvent::CandidateCommitted { code, text, .. } => {
+                    if let Some(previous) = pending.take() {
+                        let label = if previous.code == *code
+                            && previous.decision.outcome()
+                                == NativeAutomaticTranspositionOutcome::RecoveryAvailable
+                            && previous.decision.visible_rank().is_some()
+                        {
+                            if previous.decision.recovered_text() == Some(text.as_str()) {
+                                TranspositionCalibrationLabel::Accepted
+                            } else {
+                                TranspositionCalibrationLabel::Rejected
+                            }
+                        } else {
+                            TranspositionCalibrationLabel::Unknown
+                        };
+                        finish(&mut observations, previous, label)?;
+                    }
+                }
+                NativeFeedbackEvent::RawCodeCommitted { .. }
+                | NativeFeedbackEvent::CompositionCancelled { .. } => {
+                    if let Some(previous) = pending.take() {
+                        finish(
+                            &mut observations,
+                            previous,
+                            TranspositionCalibrationLabel::Unknown,
+                        )?;
+                    }
+                }
+                NativeFeedbackEvent::CandidatePopupTiming { .. } => {}
+            }
+        }
+        if let Some(previous) = pending {
+            finish(
+                &mut observations,
+                previous,
+                TranspositionCalibrationLabel::Unknown,
+            )?;
+        }
+        Ok(observations)
+    }
+
     fn validate(&self) -> Result<(), WishFeedbackError> {
         if self.lookback_ms == 0 || self.events.len() > MAX_WISH_EVENTS {
+            return Err(WishFeedbackError::InvalidSnapshot);
+        }
+        let focus_end = self
+            .focus_event_start
+            .checked_add(self.focus_event_count)
+            .ok_or(WishFeedbackError::InvalidSnapshot)?;
+        if self.capture_scope == WishCaptureScope::LegacyWindow {
+            if self.focus_event_start != 0 || self.focus_event_count != self.events.len() {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+        } else if self.events.is_empty()
+            || self.focus_event_count == 0
+            || focus_end > self.events.len()
+        {
             return Err(WishFeedbackError::InvalidSnapshot);
         }
         let accounted = self
@@ -148,7 +401,11 @@ impl WishSnapshot {
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V5);
+        output.push(self.capture_scope.encoded());
+        output.push(self.category.encoded());
+        put_usize(&mut output, self.focus_event_start)?;
+        put_usize(&mut output, self.focus_event_count)?;
         put_u32(&mut output, self.lookback_ms);
         output.push(u8::from(self.source_complete));
         put_usize(&mut output, self.source_events)?;
@@ -167,11 +424,37 @@ impl WishSnapshot {
     }
 
     fn parse(input: &[u8]) -> Result<Self, WishFeedbackError> {
-        if input.len() <= WISH_PLAINTEXT_MAGIC.len() || input.len() > MAX_WISH_PLAINTEXT_BYTES {
+        if input.len() <= WISH_PLAINTEXT_MAGIC_V1.len() || input.len() > MAX_WISH_PLAINTEXT_BYTES {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        reader.expect(WISH_PLAINTEXT_MAGIC)?;
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V5) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V5)?;
+            5
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V4) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V4)?;
+            4
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V3) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V3)?;
+            3
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V2) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V2)?;
+            2
+        } else {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V1)?;
+            1
+        };
+        let (capture_scope, category, focus_event_start, focus_event_count) = if version >= 2 {
+            (
+                WishCaptureScope::decode(reader.byte()?)
+                    .ok_or(WishFeedbackError::InvalidSnapshot)?,
+                WishCategory::decode(reader.byte()?).ok_or(WishFeedbackError::InvalidSnapshot)?,
+                reader.usize()?,
+                reader.usize()?,
+            )
+        } else {
+            (WishCaptureScope::LegacyWindow, WishCategory::Other, 0, 0)
+        };
         let lookback_ms = reader.u32()?;
         let source_complete = reader.boolean()?;
         let source_events = reader.usize()?;
@@ -186,13 +469,21 @@ impl WishSnapshot {
         for _ in 0..event_count {
             events.push(WishEvent {
                 milliseconds_before_marker: reader.u32()?,
-                event: parse_event(&mut reader)?,
+                event: parse_event(&mut reader, version)?,
             });
         }
         if !reader.is_empty() {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let snapshot = Self {
+            capture_scope,
+            category,
+            focus_event_start,
+            focus_event_count: if version == 1 {
+                events.len()
+            } else {
+                focus_event_count
+            },
             lookback_ms,
             source_complete,
             source_events,
@@ -204,6 +495,31 @@ impl WishSnapshot {
         snapshot.validate()?;
         Ok(snapshot)
     }
+}
+
+fn latest_completed_episode_range(events: &[FrozenNativeFeedbackEvent]) -> (usize, usize) {
+    let terminals = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(
+                event.event(),
+                NativeFeedbackEvent::CandidateCommitted { .. }
+                    | NativeFeedbackEvent::RawCodeCommitted { .. }
+                    | NativeFeedbackEvent::CompositionCancelled { .. }
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(end) = terminals.last().map(|index| index.saturating_add(1)) else {
+        return (0, events.len());
+    };
+    let start = if terminals.len() >= 2 {
+        terminals[terminals.len() - 2].saturating_add(1)
+    } else {
+        0
+    };
+    (start, end.saturating_sub(start))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +555,31 @@ impl WishCategory {
             "input-mode" => Some(Self::InputMode),
             "compatibility" => Some(Self::Compatibility),
             "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    fn encoded(self) -> u8 {
+        match self {
+            Self::Candidates => 1,
+            Self::Ranking => 2,
+            Self::Display => 3,
+            Self::Latency => 4,
+            Self::InputMode => 5,
+            Self::Compatibility => 6,
+            Self::Other => 7,
+        }
+    }
+
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Candidates),
+            2 => Some(Self::Ranking),
+            3 => Some(Self::Display),
+            4 => Some(Self::Latency),
+            5 => Some(Self::InputMode),
+            6 => Some(Self::Compatibility),
+            7 => Some(Self::Other),
             _ => None,
         }
     }
@@ -316,6 +657,7 @@ impl WishNote {
 pub struct WishPackageInfo {
     id: String,
     protected_bytes: u64,
+    modified: SystemTime,
 }
 
 impl WishPackageInfo {
@@ -325,6 +667,10 @@ impl WishPackageInfo {
 
     pub fn protected_bytes(&self) -> u64 {
         self.protected_bytes
+    }
+
+    pub fn modified(&self) -> SystemTime {
+        self.modified
     }
 }
 
@@ -473,6 +819,7 @@ pub fn list_wish_packages(root: &Path) -> Result<Vec<WishPackageInfo>, WishFeedb
             WishPackageInfo {
                 id: id.to_owned(),
                 protected_bytes: metadata.len(),
+                modified,
             },
         ));
     }
@@ -509,6 +856,30 @@ pub fn save_wish_note(
         &protected,
         WishFeedbackError::NoteAlreadyExists,
     )
+}
+
+/// Creates or replaces the editable note bound to one immutable wish.
+///
+/// Only encrypted bytes are written to the temporary file. On Windows the
+/// final publication uses a write-through replace so readers see either the
+/// old complete note or the new complete note.
+pub fn save_or_replace_wish_note(
+    root: &Path,
+    note: &WishNote,
+    protector: &dyn DataProtector,
+) -> Result<(), WishFeedbackError> {
+    ensure_regular_file(
+        &root.join(wish_filename(note.wish_id())?),
+        WishFeedbackError::WishUnavailable,
+    )?;
+    let mut plaintext = note.render()?;
+    let protected = protect_payload(&plaintext, WISH_NOTE_PROTECTED_MAGIC, protector);
+    plaintext.fill(0);
+    let protected = protected?;
+    if protected.len() > MAX_WISH_NOTE_BYTES.saturating_add(1024) {
+        return Err(WishFeedbackError::InvalidProtectedPackage);
+    }
+    publish_replace(root, &root.join(note_filename(note.wish_id())?), &protected)
 }
 
 pub fn load_wish_note(
@@ -644,6 +1015,47 @@ fn render_event(
             }
             output.push(u8::from(*may_have_more));
         }
+        NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code,
+            view,
+            page_start,
+            candidates,
+            provenance,
+            automatic_transposition,
+            may_have_more,
+        } => {
+            output.push(automatic_transposition.as_ref().map_or(6, |decision| {
+                if decision.syllable_count() == 1 { 7 } else { 8 }
+            }));
+            put_string(output, code)?;
+            output.push(view_tag(*view));
+            put_usize(output, *page_start)?;
+            put_usize(output, candidates.len())?;
+            for candidate in candidates {
+                put_string(output, candidate)?;
+            }
+            put_usize(output, provenance.len())?;
+            for provenance in provenance {
+                output.push(candidate_source_tag(provenance.source()));
+                output.push(u8::from(provenance.session_promoted()));
+            }
+            if let Some(decision) = automatic_transposition {
+                put_usize(output, decision.syllable_index())?;
+                if decision.syllable_count() > 1 {
+                    put_usize(output, decision.syllable_count())?;
+                }
+                put_u32(output, decision.pair_gap_ms());
+                output.push(automatic_transposition_tier_tag(decision.cold_tier()));
+                output.push(automatic_transposition_tier_tag(decision.tier()));
+                output.push(automatic_transposition_outcome_tag(decision.outcome()));
+                output.push(u8::from(decision.recovered_text().is_some()));
+                if let Some(text) = decision.recovered_text() {
+                    put_string(output, text)?;
+                }
+                put_usize(output, decision.visible_rank().unwrap_or(0))?;
+            }
+            output.push(u8::from(*may_have_more));
+        }
         NativeFeedbackEvent::CandidateCommitted {
             code,
             text,
@@ -683,7 +1095,10 @@ fn render_event(
     Ok(())
 }
 
-fn parse_event(reader: &mut SliceReader<'_>) -> Result<NativeFeedbackEvent, WishFeedbackError> {
+fn parse_event(
+    reader: &mut SliceReader<'_>,
+    version: u8,
+) -> Result<NativeFeedbackEvent, WishFeedbackError> {
     let event = match reader.byte()? {
         1 => {
             let code = reader.string()?;
@@ -725,12 +1140,151 @@ fn parse_event(reader: &mut SliceReader<'_>) -> Result<NativeFeedbackEvent, Wish
             fully_visible_ms: reader.u32()?,
             initial_show: reader.boolean()?,
         },
+        tag if (tag == 6 && version >= 3)
+            || (tag == 7 && version >= 4)
+            || (tag == 8 && version >= 5) =>
+        {
+            let code = reader.string()?;
+            let view = parse_view(reader.byte()?)?;
+            let page_start = reader.usize()?;
+            let candidate_count = reader.usize()?;
+            if candidate_count > 7 {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            let mut candidates = Vec::with_capacity(candidate_count);
+            for _ in 0..candidate_count {
+                candidates.push(reader.string()?);
+            }
+            let provenance_count = reader.usize()?;
+            if provenance_count != candidate_count {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            let mut provenance = Vec::with_capacity(provenance_count);
+            for _ in 0..provenance_count {
+                provenance.push(NativeCandidateProvenance::new(
+                    parse_candidate_source(reader.byte()?)?,
+                    reader.boolean()?,
+                ));
+            }
+            let automatic_transposition = if matches!(tag, 7 | 8) {
+                let syllable_index = reader.usize()?;
+                let syllable_count = if tag == 8 { reader.usize()? } else { 1 };
+                let pair_gap_ms = reader.u32()?;
+                let cold_tier = parse_automatic_transposition_tier(reader.byte()?)?;
+                let tier = parse_automatic_transposition_tier(reader.byte()?)?;
+                let outcome = parse_automatic_transposition_outcome(reader.byte()?)?;
+                let recovered_text = reader.boolean()?.then(|| reader.string()).transpose()?;
+                let visible_rank = match reader.usize()? {
+                    0 => None,
+                    rank => Some(rank),
+                };
+                Some(if syllable_count == 1 {
+                    NativeAutomaticTranspositionDecision::new(
+                        syllable_index,
+                        pair_gap_ms,
+                        cold_tier,
+                        tier,
+                        outcome,
+                        recovered_text,
+                        visible_rank,
+                    )
+                } else {
+                    NativeAutomaticTranspositionDecision::new_span(
+                        syllable_index..syllable_index.saturating_add(syllable_count),
+                        pair_gap_ms,
+                        cold_tier,
+                        tier,
+                        outcome,
+                        recovered_text,
+                        visible_rank,
+                    )
+                })
+            } else {
+                None
+            };
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code,
+                view,
+                page_start,
+                candidates,
+                provenance,
+                automatic_transposition,
+                may_have_more: reader.boolean()?,
+            }
+        }
         _ => return Err(WishFeedbackError::InvalidSnapshot),
     };
     if event.validate_and_measure().is_none() {
         return Err(WishFeedbackError::InvalidSnapshot);
     }
     Ok(event)
+}
+
+fn candidate_source_tag(value: NativeCandidateSource) -> u8 {
+    match value {
+        NativeCandidateSource::Unknown => 1,
+        NativeCandidateSource::ExplicitAlias => 2,
+        NativeCandidateSource::ProjectOverlay => 3,
+        NativeCandidateSource::CoreExact => 4,
+        NativeCandidateSource::SupplementalExact => 5,
+        NativeCandidateSource::CharacterPair => 6,
+        NativeCandidateSource::Decoder => 7,
+        NativeCandidateSource::TranspositionRecovery => 8,
+        NativeCandidateSource::Shape => 9,
+    }
+}
+
+fn parse_candidate_source(value: u8) -> Result<NativeCandidateSource, WishFeedbackError> {
+    match value {
+        1 => Ok(NativeCandidateSource::Unknown),
+        2 => Ok(NativeCandidateSource::ExplicitAlias),
+        3 => Ok(NativeCandidateSource::ProjectOverlay),
+        4 => Ok(NativeCandidateSource::CoreExact),
+        5 => Ok(NativeCandidateSource::SupplementalExact),
+        6 => Ok(NativeCandidateSource::CharacterPair),
+        7 => Ok(NativeCandidateSource::Decoder),
+        8 => Ok(NativeCandidateSource::TranspositionRecovery),
+        9 => Ok(NativeCandidateSource::Shape),
+        _ => Err(WishFeedbackError::InvalidSnapshot),
+    }
+}
+
+fn automatic_transposition_tier_tag(value: NativeAutomaticTranspositionTier) -> u8 {
+    match value {
+        NativeAutomaticTranspositionTier::Shadow => 1,
+        NativeAutomaticTranspositionTier::Secondary => 2,
+        NativeAutomaticTranspositionTier::Primary => 3,
+    }
+}
+
+fn parse_automatic_transposition_tier(
+    value: u8,
+) -> Result<NativeAutomaticTranspositionTier, WishFeedbackError> {
+    match value {
+        1 => Ok(NativeAutomaticTranspositionTier::Shadow),
+        2 => Ok(NativeAutomaticTranspositionTier::Secondary),
+        3 => Ok(NativeAutomaticTranspositionTier::Primary),
+        _ => Err(WishFeedbackError::InvalidSnapshot),
+    }
+}
+
+fn automatic_transposition_outcome_tag(value: NativeAutomaticTranspositionOutcome) -> u8 {
+    match value {
+        NativeAutomaticTranspositionOutcome::Suppressed => 1,
+        NativeAutomaticTranspositionOutcome::NoRecovery => 2,
+        NativeAutomaticTranspositionOutcome::RecoveryAvailable => 3,
+    }
+}
+
+fn parse_automatic_transposition_outcome(
+    value: u8,
+) -> Result<NativeAutomaticTranspositionOutcome, WishFeedbackError> {
+    match value {
+        1 => Ok(NativeAutomaticTranspositionOutcome::Suppressed),
+        2 => Ok(NativeAutomaticTranspositionOutcome::NoRecovery),
+        3 => Ok(NativeAutomaticTranspositionOutcome::RecoveryAvailable),
+        _ => Err(WishFeedbackError::InvalidSnapshot),
+    }
 }
 
 fn view_tag(value: NativeCandidateView) -> u8 {
@@ -998,6 +1552,71 @@ fn publish_new(
     result
 }
 
+fn publish_replace(
+    root: &Path,
+    destination: &Path,
+    contents: &[u8],
+) -> Result<(), WishFeedbackError> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(WishFeedbackError::NoteUnavailable);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(WishFeedbackError::NoteUnavailable),
+    }
+    let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = root.join(format!(".wish-{}-{counter}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| WishFeedbackError::Io)?;
+        file.write_all(contents)
+            .map_err(|_| WishFeedbackError::Io)?;
+        file.sync_all().map_err(|_| WishFeedbackError::Io)?;
+        drop(file);
+        move_replace(&temporary, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn move_replace(source: &Path, destination: &Path) -> Result<(), WishFeedbackError> {
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    // SAFETY: both NUL-terminated buffers remain alive for this synchronous
+    // call, and the temporary file contains only protected bytes.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(|_| WishFeedbackError::Io)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Result<Vec<u16>, WishFeedbackError> {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(WishFeedbackError::Io);
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(not(windows))]
+fn move_replace(source: &Path, destination: &Path) -> Result<(), WishFeedbackError> {
+    fs::rename(source, destination).map_err(|_| WishFeedbackError::Io)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,10 +1709,383 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V5));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
+        assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
+        assert_eq!(parsed.category(), WishCategory::Other);
+        assert_eq!(parsed.focus_event_range(), 0..2);
         assert!(parsed == snapshot);
         assert!(WishSnapshot::parse(&rendered[..rendered.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn v5_round_trips_candidate_provenance_and_multi_syllable_transposition() {
+        let mut snapshot = private_snapshot();
+        snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "fuem".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: vec!["什么".to_owned(), "发射没".to_owned()],
+            provenance: vec![
+                NativeCandidateProvenance::new(NativeCandidateSource::TranspositionRecovery, false),
+                NativeCandidateProvenance::new(NativeCandidateSource::Decoder, false),
+            ],
+            automatic_transposition: Some(NativeAutomaticTranspositionDecision::new_span(
+                0..2,
+                31,
+                NativeAutomaticTranspositionTier::Primary,
+                NativeAutomaticTranspositionTier::Primary,
+                NativeAutomaticTranspositionOutcome::RecoveryAvailable,
+                Some("什么".to_owned()),
+                Some(1),
+            )),
+            may_have_more: false,
+        };
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V5));
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert!(parsed == snapshot);
+    }
+
+    #[test]
+    fn v5_reader_keeps_v4_single_syllable_transposition_compatibility() {
+        let mut snapshot = private_snapshot();
+        snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "am".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: vec!["马".to_owned()],
+            provenance: vec![NativeCandidateProvenance::new(
+                NativeCandidateSource::TranspositionRecovery,
+                false,
+            )],
+            automatic_transposition: Some(NativeAutomaticTranspositionDecision::new(
+                0,
+                31,
+                NativeAutomaticTranspositionTier::Primary,
+                NativeAutomaticTranspositionTier::Primary,
+                NativeAutomaticTranspositionOutcome::RecoveryAvailable,
+                Some("马".to_owned()),
+                Some(1),
+            )),
+            may_have_more: false,
+        };
+
+        let rendered_v5 = snapshot.render().unwrap();
+        let mut rendered_v4 = Vec::with_capacity(rendered_v5.len());
+        rendered_v4.extend_from_slice(WISH_PLAINTEXT_MAGIC_V4);
+        rendered_v4.extend_from_slice(&rendered_v5[WISH_PLAINTEXT_MAGIC_V5.len()..]);
+        let parsed = WishSnapshot::parse(&rendered_v4).unwrap();
+        assert!(parsed == snapshot);
+    }
+
+    #[test]
+    fn calibration_observations_use_only_visible_same_code_commits_as_labels() {
+        let mut feedback = NativeFeedbackSession::default();
+        feedback.start_memory(
+            NativeFeedbackAuthorization::explicit_memory_only(),
+            NativeFeedbackLimits::default(),
+        );
+        let decision_frame = |code: &str, tier, recovered: &str, visible_rank| {
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code: code.to_owned(),
+                view: NativeCandidateView::Ordinary,
+                page_start: 0,
+                candidates: vec!["普通".to_owned(), recovered.to_owned()],
+                provenance: vec![
+                    NativeCandidateProvenance::new(NativeCandidateSource::Decoder, false),
+                    NativeCandidateProvenance::new(
+                        NativeCandidateSource::TranspositionRecovery,
+                        false,
+                    ),
+                ],
+                automatic_transposition: Some(NativeAutomaticTranspositionDecision::new(
+                    0,
+                    55,
+                    tier,
+                    tier,
+                    NativeAutomaticTranspositionOutcome::RecoveryAvailable,
+                    Some(recovered.to_owned()),
+                    visible_rank,
+                )),
+                may_have_more: false,
+            }
+        };
+        let events = [
+            decision_frame(
+                "am",
+                NativeAutomaticTranspositionTier::Secondary,
+                "马",
+                Some(2),
+            ),
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "am".to_owned(),
+                text: "马".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::Numeric,
+                absolute_rank: 2,
+                visible_rank: 2,
+            },
+            decision_frame(
+                "ma",
+                NativeAutomaticTranspositionTier::Secondary,
+                "俺们",
+                Some(2),
+            ),
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "ma".to_owned(),
+                text: "普通".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 1,
+                visible_rank: 1,
+            },
+            decision_frame("am", NativeAutomaticTranspositionTier::Shadow, "马", None),
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "am".to_owned(),
+                text: "普通".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 1,
+                visible_rank: 1,
+            },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            feedback.record_at(
+                NativeFeedbackContext::Eligible,
+                event,
+                u64::try_from(index).unwrap().saturating_add(1),
+            );
+        }
+        let frozen = feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                10,
+                100,
+                32,
+            )
+            .unwrap();
+        let snapshot = WishSnapshot::from_frozen(&frozen).unwrap();
+        let observations = snapshot.automatic_transposition_observations().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.label())
+                .collect::<Vec<_>>(),
+            [
+                TranspositionCalibrationLabel::Accepted,
+                TranspositionCalibrationLabel::Rejected,
+                TranspositionCalibrationLabel::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_snapshot_marks_context_focus_and_wish_trigger_separately() {
+        let mut feedback = NativeFeedbackSession::default();
+        feedback.start_memory(
+            NativeFeedbackAuthorization::explicit_memory_only(),
+            NativeFeedbackLimits::default(),
+        );
+        for (event, timestamp) in [
+            (
+                NativeFeedbackEvent::RawCodeCommitted {
+                    code: "ab".to_owned(),
+                },
+                10,
+            ),
+            (
+                NativeFeedbackEvent::CandidatesPresented {
+                    code: "cd".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["乙".to_owned()],
+                    may_have_more: false,
+                },
+                20,
+            ),
+            (
+                NativeFeedbackEvent::RawCodeCommitted {
+                    code: "cd".to_owned(),
+                },
+                30,
+            ),
+            (
+                NativeFeedbackEvent::CandidatesPresented {
+                    code: "xuy".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["许愿".to_owned()],
+                    may_have_more: false,
+                },
+                40,
+            ),
+        ] {
+            feedback.record_at(NativeFeedbackContext::Eligible, event, timestamp);
+        }
+        let frozen = feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                50,
+                1_000,
+                128,
+            )
+            .unwrap();
+        let snapshot = WishSnapshot::from_frozen_with_metadata(
+            &frozen,
+            WishCaptureScope::RecentEpisodes,
+            WishCategory::Ranking,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.focus_event_range(), 1..3);
+        assert_eq!(snapshot.event_role(0), Some(WishEventRole::Context));
+        assert_eq!(snapshot.event_role(1), Some(WishEventRole::Focus));
+        assert_eq!(snapshot.event_role(2), Some(WishEventRole::Focus));
+        assert_eq!(snapshot.event_role(3), Some(WishEventRole::Trigger));
+        assert_eq!(snapshot.category(), WishCategory::Ranking);
+        assert_eq!(
+            WishSnapshot::parse(&snapshot.render().unwrap())
+                .unwrap()
+                .focus_event_range(),
+            1..3
+        );
+    }
+
+    #[test]
+    fn legacy_v1_snapshot_remains_readable_as_one_unclassified_window() {
+        let snapshot = private_snapshot();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(WISH_PLAINTEXT_MAGIC_V1);
+        put_u32(&mut legacy, snapshot.lookback_ms);
+        legacy.push(u8::from(snapshot.source_complete));
+        put_usize(&mut legacy, snapshot.source_events).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_before_window).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_untimed).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_by_event_limit).unwrap();
+        put_usize(&mut legacy, snapshot.events.len()).unwrap();
+        for event in &snapshot.events {
+            put_u32(&mut legacy, event.milliseconds_before_marker);
+            render_event(&mut legacy, &event.event).unwrap();
+        }
+
+        let parsed = WishSnapshot::parse(&legacy).unwrap();
+        assert_eq!(parsed.capture_scope(), WishCaptureScope::LegacyWindow);
+        assert_eq!(parsed.category(), WishCategory::Other);
+        assert_eq!(parsed.focus_event_range(), 0..parsed.events().len());
+    }
+
+    #[test]
+    fn legacy_v2_snapshot_remains_readable() {
+        let snapshot = private_snapshot();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(WISH_PLAINTEXT_MAGIC_V2);
+        legacy.push(snapshot.capture_scope.encoded());
+        legacy.push(snapshot.category.encoded());
+        put_usize(&mut legacy, snapshot.focus_event_start).unwrap();
+        put_usize(&mut legacy, snapshot.focus_event_count).unwrap();
+        put_u32(&mut legacy, snapshot.lookback_ms);
+        legacy.push(u8::from(snapshot.source_complete));
+        put_usize(&mut legacy, snapshot.source_events).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_before_window).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_untimed).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_by_event_limit).unwrap();
+        put_usize(&mut legacy, snapshot.events.len()).unwrap();
+        for event in &snapshot.events {
+            put_u32(&mut legacy, event.milliseconds_before_marker);
+            render_event(&mut legacy, &event.event).unwrap();
+        }
+
+        let parsed = WishSnapshot::parse(&legacy).unwrap();
+        assert!(parsed == snapshot);
+    }
+
+    fn v3_provenance_fixture(provenance_count: usize, source_tag: Option<u8>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WISH_PLAINTEXT_MAGIC_V3);
+        bytes.push(WishCaptureScope::RecentWindow.encoded());
+        bytes.push(WishCategory::Other.encoded());
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_u32(&mut bytes, 1_000);
+        bytes.push(1);
+        put_usize(&mut bytes, 1).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_u32(&mut bytes, 0);
+        bytes.push(6);
+        put_string(&mut bytes, "ab").unwrap();
+        bytes.push(view_tag(NativeCandidateView::Ordinary));
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_string(&mut bytes, "甲").unwrap();
+        put_usize(&mut bytes, provenance_count).unwrap();
+        if let Some(source_tag) = source_tag {
+            bytes.push(source_tag);
+            bytes.push(0);
+        }
+        bytes.push(0);
+        bytes
+    }
+
+    #[test]
+    fn v3_rejects_misaligned_or_unknown_candidate_provenance() {
+        assert!(WishSnapshot::parse(&v3_provenance_fixture(0, None)).is_err());
+        assert!(WishSnapshot::parse(&v3_provenance_fixture(1, Some(255))).is_err());
+    }
+
+    #[test]
+    fn valid_v3_candidate_provenance_remains_readable_without_a_decision() {
+        let parsed = WishSnapshot::parse(&v3_provenance_fixture(
+            1,
+            Some(candidate_source_tag(NativeCandidateSource::CoreExact)),
+        ))
+        .unwrap();
+        assert!(matches!(
+            parsed.events()[0].event(),
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                automatic_transposition: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn candidate_source_tags_round_trip_exactly() {
+        for source in [
+            NativeCandidateSource::Unknown,
+            NativeCandidateSource::ExplicitAlias,
+            NativeCandidateSource::ProjectOverlay,
+            NativeCandidateSource::CoreExact,
+            NativeCandidateSource::SupplementalExact,
+            NativeCandidateSource::CharacterPair,
+            NativeCandidateSource::Decoder,
+            NativeCandidateSource::TranspositionRecovery,
+            NativeCandidateSource::Shape,
+        ] {
+            assert_eq!(
+                parse_candidate_source(candidate_source_tag(source)),
+                Ok(source)
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_event_tag_is_not_accepted_by_legacy_schemas() {
+        let mut fixture = v3_provenance_fixture(
+            1,
+            Some(candidate_source_tag(NativeCandidateSource::CoreExact)),
+        );
+        fixture.splice(
+            ..WISH_PLAINTEXT_MAGIC_V3.len(),
+            WISH_PLAINTEXT_MAGIC_V2.iter().copied(),
+        );
+        assert!(WishSnapshot::parse(&fixture).is_err());
     }
 
     #[test]
@@ -1141,6 +2133,28 @@ mod tests {
                 .join(note_filename(receipt.id()).unwrap())
                 .is_file()
         );
+    }
+
+    #[test]
+    fn editable_note_replaces_only_the_encrypted_sidecar() {
+        let root = TemporaryDirectory::new();
+        let receipt = save_wish_snapshot(&root.0, &private_snapshot(), &TestProtector).unwrap();
+        let first = WishNote::new(receipt.id(), WishCategory::Ranking, "第一项不太对").unwrap();
+        let revised =
+            WishNote::new(receipt.id(), WishCategory::Display, "候选间距想再看看").unwrap();
+
+        save_or_replace_wish_note(&root.0, &first, &TestProtector).unwrap();
+        save_or_replace_wish_note(&root.0, &revised, &TestProtector).unwrap();
+
+        assert!(load_wish_snapshot(&root.0, receipt.id(), &TestProtector).is_ok());
+        assert!(load_wish_note(&root.0, receipt.id(), &TestProtector).unwrap() == revised);
+        assert!(fs::read_dir(&root.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     #[test]

@@ -17,25 +17,41 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak as SyncWeak};
 use std::time::Instant;
 
+use crate::candidate_snapshot::{
+    InteractiveCandidateQuery, InteractiveCandidateSource, layered_candidate_query_with_sources,
+};
+use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::{
     CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
-    CandidateRuntimeError, CandidateSnapshot, CompositionEffect, CompositionInput,
-    CompositionPunctuation, CompositionSession, DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
-    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder, ExplicitAliasSnapshot,
+    CandidateRuntimeError, CandidateSnapshot, CharacterShapeIndex, CompositionEffect,
+    CompositionInput, CompositionPunctuation, CompositionSession,
+    DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
+    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder,
+    ExplicitAliasSnapshot, LoadedPersonalRanking, LoadedPersonalRankingSuppressions,
     MAX_CANDIDATE_SNAPSHOT_RANK, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS,
-    NativeCancellationSource, NativeCandidateView, NativeFeedbackAuthorization,
+    NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateProvenance,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackAuthorization,
     NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
     NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle, NativeFeedbackLimits,
     NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
-    NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource, SessionSelectionMemory,
-    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
+    NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource,
+    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
+    PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
+    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
+    PersonalRankingSuppressionSnapshot, SessionSelectionMemory, WISH_ACK_COMPARTMENT_GUID,
+    WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
     WishCommand, WishCommandAck, WishCommandAckStatus, WishSnapshot,
-    load_current_candidate_snapshot, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, parse_lexicon_tsv, save_wish_snapshot,
+    load_candidate_runtime_snapshots, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
+    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
+    refresh_personal_ranking_suppressions, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
-    E_UNEXPECTED, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, S_FALSE, S_OK, SIZE, WPARAM,
+    E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, S_FALSE, S_OK, SIZE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
@@ -43,11 +59,12 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CombineRgn, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, FillRgn,
-    GetMonitorInfoW, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
+    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
+    FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+    TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -63,10 +80,10 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_0, VK_1, VK_6, VK_9, VK_A, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LWIN,
-    VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
-    VK_OEM_8, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
-    VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
+    GetKeyState, VK_0, VK_1, VK_6, VK_9, VK_A, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE,
+    VK_ESCAPE, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
+    VK_OEM_6, VK_OEM_7, VK_OEM_8, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+    VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_Z,
 };
 use windows::Win32::UI::TextServices::{
     CLSID_TF_ThreadMgr, GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
@@ -92,13 +109,14 @@ use windows::Win32::UI::TextServices::{
     TF_SELECTIONSTYLE, TF_TF_MOVESTART, TfLBIClick,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyMenu, DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetForegroundWindow,
-    GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
+    AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DI_NORMAL,
+    DefWindowProcW, DestroyMenu, DestroyWindow, DrawIconEx, GWLP_USERDATA, GWLP_WNDPROC,
+    GetClientRect, GetForegroundWindow, GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON,
+    KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT,
-    WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY,
+    WM_PAINT, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -125,10 +143,19 @@ const TSF_DEVELOPMENT_MANIFEST: &str =
 const TSF_TECHNICAL_OVERLAY: &str = include_str!("../data/public/ziranma-technical-overlay-v1.tsv");
 const TSF_CONVERSATION_OVERLAY: &str =
     include_str!("../data/public/ziranma-conversation-overlay-v1.tsv");
+const TSF_PUBLIC_STROKE_SEQUENCES: &str =
+    include_str!("../data/public/conway-stroke-data/sequence-characters.txt");
 const CANDIDATE_PAGE_SIZE: usize = 6;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
+const AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS: u64 = 48;
+const AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS: u64 = 64;
+const AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS: u64 = 96;
+const PERSONAL_RANKING_FLUSH_SELECTIONS: usize = 8;
 const INLINE_WISH_TRIGGER_CODE: &str = "xuy";
+const INLINE_WISH_NOTICE_TIMER_ID: usize = 1;
+const INLINE_WISH_NOTICE_DURATION_MS: u32 = 1_200;
+const INLINE_WISH_NOTICE_ICON_RESOURCE_ID: usize = 103;
 const CANDIDATE_UI_GUID: GUID = GUID::from_u128(0xb9fdad61_3f19_4d6c_86f7_72e9d3064f84);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -138,21 +165,152 @@ enum InteractiveCandidateView {
     TranspositionRecovery,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticTranspositionTier {
+    Shadow,
+    Secondary,
+    Primary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutomaticTranspositionPattern {
+    first_syllable_index: usize,
+    syllable_count: usize,
+}
+
+impl AutomaticTranspositionPattern {
+    const fn single(syllable_index: usize) -> Self {
+        Self {
+            first_syllable_index: syllable_index,
+            syllable_count: 1,
+        }
+    }
+
+    const fn adjacent_pair(first_syllable_index: usize) -> Self {
+        Self {
+            first_syllable_index,
+            syllable_count: 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutomaticTranspositionAttempt {
+    pattern: AutomaticTranspositionPattern,
+    cold_tier: AutomaticTranspositionTier,
+    tier: AutomaticTranspositionTier,
+    pair_gap_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutomaticTranspositionRequest {
+    primary: AutomaticTranspositionAttempt,
+    fallback: Option<AutomaticTranspositionAttempt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletedPairTiming {
+    syllable_index: usize,
+    pair_gap_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AutomaticTranspositionTimingEvidence {
+    current_pair_gap_ms: Option<u64>,
+    previous_pair: Option<CompletedPairTiming>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AutomaticTranspositionOutcome {
+    #[default]
+    NotRequested,
+    Suppressed(AutomaticTranspositionTier),
+    NoRecovery(AutomaticTranspositionTier),
+    RecoveryAvailable(AutomaticTranspositionTier),
+}
+
 trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, bounded candidate page without learning or
     /// I/O. Implementations should decode once rather than once per rank.
     fn candidates(&self, code: &str, limit: usize, view: InteractiveCandidateView) -> Vec<String>;
+
+    fn candidates_with_provenance(
+        &self,
+        code: &str,
+        limit: usize,
+        view: InteractiveCandidateView,
+    ) -> CandidateProviderOutput {
+        let candidates = self.candidates(code, limit, view);
+        let source = match view {
+            InteractiveCandidateView::Primary => NativeCandidateSource::Unknown,
+            InteractiveCandidateView::TranspositionRecovery => {
+                NativeCandidateSource::TranspositionRecovery
+            }
+        };
+        let provenance = vec![NativeCandidateProvenance::new(source, false); candidates.len()];
+        CandidateProviderOutput {
+            candidates,
+            provenance,
+            automatic_transposition_blocked: false,
+        }
+    }
+
+    /// Returns exact candidates for one conservatively identified reversed
+    /// double-pinyin pair. Hosts decide separately whether timing evidence is
+    /// strong enough to expose this lane automatically.
+    fn automatic_transposition_candidates(
+        &self,
+        _code: &str,
+        _pattern: AutomaticTranspositionPattern,
+        _limit: usize,
+    ) -> Option<CandidateProviderOutput> {
+        None
+    }
 
     /// Checks a small version pointer only at a new-composition boundary.
     /// Invalid updates retain the last known-good in-memory snapshot.
     fn refresh_at_safe_boundary(&self) -> bool {
         false
     }
+
+    /// Number of leading candidates that transient session preferences may
+    /// not cross. Explicit user aliases occupy this protected prefix.
+    fn protected_candidate_prefix_len(
+        &self,
+        _code: &str,
+        _view: InteractiveCandidateView,
+    ) -> usize {
+        0
+    }
+
+    /// Verifies that `text` is a public exact whole-word candidate for one
+    /// complete double-pinyin code. Personal code-family inheritance uses
+    /// this to reject aliases, free sentence segmentation, and arbitrary
+    /// even-length input observations.
+    fn is_exact_full_code_candidate(&self, _code: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Returns the stable exact-code single-character pool after an explicit
+    /// Tab stroke-prefix filter. Ordinary providers may leave this unsupported;
+    /// the Windows host never infers shape mode from candidate contents.
+    fn shape_candidates(&self, _code: &str, _stroke_prefix: &str, _limit: usize) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+struct CandidateProviderOutput {
+    candidates: Vec<String>,
+    provenance: Vec<NativeCandidateProvenance>,
+    automatic_transposition_blocked: bool,
 }
 
 #[derive(Clone, Default)]
 struct CandidateBatch {
     candidates: Vec<String>,
+    provenance: Vec<NativeCandidateProvenance>,
+    personalized: Vec<bool>,
+    automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
     may_have_more: bool,
     view: InteractiveCandidateView,
 }
@@ -162,11 +320,19 @@ struct CandidateCache {
     code: String,
     view: InteractiveCandidateView,
     candidates: Vec<String>,
+    provenance: Vec<NativeCandidateProvenance>,
     requested_limit: usize,
     exhausted: bool,
+    automatic_transposition_blocked: bool,
+    automatic_transposition_request: Option<AutomaticTranspositionRequest>,
+    automatic_transposition_effective_attempt: Option<AutomaticTranspositionAttempt>,
+    automatic_transposition_outcome: AutomaticTranspositionOutcome,
+    automatic_transposition_recovered_text: Option<String>,
+    automatic_transposition_visible_rank: Option<usize>,
 }
 
 impl CandidateCache {
+    #[cfg(test)]
     fn load(
         &mut self,
         provider: &dyn CandidateProvider,
@@ -174,25 +340,218 @@ impl CandidateCache {
         requested_limit: usize,
         view: InteractiveCandidateView,
     ) -> CandidateBatch {
+        self.load_with_automatic_transposition(provider, code, requested_limit, view, None)
+    }
+
+    fn load_with_automatic_transposition(
+        &mut self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        requested_limit: usize,
+        view: InteractiveCandidateView,
+        requested_transposition: Option<AutomaticTranspositionRequest>,
+    ) -> CandidateBatch {
         let requested_limit = requested_limit.min(CANDIDATE_LIMIT);
-        let reusable = self.code == code
-            && self.view == view
-            && (self.exhausted || self.requested_limit >= requested_limit);
+        let same_query = self.code == code && self.view == view;
+        if !same_query || view != InteractiveCandidateView::Primary {
+            self.automatic_transposition_request = None;
+            self.automatic_transposition_effective_attempt = None;
+            self.automatic_transposition_outcome = AutomaticTranspositionOutcome::NotRequested;
+            self.automatic_transposition_recovered_text = None;
+            self.automatic_transposition_visible_rank = None;
+        }
+        if let Some(request) = requested_transposition
+            && self.automatic_transposition_request != Some(request)
+        {
+            self.automatic_transposition_request = Some(request);
+            self.automatic_transposition_effective_attempt = None;
+            self.automatic_transposition_outcome = AutomaticTranspositionOutcome::NotRequested;
+            self.automatic_transposition_recovered_text = None;
+            self.automatic_transposition_visible_rank = None;
+        }
+        let reusable = same_query && (self.exhausted || self.requested_limit >= requested_limit);
         if !reusable {
-            let candidates = provider.candidates(code, requested_limit, view);
+            let mut output = provider.candidates_with_provenance(code, requested_limit, view);
+            if output.provenance.len() != output.candidates.len() {
+                output.provenance =
+                    vec![NativeCandidateProvenance::default(); output.candidates.len()];
+            }
             self.code.clear();
             self.code.push_str(code);
             self.view = view;
-            self.exhausted = candidates.len() < requested_limit;
+            self.exhausted = output.candidates.len() < requested_limit;
             self.requested_limit = requested_limit;
-            self.candidates = candidates;
+            self.candidates = output.candidates;
+            self.provenance = output.provenance;
+            self.automatic_transposition_blocked = output.automatic_transposition_blocked;
+            self.automatic_transposition_effective_attempt = None;
+            self.automatic_transposition_outcome = AutomaticTranspositionOutcome::NotRequested;
+            self.automatic_transposition_recovered_text = None;
+            self.automatic_transposition_visible_rank = None;
+        }
+        if self.automatic_transposition_outcome == AutomaticTranspositionOutcome::NotRequested
+            && let Some(request) = self.automatic_transposition_request
+        {
+            self.apply_automatic_transposition(provider, code, request);
         }
         CandidateBatch {
             candidates: self.candidates.clone(),
+            provenance: self.provenance.clone(),
+            personalized: vec![false; self.candidates.len()],
+            automatic_transposition: self.automatic_transposition_decision(),
             may_have_more: !self.exhausted && self.requested_limit < CANDIDATE_LIMIT,
             view,
         }
     }
+
+    fn automatic_transposition_decision(&self) -> Option<NativeAutomaticTranspositionDecision> {
+        let request = self.automatic_transposition_effective_attempt?;
+        let outcome = match self.automatic_transposition_outcome {
+            AutomaticTranspositionOutcome::NotRequested => return None,
+            AutomaticTranspositionOutcome::Suppressed(_) => {
+                NativeAutomaticTranspositionOutcome::Suppressed
+            }
+            AutomaticTranspositionOutcome::NoRecovery(_) => {
+                NativeAutomaticTranspositionOutcome::NoRecovery
+            }
+            AutomaticTranspositionOutcome::RecoveryAvailable(_) => {
+                NativeAutomaticTranspositionOutcome::RecoveryAvailable
+            }
+        };
+        Some(NativeAutomaticTranspositionDecision::new_span(
+            request.pattern.first_syllable_index
+                ..request
+                    .pattern
+                    .first_syllable_index
+                    .saturating_add(request.pattern.syllable_count),
+            request.pair_gap_ms,
+            match request.cold_tier {
+                AutomaticTranspositionTier::Shadow => NativeAutomaticTranspositionTier::Shadow,
+                AutomaticTranspositionTier::Secondary => {
+                    NativeAutomaticTranspositionTier::Secondary
+                }
+                AutomaticTranspositionTier::Primary => NativeAutomaticTranspositionTier::Primary,
+            },
+            match request.tier {
+                AutomaticTranspositionTier::Shadow => NativeAutomaticTranspositionTier::Shadow,
+                AutomaticTranspositionTier::Secondary => {
+                    NativeAutomaticTranspositionTier::Secondary
+                }
+                AutomaticTranspositionTier::Primary => NativeAutomaticTranspositionTier::Primary,
+            },
+            outcome,
+            self.automatic_transposition_recovered_text.clone(),
+            self.automatic_transposition_visible_rank,
+        ))
+    }
+
+    fn apply_automatic_transposition(
+        &mut self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        request: AutomaticTranspositionRequest,
+    ) {
+        self.automatic_transposition_effective_attempt = None;
+        self.automatic_transposition_recovered_text = None;
+        self.automatic_transposition_visible_rank = None;
+        if self.requested_limit == 0
+            || self.automatic_transposition_blocked
+            || provider.protected_candidate_prefix_len(code, InteractiveCandidateView::Primary) > 0
+            || self
+                .provenance
+                .iter()
+                .any(|item| native_source_is_explicit_exact(item.source()))
+        {
+            self.automatic_transposition_effective_attempt = Some(request.primary);
+            self.automatic_transposition_outcome =
+                AutomaticTranspositionOutcome::Suppressed(request.primary.tier);
+            return;
+        }
+        let mut recovery = None;
+        for attempt in [Some(request.primary), request.fallback]
+            .into_iter()
+            .flatten()
+        {
+            let recovery_limit = if attempt.tier == AutomaticTranspositionTier::Shadow {
+                1
+            } else {
+                self.requested_limit
+            };
+            if let Some(recovered) =
+                provider.automatic_transposition_candidates(code, attempt.pattern, recovery_limit)
+                && !recovered.candidates.is_empty()
+            {
+                recovery = Some((attempt, recovered));
+                break;
+            }
+        }
+        let Some((attempt, mut recovered)) = recovery else {
+            self.automatic_transposition_effective_attempt = Some(request.primary);
+            self.automatic_transposition_outcome =
+                AutomaticTranspositionOutcome::NoRecovery(request.primary.tier);
+            return;
+        };
+        self.automatic_transposition_effective_attempt = Some(attempt);
+        self.automatic_transposition_outcome =
+            AutomaticTranspositionOutcome::RecoveryAvailable(attempt.tier);
+        self.automatic_transposition_recovered_text = recovered.candidates.first().cloned();
+        if attempt.tier == AutomaticTranspositionTier::Shadow {
+            return;
+        }
+        if recovered.provenance.len() != recovered.candidates.len() {
+            recovered.provenance =
+                vec![NativeCandidateProvenance::default(); recovered.candidates.len()];
+        }
+        let insertion_index = match attempt.tier {
+            AutomaticTranspositionTier::Shadow => unreachable!("shadow recovery returned above"),
+            AutomaticTranspositionTier::Secondary => 1.min(self.candidates.len()),
+            AutomaticTranspositionTier::Primary => 0,
+        };
+        let existing = self
+            .candidates
+            .iter()
+            .cloned()
+            .zip(self.provenance.iter().copied())
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::with_capacity(self.requested_limit);
+        let mut provenance = Vec::with_capacity(self.requested_limit);
+        let mut seen = HashSet::new();
+        let ordered = existing[..insertion_index]
+            .iter()
+            .cloned()
+            .chain(recovered.candidates.into_iter().zip(recovered.provenance))
+            .chain(existing[insertion_index..].iter().cloned());
+        for (candidate, source) in ordered {
+            if seen.insert(candidate.clone()) {
+                candidates.push(candidate);
+                provenance.push(source);
+                if candidates.len() == self.requested_limit {
+                    break;
+                }
+            }
+        }
+        self.candidates = candidates;
+        self.provenance = provenance;
+        self.automatic_transposition_visible_rank = self
+            .automatic_transposition_recovered_text
+            .as_ref()
+            .and_then(|recovered| {
+                self.candidates
+                    .iter()
+                    .position(|candidate| candidate == recovered)
+            })
+            .map(|index| index.saturating_add(1));
+    }
+}
+
+fn native_source_is_explicit_exact(source: NativeCandidateSource) -> bool {
+    matches!(
+        source,
+        NativeCandidateSource::ExplicitAlias
+            | NativeCandidateSource::ProjectOverlay
+            | NativeCandidateSource::CoreExact
+            | NativeCandidateSource::SupplementalExact
+    )
 }
 
 fn candidate_visible_limit(page_start: usize) -> usize {
@@ -219,21 +578,143 @@ enum CandidateProviderLoadError {
 
 struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
+    supplemental: Option<(
+        Arc<CandidateSnapshot>,
+        crate::SupplementalCandidateLayerConfig,
+    )>,
     aliases: Option<ExplicitAliasRuntime>,
 }
 
 impl SnapshotCandidateProvider {
-    fn new(snapshot: Arc<CandidateSnapshot>, alias_root: Option<PathBuf>) -> Self {
+    fn new(
+        snapshot: Arc<CandidateSnapshot>,
+        supplemental: Option<(
+            Arc<CandidateSnapshot>,
+            crate::SupplementalCandidateLayerConfig,
+        )>,
+        alias_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             snapshot,
+            supplemental,
             aliases: alias_root.map(ExplicitAliasRuntime::new),
         }
+    }
+
+    fn candidate_output(
+        &self,
+        code: &str,
+        limit: usize,
+        view: InteractiveCandidateView,
+    ) -> CandidateProviderOutput {
+        match view {
+            InteractiveCandidateView::Primary => {
+                let mut candidates = Vec::new();
+                let mut provenance = Vec::new();
+                let mut seen = HashSet::new();
+                let mut automatic_transposition_blocked = false;
+                if let Some(alias) = self.aliases.as_ref().and_then(|aliases| aliases.text(code)) {
+                    automatic_transposition_blocked = true;
+                    seen.insert(alias.clone());
+                    candidates.push(alias);
+                    provenance.push(NativeCandidateProvenance::new(
+                        NativeCandidateSource::ExplicitAlias,
+                        false,
+                    ));
+                }
+                for candidate in project_overlay_decoder()
+                    .decode_exact_full_code(code, limit)
+                    .unwrap_or_default()
+                {
+                    automatic_transposition_blocked = true;
+                    if seen.insert(candidate.text.clone()) {
+                        candidates.push(candidate.text);
+                        provenance.push(NativeCandidateProvenance::new(
+                            NativeCandidateSource::ProjectOverlay,
+                            false,
+                        ));
+                    }
+                }
+                let snapshot_query = self
+                    .supplemental
+                    .as_ref()
+                    .and_then(|(supplemental, config)| {
+                        layered_candidate_query_with_sources(
+                            &self.snapshot,
+                            supplemental,
+                            code,
+                            limit,
+                            *config,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(|| {
+                        self.snapshot
+                            .interactive_candidate_query(code, limit)
+                            .unwrap_or_else(|_| InteractiveCandidateQuery {
+                                candidates: Vec::new(),
+                                automatic_transposition_blocked: true,
+                            })
+                    });
+                automatic_transposition_blocked |= snapshot_query.automatic_transposition_blocked;
+                for candidate in snapshot_query.candidates {
+                    if seen.insert(candidate.text.clone()) {
+                        candidates.push(candidate.text);
+                        provenance.push(NativeCandidateProvenance::new(
+                            native_candidate_source(candidate.source),
+                            false,
+                        ));
+                    }
+                    if candidates.len() == limit {
+                        break;
+                    }
+                }
+                candidates.truncate(limit);
+                provenance.truncate(candidates.len());
+                CandidateProviderOutput {
+                    candidates,
+                    provenance,
+                    automatic_transposition_blocked,
+                }
+            }
+            InteractiveCandidateView::TranspositionRecovery => {
+                let candidates = self
+                    .snapshot
+                    .transposition_recovery_texts(code, limit)
+                    .unwrap_or_default();
+                let provenance = vec![
+                    NativeCandidateProvenance::new(
+                        NativeCandidateSource::TranspositionRecovery,
+                        false,
+                    );
+                    candidates.len()
+                ];
+                CandidateProviderOutput {
+                    candidates,
+                    provenance,
+                    automatic_transposition_blocked: true,
+                }
+            }
+        }
+    }
+}
+
+fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidateSource {
+    match source {
+        InteractiveCandidateSource::CoreExact => NativeCandidateSource::CoreExact,
+        InteractiveCandidateSource::SupplementalExact => NativeCandidateSource::SupplementalExact,
+        InteractiveCandidateSource::CharacterPair => NativeCandidateSource::CharacterPair,
+        InteractiveCandidateSource::Decoder => NativeCandidateSource::Decoder,
     }
 }
 
 #[derive(Clone)]
 struct CandidateProviderBlueprint {
     snapshot: Arc<CandidateSnapshot>,
+    supplemental: Option<(
+        Arc<CandidateSnapshot>,
+        crate::SupplementalCandidateLayerConfig,
+    )>,
     alias_root: Option<PathBuf>,
 }
 
@@ -241,6 +722,7 @@ impl CandidateProviderBlueprint {
     fn build(&self) -> Arc<dyn CandidateProvider> {
         Arc::new(SnapshotCandidateProvider::new(
             Arc::clone(&self.snapshot),
+            self.supplemental.clone(),
             self.alias_root.clone(),
         ))
     }
@@ -315,42 +797,58 @@ impl ExplicitAliasRuntime {
 
 impl CandidateProvider for SnapshotCandidateProvider {
     fn candidates(&self, code: &str, limit: usize, view: InteractiveCandidateView) -> Vec<String> {
-        match view {
-            InteractiveCandidateView::Primary => {
-                let mut candidates = Vec::new();
-                let mut seen = HashSet::new();
-                if let Some(alias) = self.aliases.as_ref().and_then(|aliases| aliases.text(code)) {
-                    seen.insert(alias.clone());
-                    candidates.push(alias);
-                }
-                for candidate in project_overlay_decoder()
-                    .decode_exact_full_code(code, limit)
-                    .unwrap_or_default()
-                {
-                    if seen.insert(candidate.text.clone()) {
-                        candidates.push(candidate.text);
-                    }
-                }
-                for candidate in self
-                    .snapshot
-                    .candidate_texts(code, limit)
-                    .unwrap_or_default()
-                {
-                    if seen.insert(candidate.clone()) {
-                        candidates.push(candidate);
-                    }
-                    if candidates.len() == limit {
-                        break;
-                    }
-                }
-                candidates.truncate(limit);
-                candidates
-            }
-            InteractiveCandidateView::TranspositionRecovery => self
-                .snapshot
-                .transposition_recovery_texts(code, limit)
-                .unwrap_or_default(),
+        self.candidate_output(code, limit, view).candidates
+    }
+
+    fn candidates_with_provenance(
+        &self,
+        code: &str,
+        limit: usize,
+        view: InteractiveCandidateView,
+    ) -> CandidateProviderOutput {
+        self.candidate_output(code, limit, view)
+    }
+
+    fn automatic_transposition_candidates(
+        &self,
+        code: &str,
+        pattern: AutomaticTranspositionPattern,
+        limit: usize,
+    ) -> Option<CandidateProviderOutput> {
+        let promotion = if pattern.syllable_count == 1 {
+            self.snapshot
+                .automatic_transposition_recovery_after_primary(
+                    code,
+                    pattern.first_syllable_index,
+                    limit,
+                )
+        } else {
+            self.snapshot
+                .automatic_transposition_span_recovery_after_primary(
+                    code,
+                    pattern.first_syllable_index,
+                    pattern.syllable_count,
+                    limit,
+                )
         }
+        .ok()??;
+        let candidates = promotion
+            .candidates
+            .into_iter()
+            .take(limit)
+            .collect::<Vec<_>>();
+        let provenance = vec![
+            NativeCandidateProvenance::new(
+                NativeCandidateSource::TranspositionRecovery,
+                false,
+            );
+            candidates.len()
+        ];
+        Some(CandidateProviderOutput {
+            candidates,
+            provenance,
+            automatic_transposition_blocked: true,
+        })
     }
 
     fn refresh_at_safe_boundary(&self) -> bool {
@@ -358,6 +856,83 @@ impl CandidateProvider for SnapshotCandidateProvider {
             .as_ref()
             .is_some_and(ExplicitAliasRuntime::refresh)
     }
+
+    fn protected_candidate_prefix_len(&self, code: &str, view: InteractiveCandidateView) -> usize {
+        usize::from(
+            view == InteractiveCandidateView::Primary
+                && self
+                    .aliases
+                    .as_ref()
+                    .and_then(|aliases| aliases.text(code))
+                    .is_some(),
+        )
+    }
+
+    fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+        project_overlay_decoder()
+            .decode_exact_full_code(code, CANDIDATE_LIMIT)
+            .ok()
+            .is_some_and(|candidates| candidates.iter().any(|candidate| candidate.text == text))
+            || self
+                .snapshot
+                .exact_full_code_texts(code, CANDIDATE_LIMIT)
+                .ok()
+                .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
+            || self.supplemental.as_ref().is_some_and(|(snapshot, _)| {
+                snapshot
+                    .exact_full_code_texts(code, CANDIDATE_LIMIT)
+                    .ok()
+                    .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
+            })
+    }
+
+    fn shape_candidates(&self, code: &str, stroke_prefix: &str, limit: usize) -> Vec<String> {
+        if code.len() != 2
+            || limit == 0
+            || !stroke_prefix
+                .as_bytes()
+                .iter()
+                .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z'))
+        {
+            return Vec::new();
+        }
+        let Some(shapes) = public_shape_index() else {
+            return Vec::new();
+        };
+        self.snapshot
+            .exact_full_code_texts(code, CANDIDATE_LIMIT)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|candidate| {
+                let mut characters = candidate.chars();
+                let Some(character) = characters.next() else {
+                    return false;
+                };
+                if characters.next().is_some() {
+                    return false;
+                }
+                stroke_prefix.is_empty()
+                    || shapes.get(character).is_some_and(|shape| {
+                        shape
+                            .stroke_codes()
+                            .iter()
+                            .any(|code| code.starts_with(stroke_prefix))
+                    })
+            })
+            .take(limit.min(CANDIDATE_LIMIT))
+            .collect()
+    }
+}
+
+fn public_shape_index() -> Option<&'static CharacterShapeIndex> {
+    static INDEX: OnceLock<Option<CharacterShapeIndex>> = OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            parse_stroke_sequence_tsv(TSF_PUBLIC_STROKE_SEQUENCES)
+                .ok()
+                .and_then(|import| CharacterShapeIndex::new(import.into_shapes()).ok())
+        })
+        .as_ref()
 }
 
 fn project_overlay_decoder() -> &'static Decoder {
@@ -376,20 +951,131 @@ fn project_overlay_decoder() -> &'static Decoder {
 #[derive(Clone, Default)]
 struct CandidateDisplay {
     candidates: Vec<String>,
+    provenance: Vec<NativeCandidateProvenance>,
+    personalized: Vec<bool>,
+    automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
     page_start: usize,
     may_have_more: bool,
     view: InteractiveCandidateView,
     action_detail: Option<String>,
+    notice: bool,
+    notice_icon: CandidateNoticeIcon,
+    mode: CandidateDisplayMode,
+    mode_label_override: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CandidateNoticeIcon {
+    #[default]
+    None,
+    WishReceived,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CandidateDisplayMode {
+    #[default]
+    Normal,
+    Shape,
+    ShapeAssemblyFirst,
+    ShapeAssemblySecond,
+    ForgetSelecting,
+    ForgetUndo,
+    ForgetProtected,
+    ForgetNotPersonal,
+    ForgetSaveFailed,
+    ForgetRestored,
+}
+
+impl CandidateDisplayMode {
+    fn footer_label(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Shape => Some("找字"),
+            Self::ShapeAssemblyFirst => Some("找第 1 字"),
+            Self::ShapeAssemblySecond => Some("找第 2 字"),
+            Self::ForgetSelecting => Some("忘记 · 数字选择"),
+            Self::ForgetUndo => Some("已忘记 · 退格撤销"),
+            Self::ForgetProtected => Some("固定词"),
+            Self::ForgetNotPersonal => Some("没有个人排序"),
+            Self::ForgetSaveFailed => Some("未保存"),
+            Self::ForgetRestored => Some("已恢复"),
+        }
+    }
+}
+
+fn shape_display_mode(session: &CompositionSession) -> CandidateDisplayMode {
+    match session.tab_assembly_stage() {
+        Some(TabAssemblyStage::First) => CandidateDisplayMode::ShapeAssemblyFirst,
+        Some(TabAssemblyStage::Second | TabAssemblyStage::Later(_)) => {
+            CandidateDisplayMode::ShapeAssemblySecond
+        }
+        None => CandidateDisplayMode::Shape,
+    }
+}
+
+fn active_shape_code(session: &CompositionSession) -> &str {
+    session.shape_pinyin().unwrap_or(session.phonetic())
+}
+
+fn shape_candidate_display(
+    display: CandidateDisplay,
+    session: &CompositionSession,
+) -> CandidateDisplay {
+    let display = display.with_mode(shape_display_mode(session));
+    match (
+        session.tab_assembly_selected_text(),
+        session.tab_assembly_position(),
+    ) {
+        (Some(selected), Some(position)) => {
+            display.with_mode_label(format!("{selected} → 第 {position} 字"))
+        }
+        _ => display,
+    }
 }
 
 impl CandidateDisplay {
-    fn action(label: &str, detail: &str) -> Self {
+    fn actions(actions: &[InlineWishAction]) -> Self {
+        Self {
+            candidates: actions
+                .iter()
+                .map(|action| action.label.to_owned())
+                .collect(),
+            provenance: vec![NativeCandidateProvenance::default(); actions.len()],
+            personalized: vec![false; actions.len()],
+            automatic_transposition: None,
+            page_start: 0,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+            action_detail: if actions.len() == 1 {
+                actions.first().map(|action| action.detail.to_owned())
+            } else {
+                None
+            },
+            notice: false,
+            notice_icon: CandidateNoticeIcon::None,
+            mode: CandidateDisplayMode::Normal,
+            mode_label_override: None,
+        }
+    }
+
+    fn notice(label: &str, detail: &str) -> Self {
+        Self::notice_with_icon(label, detail, CandidateNoticeIcon::None)
+    }
+
+    fn notice_with_icon(label: &str, detail: &str, notice_icon: CandidateNoticeIcon) -> Self {
         Self {
             candidates: vec![label.to_owned()],
+            provenance: vec![NativeCandidateProvenance::default()],
+            personalized: vec![false],
+            automatic_transposition: None,
             page_start: 0,
             may_have_more: false,
             view: InteractiveCandidateView::Primary,
             action_detail: Some(detail.to_owned()),
+            notice: true,
+            notice_icon,
+            mode: CandidateDisplayMode::Normal,
+            mode_label_override: None,
         }
     }
 
@@ -397,7 +1083,10 @@ impl CandidateDisplay {
     fn from_candidates(candidates: Vec<String>, requested_page_start: usize) -> Self {
         Self::from_batch(
             CandidateBatch {
+                provenance: vec![NativeCandidateProvenance::default(); candidates.len()],
+                personalized: vec![false; candidates.len()],
                 candidates,
+                automatic_transposition: None,
                 may_have_more: false,
                 view: InteractiveCandidateView::Primary,
             },
@@ -408,9 +1097,18 @@ impl CandidateDisplay {
     fn from_batch(batch: CandidateBatch, requested_page_start: usize) -> Self {
         let CandidateBatch {
             candidates,
+            mut provenance,
+            mut personalized,
+            automatic_transposition,
             may_have_more,
             view,
         } = batch;
+        if provenance.len() != candidates.len() {
+            provenance = vec![NativeCandidateProvenance::default(); candidates.len()];
+        }
+        if personalized.len() != candidates.len() {
+            personalized = vec![false; candidates.len()];
+        }
         let page_start = if candidates.is_empty() {
             0
         } else {
@@ -419,11 +1117,28 @@ impl CandidateDisplay {
         };
         Self {
             candidates,
+            provenance,
+            personalized,
+            automatic_transposition,
             page_start,
             may_have_more,
             view,
             action_detail: None,
+            notice: false,
+            notice_icon: CandidateNoticeIcon::None,
+            mode: CandidateDisplayMode::Normal,
+            mode_label_override: None,
         }
+    }
+
+    fn with_mode(mut self, mode: CandidateDisplayMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    fn with_mode_label(mut self, label: String) -> Self {
+        self.mode_label_override = Some(label);
+        self
     }
 
     fn visible(&self) -> &[String] {
@@ -432,6 +1147,22 @@ impl CandidateDisplay {
             .saturating_add(CANDIDATE_PAGE_SIZE)
             .min(self.candidates.len());
         &self.candidates[self.page_start.min(end)..end]
+    }
+
+    fn visible_provenance(&self) -> &[NativeCandidateProvenance] {
+        let end = self
+            .page_start
+            .saturating_add(CANDIDATE_PAGE_SIZE)
+            .min(self.provenance.len());
+        &self.provenance[self.page_start.min(end)..end]
+    }
+
+    fn visible_personalized(&self) -> &[bool] {
+        let end = self
+            .page_start
+            .saturating_add(CANDIDATE_PAGE_SIZE)
+            .min(self.personalized.len());
+        &self.personalized[self.page_start.min(end)..end]
     }
 
     fn page_starts(&self) -> Vec<u32> {
@@ -461,12 +1192,48 @@ impl CandidateDisplay {
         self.action_detail.as_deref()
     }
 
+    fn is_notice(&self) -> bool {
+        self.notice
+    }
+
+    fn notice_icon(&self) -> CandidateNoticeIcon {
+        self.notice_icon
+    }
+
+    #[cfg(test)]
+    fn mode(&self) -> CandidateDisplayMode {
+        self.mode
+    }
+
+    fn mode_label(&self) -> Option<&str> {
+        self.mode_label_override
+            .as_deref()
+            .or_else(|| self.mode.footer_label())
+    }
+
     fn feedback_event(&self, code: &str, shape_mode: bool) -> NativeFeedbackEvent {
-        NativeFeedbackEvent::CandidatesPresented {
+        let provenance = if shape_mode {
+            self.visible_provenance()
+                .iter()
+                .map(|item| {
+                    NativeCandidateProvenance::new(
+                        NativeCandidateSource::Shape,
+                        item.session_promoted(),
+                    )
+                })
+                .collect()
+        } else {
+            self.visible_provenance().to_vec()
+        };
+        NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: code.to_owned(),
             view: native_candidate_view(self.view, shape_mode),
             page_start: self.page_start,
             candidates: self.visible().to_vec(),
+            provenance,
+            automatic_transposition: (!shape_mode)
+                .then(|| self.automatic_transposition.clone())
+                .flatten(),
             may_have_more: self.may_have_more,
         }
     }
@@ -507,28 +1274,71 @@ fn native_candidate_view(view: InteractiveCandidateView, shape_mode: bool) -> Na
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InlineWishAction {
-    command: WishCommand,
+    operation: InlineWishOperation,
     label: &'static str,
     detail: &'static str,
 }
 
-fn inline_wish_action(summary: NativeFeedbackSummary) -> InlineWishAction {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineWishOperation {
+    Command(WishCommand),
+    Capture {
+        scope: WishCaptureScope,
+        category: WishCategory,
+    },
+}
+
+fn inline_wish_actions(summary: NativeFeedbackSummary) -> Vec<InlineWishAction> {
     match summary.lifecycle {
-        NativeFeedbackLifecycle::Disabled => InlineWishAction {
-            command: WishCommand::Start,
+        NativeFeedbackLifecycle::Disabled => vec![InlineWishAction {
+            operation: InlineWishOperation::Command(WishCommand::Start),
             label: "开始反馈",
             detail: "暂不保存",
-        },
-        NativeFeedbackLifecycle::Recording => InlineWishAction {
-            command: WishCommand::SaveRecent,
-            label: "向猫猫许愿",
-            detail: "近30秒",
-        },
-        NativeFeedbackLifecycle::Stopped => InlineWishAction {
-            command: WishCommand::ClearStopped,
+        }],
+        NativeFeedbackLifecycle::Recording => vec![
+            InlineWishAction {
+                operation: InlineWishOperation::Capture {
+                    scope: WishCaptureScope::RecentEpisodes,
+                    category: WishCategory::Other,
+                },
+                label: "记录刚才的情况",
+                detail: "自动分段",
+            },
+            InlineWishAction {
+                operation: InlineWishOperation::Capture {
+                    scope: WishCaptureScope::RecentWindow,
+                    category: WishCategory::Other,
+                },
+                label: "记录更多内容",
+                detail: "近30秒",
+            },
+        ],
+        NativeFeedbackLifecycle::Stopped => vec![InlineWishAction {
+            operation: InlineWishOperation::Command(WishCommand::ClearStopped),
             label: "清除反馈",
             detail: "已停止",
-        },
+        }],
+    }
+}
+
+fn inline_wish_notice(operation: InlineWishOperation, succeeded: bool) -> CandidateDisplay {
+    let label = match (operation, succeeded) {
+        (InlineWishOperation::Capture { .. }, true) => "已经保存",
+        (InlineWishOperation::Capture { .. }, false) => "保存失败",
+        (InlineWishOperation::Command(WishCommand::Start), true) => "反馈已开始",
+        (InlineWishOperation::Command(WishCommand::ClearStopped), true) => "反馈已清除",
+        (InlineWishOperation::Command(_), true) => "操作已完成",
+        (InlineWishOperation::Command(_), false) => "操作未完成",
+    };
+    let detail = if succeeded {
+        "可以继续输入"
+    } else {
+        "稍后再试"
+    };
+    if matches!(operation, InlineWishOperation::Capture { .. }) && succeeded {
+        CandidateDisplay::notice_with_icon(label, detail, CandidateNoticeIcon::WishReceived)
+    } else {
+        CandidateDisplay::notice(label, detail)
     }
 }
 
@@ -545,6 +1355,7 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
             );
             Ok(CandidateProviderBlueprint {
                 snapshot,
+                supplemental: None,
                 alias_root: None,
             })
         })
@@ -557,13 +1368,27 @@ fn development_candidate_provider()
     development_candidate_blueprint().map(|blueprint| blueprint.build())
 }
 
+#[cfg(test)]
 fn candidate_provider_for_root(
     root: &Path,
     alias_root: Option<PathBuf>,
 ) -> CandidateProviderLoadResult {
-    match load_current_candidate_snapshot(root).map_err(CandidateProviderLoadError::Runtime)? {
-        Some(snapshot) => Ok(CandidateProviderBlueprint {
-            snapshot,
+    candidate_provider_for_roots(root, alias_root, None)
+}
+
+fn candidate_provider_for_roots(
+    root: &Path,
+    alias_root: Option<PathBuf>,
+    supplemental_root: Option<&Path>,
+) -> CandidateProviderLoadResult {
+    match load_candidate_runtime_snapshots(root, supplemental_root)
+        .map_err(CandidateProviderLoadError::Runtime)?
+    {
+        Some(runtime) => Ok(CandidateProviderBlueprint {
+            snapshot: Arc::clone(runtime.core()),
+            supplemental: runtime
+                .supplemental()
+                .map(|supplemental| (Arc::clone(supplemental.snapshot()), supplemental.config())),
             alias_root,
         }),
         None => development_candidate_blueprint().map(|mut blueprint| {
@@ -573,7 +1398,7 @@ fn candidate_provider_for_root(
     }
 }
 
-fn module_path() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
+fn current_module_handle() -> std::result::Result<HMODULE, CandidateProviderLoadError> {
     let mut module = HMODULE::default();
     let address = DllGetClassObject as *const () as *const u16;
     // SAFETY: FROM_ADDRESS treats the non-null value as an address within the
@@ -587,7 +1412,11 @@ fn module_path() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
         )
     }
     .map_err(|_| CandidateProviderLoadError::ModuleLocation)?;
+    Ok(module)
+}
 
+fn module_path() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
+    let module = current_module_handle()?;
     let mut buffer = vec![0_u16; 32_768];
     // SAFETY: `module` identifies the image containing this function and the
     // writable buffer remains alive for the synchronous call.
@@ -637,10 +1466,29 @@ fn wish_root_for_module(module_path: &Path) -> Option<PathBuf> {
     installed_user_data_root_for_module(module_path, "wishes")
 }
 
+fn personal_ranking_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, "personal-ranking")
+}
+
+fn personal_ranking_suppression_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, PERSONAL_RANKING_SUPPRESSION_DIRECTORY)
+}
+
+fn public_supplement_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, "public-supplement")
+}
+
 fn class_factory_candidate_provider() -> CandidateProviderLoadResult {
-    let root = module_candidate_runtime_root()?;
-    let alias_root = explicit_alias_root_for_module(&module_path()?);
-    candidate_provider_for_root(&root, alias_root)
+    static BLUEPRINT: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
+    BLUEPRINT
+        .get_or_init(|| {
+            let root = module_candidate_runtime_root()?;
+            let module_path = module_path()?;
+            let alias_root = explicit_alias_root_for_module(&module_path);
+            let supplemental_root = public_supplement_root_for_module(&module_path);
+            candidate_provider_for_roots(&root, alias_root, supplemental_root.as_deref())
+        })
+        .clone()
 }
 
 const MAX_TSF_PREFLIGHT_CODE_KEYS: usize = 64;
@@ -916,6 +1764,7 @@ fn run_candidate_preflight(
     let factory: IClassFactory = TsfClassFactory::counted_with_options(
         Ok(CandidateProviderBlueprint {
             snapshot,
+            supplemental: None,
             alias_root: None,
         }),
         KeyAdviceMode::SyntheticHost,
@@ -1069,18 +1918,133 @@ struct PlannedKey {
     edit: Option<PendingDocumentEdit>,
     candidate_display: Option<CandidateDisplay>,
     selection_to_remember: Option<PlannedSelection>,
+    overruled_text_to_remember: Option<String>,
     feedback_after_success: Option<NativeFeedbackEvent>,
     action_after_success: Option<PlannedAction>,
+    candidate_forget_action_after_success: Option<PlannedCandidateForgetAction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlannedAction {
-    Wish(WishCommand),
+    Wish(InlineWishOperation),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateForgetMessage {
+    Select,
+    Protected,
+    NotPersonal,
+    SaveFailed,
+}
+
+impl CandidateForgetMessage {
+    fn display_mode(self) -> CandidateDisplayMode {
+        match self {
+            Self::Select => CandidateDisplayMode::ForgetSelecting,
+            Self::Protected => CandidateDisplayMode::ForgetProtected,
+            Self::NotPersonal => CandidateDisplayMode::ForgetNotPersonal,
+            Self::SaveFailed => CandidateDisplayMode::ForgetSaveFailed,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+enum CandidateForgetState {
+    #[default]
+    Inactive,
+    Choosing(CandidateForgetMessage),
+    UndoAvailable {
+        code: String,
+        text: String,
+        restore_session: bool,
+    },
+}
+
+impl fmt::Debug for CandidateForgetState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive => formatter.write_str("Inactive"),
+            Self::Choosing(message) => formatter.debug_tuple("Choosing").field(message).finish(),
+            Self::UndoAvailable { .. } => formatter
+                .debug_struct("UndoAvailable")
+                .field("debug_contains_text", &false)
+                .finish(),
+        }
+    }
+}
+
+enum PlannedCandidateForgetAction {
+    Enter,
+    Cancel,
+    Message(CandidateForgetMessage),
+    Suppress {
+        code: String,
+        text: String,
+        restore_session: bool,
+    },
+    Restore {
+        code: String,
+        text: String,
+        restore_session: bool,
+    },
+    Finalize,
+}
+
+fn plan_candidate_forget_ui(
+    session: &CompositionSession,
+    candidate_display: Option<CandidateDisplay>,
+    action: PlannedCandidateForgetAction,
+) -> PlannedKey {
+    PlannedKey {
+        before: session.clone(),
+        after: session.clone(),
+        edit: None,
+        candidate_display,
+        selection_to_remember: None,
+        overruled_text_to_remember: None,
+        feedback_after_success: None,
+        action_after_success: None,
+        candidate_forget_action_after_success: Some(action),
+    }
+}
+
+#[derive(Clone)]
 struct PlannedSelection {
     code: String,
     text: String,
+    retractable_by_immediate_backspace: bool,
+}
+
+#[derive(Clone)]
+struct PersonalPhraseComponent {
+    code: String,
+    text: String,
+}
+
+#[derive(Default)]
+struct PersonalPhraseComposer {
+    previous: Option<PersonalPhraseComponent>,
+}
+
+struct PendingPersonalPhrase {
+    selection: PlannedSelection,
+    previous_session_text: Option<String>,
+}
+
+struct PendingPersonalSelection {
+    selection: PlannedSelection,
+    overruled_text: Option<String>,
+    previous_session_text: Option<String>,
+    phrase: Option<PendingPersonalPhrase>,
+    previous_phrase_component: Option<PersonalPhraseComponent>,
+    previous_left_context: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingPersonalKeyResolution {
+    None,
+    Confirmed,
+    Retracted,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1150,6 +2114,23 @@ fn is_host_printable_key(vkey: u16) -> bool {
         )
 }
 
+fn is_candidate_forget_shortcut(vkey: u16, modifiers: KeyModifiers) -> bool {
+    vkey == VK_DELETE.0
+        && modifiers.control
+        && !modifiers.shift
+        && !modifiers.alt
+        && !modifiers.windows
+}
+
+fn candidate_numeric_rank(vkey: u16, modifiers: KeyModifiers) -> Option<usize> {
+    ((VK_1.0..=VK_6.0).contains(&vkey)
+        && !modifiers.shift
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.windows)
+        .then(|| usize::from(vkey - VK_1.0) + 1)
+}
+
 fn decode_virtual_key(
     vkey: u16,
     modifiers: KeyModifiers,
@@ -1183,6 +2164,9 @@ fn decode_virtual_key(
         }
         key if key == VK_1.0 && modifiers.shift => Some(CompositionInput::Punctuation(
             CompositionPunctuation::ExclamationMark,
+        )),
+        key if key == VK_6.0 && modifiers.shift => Some(CompositionInput::Punctuation(
+            CompositionPunctuation::Ellipsis,
         )),
         key if key == VK_9.0 && modifiers.shift => Some(CompositionInput::Punctuation(
             CompositionPunctuation::LeftParenthesis,
@@ -1220,6 +2204,7 @@ fn plan_session_input(
     let effect = after.apply(input.clone());
     let edit = match (input, effect) {
         (_, CompositionEffect::Continue) if before.wish_prompt() && after.wish_prompt() => None,
+        (_, CompositionEffect::Continue) if before.tab_mode() || after.tab_mode() => None,
         (CompositionInput::Letters(_), CompositionEffect::Continue) => Some(
             PendingDocumentEdit::UpdatePreedit(after.phonetic().to_owned()),
         ),
@@ -1294,9 +2279,156 @@ fn plan_session_input(
         edit,
         candidate_display: None,
         selection_to_remember: None,
+        overruled_text_to_remember: None,
         feedback_after_success: None,
         action_after_success: None,
+        candidate_forget_action_after_success: None,
     })
+}
+
+fn plan_tab_assembly_selection(
+    session: &CompositionSession,
+    input: &CompositionInput,
+    selected_text: Option<String>,
+) -> Option<PlannedKey> {
+    let (source, visible_rank) = match input {
+        CompositionInput::Confirm => (NativeSelectionSource::FirstCandidate, 1),
+        CompositionInput::Select(rank) => (NativeSelectionSource::Numeric, *rank),
+        _ => return None,
+    };
+    let selected_text = selected_text.filter(|text| !text.is_empty())?;
+    let before = session.clone();
+    let mut after = before.clone();
+    let selection = after.accept_tab_assembly_candidate(&selected_text)?;
+    let (edit, selection_to_remember, feedback_after_success) = match selection {
+        TabAssemblySelection::Advanced => (None, None, None),
+        TabAssemblySelection::Complete(text) => {
+            let selection = PlannedSelection {
+                code: before.phonetic().to_owned(),
+                text: text.clone(),
+                retractable_by_immediate_backspace: true,
+            };
+            let feedback = NativeFeedbackEvent::CandidateCommitted {
+                code: before.phonetic().to_owned(),
+                text: text.clone(),
+                view: NativeCandidateView::Shape,
+                source,
+                absolute_rank: before.candidate_page_start().saturating_add(visible_rank),
+                visible_rank,
+            };
+            (
+                Some(PendingDocumentEdit::Commit(text)),
+                Some(selection),
+                Some(feedback),
+            )
+        }
+    };
+    Some(PlannedKey {
+        before,
+        after,
+        edit,
+        candidate_display: None,
+        selection_to_remember,
+        overruled_text_to_remember: None,
+        feedback_after_success,
+        action_after_success: None,
+        candidate_forget_action_after_success: None,
+    })
+}
+
+fn automatic_transposition_tier(delivered_pair_gap_ms: u64) -> Option<AutomaticTranspositionTier> {
+    if delivered_pair_gap_ms <= AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS {
+        Some(AutomaticTranspositionTier::Primary)
+    } else if delivered_pair_gap_ms < AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS {
+        Some(AutomaticTranspositionTier::Secondary)
+    } else if delivered_pair_gap_ms < AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS {
+        Some(AutomaticTranspositionTier::Shadow)
+    } else {
+        None
+    }
+}
+
+fn automatic_transposition_request(
+    input: &CompositionInput,
+    after: &CompositionSession,
+    timing: AutomaticTranspositionTimingEvidence,
+) -> Option<AutomaticTranspositionRequest> {
+    let CompositionInput::Letters(letters) = input else {
+        return None;
+    };
+    let delivered_pair_gap_ms = timing.current_pair_gap_ms?;
+    let tier = automatic_transposition_tier(delivered_pair_gap_ms)?;
+    let code_len = after.phonetic().len();
+    if letters.len() != 1
+        || code_len < 2
+        || !code_len.is_multiple_of(2)
+        || after.tab_mode()
+        || after.recovery_mode()
+        || after.wish_prompt()
+    {
+        return None;
+    }
+    let syllable_index = code_len / 2 - 1;
+    let primary = AutomaticTranspositionAttempt {
+        pattern: AutomaticTranspositionPattern::single(syllable_index),
+        cold_tier: tier,
+        tier,
+        pair_gap_ms: u32::try_from(delivered_pair_gap_ms).ok()?,
+    };
+    let fallback = (code_len == 4 && syllable_index == 1)
+        .then_some(timing.previous_pair)
+        .flatten()
+        .filter(|previous| previous.syllable_index == 0)
+        .and_then(|previous| {
+            let combined_gap_ms = delivered_pair_gap_ms.max(previous.pair_gap_ms);
+            let combined_tier = automatic_transposition_tier(combined_gap_ms)?;
+            Some(AutomaticTranspositionAttempt {
+                pattern: AutomaticTranspositionPattern::adjacent_pair(0),
+                cold_tier: combined_tier,
+                tier: combined_tier,
+                pair_gap_ms: u32::try_from(combined_gap_ms).ok()?,
+            })
+        });
+    Some(AutomaticTranspositionRequest { primary, fallback })
+}
+
+fn completed_pair_timing_after_key(
+    after_code_len: usize,
+    delivered_letter: bool,
+    current_pair_gap_ms: Option<u64>,
+    previous_pair: Option<CompletedPairTiming>,
+) -> Option<CompletedPairTiming> {
+    if !delivered_letter {
+        return None;
+    }
+    if after_code_len >= 2 && after_code_len.is_multiple_of(2) {
+        return current_pair_gap_ms.map(|pair_gap_ms| CompletedPairTiming {
+            syllable_index: after_code_len / 2 - 1,
+            pair_gap_ms,
+        });
+    }
+    previous_pair
+        .filter(|previous| after_code_len == previous.syllable_index.saturating_add(1) * 2 + 1)
+}
+
+fn plan_immediate_inline_wish(
+    session: &CompositionSession,
+    operation: InlineWishOperation,
+) -> PlannedKey {
+    let before = session.clone();
+    let mut after = before.clone();
+    after.finish_commit();
+    PlannedKey {
+        before,
+        after,
+        edit: Some(PendingDocumentEdit::Cancel),
+        candidate_display: None,
+        selection_to_remember: None,
+        overruled_text_to_remember: None,
+        feedback_after_success: None,
+        action_after_success: Some(PlannedAction::Wish(operation)),
+        candidate_forget_action_after_success: None,
+    }
 }
 
 fn lifecycle_error(code: HRESULT) -> Error {
@@ -1475,15 +2607,20 @@ const POPUP_TEXT_PADDING_LOGICAL: i32 = 7;
 const POPUP_SELECTED_TEXT_INSET_LOGICAL: i32 = 13;
 const POPUP_RANK_WIDTH_LOGICAL: i32 = 16;
 const POPUP_RANK_GAP_LOGICAL: i32 = 4;
-const POPUP_METADATA_BASELINE_OFFSET_LOGICAL: i32 = 2;
-const POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL: i32 = 42;
 const POPUP_FOOTER_CONTENT_INSET_LOGICAL: i32 = 10;
 const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 640;
 const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 54;
 const POPUP_ACTION_MIN_WIDTH_LOGICAL: i32 = 210;
 const POPUP_ACTION_DETAIL_GAP_LOGICAL: i32 = 12;
+const POPUP_NOTICE_ICON_SIZE_LOGICAL: i32 = 24;
+const POPUP_NOTICE_ICON_GAP_LOGICAL: i32 = 7;
 const POPUP_CORNER_DIAMETER_LOGICAL: i32 = 16;
 const POPUP_BORDER_WIDTH_LOGICAL: i32 = 1;
+const POPUP_SELECTED_SURFACE_HEIGHT_LOGICAL: i32 = 28;
+const POPUP_SELECTION_ACCENT_WIDTH_LOGICAL: i32 = 3;
+const POPUP_SELECTION_ACCENT_FALLBACK_HEIGHT_LOGICAL: i32 = 14;
+const POPUP_SELECTION_ACCENT_LEFT_INSET_LOGICAL: i32 = 5;
+const POPUP_PERSONAL_MARK_SIZE_LOGICAL: i32 = 3;
 
 fn candidate_popup_corner_diameter(dpi: u32) -> i32 {
     popup_scale(dpi, POPUP_CORNER_DIAMETER_LOGICAL)
@@ -1519,7 +2656,7 @@ fn candidate_popup_border_geometry(client: RECT, dpi: u32) -> Option<CandidatePo
     })
 }
 
-fn horizontal_candidate_logical_width(candidate: &str) -> i32 {
+fn horizontal_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
     let text_width = candidate
         .chars()
         .take(CANDIDATE_DISPLAY_MAX_CHARS)
@@ -1527,7 +2664,16 @@ fn horizontal_candidate_logical_width(candidate: &str) -> i32 {
             width.saturating_add(if character.is_ascii() { 9 } else { 18 })
         })
         .clamp(18, 144);
-    POPUP_CANDIDATE_CHROME_WIDTH_LOGICAL.saturating_add(text_width)
+    let leading_inset = if selected {
+        POPUP_SELECTED_TEXT_INSET_LOGICAL
+    } else {
+        POPUP_TEXT_PADDING_LOGICAL
+    };
+    leading_inset
+        .saturating_add(POPUP_RANK_WIDTH_LOGICAL)
+        .saturating_add(POPUP_RANK_GAP_LOGICAL)
+        .saturating_add(text_width)
+        .saturating_add(POPUP_TEXT_PADDING_LOGICAL)
 }
 
 fn estimated_popup_text_width(text: &str, ascii_width: i32, other_width: i32) -> i32 {
@@ -1540,14 +2686,20 @@ fn estimated_popup_text_width(text: &str, ascii_width: i32, other_width: i32) ->
     })
 }
 
-fn action_popup_logical_width(label: &str, detail: &str) -> i32 {
+fn action_popup_logical_width(display: &CandidateDisplay, label: &str, detail: &str) -> i32 {
     let label_width = estimated_popup_text_width(label, 9, 18);
     let detail_width = estimated_popup_text_width(detail, 7, 14);
+    let notice_icon_width = if display.notice_icon() == CandidateNoticeIcon::WishReceived {
+        POPUP_NOTICE_ICON_SIZE_LOGICAL.saturating_add(POPUP_NOTICE_ICON_GAP_LOGICAL)
+    } else {
+        0
+    };
     POPUP_OUTER_PADDING_LOGICAL
         .saturating_mul(2)
         .saturating_add(POPUP_SELECTED_TEXT_INSET_LOGICAL)
         .saturating_add(POPUP_RANK_WIDTH_LOGICAL)
         .saturating_add(POPUP_RANK_GAP_LOGICAL)
+        .saturating_add(notice_icon_width)
         .saturating_add(label_width)
         .saturating_add(POPUP_ACTION_DETAIL_GAP_LOGICAL)
         .saturating_add(detail_width)
@@ -1555,13 +2707,23 @@ fn action_popup_logical_width(label: &str, detail: &str) -> i32 {
         .max(POPUP_ACTION_MIN_WIDTH_LOGICAL)
 }
 
+fn candidate_popup_mode_label(display: &CandidateDisplay) -> Option<&str> {
+    display.mode_label().or_else(|| {
+        (display.view() == InteractiveCandidateView::TranspositionRecovery).then_some("换序")
+    })
+}
+
+fn candidate_popup_mode_logical_width(display: &CandidateDisplay) -> i32 {
+    candidate_popup_mode_label(display)
+        .map(|label| estimated_popup_text_width(label, 7, 14).saturating_add(32))
+        .unwrap_or(0)
+}
+
 fn candidate_popup_footer_logical_width(display: &CandidateDisplay) -> i32 {
-    match (
-        display.view() == InteractiveCandidateView::TranspositionRecovery,
-        display.page_starts().len() > 1,
-    ) {
-        (true, true) => 108,
-        (true, false) => 60,
+    let mode_width = candidate_popup_mode_logical_width(display);
+    match (mode_width > 0, display.page_starts().len() > 1) {
+        (true, true) => mode_width.saturating_add(48),
+        (true, false) => mode_width,
         (false, true) => 62,
         (false, false) => 0,
     }
@@ -1580,7 +2742,13 @@ fn horizontal_candidate_widths(display: &CandidateDisplay, dpi: u32, popup_width
     let mut widths = display
         .visible()
         .iter()
-        .map(|candidate| popup_scale(dpi, horizontal_candidate_logical_width(candidate)))
+        .enumerate()
+        .map(|(index, candidate)| {
+            popup_scale(
+                dpi,
+                horizontal_candidate_logical_width(candidate, index == 0),
+            )
+        })
         .collect::<Vec<_>>();
     let minimums = widths
         .iter()
@@ -1624,7 +2792,7 @@ fn candidate_popup_metrics(
             .max(1);
         return CandidatePopupMetrics {
             layout: CandidatePopupLayout::Horizontal,
-            width: popup_scale(dpi, action_popup_logical_width(label, detail))
+            width: popup_scale(dpi, action_popup_logical_width(display, label, detail))
                 .min(horizontal_limit),
             height: popup_scale(
                 dpi,
@@ -1634,18 +2802,19 @@ fn candidate_popup_metrics(
             ),
         };
     }
-    let footer_needed = display.page_starts().len() > 1
-        || display.view() == InteractiveCandidateView::TranspositionRecovery;
+    let footer_needed =
+        display.page_starts().len() > 1 || candidate_popup_mode_label(display).is_some();
     let footer_width = popup_scale(dpi, candidate_popup_footer_logical_width(display));
     let outer_width = popup_scale(dpi, POPUP_OUTER_PADDING_LOGICAL.saturating_mul(2));
     let horizontal_content_width =
         display
             .visible()
             .iter()
-            .fold(outer_width, |width, candidate| {
+            .enumerate()
+            .fold(outer_width, |width, (index, candidate)| {
                 width.saturating_add(popup_scale(
                     dpi,
-                    horizontal_candidate_logical_width(candidate),
+                    horizontal_candidate_logical_width(candidate, index == 0),
                 ))
             });
     let desired_horizontal_width = horizontal_content_width
@@ -1662,7 +2831,7 @@ fn candidate_popup_metrics(
                 width.saturating_add(popup_scale(
                     dpi,
                     if index == 0 {
-                        horizontal_candidate_logical_width(candidate)
+                        horizontal_candidate_logical_width(candidate, true)
                     } else {
                         POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL
                     },
@@ -1716,6 +2885,8 @@ struct CandidatePopupPaintState {
     native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
     pending_timing: Option<PendingCandidatePopupTiming>,
     corner_strategy: CandidatePopupCornerStrategy,
+    transient_notice: bool,
+    transient_hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1840,7 +3011,34 @@ impl CandidatePopup {
         display: &CandidateDisplay,
         feedback_context: NativeFeedbackContext,
     ) -> Result<()> {
+        self.show_inner(owner, anchor, display, feedback_context, false)
+    }
+
+    fn show_notice(&mut self, display: &CandidateDisplay) -> Result<()> {
+        let (Some(owner), Some(anchor)) = (self.owner, self.anchor) else {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        };
+        self.show_inner(owner, anchor, display, NativeFeedbackContext::Unknown, true)
+    }
+
+    fn show_inner(
+        &mut self,
+        owner: HWND,
+        anchor: RECT,
+        display: &CandidateDisplay,
+        feedback_context: NativeFeedbackContext,
+        transient_notice: bool,
+    ) -> Result<()> {
         let timing_started_at = Instant::now();
+        if let Some(hwnd) = self.hwnd {
+            // SAFETY: this controller owns the popup and its fixed timer id.
+            let _ = unsafe { KillTimer(Some(hwnd), INLINE_WISH_NOTICE_TIMER_ID) };
+        }
+        if self.paint.transient_hidden {
+            self.visible = false;
+            self.paint.transient_hidden = false;
+        }
+        self.paint.transient_notice = transient_notice;
         if display.visible().is_empty() {
             self.hide();
             return Ok(());
@@ -2042,11 +3240,19 @@ impl CandidatePopup {
     }
 
     fn hide(&mut self) {
+        if let Some(hwnd) = self.hwnd {
+            // SAFETY: this controller owns the popup and its fixed timer id.
+            let _ = unsafe { KillTimer(Some(hwnd), INLINE_WISH_NOTICE_TIMER_ID) };
+        }
+        self.paint.transient_notice = false;
+        self.paint.transient_hidden = false;
         self.set_visible(false);
     }
 
     fn destroy(&mut self) {
         if let Some(hwnd) = self.hwnd.take() {
+            // SAFETY: this controller owns the popup and its fixed timer id.
+            let _ = unsafe { KillTimer(Some(hwnd), INLINE_WISH_NOTICE_TIMER_ID) };
             // SAFETY: this controller created and still owns the popup.
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -2057,6 +3263,8 @@ impl CandidatePopup {
         self.anchor = None;
         self.placement = None;
         self.visible = false;
+        self.paint.transient_notice = false;
+        self.paint.transient_hidden = false;
     }
 }
 
@@ -2137,21 +3345,116 @@ unsafe fn create_candidate_popup_font(dpi: u32, logical_height: i32, weight: u32
     }
 }
 
-fn candidate_label_rects(mut content: RECT, dpi: u32) -> (RECT, RECT) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PopupFontMetrics {
+    height: i32,
+    ascent: i32,
+}
+
+fn candidate_label_columns(mut content: RECT, dpi: u32) -> (RECT, RECT) {
     let scale = |logical: i32| popup_scale(dpi, logical);
     let mut rank = content;
     rank.right = rank
         .left
         .saturating_add(scale(POPUP_RANK_WIDTH_LOGICAL))
         .min(rank.right);
-    rank.top = rank
-        .top
-        .saturating_add(scale(POPUP_METADATA_BASELINE_OFFSET_LOGICAL));
-    rank.bottom = rank
-        .bottom
-        .saturating_add(scale(POPUP_METADATA_BASELINE_OFFSET_LOGICAL));
     content.left = rank.right.saturating_add(scale(POPUP_RANK_GAP_LOGICAL));
     (rank, content)
+}
+
+fn baseline_aligned_label_rects(
+    content: RECT,
+    dpi: u32,
+    rank_metrics: PopupFontMetrics,
+    text_metrics: PopupFontMetrics,
+) -> (RECT, RECT) {
+    let (mut rank, mut text) = candidate_label_columns(content, dpi);
+    let available_height = content.bottom.saturating_sub(content.top).max(0);
+    let text_height = text_metrics.height.clamp(0, available_height);
+    text.top = content
+        .top
+        .saturating_add(available_height.saturating_sub(text_height) / 2);
+    text.bottom = text.top.saturating_add(text_height);
+    let baseline = text
+        .top
+        .saturating_add(text_metrics.ascent.min(text_height));
+    let rank_height = rank_metrics.height.clamp(0, available_height);
+    rank.top = baseline
+        .saturating_sub(rank_metrics.ascent.min(rank_height))
+        .max(content.top);
+    rank.bottom = rank.top.saturating_add(rank_height).min(content.bottom);
+    (rank, text)
+}
+
+unsafe fn selected_popup_font_metrics(hdc: HDC, font: HFONT) -> Option<PopupFontMetrics> {
+    if font.is_invalid() {
+        return None;
+    }
+    // SAFETY: the font and paint DC belong to the active WM_PAINT operation.
+    unsafe {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let mut metrics = TEXTMETRICW::default();
+    // SAFETY: the output structure is valid for the duration of this call.
+    if !unsafe { GetTextMetricsW(hdc, &mut metrics) }.as_bool() {
+        return None;
+    }
+    Some(PopupFontMetrics {
+        height: metrics.tmHeight,
+        ascent: metrics.tmAscent,
+    })
+}
+
+fn candidate_personal_mark_rect(rank: RECT, dpi: u32) -> Option<RECT> {
+    let size = popup_scale(dpi, POPUP_PERSONAL_MARK_SIZE_LOGICAL).max(2);
+    let height = rank.bottom.saturating_sub(rank.top);
+    if height < size || rank.right.saturating_sub(rank.left) < size {
+        return None;
+    }
+    let top = rank.top.saturating_add(height.saturating_sub(size) / 2);
+    Some(RECT {
+        left: rank.left,
+        top,
+        right: rank.left.saturating_add(size),
+        bottom: top.saturating_add(size),
+    })
+}
+
+unsafe fn paint_candidate_personal_mark(hdc: HDC, rank: RECT, dpi: u32) {
+    let Some(mark) = candidate_personal_mark_rect(rank, dpi) else {
+        return;
+    };
+    // A tiny rounded dot lives inside the existing rank column, so personal
+    // recall remains recognizable without widening or reflowing candidates.
+    let diameter = mark.right.saturating_sub(mark.left).max(1);
+    // SAFETY: the region and brush are bounded to the current candidate row
+    // and released before returning.
+    let region = unsafe {
+        CreateRoundRectRgn(
+            mark.left,
+            mark.top,
+            mark.right,
+            mark.bottom,
+            diameter,
+            diameter,
+        )
+    };
+    if region.is_invalid() {
+        return;
+    }
+    // SAFETY: the fixed popup color creates one local GDI brush.
+    let brush = unsafe { CreateSolidBrush(popup_color(POPUP_MODE_ACCENT_RGB)) };
+    if !brush.is_invalid() {
+        // SAFETY: hdc, region, and brush remain valid for this bounded fill.
+        unsafe {
+            let _ = FillRgn(hdc, region, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+    }
+    // SAFETY: the region is no longer used after this call.
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(region.0));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2162,42 +3465,68 @@ unsafe fn paint_candidate_label(
     index: usize,
     candidate: &str,
     action_detail: Option<&str>,
+    show_rank: bool,
     selected: bool,
+    personalized: bool,
     candidate_font: HFONT,
     selected_font: HFONT,
     metadata_font: HFONT,
 ) {
-    let (mut rank, mut content) = candidate_label_rects(content, dpi);
-    let mut rank_label = (index + 1).to_string().encode_utf16().collect::<Vec<_>>();
-    if !metadata_font.is_invalid() {
-        // SAFETY: this font remains owned by the current paint operation.
-        unsafe {
-            let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-        }
-    }
-    // SAFETY: the paint DC and bounded label rectangle are valid.
-    unsafe {
-        let _ = SetTextColor(
-            hdc,
-            popup_color(if selected {
-                POPUP_SELECTED_RANK_RGB
-            } else {
-                POPUP_RANK_RGB
-            }),
-        );
-        let _ = DrawTextW(
-            hdc,
-            &mut rank_label,
-            &mut rank,
-            DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
-    }
-
     let font = if selected {
         selected_font
     } else {
         candidate_font
     };
+    let rank_metrics = unsafe { selected_popup_font_metrics(hdc, metadata_font) };
+    let text_metrics = unsafe { selected_popup_font_metrics(hdc, font) };
+    let baseline_aligned = rank_metrics.is_some() && text_metrics.is_some();
+    let original_content = content;
+    let (mut rank, mut content) = match (rank_metrics, text_metrics) {
+        (Some(rank_metrics), Some(text_metrics)) => {
+            baseline_aligned_label_rects(content, dpi, rank_metrics, text_metrics)
+        }
+        _ => candidate_label_columns(content, dpi),
+    };
+    if !show_rank {
+        content.left = original_content.left;
+    }
+    if show_rank {
+        let mut rank_label = (index + 1).to_string().encode_utf16().collect::<Vec<_>>();
+        if !metadata_font.is_invalid() {
+            // SAFETY: this font remains owned by the current paint operation.
+            unsafe {
+                let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+            }
+        }
+        // SAFETY: the paint DC and bounded label rectangle are valid.
+        unsafe {
+            let _ = SetTextColor(
+                hdc,
+                popup_color(if selected {
+                    POPUP_SELECTED_RANK_RGB
+                } else {
+                    POPUP_RANK_RGB
+                }),
+            );
+            let _ = DrawTextW(
+                hdc,
+                &mut rank_label,
+                &mut rank,
+                DT_RIGHT
+                    | DT_SINGLELINE
+                    | if baseline_aligned { DT_TOP } else { DT_VCENTER }
+                    | DT_NOPREFIX,
+            );
+        }
+        if personalized {
+            // SAFETY: the marker is confined to the already measured rank
+            // rectangle and owns every temporary GDI object it creates.
+            unsafe {
+                paint_candidate_personal_mark(hdc, rank, dpi);
+            }
+        }
+    }
+
     if !font.is_invalid() {
         // SAFETY: this font remains owned by the current paint operation.
         unsafe {
@@ -2232,9 +3561,9 @@ unsafe fn paint_candidate_label(
                 let detail_left = content.right.saturating_sub(detail_size.cx);
                 detail_rect = Some(RECT {
                     left: detail_left,
-                    top: content.top,
+                    top: rank.top,
                     right: content.right,
-                    bottom: content.bottom,
+                    bottom: rank.bottom,
                 });
                 content.right = detail_left.saturating_sub(gap);
             }
@@ -2261,7 +3590,10 @@ unsafe fn paint_candidate_label(
             hdc,
             &mut text,
             &mut content,
-            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            DT_SINGLELINE
+                | if baseline_aligned { DT_TOP } else { DT_VCENTER }
+                | DT_NOPREFIX
+                | DT_END_ELLIPSIS,
         );
     }
     if let (Some(mut detail_rect), Some(detail)) = (detail_rect, action_detail) {
@@ -2275,7 +3607,10 @@ unsafe fn paint_candidate_label(
                 hdc,
                 &mut detail,
                 &mut detail_rect,
-                DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                DT_RIGHT
+                    | DT_SINGLELINE
+                    | if baseline_aligned { DT_TOP } else { DT_VCENTER }
+                    | DT_NOPREFIX,
             );
         }
     }
@@ -2410,19 +3745,40 @@ unsafe fn paint_rounded_popup_border(hdc: HDC, client: RECT, dpi: u32, color: CO
     }
 }
 
-fn candidate_selection_rects(item: RECT, dpi: u32) -> (RECT, RECT) {
+fn candidate_selection_rects(
+    item: RECT,
+    dpi: u32,
+    selected_text_metrics: Option<PopupFontMetrics>,
+) -> (RECT, RECT) {
     let scale = |logical: i32| popup_scale(dpi, logical);
+    let center_vertical = |bounds: RECT, height: i32| {
+        let available = bounds.bottom.saturating_sub(bounds.top).max(0);
+        let height = height.clamp(0, available);
+        let top = bounds
+            .top
+            .saturating_add(available.saturating_sub(height) / 2);
+        (top, top.saturating_add(height))
+    };
+    let (selected_top, selected_bottom) =
+        center_vertical(item, scale(POPUP_SELECTED_SURFACE_HEIGHT_LOGICAL));
     let selected = RECT {
         left: item.left.saturating_add(scale(1)),
-        top: item.top.saturating_add(scale(4)),
+        top: selected_top,
         right: item.right.saturating_sub(scale(5)),
-        bottom: item.bottom.saturating_sub(scale(4)),
+        bottom: selected_bottom,
     };
+    let accent_height = selected_text_metrics
+        .map(|metrics| metrics.height)
+        .unwrap_or_else(|| scale(POPUP_SELECTION_ACCENT_FALLBACK_HEIGHT_LOGICAL));
+    let (accent_top, accent_bottom) = center_vertical(item, accent_height);
+    let accent_left = selected
+        .left
+        .saturating_add(scale(POPUP_SELECTION_ACCENT_LEFT_INSET_LOGICAL));
     let accent = RECT {
-        left: selected.left.saturating_add(scale(5)),
-        top: selected.top.saturating_add(scale(7)),
-        right: selected.left.saturating_add(scale(8)),
-        bottom: selected.bottom.saturating_sub(scale(7)),
+        left: accent_left,
+        top: accent_top,
+        right: accent_left.saturating_add(scale(POPUP_SELECTION_ACCENT_WIDTH_LOGICAL)),
+        bottom: accent_bottom,
     };
     (selected, accent)
 }
@@ -2431,11 +3787,12 @@ unsafe fn paint_candidate_selection(
     hdc: HDC,
     item: RECT,
     dpi: u32,
+    selected_text_metrics: Option<PopupFontMetrics>,
     selected_background: COLORREF,
     selection_accent: COLORREF,
 ) {
     let scale = |logical: i32| popup_scale(dpi, logical);
-    let (selected, accent) = candidate_selection_rects(item, dpi);
+    let (selected, accent) = candidate_selection_rects(item, dpi, selected_text_metrics);
     unsafe {
         fill_rounded_popup_rect(hdc, selected, scale(6), selected_background);
     }
@@ -2454,9 +3811,34 @@ unsafe extern "system" fn candidate_popup_window_proc(
     // cleared during WM_NCDESTROY.
     let state_pointer =
         unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CandidatePopupPaintState;
+    if message == WM_TIMER && wparam.0 == INLINE_WISH_NOTICE_TIMER_ID && !state_pointer.is_null() {
+        // SAFETY: the popup owns this fixed timer and remains valid throughout
+        // the synchronous window callback.
+        let _ = unsafe { KillTimer(Some(hwnd), INLINE_WISH_NOTICE_TIMER_ID) };
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        // SAFETY: the boxed state outlives this window.
+        unsafe {
+            (*state_pointer).transient_notice = false;
+            (*state_pointer).transient_hidden = true;
+        }
+        return LRESULT(0);
+    }
     if message == WM_PAINT && !state_pointer.is_null() {
         // SAFETY: the boxed state outlives this window.
         unsafe { paint_candidate_popup(hwnd, &mut *state_pointer) };
+        // Start the short acknowledgement lifetime only after a complete frame
+        // has been painted, so a busy host cannot consume the visible interval.
+        if unsafe { (*state_pointer).transient_notice } {
+            // SAFETY: the popup owns this fixed timer and uses no callback.
+            let _ = unsafe {
+                SetTimer(
+                    Some(hwnd),
+                    INLINE_WISH_NOTICE_TIMER_ID,
+                    INLINE_WISH_NOTICE_DURATION_MS,
+                    None,
+                )
+            };
+        }
         return LRESULT(0);
     }
     if message == WM_ERASEBKGND && !state_pointer.is_null() {
@@ -2481,6 +3863,53 @@ unsafe extern "system" fn candidate_popup_window_proc(
     // SAFETY: SetWindowLongPtrW returned the system STATIC window procedure.
     let original: WNDPROC = unsafe { std::mem::transmute(original) };
     unsafe { CallWindowProcW(original, hwnd, message, wparam, lparam) }
+}
+
+fn load_inline_wish_notice_icon(dpi: u32) -> Option<HICON> {
+    let module = current_module_handle().ok()?;
+    let size = popup_scale(dpi, POPUP_NOTICE_ICON_SIZE_LOGICAL);
+    let resource = PCWSTR(INLINE_WISH_NOTICE_ICON_RESOURCE_ID as *const u16);
+    // SAFETY: the fixed integer resource belongs to this loaded module. The
+    // shared icon remains owned by Windows and must not be destroyed here.
+    let image = unsafe {
+        LoadImageW(
+            Some(HINSTANCE(module.0)),
+            resource,
+            IMAGE_ICON,
+            size,
+            size,
+            LR_DEFAULTCOLOR | LR_SHARED,
+        )
+    }
+    .ok()?;
+    Some(HICON(image.0))
+}
+
+unsafe fn paint_candidate_notice_icon(
+    hdc: HDC,
+    item: RECT,
+    dpi: u32,
+    icon: CandidateNoticeIcon,
+) -> i32 {
+    if icon != CandidateNoticeIcon::WishReceived {
+        return 0;
+    }
+    let Some(icon) = load_inline_wish_notice_icon(dpi) else {
+        return 0;
+    };
+    let size = popup_scale(dpi, POPUP_NOTICE_ICON_SIZE_LOGICAL);
+    let gap = popup_scale(dpi, POPUP_NOTICE_ICON_GAP_LOGICAL);
+    let left = item
+        .left
+        .saturating_add(popup_scale(dpi, POPUP_TEXT_PADDING_LOGICAL));
+    let available_height = item.bottom.saturating_sub(item.top).max(0);
+    let top = item
+        .top
+        .saturating_add(available_height.saturating_sub(size).max(0) / 2);
+    // SAFETY: the shared resource icon and the current paint DC remain valid
+    // for this bounded draw call.
+    let _ = unsafe { DrawIconEx(hdc, left, top, icon, size, size, 0, None, DI_NORMAL) };
+    size.saturating_add(gap)
 }
 
 unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState) {
@@ -2564,6 +3993,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
     }
+    let selected_text_metrics = unsafe { selected_popup_font_metrics(hdc, selected_font) };
 
     let padding = scale(POPUP_OUTER_PADDING_LOGICAL);
     let row_height = scale(POPUP_ROW_HEIGHT_LOGICAL);
@@ -2581,7 +4011,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                     right: left.saturating_add(width),
                     bottom: padding.saturating_add(row_height),
                 };
-                if index == 0 {
+                if index == 0 && !state.display.is_notice() {
                     // SAFETY: the selected decoration is bounded to this
                     // candidate item and uses only local GDI objects.
                     unsafe {
@@ -2589,16 +4019,23 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                             hdc,
                             item,
                             state.dpi,
+                            selected_text_metrics,
                             selected_background,
                             selection_accent,
                         );
                     }
                 }
-                item.left = item.left.saturating_add(if index == 0 {
-                    scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
-                } else {
-                    text_padding
-                });
+                let notice_inset = unsafe {
+                    paint_candidate_notice_icon(hdc, item, state.dpi, state.display.notice_icon())
+                };
+                item.left = item
+                    .left
+                    .saturating_add(if index == 0 && !state.display.is_notice() {
+                        scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
+                    } else {
+                        text_padding
+                    })
+                    .saturating_add(notice_inset);
                 item.right = item.right.saturating_sub(text_padding);
                 // SAFETY: fonts and paint rectangles remain owned by this
                 // WM_PAINT operation.
@@ -2612,7 +4049,14 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                         (index == 0)
                             .then(|| state.display.action_detail())
                             .flatten(),
+                        !state.display.is_notice(),
                         index == 0,
+                        state
+                            .display
+                            .visible_personalized()
+                            .get(index)
+                            .copied()
+                            .unwrap_or(false),
                         candidate_font,
                         selected_font,
                         metadata_font,
@@ -2632,7 +4076,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                     right: client.right.saturating_sub(padding),
                     bottom: top.saturating_add(row_height),
                 };
-                if index == 0 {
+                if index == 0 && !state.display.is_notice() {
                     // SAFETY: the selected decoration is bounded to this row
                     // and uses only local GDI objects.
                     unsafe {
@@ -2640,16 +4084,23 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                             hdc,
                             row,
                             state.dpi,
+                            selected_text_metrics,
                             selected_background,
                             selection_accent,
                         );
                     }
                 }
-                row.left = row.left.saturating_add(if index == 0 {
-                    scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
-                } else {
-                    text_padding
-                });
+                let notice_inset = unsafe {
+                    paint_candidate_notice_icon(hdc, row, state.dpi, state.display.notice_icon())
+                };
+                row.left = row
+                    .left
+                    .saturating_add(if index == 0 && !state.display.is_notice() {
+                        scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
+                    } else {
+                        text_padding
+                    })
+                    .saturating_add(notice_inset);
                 row.right = row.right.saturating_sub(text_padding);
                 // SAFETY: fonts and paint rectangles remain owned by this
                 // WM_PAINT operation.
@@ -2663,7 +4114,14 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                         (index == 0)
                             .then(|| state.display.action_detail())
                             .flatten(),
+                        !state.display.is_notice(),
                         index == 0,
+                        state
+                            .display
+                            .visible_personalized()
+                            .get(index)
+                            .copied()
+                            .unwrap_or(false),
                         candidate_font,
                         selected_font,
                         metadata_font,
@@ -2674,8 +4132,8 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     }
 
     let pages = state.display.page_starts().len();
-    let recovery = state.display.view() == InteractiveCandidateView::TranspositionRecovery;
-    if pages > 1 || recovery {
+    let mode_label = candidate_popup_mode_label(&state.display);
+    if pages > 1 || mode_label.is_some() {
         let footer_width = scale(candidate_popup_footer_logical_width(&state.display));
         let mut footer = match state.layout {
             CandidatePopupLayout::Horizontal => RECT {
@@ -2726,10 +4184,11 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                 footer.top = footer.top.saturating_add(scale(2));
             }
         }
-        if recovery {
+        if let Some(mode_label) = mode_label {
             let mut mode = footer;
-            mode.right = mode.left.saturating_add(scale(44)).min(mode.right);
-            let mut label = "换序".encode_utf16().collect::<Vec<_>>();
+            let page_width = if pages > 1 { scale(48) } else { 0 };
+            mode.right = mode.right.saturating_sub(page_width).max(mode.left);
+            let mut label = mode_label.encode_utf16().collect::<Vec<_>>();
             // SAFETY: the mode label is bounded to the footer rectangle.
             unsafe {
                 if !metadata_font.is_invalid() {
@@ -3244,6 +4703,26 @@ impl CandidateUiController {
         true
     }
 
+    fn show_notice(&mut self, display: CandidateDisplay) -> bool {
+        if !self.enabled || display.candidates.is_empty() {
+            return false;
+        }
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.display = Some(display.clone());
+            state.shown = true;
+        } else {
+            return false;
+        }
+        #[cfg(test)]
+        if self.headless {
+            return true;
+        }
+        self.popup
+            .try_borrow_mut()
+            .map(|mut popup| popup.show_notice(&display).is_ok())
+            .unwrap_or(false)
+    }
+
     fn end(&mut self) {
         if let (Some(manager), Some(element_id)) = (&self.manager, self.element_id.take()) {
             // SAFETY: best-effort cleanup of the id begun by this controller.
@@ -3649,27 +5128,24 @@ impl Drop for TsfDocumentEditSession {
 
 impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let feedback_accepting = self
-            .native_feedback
-            .lock()
-            .map(|feedback| feedback.is_accepting())
-            .unwrap_or(false);
-        let feedback_context_before = if feedback_accepting
-            && !matches!(&self.action, PendingDocumentEdit::UpdatePreedit(_))
-        {
-            self.active_composition()?
-                .map(|active| {
-                    classify_feedback_context(
-                        &self.context,
-                        &active.range,
-                        ec,
-                        self.key_advice_mode,
-                    )
-                })
-                .unwrap_or(NativeFeedbackContext::Unknown)
-        } else {
-            NativeFeedbackContext::Unknown
-        };
+        // Input-scope classification also gates personal learning. Keep it
+        // available even when the optional wish/feedback recorder is stopped;
+        // the classification reads no surrounding text and stores no event.
+        let feedback_context_before =
+            if !matches!(&self.action, PendingDocumentEdit::UpdatePreedit(_)) {
+                self.active_composition()?
+                    .map(|active| {
+                        classify_feedback_context(
+                            &self.context,
+                            &active.range,
+                            ec,
+                            self.key_advice_mode,
+                        )
+                    })
+                    .unwrap_or(NativeFeedbackContext::Unknown)
+            } else {
+                NativeFeedbackContext::Unknown
+            };
         let mut cleanup_applied = false;
         match &self.action {
             PendingDocumentEdit::UpdatePreedit(text) => match self.active_composition()? {
@@ -3686,26 +5162,25 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
             PendingDocumentEdit::Commit(text) => self.finish_composition(ec, text)?,
             PendingDocumentEdit::Insert(text) => self.insert_text_at_selection(ec, text)?,
         }
-        let feedback_context =
-            if feedback_accepting && let PendingDocumentEdit::UpdatePreedit(code) = &self.action {
-                let context = self
-                    .active_composition()?
-                    .map(|active| {
-                        classify_feedback_context(
-                            &self.context,
-                            &active.range,
-                            ec,
-                            self.key_advice_mode,
-                        )
-                    })
-                    .unwrap_or(NativeFeedbackContext::Unknown);
-                if let Ok(mut cache) = self.native_feedback_context.lock() {
-                    cache.remember(code, context);
-                }
-                context
-            } else {
-                feedback_context_before
-            };
+        let feedback_context = if let PendingDocumentEdit::UpdatePreedit(code) = &self.action {
+            let context = self
+                .active_composition()?
+                .map(|active| {
+                    classify_feedback_context(
+                        &self.context,
+                        &active.range,
+                        ec,
+                        self.key_advice_mode,
+                    )
+                })
+                .unwrap_or(NativeFeedbackContext::Unknown);
+            if let Ok(mut cache) = self.native_feedback_context.lock() {
+                cache.remember(code, context);
+            }
+            context
+        } else {
+            feedback_context_before
+        };
         let feedback_action_succeeded =
             if matches!(self.action, PendingDocumentEdit::UpdatePreedit(_)) {
                 if let (Some(active), Some(display)) =
@@ -3968,7 +5443,7 @@ impl NativeFeedbackLanguageBarState {
         ))
     }
 
-    fn save_recent_wish(&self) -> bool {
+    fn save_wish(&self, scope: WishCaptureScope, category: WishCategory) -> bool {
         let Some(root) = self.wish_root.as_deref() else {
             self.wish_save_status.set(WishSaveStatus::Failed);
             self.notify();
@@ -3976,17 +5451,45 @@ impl NativeFeedbackLanguageBarState {
         };
         let frozen = self.feedback.lock().ok().and_then(|feedback| {
             let marker_ms = native_feedback_monotonic_ms();
-            feedback
-                .freeze_recent(
-                    NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
-                    marker_ms,
-                    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
-                    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
-                )
-                .ok()
+            let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
+            match scope {
+                WishCaptureScope::RecentEpisodes => feedback
+                    .freeze_recent_episodes(
+                        authorization,
+                        marker_ms,
+                        DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
+                        DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
+                        DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|frozen| (frozen, WishCaptureScope::RecentEpisodes))
+                    .or_else(|| {
+                        feedback
+                            .freeze_recent(
+                                authorization,
+                                marker_ms,
+                                DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+                                DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+                            )
+                            .ok()
+                            .map(|frozen| (frozen, WishCaptureScope::RecentWindow))
+                    }),
+                WishCaptureScope::LegacyWindow | WishCaptureScope::RecentWindow => feedback
+                    .freeze_recent(
+                        authorization,
+                        marker_ms,
+                        DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+                        DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+                    )
+                    .ok()
+                    .map(|frozen| (frozen, WishCaptureScope::RecentWindow)),
+            }
         });
         let saved_events = frozen
-            .and_then(|frozen| WishSnapshot::from_frozen(&frozen).ok())
+            .and_then(|(frozen, effective_scope)| {
+                WishSnapshot::from_frozen_with_metadata(&frozen, effective_scope, category).ok()
+            })
             .and_then(|snapshot| {
                 let event_count = snapshot.events().len();
                 if event_count == 0 {
@@ -4006,7 +5509,7 @@ impl NativeFeedbackLanguageBarState {
 
     fn perform_feedback_action(&self, action: u32) -> Result<bool> {
         if action == FEEDBACK_MENU_WISH {
-            return Ok(self.save_recent_wish());
+            return Ok(self.save_wish(WishCaptureScope::RecentWindow, WishCategory::Other));
         }
         let changed = {
             let mut feedback = self
@@ -4045,7 +5548,7 @@ impl NativeFeedbackLanguageBarState {
                 if event_count == 0 {
                     return WishCommandAckStatus::NoChange;
                 }
-                return if self.save_recent_wish() {
+                return if self.save_wish(WishCaptureScope::RecentWindow, WishCategory::Other) {
                     WishCommandAckStatus::Applied
                 } else {
                     WishCommandAckStatus::Failed
@@ -4058,6 +5561,15 @@ impl NativeFeedbackLanguageBarState {
             Ok(true) => WishCommandAckStatus::Applied,
             Ok(false) => WishCommandAckStatus::NoChange,
             Err(_) => WishCommandAckStatus::Failed,
+        }
+    }
+
+    fn perform_inline_wish_operation(&self, operation: InlineWishOperation) -> bool {
+        match operation {
+            InlineWishOperation::Command(command) => {
+                self.perform_wish_command(command) == WishCommandAckStatus::Applied
+            }
+            InlineWishOperation::Capture { scope, category } => self.save_wish(scope, category),
         }
     }
 }
@@ -4751,6 +6263,7 @@ impl Drop for NativeWishCommandController {
 fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
     match event {
         NativeFeedbackEvent::CandidatesPresented { code, .. }
+        | NativeFeedbackEvent::CandidatesPresentedWithProvenance { code, .. }
         | NativeFeedbackEvent::CandidateCommitted { code, .. }
         | NativeFeedbackEvent::RawCodeCommitted { code }
         | NativeFeedbackEvent::CompositionCancelled { code, .. } => Some(code),
@@ -4892,6 +6405,332 @@ fn classify_feedback_context(
     }
 }
 
+fn provider_verifies_personal_character_composition(
+    provider: &dyn CandidateProvider,
+    full_code: &str,
+    text: &str,
+) -> bool {
+    if !(4..=MAX_TAB_ASSEMBLY_CHARACTERS.saturating_mul(2)).contains(&full_code.len())
+        || !full_code.len().is_multiple_of(2)
+        || !full_code.as_bytes().iter().all(u8::is_ascii_lowercase)
+    {
+        return false;
+    }
+    let mut characters = text.chars();
+    for start in (0..full_code.len()).step_by(2) {
+        let Some(character) = characters.next() else {
+            return false;
+        };
+        let pinyin = &full_code[start..start + 2];
+        if !provider.is_exact_full_code_candidate(pinyin, &character.to_string()) {
+            return false;
+        }
+    }
+    characters.next().is_none()
+}
+
+struct PersonalRankingRuntime {
+    root: Option<PathBuf>,
+    suppression_root: Option<PathBuf>,
+    persisted: LoadedPersonalRanking,
+    persisted_suppressions: LoadedPersonalRankingSuppressions,
+    snapshot: PersonalRankingSnapshot,
+    suppressions: PersonalRankingSuppressionSnapshot,
+    unflushed: Vec<PersonalRankingSelection>,
+    next_sequence: u64,
+    next_suppression_sequence: u64,
+}
+
+impl PersonalRankingRuntime {
+    #[cfg(test)]
+    fn new(root: Option<PathBuf>) -> Self {
+        let suppression_root = root
+            .as_ref()
+            .and_then(|root| root.parent())
+            .map(|parent| parent.join(PERSONAL_RANKING_SUPPRESSION_DIRECTORY));
+        Self::new_with_roots(root, suppression_root)
+    }
+
+    fn new_with_roots(root: Option<PathBuf>, suppression_root: Option<PathBuf>) -> Self {
+        let Some(root) = root else {
+            return Self::memory_only();
+        };
+        let loaded_ranking = load_personal_ranking(&root, &WindowsUserDataProtector);
+        let loaded_suppressions = suppression_root
+            .as_ref()
+            .map(|root| load_personal_ranking_suppressions(root, &WindowsUserDataProtector))
+            .transpose();
+        match (loaded_ranking, loaded_suppressions) {
+            (Ok(loaded), Ok(loaded_suppressions)) => {
+                let loaded_suppressions = loaded_suppressions.unwrap_or_default();
+                let checkpoint_base = loaded.checkpoint_batch_count();
+                let checkpoint_due = loaded.batch_count()
+                    >= crate::MIN_PERSONAL_RANKING_CHECKPOINT_BATCHES
+                    && (checkpoint_base == 0
+                        || loaded.batch_count() >= checkpoint_base.saturating_mul(2));
+                if checkpoint_due {
+                    let _ =
+                        save_personal_ranking_checkpoint(&root, &loaded, &WindowsUserDataProtector);
+                }
+                let next_sequence = u64::try_from(loaded.batch_count()).unwrap_or(u64::MAX);
+                let next_suppression_sequence =
+                    u64::try_from(loaded_suppressions.action_count()).unwrap_or(u64::MAX);
+                let snapshot = loaded.snapshot().clone();
+                let suppressions = loaded_suppressions.snapshot().clone();
+                Self {
+                    root: Some(root),
+                    suppression_root,
+                    persisted: loaded,
+                    persisted_suppressions: loaded_suppressions,
+                    next_sequence,
+                    snapshot,
+                    suppressions,
+                    unflushed: Vec::new(),
+                    next_suppression_sequence,
+                }
+            }
+            _ => Self::memory_only(),
+        }
+    }
+
+    fn memory_only() -> Self {
+        Self {
+            root: None,
+            suppression_root: None,
+            persisted: LoadedPersonalRanking::default(),
+            persisted_suppressions: LoadedPersonalRankingSuppressions::default(),
+            snapshot: PersonalRankingSnapshot::default(),
+            suppressions: PersonalRankingSuppressionSnapshot::default(),
+            unflushed: Vec::new(),
+            next_sequence: 0,
+            next_suppression_sequence: 0,
+        }
+    }
+
+    fn refresh(&mut self) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        let Ok(loaded) = refresh_personal_ranking(root, &WindowsUserDataProtector, &self.persisted)
+        else {
+            return false;
+        };
+        let loaded_suppressions = match self.suppression_root.as_ref() {
+            Some(root) => refresh_personal_ranking_suppressions(
+                root,
+                &WindowsUserDataProtector,
+                &self.persisted_suppressions,
+            ),
+            None => Ok(self.persisted_suppressions.clone()),
+        };
+        let Ok(loaded_suppressions) = loaded_suppressions else {
+            return false;
+        };
+        let mut snapshot = loaded.snapshot().clone();
+        for selection in &self.unflushed {
+            if snapshot.record(selection.code(), selection.text()).is_err() {
+                return false;
+            }
+        }
+        self.persisted = loaded;
+        self.persisted_suppressions = loaded_suppressions;
+        self.snapshot = snapshot;
+        self.suppressions = self.persisted_suppressions.snapshot().clone();
+        self.next_suppression_sequence = self
+            .next_suppression_sequence
+            .max(u64::try_from(self.persisted_suppressions.action_count()).unwrap_or(u64::MAX));
+        true
+    }
+
+    fn record(&mut self, code: &str, text: &str) -> bool {
+        let Ok(selection) = PersonalRankingSelection::new(code, text) else {
+            return false;
+        };
+        if self.snapshot.record(code, text).is_err() {
+            return false;
+        }
+        if self.root.is_none() {
+            return true;
+        }
+        if self.unflushed.len() == crate::MAX_PERSONAL_RANKING_BATCH_EVENTS {
+            self.unflushed.remove(0);
+        }
+        self.unflushed.push(selection);
+        if self.unflushed.len() >= PERSONAL_RANKING_FLUSH_SELECTIONS {
+            let _ = self.flush();
+        }
+        true
+    }
+
+    fn promote_texts_after(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> bool {
+        self.snapshot.promote_texts_after_with_suppressions(
+            code,
+            candidates,
+            protected_prefix,
+            &self.suppressions,
+        )
+    }
+
+    fn promote_anchored_suffix_texts_after(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> bool {
+        self.snapshot
+            .promote_anchored_suffix_texts_after_with_suppressions(
+                code,
+                candidates,
+                protected_prefix,
+                &self.suppressions,
+                |source_code, text| provider.is_exact_full_code_candidate(source_code, text),
+            )
+    }
+
+    fn is_suppressed(&self, code: &str, text: &str) -> bool {
+        self.suppressions.is_suppressed(code, text)
+    }
+
+    fn has_evidence(&self, code: &str, text: &str) -> bool {
+        self.snapshot.has_evidence(code, text)
+    }
+
+    fn has_anchored_suffix_evidence(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        text: &str,
+    ) -> bool {
+        self.snapshot
+            .has_anchored_suffix_evidence_with_suppressions(
+                code,
+                text,
+                &self.suppressions,
+                |source_code, text| provider.is_exact_full_code_candidate(source_code, text),
+            )
+    }
+
+    fn recall_repeated_anchored_suffix_text_after(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> Option<usize> {
+        self.snapshot
+            .recall_repeated_anchored_suffix_text_after_with_suppressions(
+                code,
+                candidates,
+                protected_prefix,
+                &self.suppressions,
+                |source_code, text| {
+                    provider_verifies_personal_character_composition(provider, source_code, text)
+                },
+            )
+    }
+
+    fn has_repeated_anchored_suffix_evidence(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        text: &str,
+    ) -> bool {
+        self.snapshot
+            .has_repeated_anchored_suffix_evidence_with_suppressions(
+                code,
+                text,
+                &self.suppressions,
+                |source_code, text| {
+                    provider_verifies_personal_character_composition(provider, source_code, text)
+                },
+            )
+    }
+
+    fn append_suppression_action(
+        &mut self,
+        kind: PersonalRankingSuppressionActionKind,
+        code: &str,
+        text: &str,
+    ) -> bool {
+        let already_in_requested_state = match kind {
+            PersonalRankingSuppressionActionKind::Suppress => {
+                self.suppressions.is_suppressed(code, text)
+            }
+            PersonalRankingSuppressionActionKind::Restore => {
+                !self.suppressions.is_suppressed(code, text)
+            }
+        };
+        if already_in_requested_state {
+            return false;
+        }
+        let mut updated_suppressions = self.suppressions.clone();
+        let updated = match kind {
+            PersonalRankingSuppressionActionKind::Suppress => {
+                updated_suppressions.suppress(code, text)
+            }
+            PersonalRankingSuppressionActionKind::Restore => {
+                updated_suppressions.restore(code, text)
+            }
+        };
+        if !matches!(updated, Ok(true)) {
+            return false;
+        }
+        let Ok(action) = PersonalRankingSuppressionAction::now(
+            std::process::id(),
+            self.next_suppression_sequence,
+            kind,
+            code,
+            text,
+        ) else {
+            return false;
+        };
+        if let Some(root) = self.suppression_root.as_ref()
+            && save_personal_ranking_suppression_action(root, &action, &WindowsUserDataProtector)
+                .is_err()
+        {
+            return false;
+        }
+        self.suppressions = updated_suppressions;
+        self.next_suppression_sequence = self.next_suppression_sequence.saturating_add(1);
+        true
+    }
+
+    fn selected_is_preferred(&self, code: &str, text: &str) -> bool {
+        self.snapshot
+            .preferred_text_with_suppressions(code, &self.suppressions)
+            == Some(text)
+    }
+
+    fn flush(&mut self) -> bool {
+        if self.unflushed.is_empty() {
+            return true;
+        }
+        let Some(root) = self.root.as_ref() else {
+            self.unflushed.clear();
+            return true;
+        };
+        let Ok(batch) = PersonalRankingBatch::now(
+            std::process::id(),
+            self.next_sequence,
+            self.unflushed.clone(),
+        ) else {
+            return false;
+        };
+        if save_personal_ranking_batch(root, &batch, &WindowsUserDataProtector).is_err() {
+            return false;
+        }
+        self.unflushed.clear();
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        true
+    }
+}
+
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
 struct TsfTextService {
     activation: Mutex<ActivationState>,
@@ -4900,6 +6739,12 @@ struct TsfTextService {
     candidate_provider: Option<Arc<dyn CandidateProvider>>,
     candidate_cache: RefCell<CandidateCache>,
     selection_memory: RefCell<SessionSelectionMemory>,
+    pending_personal_selection: RefCell<Option<PendingPersonalSelection>>,
+    personal_phrase_composer: RefCell<PersonalPhraseComposer>,
+    personal_context_ranking: RefCell<PersonalContextRanking>,
+    personal_left_context: RefCell<Option<String>>,
+    personal_ranking: RefCell<PersonalRankingRuntime>,
+    candidate_forget_state: RefCell<CandidateForgetState>,
     candidate_ui: Rc<RefCell<CandidateUiController>>,
     edit_telemetry: Arc<Mutex<EditSessionTelemetry>>,
     native_feedback: Arc<Mutex<NativeFeedbackSession>>,
@@ -4910,7 +6755,29 @@ struct TsfTextService {
     input_mode: Rc<Cell<InputMode>>,
     shift_tap_armed: Cell<bool>,
     shift_chord_pending: Cell<bool>,
+    last_delivered_letter: Cell<Option<DeliveredLetterAnchor>>,
+    last_completed_pair_timing: Cell<Option<CompletedPairTiming>>,
     key_advice_mode: KeyAdviceMode,
+    #[cfg(test)]
+    synthetic_key_modifiers: Cell<KeyModifiers>,
+}
+
+#[derive(Clone, Copy)]
+struct DeliveredLetterAnchor {
+    at: Instant,
+    code_len_after: usize,
+}
+
+fn native_feedback_session_for_mode(key_advice_mode: KeyAdviceMode) -> NativeFeedbackSession {
+    let mut feedback = NativeFeedbackSession::default();
+    if matches!(key_advice_mode, KeyAdviceMode::Foreground) {
+        let started = feedback.start_rolling_memory(
+            NativeFeedbackAuthorization::explicit_memory_only(),
+            NativeFeedbackLimits::default(),
+        );
+        debug_assert_eq!(started, NativeFeedbackStartResult::Started);
+    }
+    feedback
 }
 
 impl TsfTextService {
@@ -4919,7 +6786,9 @@ impl TsfTextService {
         key_advice_mode: KeyAdviceMode,
     ) -> Self {
         object_created();
-        let native_feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let native_feedback = Arc::new(Mutex::new(native_feedback_session_for_mode(
+            key_advice_mode,
+        )));
         let native_feedback_context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
         let input_mode = Rc::new(Cell::new(InputMode::Chinese));
         let native_feedback_language_bar_state = Rc::new(NativeFeedbackLanguageBarState::new(
@@ -4937,6 +6806,17 @@ impl TsfTextService {
             matches!(key_advice_mode, KeyAdviceMode::Foreground),
             Rc::downgrade(&native_feedback_language_bar_state),
         ));
+        let personal_ranking_roots = matches!(key_advice_mode, KeyAdviceMode::Foreground)
+            .then(|| {
+                module_path().ok().map(|module| {
+                    (
+                        personal_ranking_root_for_module(&module),
+                        personal_ranking_suppression_root_for_module(&module),
+                    )
+                })
+            })
+            .flatten()
+            .unwrap_or_default();
         Self {
             activation: Mutex::new(ActivationState::default()),
             composition: Rc::new(RefCell::new(CompositionSession::default())),
@@ -4944,6 +6824,15 @@ impl TsfTextService {
             candidate_provider,
             candidate_cache: RefCell::new(CandidateCache::default()),
             selection_memory: RefCell::new(SessionSelectionMemory::default()),
+            pending_personal_selection: RefCell::new(None),
+            personal_phrase_composer: RefCell::new(PersonalPhraseComposer::default()),
+            personal_context_ranking: RefCell::new(PersonalContextRanking::default()),
+            personal_left_context: RefCell::new(None),
+            personal_ranking: RefCell::new(PersonalRankingRuntime::new_with_roots(
+                personal_ranking_roots.0,
+                personal_ranking_roots.1,
+            )),
+            candidate_forget_state: RefCell::new(CandidateForgetState::Inactive),
             candidate_ui: Rc::new(RefCell::new(candidate_ui)),
             edit_telemetry: Arc::new(Mutex::new(EditSessionTelemetry::default())),
             native_feedback,
@@ -4957,7 +6846,11 @@ impl TsfTextService {
             input_mode,
             shift_tap_armed: Cell::new(false),
             shift_chord_pending: Cell::new(false),
+            last_delivered_letter: Cell::new(None),
+            last_completed_pair_timing: Cell::new(None),
             key_advice_mode,
+            #[cfg(test)]
+            synthetic_key_modifiers: Cell::new(KeyModifiers::default()),
         }
     }
 
@@ -4988,6 +6881,14 @@ impl TsfTextService {
 
 impl Drop for TsfTextService {
     fn drop(&mut self) {
+        if let Some(pending) = self.pending_personal_selection.get_mut().take() {
+            let ranking = self.personal_ranking.get_mut();
+            let _ = ranking.record(&pending.selection.code, &pending.selection.text);
+            if let Some(phrase) = pending.phrase {
+                let _ = ranking.record(&phrase.selection.code, &phrase.selection.text);
+            }
+        }
+        let _ = self.personal_ranking.get_mut().flush();
         object_dropped();
     }
 }
@@ -4996,8 +6897,51 @@ impl TsfTextService_Impl {
     fn observed_key_modifiers(&self) -> KeyModifiers {
         match self.key_advice_mode {
             KeyAdviceMode::Foreground => current_key_modifiers(),
-            KeyAdviceMode::SyntheticHost => KeyModifiers::default(),
+            KeyAdviceMode::SyntheticHost => {
+                #[cfg(test)]
+                {
+                    self.synthetic_key_modifiers.get()
+                }
+                #[cfg(not(test))]
+                {
+                    KeyModifiers::default()
+                }
+            }
         }
+    }
+
+    fn delivered_letter_timing(
+        &self,
+        wparam: WPARAM,
+        modifiers: KeyModifiers,
+    ) -> (Option<u64>, Option<DeliveredLetterAnchor>) {
+        let Some(CompositionInput::Letters(letters)) = u16::try_from(wparam.0)
+            .ok()
+            .and_then(|vkey| decode_virtual_key(vkey, modifiers, self.input_mode.get()))
+        else {
+            return (None, None);
+        };
+        if letters.len() != 1 {
+            return (None, None);
+        }
+        let Ok(composition) = self.composition.try_borrow() else {
+            return (None, None);
+        };
+        let code_len = composition.phonetic().len();
+        let now = Instant::now();
+        let pair_gap_ms = self.last_delivered_letter.get().and_then(|anchor| {
+            (code_len % 2 == 1 && anchor.code_len_after == code_len).then(|| {
+                u64::try_from(now.saturating_duration_since(anchor.at).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+        });
+        (
+            pair_gap_ms,
+            Some(DeliveredLetterAnchor {
+                at: now,
+                code_len_after: code_len.saturating_add(1),
+            }),
+        )
     }
 
     fn load_candidate_batch(
@@ -5007,18 +6951,553 @@ impl TsfTextService_Impl {
         limit: usize,
         view: InteractiveCandidateView,
     ) -> Result<CandidateBatch> {
+        self.load_candidate_batch_with_automatic_transposition(provider, code, limit, view, None)
+    }
+
+    fn load_shape_candidate_batch(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        stroke_prefix: &str,
+        limit: usize,
+    ) -> CandidateBatch {
+        let candidates = provider.shape_candidates(code, stroke_prefix, limit);
+        CandidateBatch {
+            provenance: vec![
+                NativeCandidateProvenance::new(NativeCandidateSource::Shape, false);
+                candidates.len()
+            ],
+            personalized: vec![false; candidates.len()],
+            automatic_transposition: None,
+            may_have_more: candidates.len() == limit && limit < CANDIDATE_LIMIT,
+            candidates,
+            view: InteractiveCandidateView::Primary,
+        }
+    }
+
+    fn load_candidate_batch_with_automatic_transposition(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        limit: usize,
+        view: InteractiveCandidateView,
+        automatic_transposition_request: Option<AutomaticTranspositionRequest>,
+    ) -> Result<CandidateBatch> {
+        let left_context = self
+            .personal_left_context
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .clone();
+        let contextual_search = view == InteractiveCandidateView::Primary
+            && automatic_transposition_request.is_none()
+            && left_context.as_deref().is_some_and(|previous| {
+                self.personal_context_ranking
+                    .try_borrow()
+                    .map(|ranking| ranking.has_evidence(previous, code))
+                    .unwrap_or(false)
+            });
+        let load_limit = if contextual_search {
+            limit.max(PERSONAL_CONTEXT_SEARCH_DEPTH)
+        } else {
+            limit
+        };
         let mut batch = self
             .candidate_cache
             .try_borrow_mut()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
-            .load(provider, code, limit, view);
+            .load_with_automatic_transposition(
+                provider,
+                code,
+                load_limit,
+                view,
+                automatic_transposition_request,
+            );
         if view == InteractiveCandidateView::Primary {
-            self.selection_memory
+            let protected_prefix = provider
+                .protected_candidate_prefix_len(code, view)
+                .min(batch.candidates.len());
+            let original_candidates = batch.candidates.clone();
+            let original_provenance = batch.provenance.clone();
+            let personal_ranking = self
+                .personal_ranking
                 .try_borrow()
-                .map_err(|_| lifecycle_error(E_UNEXPECTED))?
-                .promote_texts(code, &mut batch.candidates);
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            let selection_memory = self
+                .selection_memory
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            let session_exact_text = selection_memory
+                .remembered_text(code)
+                .filter(|text| !personal_ranking.is_suppressed(code, text));
+            let mut personalized_texts = HashSet::new();
+            let persistent_exact =
+                personal_ranking.promote_texts_after(code, &mut batch.candidates, protected_prefix);
+            let persistent_anchored = if !persistent_exact && session_exact_text.is_none() {
+                personal_ranking.promote_anchored_suffix_texts_after(
+                    provider,
+                    code,
+                    &mut batch.candidates,
+                    protected_prefix,
+                )
+            } else {
+                false
+            };
+            let personal_discovery_index = if !persistent_exact
+                && !persistent_anchored
+                && session_exact_text.is_none()
+                && automatic_transposition_request.is_none()
+            {
+                personal_ranking.recall_repeated_anchored_suffix_text_after(
+                    provider,
+                    code,
+                    &mut batch.candidates,
+                    protected_prefix,
+                )
+            } else {
+                None
+            };
+            if persistent_exact {
+                for candidate in batch
+                    .candidates
+                    .iter()
+                    .take(protected_prefix.saturating_add(1))
+                {
+                    if !personal_ranking.is_suppressed(code, candidate)
+                        && personal_ranking.has_evidence(code, candidate)
+                    {
+                        personalized_texts.insert(candidate.clone());
+                    }
+                }
+            } else if persistent_anchored {
+                for candidate in batch
+                    .candidates
+                    .iter()
+                    .take(protected_prefix.saturating_add(1))
+                {
+                    if personal_ranking.has_anchored_suffix_evidence(provider, code, candidate) {
+                        personalized_texts.insert(candidate.clone());
+                    }
+                }
+            }
+            if let Some(index) = personal_discovery_index
+                && let Some(candidate) = batch.candidates.get(index)
+            {
+                personalized_texts.insert(candidate.clone());
+            }
+            let candidates_before_session = batch.candidates.clone();
+            let session_anchored = if !persistent_exact && session_exact_text.is_none() {
+                selection_memory.promote_anchored_suffix_texts_after(
+                    code,
+                    &mut batch.candidates,
+                    protected_prefix,
+                    |source_code, text| {
+                        !personal_ranking.is_suppressed(code, text)
+                            && !personal_ranking.is_suppressed(source_code, text)
+                            && provider.is_exact_full_code_candidate(source_code, text)
+                    },
+                )
+            } else {
+                false
+            };
+            let session_exact = session_exact_text.is_some()
+                && selection_memory.promote_texts_after(
+                    code,
+                    &mut batch.candidates,
+                    protected_prefix,
+                );
+            if session_exact {
+                if let Some(text) = session_exact_text {
+                    personalized_texts.insert(text.to_owned());
+                }
+            } else if session_anchored {
+                for candidate in batch
+                    .candidates
+                    .iter()
+                    .take(protected_prefix.saturating_add(1))
+                {
+                    if selection_memory.has_anchored_suffix_evidence(
+                        code,
+                        candidate,
+                        |source_code, text| {
+                            !personal_ranking.is_suppressed(code, text)
+                                && !personal_ranking.is_suppressed(source_code, text)
+                                && provider.is_exact_full_code_candidate(source_code, text)
+                        },
+                    ) {
+                        personalized_texts.insert(candidate.clone());
+                    }
+                }
+            }
+            let mut session_changed = batch.candidates != candidates_before_session;
+            if automatic_transposition_request.is_none()
+                && let Some(previous) = left_context.as_deref()
+            {
+                let context_changed = self
+                    .personal_context_ranking
+                    .try_borrow()
+                    .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+                    .promote_existing_text_after(
+                        previous,
+                        code,
+                        &mut batch.candidates,
+                        protected_prefix,
+                        |text| {
+                            !personal_ranking.is_suppressed(code, text)
+                                && personal_ranking.has_evidence(code, text)
+                        },
+                    );
+                session_changed |= context_changed;
+                if context_changed && let Some(candidate) = batch.candidates.get(protected_prefix) {
+                    personalized_texts.insert(candidate.clone());
+                }
+            }
+            if batch.candidates != original_candidates {
+                batch.provenance = batch
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| {
+                        let base = original_candidates
+                            .iter()
+                            .position(|original| original == candidate)
+                            .and_then(|source_index| original_provenance.get(source_index).copied())
+                            .unwrap_or_default();
+                        if session_changed && index == protected_prefix {
+                            NativeCandidateProvenance::new(base.source(), true)
+                        } else {
+                            base
+                        }
+                    })
+                    .collect();
+            }
+            batch.personalized = batch
+                .candidates
+                .iter()
+                .map(|candidate| personalized_texts.contains(candidate))
+                .collect();
+        }
+        if batch.candidates.len() > limit {
+            batch.may_have_more = true;
+            batch.candidates.truncate(limit);
+            batch.provenance.truncate(batch.candidates.len());
+            batch.personalized.truncate(batch.candidates.len());
         }
         Ok(batch)
+    }
+
+    fn restore_session_selection(
+        &self,
+        selection: &PlannedSelection,
+        previous_session_text: Option<&str>,
+    ) {
+        let previous_is_suppressed = previous_session_text.is_some_and(|previous| {
+            self.personal_ranking
+                .try_borrow()
+                .map(|ranking| ranking.is_suppressed(&selection.code, previous))
+                .unwrap_or(true)
+        });
+        if let Ok(mut memory) = self.selection_memory.try_borrow_mut()
+            && memory.forget_text(&selection.code, &selection.text)
+            && let Some(previous) = previous_session_text
+            && !previous_is_suppressed
+        {
+            memory.remember_text(&selection.code, previous);
+        }
+    }
+
+    fn restore_session_selection_after_pending(&self, pending: &PendingPersonalSelection) {
+        self.restore_session_selection(
+            &pending.selection,
+            pending.previous_session_text.as_deref(),
+        );
+    }
+
+    fn clear_personal_phrase_composer(&self) {
+        if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
+            composer.previous = None;
+        }
+    }
+
+    fn clear_personal_left_context(&self) {
+        if let Ok(mut context) = self.personal_left_context.try_borrow_mut() {
+            *context = None;
+        }
+    }
+
+    fn set_personal_left_context(&self, text: &str) {
+        if let Ok(mut context) = self.personal_left_context.try_borrow_mut() {
+            *context = PersonalContextRanking::accepts_left_context(text).then(|| text.to_owned());
+        }
+    }
+
+    fn personal_phrase_component(
+        &self,
+        selection: &PlannedSelection,
+        learning_context: NativeFeedbackContext,
+    ) -> Option<PersonalPhraseComponent> {
+        (learning_context == NativeFeedbackContext::Eligible
+            && selection.retractable_by_immediate_backspace
+            && selection.code.len() == 2
+            && selection.code.as_bytes().iter().all(u8::is_ascii_lowercase)
+            && selection.text.chars().count() == 1
+            && self.candidate_provider.as_ref().is_some_and(|provider| {
+                provider.is_exact_full_code_candidate(&selection.code, &selection.text)
+            }))
+        .then(|| PersonalPhraseComponent {
+            code: selection.code.clone(),
+            text: selection.text.clone(),
+        })
+    }
+
+    fn pending_personal_phrase(
+        &self,
+        previous: &PersonalPhraseComponent,
+        current: &PersonalPhraseComponent,
+    ) -> PendingPersonalPhrase {
+        let code = format!("{}{}", previous.code, current.code);
+        let text = format!("{}{}", previous.text, current.text);
+        let previous_session_text = self
+            .selection_memory
+            .try_borrow()
+            .ok()
+            .and_then(|memory| memory.remembered_text(&code).map(str::to_owned));
+        PendingPersonalPhrase {
+            selection: PlannedSelection {
+                code,
+                text,
+                retractable_by_immediate_backspace: true,
+            },
+            previous_session_text,
+        }
+    }
+
+    fn confirm_pending_personal_selection(&self) -> bool {
+        let pending = match self.pending_personal_selection.try_borrow_mut() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return false,
+        };
+        let Some(pending) = pending else {
+            return true;
+        };
+        let preferred = self
+            .personal_ranking
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut ranking| {
+                if !ranking.record(&pending.selection.code, &pending.selection.text) {
+                    return None;
+                }
+                let selection =
+                    ranking.selected_is_preferred(&pending.selection.code, &pending.selection.text);
+                let phrase = pending.phrase.as_ref().map(|phrase| {
+                    ranking.record(&phrase.selection.code, &phrase.selection.text)
+                        && ranking
+                            .selected_is_preferred(&phrase.selection.code, &phrase.selection.text)
+                });
+                Some((selection, phrase))
+            });
+        let Some((selection_is_preferred, phrase_is_preferred)) = preferred else {
+            if let Ok(mut slot) = self.pending_personal_selection.try_borrow_mut()
+                && slot.is_none()
+            {
+                *slot = Some(pending);
+            }
+            return false;
+        };
+        if let Some(previous) = pending.previous_left_context.as_deref() {
+            let context_allowed = self
+                .personal_ranking
+                .try_borrow()
+                .map(|ranking| {
+                    ranking.has_evidence(&pending.selection.code, &pending.selection.text)
+                        && !ranking.is_suppressed(&pending.selection.code, &pending.selection.text)
+                })
+                .unwrap_or(false);
+            if context_allowed
+                && let Ok(mut context) = self.personal_context_ranking.try_borrow_mut()
+            {
+                let _ = context.record_choice(
+                    previous,
+                    &pending.selection.code,
+                    &pending.selection.text,
+                    pending.overruled_text.as_deref(),
+                );
+            }
+        }
+        if !selection_is_preferred {
+            self.restore_session_selection_after_pending(&pending);
+        }
+        if phrase_is_preferred == Some(false)
+            && let Some(phrase) = pending.phrase.as_ref()
+        {
+            self.restore_session_selection(
+                &phrase.selection,
+                phrase.previous_session_text.as_deref(),
+            );
+        }
+        true
+    }
+
+    fn retract_pending_personal_selection(&self) -> bool {
+        let pending = match self.pending_personal_selection.try_borrow_mut() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return false,
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        if let Some(phrase) = pending.phrase.as_ref() {
+            self.restore_session_selection(
+                &phrase.selection,
+                phrase.previous_session_text.as_deref(),
+            );
+        }
+        self.restore_session_selection_after_pending(&pending);
+        if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
+            composer.previous = pending.previous_phrase_component;
+        }
+        if let Ok(mut context) = self.personal_left_context.try_borrow_mut() {
+            *context = pending.previous_left_context;
+        }
+        true
+    }
+
+    fn should_route_pending_personal_key_down(&self) -> Result<bool> {
+        let has_pending = self
+            .pending_personal_selection
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .is_some();
+        Ok(has_pending && !self.has_active_logical_composition()?)
+    }
+
+    fn resolve_pending_personal_selection_for_key(
+        &self,
+        vkey: u16,
+        modifiers: KeyModifiers,
+    ) -> Result<PendingPersonalKeyResolution> {
+        let retractable = {
+            let pending = self
+                .pending_personal_selection
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            let Some(pending) = pending.as_ref() else {
+                return Ok(PendingPersonalKeyResolution::None);
+            };
+            pending.selection.retractable_by_immediate_backspace
+        };
+        let immediate_plain_backspace = vkey == VK_BACK.0
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.windows
+            && !self.has_active_logical_composition()?;
+        if retractable && immediate_plain_backspace {
+            return Ok(if self.retract_pending_personal_selection() {
+                PendingPersonalKeyResolution::Retracted
+            } else {
+                PendingPersonalKeyResolution::None
+            });
+        }
+        if self.confirm_pending_personal_selection() {
+            Ok(PendingPersonalKeyResolution::Confirmed)
+        } else {
+            Ok(PendingPersonalKeyResolution::None)
+        }
+    }
+
+    #[cfg(test)]
+    fn remember_selection_after_success(&self, selection: PlannedSelection) {
+        let learning_context = self
+            .native_feedback_context
+            .lock()
+            .map(|cache| cache.context_for(&selection.code))
+            .unwrap_or(NativeFeedbackContext::Unknown);
+        self.remember_selection_after_success_in_context(selection, learning_context);
+    }
+
+    #[cfg(test)]
+    fn remember_selection_after_success_in_context(
+        &self,
+        selection: PlannedSelection,
+        learning_context: NativeFeedbackContext,
+    ) {
+        self.remember_selection_after_success_in_context_with_overrule(
+            selection,
+            learning_context,
+            None,
+        );
+    }
+
+    fn remember_selection_after_success_in_context_with_overrule(
+        &self,
+        selection: PlannedSelection,
+        learning_context: NativeFeedbackContext,
+        overruled_text: Option<String>,
+    ) {
+        // A second successful selection is an explicit boundary for the
+        // preceding transaction, even if an unusual host skipped the key that
+        // began the new composition.
+        let _ = self.confirm_pending_personal_selection();
+        let previous_left_context = (learning_context == NativeFeedbackContext::Eligible)
+            .then(|| {
+                self.personal_left_context
+                    .try_borrow()
+                    .ok()
+                    .and_then(|context| context.clone())
+            })
+            .flatten();
+        let previous_session_text = self
+            .selection_memory
+            .try_borrow()
+            .ok()
+            .and_then(|memory| memory.remembered_text(&selection.code).map(str::to_owned));
+        let selection_is_suppressed = self
+            .personal_ranking
+            .try_borrow()
+            .map(|ranking| ranking.is_suppressed(&selection.code, &selection.text))
+            .unwrap_or(true);
+        if !selection_is_suppressed && let Ok(mut memory) = self.selection_memory.try_borrow_mut() {
+            memory.remember_text(&selection.code, &selection.text);
+        }
+        let component = self.personal_phrase_component(&selection, learning_context);
+        let previous_phrase_component = self
+            .personal_phrase_composer
+            .try_borrow()
+            .ok()
+            .and_then(|composer| composer.previous.clone());
+        let phrase = previous_phrase_component
+            .as_ref()
+            .zip(component.as_ref())
+            .map(|(previous, current)| self.pending_personal_phrase(previous, current));
+        if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
+            composer.previous = component;
+        }
+        if let Some(phrase) = phrase.as_ref() {
+            let phrase_is_suppressed = self
+                .personal_ranking
+                .try_borrow()
+                .map(|ranking| {
+                    ranking.is_suppressed(&phrase.selection.code, &phrase.selection.text)
+                })
+                .unwrap_or(true);
+            if !phrase_is_suppressed && let Ok(mut memory) = self.selection_memory.try_borrow_mut()
+            {
+                memory.remember_text(&phrase.selection.code, &phrase.selection.text);
+            }
+        }
+        if learning_context == NativeFeedbackContext::Eligible
+            && let Ok(mut slot) = self.pending_personal_selection.try_borrow_mut()
+            && slot.is_none()
+        {
+            *slot = Some(PendingPersonalSelection {
+                selection,
+                overruled_text,
+                previous_session_text,
+                phrase,
+                previous_phrase_component,
+                previous_left_context,
+            });
+        }
     }
 
     fn has_active_logical_composition(&self) -> Result<bool> {
@@ -5028,6 +7507,47 @@ impl TsfTextService_Impl {
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .phonetic()
             .is_empty())
+    }
+
+    fn key_continues_personal_phrase(&self, vkey: u16, modifiers: KeyModifiers) -> bool {
+        self.input_mode.get() == InputMode::Chinese
+            && decode_virtual_key(vkey, modifiers, InputMode::Chinese)
+                .is_some_and(|input| matches!(input, CompositionInput::Letters(_)))
+    }
+
+    fn should_route_candidate_forget_key(
+        &self,
+        vkey: u16,
+        modifiers: KeyModifiers,
+    ) -> Result<bool> {
+        if is_candidate_forget_shortcut(vkey, modifiers) {
+            return Ok(true);
+        }
+        if !self.has_active_logical_composition()? {
+            if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
+                *state = CandidateForgetState::Inactive;
+            }
+            return Ok(false);
+        }
+        let state = self
+            .candidate_forget_state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        Ok(match &*state {
+            CandidateForgetState::Inactive => false,
+            CandidateForgetState::Choosing(_) => {
+                !modifiers.control && !modifiers.alt && !modifiers.windows
+            }
+            CandidateForgetState::UndoAvailable { .. } => {
+                let plain_escape_or_backspace = !modifiers.shift
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.windows
+                    && (vkey == VK_ESCAPE.0 || vkey == VK_BACK.0);
+                plain_escape_or_backspace
+                    || decode_virtual_key(vkey, modifiers, self.input_mode.get()).is_some()
+            }
+        })
     }
 
     fn can_handle_shift_tap(&self, modifiers: KeyModifiers) -> bool {
@@ -5076,7 +7596,13 @@ impl TsfTextService_Impl {
     }
 
     fn toggle_input_mode(&self, context: Ref<ITfContext>) -> Result<()> {
+        if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
+            *state = CandidateForgetState::Inactive;
+        }
         self.commit_active_composition(context)?;
+        let _ = self.confirm_pending_personal_selection();
+        self.clear_personal_phrase_composer();
+        self.clear_personal_left_context();
         self.input_mode.set(self.input_mode.get().toggled());
         self.native_feedback_language_bar_state.notify();
         Ok(())
@@ -5227,6 +7753,14 @@ impl TsfTextService_Impl {
     fn cleanup_after_focus_loss(&self) -> Result<()> {
         self.shift_tap_armed.set(false);
         self.shift_chord_pending.set(false);
+        self.last_delivered_letter.set(None);
+        self.last_completed_pair_timing.set(None);
+        if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
+            *state = CandidateForgetState::Inactive;
+        }
+        let _ = self.confirm_pending_personal_selection();
+        self.clear_personal_phrase_composer();
+        self.clear_personal_left_context();
         if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
             candidate_ui.end();
         }
@@ -5331,17 +7865,350 @@ impl TsfTextService_Impl {
             // prevent the input method itself from activating.
             let _ = commands.activate(&ui_thread_manager, client_id);
         }
+        if let Ok(mut ranking) = self.personal_ranking.try_borrow_mut() {
+            let _ = ranking.refresh();
+        }
         Ok(())
     }
 
+    fn candidate_forget_display(
+        &self,
+        provider: &dyn CandidateProvider,
+        session: &CompositionSession,
+        limit: usize,
+        mode: CandidateDisplayMode,
+    ) -> Result<Option<CandidateDisplay>> {
+        if session.phonetic().is_empty()
+            || session.tab_mode()
+            || session.recovery_mode()
+            || session.wish_prompt()
+        {
+            return Ok(None);
+        }
+        let batch = self.load_candidate_batch(
+            provider,
+            session.phonetic(),
+            limit,
+            InteractiveCandidateView::Primary,
+        )?;
+        if batch.candidates.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            CandidateDisplay::from_batch(batch, session.candidate_page_start()).with_mode(mode),
+        ))
+    }
+
+    fn plan_candidate_forget_enter(
+        &self,
+        provider: &dyn CandidateProvider,
+        session: &CompositionSession,
+    ) -> Result<Option<PlannedKey>> {
+        if self.input_mode.get() != InputMode::Chinese
+            || session.phonetic().is_empty()
+            || session.tab_mode()
+            || session.recovery_mode()
+            || session.wish_prompt()
+        {
+            return Ok(None);
+        }
+        let display = self.candidate_forget_display(
+            provider,
+            session,
+            candidate_visible_limit(session.candidate_page_start()),
+            CandidateDisplayMode::ForgetSelecting,
+        )?;
+        Ok(display.map(|display| {
+            plan_candidate_forget_ui(session, Some(display), PlannedCandidateForgetAction::Enter)
+        }))
+    }
+
+    fn plan_candidate_forget_choosing(
+        &self,
+        provider: &dyn CandidateProvider,
+        session: &CompositionSession,
+        message: CandidateForgetMessage,
+        vkey: u16,
+        modifiers: KeyModifiers,
+    ) -> Result<Option<PlannedKey>> {
+        if modifiers.control || modifiers.alt || modifiers.windows {
+            return Ok(None);
+        }
+        if (vkey == VK_ESCAPE.0 || vkey == VK_BACK.0) && !modifiers.shift {
+            let display = self.candidate_forget_display(
+                provider,
+                session,
+                candidate_visible_limit(session.candidate_page_start()),
+                CandidateDisplayMode::Normal,
+            )?;
+            return Ok(Some(plan_candidate_forget_ui(
+                session,
+                display,
+                PlannedCandidateForgetAction::Cancel,
+            )));
+        }
+
+        if let Some(rank) = candidate_numeric_rank(vkey, modifiers) {
+            let batch = self.load_candidate_batch(
+                provider,
+                session.phonetic(),
+                candidate_visible_limit(session.candidate_page_start()),
+                InteractiveCandidateView::Primary,
+            )?;
+            let absolute = session
+                .candidate_page_start()
+                .saturating_add(rank.saturating_sub(1));
+            let Some(text) = batch.candidates.get(absolute).cloned() else {
+                let display = CandidateDisplay::from_batch(batch, session.candidate_page_start())
+                    .with_mode(CandidateDisplayMode::ForgetSelecting);
+                return Ok(Some(plan_candidate_forget_ui(
+                    session,
+                    Some(display),
+                    PlannedCandidateForgetAction::Message(CandidateForgetMessage::Select),
+                )));
+            };
+            let protected_prefix = provider
+                .protected_candidate_prefix_len(
+                    session.phonetic(),
+                    InteractiveCandidateView::Primary,
+                )
+                .min(batch.candidates.len());
+            if absolute < protected_prefix {
+                let display = CandidateDisplay::from_batch(batch, session.candidate_page_start())
+                    .with_mode(CandidateDisplayMode::ForgetProtected);
+                return Ok(Some(plan_candidate_forget_ui(
+                    session,
+                    Some(display),
+                    PlannedCandidateForgetAction::Message(CandidateForgetMessage::Protected),
+                )));
+            }
+            let ranking = self
+                .personal_ranking
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            let suppressed = ranking.is_suppressed(session.phonetic(), &text);
+            let has_persistent_evidence = ranking.has_evidence(session.phonetic(), &text)
+                || ranking.has_anchored_suffix_evidence(provider, session.phonetic(), &text)
+                || ranking.has_repeated_anchored_suffix_evidence(
+                    provider,
+                    session.phonetic(),
+                    &text,
+                );
+            let selection_memory = self
+                .selection_memory
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            let has_exact_session_evidence =
+                selection_memory.remembered_text(session.phonetic()) == Some(text.as_str());
+            let has_session_evidence = has_exact_session_evidence
+                || selection_memory.has_anchored_suffix_evidence(
+                    session.phonetic(),
+                    &text,
+                    |source_code, text| {
+                        !ranking.is_suppressed(session.phonetic(), text)
+                            && !ranking.is_suppressed(source_code, text)
+                            && provider.is_exact_full_code_candidate(source_code, text)
+                    },
+                );
+            if suppressed || (!has_persistent_evidence && !has_session_evidence) {
+                let display = CandidateDisplay::from_batch(batch, session.candidate_page_start())
+                    .with_mode(CandidateDisplayMode::ForgetNotPersonal);
+                return Ok(Some(plan_candidate_forget_ui(
+                    session,
+                    Some(display),
+                    PlannedCandidateForgetAction::Message(CandidateForgetMessage::NotPersonal),
+                )));
+            }
+            return Ok(Some(plan_candidate_forget_ui(
+                session,
+                None,
+                PlannedCandidateForgetAction::Suppress {
+                    code: session.phonetic().to_owned(),
+                    text,
+                    restore_session: has_exact_session_evidence,
+                },
+            )));
+        }
+
+        let decoded = decode_virtual_key(vkey, modifiers, InputMode::Chinese);
+        if matches!(
+            decoded,
+            Some(CompositionInput::PreviousPage | CompositionInput::NextPage)
+        ) {
+            let input = decoded.expect("the paging branch contains one decoded input");
+            let limit = if matches!(input, CompositionInput::NextPage) {
+                candidate_next_page_limit(session.candidate_page_start())
+            } else {
+                candidate_visible_limit(session.candidate_page_start())
+            };
+            let batch = self.load_candidate_batch(
+                provider,
+                session.phonetic(),
+                limit,
+                InteractiveCandidateView::Primary,
+            )?;
+            let Some(mut plan) = plan_session_input(session, input, None, batch.candidates.len())
+            else {
+                return Ok(None);
+            };
+            plan.after
+                .normalize_candidate_page(batch.candidates.len(), CANDIDATE_PAGE_SIZE);
+            plan.candidate_display = Some(
+                CandidateDisplay::from_batch(batch, plan.after.candidate_page_start())
+                    .with_mode(CandidateDisplayMode::ForgetSelecting),
+            );
+            plan.candidate_forget_action_after_success = Some(
+                PlannedCandidateForgetAction::Message(CandidateForgetMessage::Select),
+            );
+            return Ok(Some(plan));
+        }
+
+        let display = self.candidate_forget_display(
+            provider,
+            session,
+            candidate_visible_limit(session.candidate_page_start()),
+            message.display_mode(),
+        )?;
+        Ok(Some(plan_candidate_forget_ui(
+            session,
+            display,
+            PlannedCandidateForgetAction::Message(message),
+        )))
+    }
+
+    fn refreshed_candidate_forget_display(
+        &self,
+        mode: CandidateDisplayMode,
+    ) -> Option<CandidateDisplay> {
+        let provider = self.candidate_provider.as_ref()?;
+        let session = self.composition.try_borrow().ok()?.clone();
+        self.candidate_forget_display(
+            provider.as_ref(),
+            &session,
+            candidate_visible_limit(session.candidate_page_start()),
+            mode,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn apply_candidate_forget_action(
+        &self,
+        action: PlannedCandidateForgetAction,
+    ) -> Option<CandidateDisplay> {
+        match action {
+            PlannedCandidateForgetAction::Enter => {
+                *self.candidate_forget_state.try_borrow_mut().ok()? =
+                    CandidateForgetState::Choosing(CandidateForgetMessage::Select);
+                None
+            }
+            PlannedCandidateForgetAction::Cancel | PlannedCandidateForgetAction::Finalize => {
+                *self.candidate_forget_state.try_borrow_mut().ok()? =
+                    CandidateForgetState::Inactive;
+                None
+            }
+            PlannedCandidateForgetAction::Message(message) => {
+                *self.candidate_forget_state.try_borrow_mut().ok()? =
+                    CandidateForgetState::Choosing(message);
+                None
+            }
+            PlannedCandidateForgetAction::Suppress {
+                code,
+                text,
+                restore_session,
+            } => {
+                let saved = self
+                    .personal_ranking
+                    .try_borrow_mut()
+                    .ok()?
+                    .append_suppression_action(
+                        PersonalRankingSuppressionActionKind::Suppress,
+                        &code,
+                        &text,
+                    );
+                if saved {
+                    if let Ok(mut memory) = self.selection_memory.try_borrow_mut() {
+                        memory.forget_text(&code, &text);
+                    }
+                    *self.candidate_forget_state.try_borrow_mut().ok()? =
+                        CandidateForgetState::UndoAvailable {
+                            code,
+                            text,
+                            restore_session,
+                        };
+                    self.refreshed_candidate_forget_display(CandidateDisplayMode::ForgetUndo)
+                } else {
+                    *self.candidate_forget_state.try_borrow_mut().ok()? =
+                        CandidateForgetState::Choosing(CandidateForgetMessage::SaveFailed);
+                    self.refreshed_candidate_forget_display(CandidateDisplayMode::ForgetSaveFailed)
+                }
+            }
+            PlannedCandidateForgetAction::Restore {
+                code,
+                text,
+                restore_session,
+            } => {
+                let restored = self
+                    .personal_ranking
+                    .try_borrow_mut()
+                    .ok()?
+                    .append_suppression_action(
+                        PersonalRankingSuppressionActionKind::Restore,
+                        &code,
+                        &text,
+                    );
+                if restored {
+                    if restore_session
+                        && let Ok(mut memory) = self.selection_memory.try_borrow_mut()
+                    {
+                        memory.remember_text(&code, &text);
+                    }
+                    *self.candidate_forget_state.try_borrow_mut().ok()? =
+                        CandidateForgetState::Inactive;
+                    self.refreshed_candidate_forget_display(CandidateDisplayMode::ForgetRestored)
+                } else {
+                    *self.candidate_forget_state.try_borrow_mut().ok()? =
+                        CandidateForgetState::UndoAvailable {
+                            code,
+                            text,
+                            restore_session,
+                        };
+                    self.refreshed_candidate_forget_display(CandidateDisplayMode::ForgetSaveFailed)
+                }
+            }
+        }
+    }
+
     fn plan_key(&self, wparam: WPARAM, modifiers: KeyModifiers) -> Result<Option<PlannedKey>> {
+        self.plan_key_with_pair_gap(wparam, modifiers, None)
+    }
+
+    fn plan_key_with_pair_gap(
+        &self,
+        wparam: WPARAM,
+        modifiers: KeyModifiers,
+        delivered_pair_gap_ms: Option<u64>,
+    ) -> Result<Option<PlannedKey>> {
+        self.plan_key_with_transposition_timing(
+            wparam,
+            modifiers,
+            AutomaticTranspositionTimingEvidence {
+                current_pair_gap_ms: delivered_pair_gap_ms,
+                previous_pair: None,
+            },
+        )
+    }
+
+    fn plan_key_with_transposition_timing(
+        &self,
+        wparam: WPARAM,
+        modifiers: KeyModifiers,
+        transposition_timing: AutomaticTranspositionTimingEvidence,
+    ) -> Result<Option<PlannedKey>> {
         let Some(provider) = self.candidate_provider.as_ref() else {
             return Ok(None);
         };
         let Ok(vkey) = u16::try_from(wparam.0) else {
-            return Ok(None);
-        };
-        let Some(mut input) = decode_virtual_key(vkey, modifiers, self.input_mode.get()) else {
             return Ok(None);
         };
         if self
@@ -5357,22 +8224,180 @@ impl TsfTextService_Impl {
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .clone();
-        if matches!(&input, CompositionInput::EnterTab)
+        if is_candidate_forget_shortcut(vkey, modifiers) {
+            return self.plan_candidate_forget_enter(provider.as_ref(), &session);
+        }
+        let forget_state = self
+            .candidate_forget_state
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .clone();
+        if let CandidateForgetState::Choosing(message) = &forget_state {
+            return self.plan_candidate_forget_choosing(
+                provider.as_ref(),
+                &session,
+                *message,
+                vkey,
+                modifiers,
+            );
+        }
+        let mut finalize_candidate_forget = false;
+        if let CandidateForgetState::UndoAvailable {
+            code,
+            text,
+            restore_session,
+        } = forget_state
+        {
+            let plain_key =
+                !modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.windows;
+            if plain_key && vkey == VK_BACK.0 && !session.phonetic().is_empty() {
+                return Ok(Some(plan_candidate_forget_ui(
+                    &session,
+                    None,
+                    PlannedCandidateForgetAction::Restore {
+                        code,
+                        text,
+                        restore_session,
+                    },
+                )));
+            }
+            if plain_key && vkey == VK_ESCAPE.0 {
+                let display = self.candidate_forget_display(
+                    provider.as_ref(),
+                    &session,
+                    candidate_visible_limit(session.candidate_page_start()),
+                    CandidateDisplayMode::Normal,
+                )?;
+                return Ok(Some(plan_candidate_forget_ui(
+                    &session,
+                    display,
+                    PlannedCandidateForgetAction::Cancel,
+                )));
+            }
+            finalize_candidate_forget = true;
+        }
+        let Some(mut input) = decode_virtual_key(vkey, modifiers, self.input_mode.get()) else {
+            return Ok(None);
+        };
+        let exact_inline_wish_trigger = matches!(&input, CompositionInput::EnterTab)
             && session.phonetic() == INLINE_WISH_TRIGGER_CODE
+            && !session.tab_mode()
+            && !session.recovery_mode()
+            && !session.wish_prompt();
+        if exact_inline_wish_trigger {
+            let summary = self
+                .native_feedback_language_bar_state
+                .summary()
+                .unwrap_or_default();
+            if summary.lifecycle == NativeFeedbackLifecycle::Recording {
+                let mut plan = plan_immediate_inline_wish(
+                    &session,
+                    InlineWishOperation::Capture {
+                        scope: WishCaptureScope::RecentEpisodes,
+                        category: WishCategory::Other,
+                    },
+                );
+                if finalize_candidate_forget {
+                    plan.candidate_forget_action_after_success =
+                        Some(PlannedCandidateForgetAction::Finalize);
+                }
+                return Ok(Some(plan));
+            }
+            input = CompositionInput::EnterWish;
+        }
+        if matches!(&input, CompositionInput::EnterTab)
+            && !session.phonetic().is_empty()
             && !session.tab_mode()
             && !session.recovery_mode()
             && !session.wish_prompt()
         {
-            input = CompositionInput::EnterWish;
+            let code = session.phonetic();
+            let entry = if code.len() == 2 {
+                let batch = self.load_shape_candidate_batch(
+                    provider.as_ref(),
+                    code,
+                    "",
+                    CANDIDATE_PAGE_SIZE,
+                );
+                (!batch.candidates.is_empty()).then(|| {
+                    let mut after = session.clone();
+                    after.enter_tab(code.to_owned());
+                    (after, batch)
+                })
+            } else if (4..=MAX_TAB_ASSEMBLY_CHARACTERS.saturating_mul(2)).contains(&code.len())
+                && code.len() % 2 == 0
+                && code.as_bytes().iter().all(u8::is_ascii_lowercase)
+            {
+                let pinyin_segments = (0..code.len())
+                    .step_by(2)
+                    .map(|start| &code[start..start + 2])
+                    .collect::<Vec<_>>();
+                let first_batch = self.load_shape_candidate_batch(
+                    provider.as_ref(),
+                    pinyin_segments[0],
+                    "",
+                    CANDIDATE_PAGE_SIZE,
+                );
+                let remaining_available = pinyin_segments.iter().skip(1).all(|pinyin| {
+                    !self
+                        .load_shape_candidate_batch(provider.as_ref(), pinyin, "", 1)
+                        .candidates
+                        .is_empty()
+                });
+                (!first_batch.candidates.is_empty() && remaining_available).then(|| {
+                    let mut after = session.clone();
+                    let entered = after.enter_tab_path(&pinyin_segments);
+                    debug_assert!(entered, "validated bounded Tab segments must enter");
+                    (after, first_batch)
+                })
+            } else {
+                None
+            };
+            if let Some((after, batch)) = entry {
+                let display =
+                    shape_candidate_display(CandidateDisplay::from_batch(batch, 0), &after);
+                let mut plan = PlannedKey {
+                    before: session.clone(),
+                    after,
+                    edit: None,
+                    selection_to_remember: None,
+                    feedback_after_success: Some(display.feedback_event(session.phonetic(), true)),
+                    candidate_display: Some(display),
+                    action_after_success: None,
+                    candidate_forget_action_after_success: None,
+                    overruled_text_to_remember: None,
+                };
+                if finalize_candidate_forget {
+                    plan.candidate_forget_action_after_success =
+                        Some(PlannedCandidateForgetAction::Finalize);
+                }
+                return Ok(Some(plan));
+            }
         }
-        let wish_action = (session.wish_prompt() || matches!(&input, CompositionInput::EnterWish))
+        let wish_actions = (session.wish_prompt() || matches!(&input, CompositionInput::EnterWish))
             .then(|| {
-                inline_wish_action(
+                inline_wish_actions(
                     self.native_feedback_language_bar_state
                         .summary()
                         .unwrap_or_default(),
                 )
             });
+        let wish_selection_rank = session.wish_prompt().then_some(match &input {
+            CompositionInput::Confirm => Some(1),
+            CompositionInput::Select(rank) => Some(*rank),
+            _ => None,
+        });
+        let wish_selection_rank = wish_selection_rank.flatten().filter(|rank| {
+            wish_actions
+                .as_ref()
+                .is_some_and(|actions| (1..=actions.len()).contains(rank))
+        });
+        if wish_selection_rank.is_some_and(|rank| rank != 1) {
+            // The host-independent composition state only needs to know that
+            // one visible wish action was confirmed. Preserve the original
+            // rank separately for the structured capture operation.
+            input = CompositionInput::Select(1);
+        }
         let needs_existing_candidates = !session.wish_prompt()
             && matches!(
                 &input,
@@ -5388,130 +8413,244 @@ impl TsfTextService_Impl {
             } else {
                 candidate_visible_limit(session.candidate_page_start())
             };
-            self.load_candidate_batch(
-                provider.as_ref(),
-                session.phonetic(),
-                limit,
-                if session.recovery_mode() {
-                    InteractiveCandidateView::TranspositionRecovery
-                } else {
-                    InteractiveCandidateView::Primary
-                },
-            )?
+            if session.tab_mode() {
+                self.load_shape_candidate_batch(
+                    provider.as_ref(),
+                    active_shape_code(&session),
+                    session.stroke_prefix(),
+                    limit,
+                )
+            } else {
+                self.load_candidate_batch(
+                    provider.as_ref(),
+                    session.phonetic(),
+                    limit,
+                    if session.recovery_mode() {
+                        InteractiveCandidateView::TranspositionRecovery
+                    } else {
+                        InteractiveCandidateView::Primary
+                    },
+                )?
+            }
         } else {
             CandidateBatch::default()
         };
-        let selected_text = match &input {
+        let selected_absolute_index = match &input {
             CompositionInput::Confirm | CompositionInput::Punctuation(_) => {
-                existing_batch.candidates.first().cloned()
+                Some(session.candidate_page_start())
             }
-            CompositionInput::Select(rank) => {
-                let absolute = session
+            CompositionInput::Select(rank) => Some(
+                session
                     .candidate_page_start()
-                    .saturating_add(rank.saturating_sub(1));
-                existing_batch.candidates.get(absolute).cloned()
-            }
+                    .saturating_add(rank.saturating_sub(1)),
+            ),
             _ => None,
         };
-        let selection_to_remember = (matches!(&input, CompositionInput::Select(_))
+        let selected_text = selected_absolute_index
+            .and_then(|index| existing_batch.candidates.get(index))
+            .cloned();
+        let tab_assembly_selection = session.tab_assembly_mode()
+            && matches!(
+                &input,
+                CompositionInput::Confirm | CompositionInput::Select(_)
+            );
+        let explicit_primary_selection = matches!(&input, CompositionInput::Select(_))
+            || (session.candidate_page_start() > 0
+                && matches!(
+                    &input,
+                    CompositionInput::Confirm | CompositionInput::Punctuation(_)
+                ));
+        let repeated_personal_primary_confirmation = matches!(&input, CompositionInput::Confirm)
+            && session.candidate_page_start() == 0
+            && !session.recovery_mode()
+            && !session.tab_mode()
+            && selected_absolute_index.is_some_and(|index| {
+                existing_batch
+                    .personalized
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            && selected_text.as_ref().is_some_and(|text| {
+                provider_verifies_personal_character_composition(
+                    provider.as_ref(),
+                    session.phonetic(),
+                    text,
+                )
+            });
+        let overruled_text_to_remember =
+            (explicit_primary_selection && !session.recovery_mode() && !session.tab_mode())
+                .then(|| {
+                    let protected_prefix = provider
+                        .protected_candidate_prefix_len(
+                            session.phonetic(),
+                            InteractiveCandidateView::Primary,
+                        )
+                        .min(existing_batch.candidates.len());
+                    selected_absolute_index
+                        .filter(|index| *index > protected_prefix)
+                        .and_then(|_| existing_batch.candidates.get(protected_prefix))
+                        .filter(|overruled| selected_text.as_ref() != Some(*overruled))
+                        .cloned()
+                })
+                .flatten();
+        let selection_to_remember = ((explicit_primary_selection
+            || repeated_personal_primary_confirmation)
             && !session.recovery_mode()
             && !session.tab_mode())
         .then(|| {
             selected_text.as_ref().map(|text| PlannedSelection {
                 code: session.phonetic().to_owned(),
                 text: text.clone(),
+                // A punctuation commit appends a suffix after the
+                // candidate. Its first Backspace normally removes that
+                // suffix rather than retracting the selected text.
+                retractable_by_immediate_backspace: !matches!(
+                    &input,
+                    CompositionInput::Punctuation(_)
+                ),
             })
         })
         .flatten();
-        let selection_feedback = selected_text.as_ref().and_then(|text| {
-            let view = native_candidate_view(
-                if session.recovery_mode() {
-                    InteractiveCandidateView::TranspositionRecovery
-                } else {
-                    InteractiveCandidateView::Primary
-                },
-                session.tab_mode(),
-            );
-            match &input {
-                CompositionInput::Confirm => Some(NativeFeedbackEvent::CandidateCommitted {
-                    code: session.phonetic().to_owned(),
-                    text: text.clone(),
-                    view,
-                    source: NativeSelectionSource::FirstCandidate,
-                    absolute_rank: 1,
-                    visible_rank: 1,
-                }),
-                CompositionInput::Select(rank) => Some(NativeFeedbackEvent::CandidateCommitted {
-                    code: session.phonetic().to_owned(),
-                    text: text.clone(),
-                    view,
-                    source: NativeSelectionSource::Numeric,
-                    absolute_rank: session.candidate_page_start().saturating_add(*rank),
-                    visible_rank: *rank,
-                }),
-                CompositionInput::Punctuation(_) => Some(NativeFeedbackEvent::CandidateCommitted {
-                    code: session.phonetic().to_owned(),
-                    text: text.clone(),
-                    view,
-                    source: NativeSelectionSource::Punctuation,
-                    absolute_rank: 1,
-                    visible_rank: 1,
-                }),
-                _ => None,
-            }
-        });
-        let mut plan = match plan_session_input(
-            &session,
-            input.clone(),
-            selected_text.clone(),
-            existing_batch.candidates.len(),
-        ) {
-            Some(plan) => plan,
-            None => return Ok(None),
-        };
-        if session.wish_prompt()
-            && matches!(
-                &input,
-                CompositionInput::Confirm | CompositionInput::Select(1)
-            )
-            && let Some(action) = wish_action
-        {
-            plan.action_after_success = Some(PlannedAction::Wish(action.command));
-        }
-        plan.selection_to_remember = selection_to_remember;
-        plan.feedback_after_success = selection_feedback
-            .or_else(|| {
-                matches!(&input, CompositionInput::CommitRaw).then(|| {
-                    NativeFeedbackEvent::RawCodeCommitted {
-                        code: session.phonetic().to_owned(),
+        let selection_feedback = (!session.tab_assembly_mode())
+            .then(|| {
+                selected_text.as_ref().and_then(|text| {
+                    let view = native_candidate_view(
+                        if session.recovery_mode() {
+                            InteractiveCandidateView::TranspositionRecovery
+                        } else {
+                            InteractiveCandidateView::Primary
+                        },
+                        session.tab_mode(),
+                    );
+                    match &input {
+                        CompositionInput::Confirm => {
+                            Some(NativeFeedbackEvent::CandidateCommitted {
+                                code: session.phonetic().to_owned(),
+                                text: text.clone(),
+                                view,
+                                source: NativeSelectionSource::FirstCandidate,
+                                absolute_rank: session.candidate_page_start().saturating_add(1),
+                                visible_rank: 1,
+                            })
+                        }
+                        CompositionInput::Select(rank) => {
+                            Some(NativeFeedbackEvent::CandidateCommitted {
+                                code: session.phonetic().to_owned(),
+                                text: text.clone(),
+                                view,
+                                source: NativeSelectionSource::Numeric,
+                                absolute_rank: session.candidate_page_start().saturating_add(*rank),
+                                visible_rank: *rank,
+                            })
+                        }
+                        CompositionInput::Punctuation(_) => {
+                            Some(NativeFeedbackEvent::CandidateCommitted {
+                                code: session.phonetic().to_owned(),
+                                text: text.clone(),
+                                view,
+                                source: NativeSelectionSource::Punctuation,
+                                absolute_rank: session.candidate_page_start().saturating_add(1),
+                                visible_rank: 1,
+                            })
+                        }
+                        _ => None,
                     }
                 })
             })
-            .or_else(|| {
-                (plan.action_after_success.is_none()
-                    && matches!(&plan.edit, Some(PendingDocumentEdit::Cancel)))
-                .then(|| NativeFeedbackEvent::CompositionCancelled {
-                    code: session.phonetic().to_owned(),
-                    source: match &input {
-                        CompositionInput::Backspace => NativeCancellationSource::Backspace,
-                        CompositionInput::Escape => NativeCancellationSource::Escape,
-                        _ => NativeCancellationSource::HostTermination,
-                    },
+            .flatten();
+        let planned = if tab_assembly_selection {
+            plan_tab_assembly_selection(&session, &input, selected_text.clone())
+        } else {
+            plan_session_input(
+                &session,
+                input.clone(),
+                selected_text.clone(),
+                existing_batch.candidates.len(),
+            )
+        };
+        let mut plan = match planned {
+            Some(plan) => plan,
+            None => return Ok(None),
+        };
+        let mut automatic_transposition_request =
+            automatic_transposition_request(&input, &plan.after, transposition_timing);
+        if let Some(request) = automatic_transposition_request.as_mut()
+            && let Ok(feedback) = self.native_feedback.lock()
+            && let Some(recommendation) = feedback.automatic_transposition_recommendation(
+                plan.after.phonetic(),
+                request.primary.pattern.first_syllable_index,
+                request.primary.pair_gap_ms,
+                match request.primary.cold_tier {
+                    AutomaticTranspositionTier::Shadow => NativeAutomaticTranspositionTier::Shadow,
+                    AutomaticTranspositionTier::Secondary => {
+                        NativeAutomaticTranspositionTier::Secondary
+                    }
+                    AutomaticTranspositionTier::Primary => {
+                        NativeAutomaticTranspositionTier::Primary
+                    }
+                },
+            )
+        {
+            request.primary.tier = match recommendation.recommended_tier {
+                NativeAutomaticTranspositionTier::Shadow => AutomaticTranspositionTier::Shadow,
+                NativeAutomaticTranspositionTier::Secondary => {
+                    AutomaticTranspositionTier::Secondary
+                }
+                NativeAutomaticTranspositionTier::Primary => AutomaticTranspositionTier::Primary,
+            };
+        }
+        if session.wish_prompt()
+            && let Some(rank) = wish_selection_rank
+            && let Some(action) = wish_actions
+                .as_ref()
+                .and_then(|actions| actions.get(rank.saturating_sub(1)))
+        {
+            plan.action_after_success = Some(PlannedAction::Wish(action.operation));
+        }
+        if !tab_assembly_selection {
+            plan.selection_to_remember = selection_to_remember;
+            plan.overruled_text_to_remember = overruled_text_to_remember;
+            plan.feedback_after_success = selection_feedback
+                .or_else(|| {
+                    matches!(&input, CompositionInput::CommitRaw).then(|| {
+                        NativeFeedbackEvent::RawCodeCommitted {
+                            code: session.phonetic().to_owned(),
+                        }
+                    })
                 })
-            });
+                .or_else(|| {
+                    (plan.action_after_success.is_none()
+                        && matches!(&plan.edit, Some(PendingDocumentEdit::Cancel)))
+                    .then(|| NativeFeedbackEvent::CompositionCancelled {
+                        code: session.phonetic().to_owned(),
+                        source: match &input {
+                            CompositionInput::Backspace => NativeCancellationSource::Backspace,
+                            CompositionInput::Escape => NativeCancellationSource::Escape,
+                            _ => NativeCancellationSource::HostTermination,
+                        },
+                    })
+                })
+        }
         if plan.after.wish_prompt() {
-            if let Some(action) = wish_action {
-                plan.candidate_display =
-                    Some(CandidateDisplay::action(action.label, action.detail));
+            if let Some(actions) = wish_actions.as_deref() {
+                plan.candidate_display = Some(CandidateDisplay::actions(actions));
             }
             plan.feedback_after_success = None;
         } else if !plan.after.phonetic().is_empty() {
-            let batch = if plan.after.phonetic() == session.phonetic()
+            let batch = if plan.after.tab_mode() {
+                self.load_shape_candidate_batch(
+                    provider.as_ref(),
+                    active_shape_code(&plan.after),
+                    plan.after.stroke_prefix(),
+                    candidate_visible_limit(plan.after.candidate_page_start()),
+                )
+            } else if plan.after.phonetic() == session.phonetic()
                 && !existing_batch.candidates.is_empty()
             {
                 existing_batch
             } else {
-                self.load_candidate_batch(
+                self.load_candidate_batch_with_automatic_transposition(
                     provider.as_ref(),
                     plan.after.phonetic(),
                     candidate_visible_limit(plan.after.candidate_page_start()),
@@ -5520,16 +8659,25 @@ impl TsfTextService_Impl {
                     } else {
                         InteractiveCandidateView::Primary
                     },
+                    automatic_transposition_request,
                 )?
             };
             plan.after
                 .normalize_candidate_page(batch.candidates.len(), CANDIDATE_PAGE_SIZE);
-            let display = CandidateDisplay::from_batch(batch, plan.after.candidate_page_start());
+            let mut display =
+                CandidateDisplay::from_batch(batch, plan.after.candidate_page_start());
+            if plan.after.tab_mode() {
+                display = shape_candidate_display(display, &plan.after);
+            }
             if plan.feedback_after_success.is_none() {
                 plan.feedback_after_success =
                     Some(display.feedback_event(plan.after.phonetic(), plan.after.tab_mode()));
             }
             plan.candidate_display = Some(display);
+        }
+        if finalize_candidate_forget {
+            plan.candidate_forget_action_after_success =
+                Some(PlannedCandidateForgetAction::Finalize);
         }
         Ok(Some(plan))
     }
@@ -5563,9 +8711,40 @@ impl TsfTextService_Impl {
                 .try_borrow_mut()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))? = CandidateCache::default();
         }
-        let Some(plan) = self.plan_key(wparam, modifiers)? else {
+        let (pair_gap_ms, next_letter_anchor) = self.delivered_letter_timing(wparam, modifiers);
+        let previous_pair_timing = self.last_completed_pair_timing.get();
+        let Some(plan) = self.plan_key_with_transposition_timing(
+            wparam,
+            modifiers,
+            AutomaticTranspositionTimingEvidence {
+                current_pair_gap_ms: pair_gap_ms,
+                previous_pair: previous_pair_timing,
+            },
+        )?
+        else {
+            self.last_delivered_letter.set(None);
+            self.last_completed_pair_timing.set(None);
+            if u16::try_from(wparam.0)
+                .ok()
+                .is_none_or(|vkey| !self.key_continues_personal_phrase(vkey, modifiers))
+            {
+                self.clear_personal_phrase_composer();
+            }
+            if !self.has_active_logical_composition()? {
+                self.clear_personal_left_context();
+            }
             return Ok(false.into());
         };
+        self.last_delivered_letter.set(next_letter_anchor);
+        let after_code_len = plan.after.phonetic().len();
+        let next_completed_pair_timing = completed_pair_timing_after_key(
+            after_code_len,
+            next_letter_anchor.is_some(),
+            pair_gap_ms,
+            previous_pair_timing,
+        );
+        self.last_completed_pair_timing
+            .set(next_completed_pair_timing);
         let client_id = {
             let activation = self
                 .activation
@@ -5581,11 +8760,58 @@ impl TsfTextService_Impl {
             before,
             after,
             edit,
-            candidate_display,
+            mut candidate_display,
             selection_to_remember,
+            overruled_text_to_remember,
             feedback_after_success,
             action_after_success,
+            candidate_forget_action_after_success,
         } = plan;
+        let breaks_personal_phrase = selection_to_remember.is_none()
+            && (edit
+                .as_ref()
+                .is_some_and(|edit| edit.kind() != DocumentEditKind::UpdatePreedit)
+                || before.tab_mode() != after.tab_mode()
+                || before.recovery_mode() != after.recovery_mode()
+                || before.wish_prompt() != after.wish_prompt()
+                || action_after_success.is_some()
+                || candidate_forget_action_after_success.is_some());
+        // A synchronous commit ends the candidate UI and clears its cached
+        // input-scope classification. Capture that classification before the
+        // document edit so both explicit learning and the process-local left
+        // context stay inside the same eligibility boundary.
+        let candidate_learning_context = feedback_after_success
+            .as_ref()
+            .and_then(|event| match event {
+                NativeFeedbackEvent::CandidateCommitted { code, .. } => Some(code.as_str()),
+                _ => None,
+            })
+            .map(|code| {
+                self.native_feedback_context
+                    .lock()
+                    .map(|cache| cache.context_for(code))
+                    .unwrap_or(NativeFeedbackContext::Unknown)
+            })
+            .unwrap_or(NativeFeedbackContext::Unknown);
+        let personal_left_context_update = match feedback_after_success.as_ref() {
+            Some(NativeFeedbackEvent::CandidateCommitted { text, source, .. }) => Some(
+                if candidate_learning_context == NativeFeedbackContext::Eligible
+                    && *source != NativeSelectionSource::Punctuation
+                    && PersonalContextRanking::accepts_left_context(text)
+                {
+                    Some(text.clone())
+                } else {
+                    None
+                },
+            ),
+            Some(NativeFeedbackEvent::RawCodeCommitted { .. }) => Some(None),
+            _ if matches!(edit.as_ref(), Some(PendingDocumentEdit::Insert(_)))
+                || action_after_success.is_some() =>
+            {
+                Some(None)
+            }
+            _ => None,
+        };
         let ui_only = edit.is_none();
         if let Some(edit) = edit {
             self.request_document_edit_session(
@@ -5610,15 +8836,33 @@ impl TsfTextService_Impl {
         }
         *composition = after;
         drop(composition);
-        if let Some(selection) = selection_to_remember
-            && let Ok(mut memory) = self.selection_memory.try_borrow_mut()
-        {
-            memory.remember_text(&selection.code, &selection.text);
+        if let Some(selection) = selection_to_remember {
+            self.remember_selection_after_success_in_context_with_overrule(
+                selection,
+                candidate_learning_context,
+                overruled_text_to_remember,
+            );
+        } else if breaks_personal_phrase {
+            self.clear_personal_phrase_composer();
         }
-        if let Some(PlannedAction::Wish(command)) = action_after_success {
-            let _ = self
+        if let Some(update) = personal_left_context_update {
+            match update {
+                Some(text) => self.set_personal_left_context(&text),
+                None => self.clear_personal_left_context(),
+            }
+        }
+        if let Some(PlannedAction::Wish(operation)) = action_after_success {
+            let succeeded = self
                 .native_feedback_language_bar_state
-                .perform_wish_command(command);
+                .perform_inline_wish_operation(operation);
+            if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
+                let _ = candidate_ui.show_notice(inline_wish_notice(operation, succeeded));
+            }
+        }
+        if let Some(action) = candidate_forget_action_after_success
+            && let Some(updated_display) = self.apply_candidate_forget_action(action)
+        {
+            candidate_display = Some(updated_display);
         }
         if ui_only && let Some(display) = candidate_display {
             let feedback_context = feedback_after_success
@@ -5661,6 +8905,17 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
     fn Deactivate(&self) -> Result<()> {
         self.shift_tap_armed.set(false);
         self.shift_chord_pending.set(false);
+        self.last_delivered_letter.set(None);
+        self.last_completed_pair_timing.set(None);
+        if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
+            *state = CandidateForgetState::Inactive;
+        }
+        let _ = self.confirm_pending_personal_selection();
+        self.clear_personal_phrase_composer();
+        self.clear_personal_left_context();
+        if let Ok(mut context_ranking) = self.personal_context_ranking.try_borrow_mut() {
+            *context_ranking = PersonalContextRanking::default();
+        }
         let previous = {
             let mut activation = self
                 .activation
@@ -5700,6 +8955,9 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             }
             Err(_) => Err(lifecycle_error(E_UNEXPECTED)),
         };
+        if let Ok(mut ranking) = self.personal_ranking.try_borrow_mut() {
+            let _ = ranking.flush();
+        }
         let feedback_context_result = match self.native_feedback_context.lock() {
             Ok(mut context) => {
                 context.clear();
@@ -5781,13 +9039,26 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
         // standalone Chinese/English mode toggle. This flag is structural
         // input state only; OnTestKeyDown still performs no document edit.
         modifiers = self.observe_nonshift_test_modifiers(modifiers);
+        if self.should_route_pending_personal_key_down()? {
+            // Route the real callback through OnKeyDown. It may withdraw an
+            // immediate Backspace transaction, or confirm the transaction and
+            // return FALSE when the key still belongs to the host.
+            return Ok(true.into());
+        }
+        if self.should_route_candidate_forget_key(vkey, modifiers)? {
+            return Ok(self.plan_key(wparam, modifiers)?.is_some().into());
+        }
         if self.direct_input_needs_commit(vkey, modifiers)? {
             // Ask TSF to route the real key-down callback through us so the
             // current preedit can be committed before the host receives the
             // shifted or Caps Lock character.
             return Ok(true.into());
         }
-        Ok(self.plan_key(wparam, modifiers)?.is_some().into())
+        let planned = self.plan_key(wparam, modifiers)?;
+        if planned.is_none() && !self.has_active_logical_composition()? {
+            self.clear_personal_left_context();
+        }
+        Ok(planned.is_some().into())
     }
 
     fn OnTestKeyUp(
@@ -5819,6 +9090,19 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
             return Ok(false.into());
         };
         let mut modifiers = self.observed_key_modifiers();
+        match self.resolve_pending_personal_selection_for_key(vkey, modifiers)? {
+            PendingPersonalKeyResolution::Retracted => {
+                // The host still owns the actual Backspace. FALSE lets it
+                // delete the committed text after learning is withdrawn.
+                return Ok(false.into());
+            }
+            PendingPersonalKeyResolution::Confirmed
+                if !self.key_continues_personal_phrase(vkey, modifiers) =>
+            {
+                self.clear_personal_phrase_composer();
+            }
+            PendingPersonalKeyResolution::None | PendingPersonalKeyResolution::Confirmed => {}
+        }
         if vkey == VK_SHIFT.0 {
             if !self.can_handle_shift_tap(modifiers) {
                 return Ok(false.into());
@@ -5828,8 +9112,13 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
             return Ok(true.into());
         }
         modifiers = self.observe_nonshift_key_down_modifiers(modifiers);
+        if self.should_route_candidate_forget_key(vkey, modifiers)? {
+            return self.apply_key_with_modifiers(context, wparam, modifiers);
+        }
         if self.direct_input_needs_commit(vkey, modifiers)? {
             self.commit_active_composition(context)?;
+            self.clear_personal_phrase_composer();
+            self.clear_personal_left_context();
             // The preedit is finished, but the printable key or Caps Lock
             // key still belongs to the host application.
             return Ok(false.into());
@@ -5871,6 +9160,7 @@ impl ITfThreadMgrEventSink_Impl for TsfTextService_Impl {
     }
 
     fn OnUninitDocumentMgr(&self, _document: Ref<ITfDocumentMgr>) -> Result<()> {
+        self.clear_personal_left_context();
         Ok(())
     }
 
@@ -5890,6 +9180,7 @@ impl ITfThreadMgrEventSink_Impl for TsfTextService_Impl {
     }
 
     fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
+        self.clear_personal_left_context();
         Ok(())
     }
 }
@@ -5976,9 +9267,310 @@ mod tests {
             Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\wishes"))
         );
         assert_eq!(
+            personal_ranking_root_for_module(&module),
+            Some(PathBuf::from(
+                r"D:\repo\.local\tsf-alpha\user-data\personal-ranking"
+            ))
+        );
+        assert_eq!(
+            personal_ranking_suppression_root_for_module(&module),
+            Some(PathBuf::from(
+                r"D:\repo\.local\tsf-alpha\user-data\personal-suppression"
+            ))
+        );
+        assert_eq!(
+            public_supplement_root_for_module(&module),
+            Some(PathBuf::from(
+                r"D:\repo\.local\tsf-alpha\user-data\public-supplement"
+            ))
+        );
+        assert_eq!(
             explicit_alias_root_for_module(Path::new(r"D:\repo\target\release\ziranma_core.dll")),
             None
         );
+    }
+
+    #[test]
+    fn personal_ranking_runtime_flushes_and_reloads_current_user_protected_batches() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-ranking-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+
+        let mut first = PersonalRankingRuntime::new(Some(root.clone()));
+        assert!(first.record("ab", "乙"));
+        assert!(first.flush());
+        let second = PersonalRankingRuntime::new(Some(root));
+        assert_eq!(second.snapshot.preferred_text("ab"), Some("乙"));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn personal_ranking_runtime_applies_and_refreshes_explicit_suppressions() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-suppression-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let ranking_root = parent.join("ranking");
+        let suppression_root = parent.join(PERSONAL_RANKING_SUPPRESSION_DIRECTORY);
+
+        let mut writer = PersonalRankingRuntime::new(Some(ranking_root.clone()));
+        assert!(writer.record("ab", "乙"));
+        assert!(writer.flush());
+        drop(writer);
+        crate::save_personal_ranking_suppression_action(
+            &suppression_root,
+            &crate::PersonalRankingSuppressionAction::new(
+                10,
+                std::process::id(),
+                0,
+                crate::PersonalRankingSuppressionActionKind::Suppress,
+                "ab",
+                "乙",
+            )
+            .unwrap(),
+            &WindowsUserDataProtector,
+        )
+        .unwrap();
+
+        let mut runtime = PersonalRankingRuntime::new(Some(ranking_root));
+        let mut suppressed = vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()];
+        assert!(!runtime.promote_texts_after("ab", &mut suppressed, 0));
+        assert_eq!(suppressed, ["甲", "乙", "丙"]);
+        assert!(runtime.is_suppressed("ab", "乙"));
+        assert!(!runtime.is_suppressed("cd", "乙"));
+
+        crate::save_personal_ranking_suppression_action(
+            &suppression_root,
+            &crate::PersonalRankingSuppressionAction::new(
+                20,
+                std::process::id(),
+                1,
+                crate::PersonalRankingSuppressionActionKind::Restore,
+                "ab",
+                "乙",
+            )
+            .unwrap(),
+            &WindowsUserDataProtector,
+        )
+        .unwrap();
+        assert!(runtime.refresh());
+        let mut restored = vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()];
+        assert!(runtime.promote_texts_after("ab", &mut restored, 0));
+        assert_eq!(restored, ["乙", "甲", "丙"]);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn personal_ranking_runtime_appends_suppression_only_after_safe_persistence() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-append-suppression-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let ranking_root = parent.join("ranking");
+        let suppression_root = parent.join(PERSONAL_RANKING_SUPPRESSION_DIRECTORY);
+        let mut runtime = PersonalRankingRuntime::new_with_roots(
+            Some(ranking_root.clone()),
+            Some(suppression_root.clone()),
+        );
+        assert!(runtime.record("ab", "乙"));
+        assert!(runtime.has_evidence("ab", "乙"));
+        assert!(runtime.append_suppression_action(
+            PersonalRankingSuppressionActionKind::Suppress,
+            "ab",
+            "乙"
+        ));
+        assert!(runtime.is_suppressed("ab", "乙"));
+        assert_eq!(fs::read_dir(&suppression_root).unwrap().count(), 1);
+        assert!(runtime.append_suppression_action(
+            PersonalRankingSuppressionActionKind::Restore,
+            "ab",
+            "乙"
+        ));
+        assert!(!runtime.is_suppressed("ab", "乙"));
+        assert_eq!(fs::read_dir(&suppression_root).unwrap().count(), 2);
+
+        let invalid_root = parent.join("not-a-directory");
+        fs::write(&invalid_root, b"occupied").unwrap();
+        let mut failing = PersonalRankingRuntime::memory_only();
+        assert!(failing.record("ab", "乙"));
+        failing.suppression_root = Some(invalid_root);
+        assert!(!failing.append_suppression_action(
+            PersonalRankingSuppressionActionKind::Suppress,
+            "ab",
+            "乙"
+        ));
+        assert!(!failing.is_suppressed("ab", "乙"));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn candidate_forget_state_debug_never_contains_private_identity() {
+        let state = CandidateForgetState::UndoAvailable {
+            code: "private-code".to_owned(),
+            text: "私人候选".to_owned(),
+            restore_session: true,
+        };
+        let debug = format!("{state:?}");
+        assert!(!debug.contains("private-code"));
+        assert!(!debug.contains("私人候选"));
+        assert!(debug.contains("debug_contains_text: false"));
+    }
+
+    #[test]
+    fn explicit_suppression_also_blocks_session_candidate_promotion() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-session-suppression-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let ranking_root = parent.join("ranking");
+        crate::save_personal_ranking_suppression_action(
+            &parent.join(PERSONAL_RANKING_SUPPRESSION_DIRECTORY),
+            &crate::PersonalRankingSuppressionAction::new(
+                10,
+                std::process::id(),
+                0,
+                crate::PersonalRankingSuppressionActionKind::Suppress,
+                "ab",
+                "乙",
+            )
+            .unwrap(),
+            &WindowsUserDataProtector,
+        )
+        .unwrap();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(ranking_root)));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ab", "乙");
+
+        let candidates = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(candidates.candidates, ["甲", "乙", "丙"]);
+        assert!(!candidates.provenance[0].session_promoted());
+
+        drop(service);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn personal_marker_follows_the_remembered_candidate_inside_a_protected_prefix() {
+        let _guard = test_lock();
+        let persistent = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ProtectedSelectionCandidateProvider,
+        ))));
+        assert!(persistent.personal_ranking.borrow_mut().record("ab", "甲"));
+
+        let candidates = persistent
+            .load_candidate_batch(
+                &ProtectedSelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(candidates.candidates, ["甲", "乙", "丙"]);
+        assert_eq!(
+            candidates.personalized,
+            [true, false, false],
+            "persistent evidence must mark its protected candidate, not the first unprotected slot"
+        );
+
+        let session = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ProtectedSelectionCandidateProvider,
+        ))));
+        session
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ab", "甲");
+        let candidates = session
+            .load_candidate_batch(
+                &ProtectedSelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(candidates.candidates, ["甲", "乙", "丙"]);
+        assert_eq!(
+            candidates.personalized,
+            [true, false, false],
+            "session evidence must keep the same marker identity"
+        );
+    }
+
+    #[test]
+    fn new_personal_ranking_runtime_checkpoints_a_large_verified_history() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-checkpoint-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+        let mut writer = PersonalRankingRuntime::new(Some(root.clone()));
+        for _ in 0..crate::MIN_PERSONAL_RANKING_CHECKPOINT_BATCHES {
+            assert!(writer.record("ab", "乙"));
+            assert!(writer.flush());
+        }
+        drop(writer);
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some(crate::PERSONAL_RANKING_CHECKPOINT_EXTENSION)
+                )
+                .count(),
+            0
+        );
+
+        let reader = PersonalRankingRuntime::new(Some(root.clone()));
+        assert_eq!(reader.snapshot.preferred_text("ab"), Some("乙"));
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some(crate::PERSONAL_RANKING_CHECKPOINT_EXTENSION)
+                )
+                .count(),
+            1
+        );
+        drop(reader);
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -6024,6 +9616,48 @@ mod tests {
         fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), "broken\n").unwrap();
         assert!(!runtime.refresh());
         assert_eq!(runtime.text("aa").as_deref(), Some("乙"));
+
+        const CORE: &str = "text\tpinyin\tfrequency\n啊\ta\t100\n";
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "alias-priority-core-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 1,
+            })
+            .unwrap(),
+        );
+        let provider = SnapshotCandidateProvider {
+            snapshot,
+            supplemental: None,
+            aliases: Some(runtime),
+        };
+        let mut candidates = provider.candidates("aa", 2, InteractiveCandidateView::Primary);
+        assert_eq!(candidates, ["乙", "啊"]);
+        let output =
+            provider.candidates_with_provenance("aa", 2, InteractiveCandidateView::Primary);
+        assert_eq!(output.candidates, candidates);
+        assert_eq!(
+            output
+                .provenance
+                .iter()
+                .map(|item| item.source())
+                .collect::<Vec<_>>(),
+            [
+                NativeCandidateSource::ExplicitAlias,
+                NativeCandidateSource::CoreExact
+            ]
+        );
+        let mut memory = SessionSelectionMemory::default();
+        memory.remember_text("aa", "啊");
+        let protected =
+            provider.protected_candidate_prefix_len("aa", InteractiveCandidateView::Primary);
+        assert_eq!(protected, 1);
+        assert!(memory.promote_texts_after("aa", &mut candidates, protected));
+        assert_eq!(candidates, ["乙", "啊"]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6163,6 +9797,262 @@ mod tests {
                 .take(limit)
                 .map(str::to_owned)
                 .collect()
+        }
+
+        fn candidates_with_provenance(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> CandidateProviderOutput {
+            let candidates = self.candidates(code, limit, view);
+            let sources = match view {
+                InteractiveCandidateView::Primary => [
+                    NativeCandidateSource::CoreExact,
+                    NativeCandidateSource::SupplementalExact,
+                    NativeCandidateSource::Decoder,
+                ],
+                InteractiveCandidateView::TranspositionRecovery => {
+                    [NativeCandidateSource::TranspositionRecovery; 3]
+                }
+            };
+            let provenance = sources
+                .into_iter()
+                .take(candidates.len())
+                .map(|source| NativeCandidateProvenance::new(source, false))
+                .collect();
+            let candidate_count = candidates.len();
+            CandidateProviderOutput {
+                candidates,
+                provenance,
+                automatic_transposition_blocked: view == InteractiveCandidateView::Primary
+                    && sources
+                        .into_iter()
+                        .take(candidate_count)
+                        .any(native_source_is_explicit_exact),
+            }
+        }
+    }
+
+    struct ShapeCandidateProvider;
+
+    impl CandidateProvider for ShapeCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if code != "qt" || limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            ["却", "缺", "雀"]
+                .into_iter()
+                .take(limit)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn shape_candidates(&self, code: &str, prefix: &str, limit: usize) -> Vec<String> {
+            if limit == 0 {
+                return Vec::new();
+            }
+            let candidates: &[&str] = match (code, prefix) {
+                ("qt", "") => &["却", "缺", "雀"],
+                ("qt", "s") => &["雀"],
+                ("hp", "") => &["很", "和", "魂"],
+                ("hp", "p") => &["魂"],
+                ("lm", "") => &["连", "脸", "练"],
+                ("lm", "s") => &["练"],
+                ("xi", "") => &["西", "系", "习"],
+                ("xi", "z") => &["习"],
+                _ => &[],
+            };
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| (*candidate).to_owned())
+                .collect()
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            matches!(
+                (code, text),
+                ("qt", "却" | "缺" | "雀")
+                    | ("hp", "很" | "和" | "魂")
+                    | ("lm", "连" | "脸" | "练")
+                    | ("xi", "西" | "系" | "习")
+            )
+        }
+    }
+
+    struct PersonalShortRecallCandidateProvider;
+
+    impl CandidateProvider for PersonalShortRecallCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if code != "qth" || limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            ["固定", "其他", "雀跃", "去向"]
+                .into_iter()
+                .take(limit)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            usize::from(code == "qth" && view == InteractiveCandidateView::Primary)
+        }
+
+        fn shape_candidates(&self, code: &str, prefix: &str, limit: usize) -> Vec<String> {
+            ShapeCandidateProvider.shape_candidates(code, prefix, limit)
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            ShapeCandidateProvider.is_exact_full_code_candidate(code, text)
+        }
+    }
+
+    struct PersonalPhraseCandidateProvider;
+
+    impl CandidateProvider for PersonalPhraseCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            let candidates: &[&str] = match code {
+                "ui" => &["是", "试"],
+                "ub" => &["受", "手"],
+                "uiub" => &["是受", "失手", "是手"],
+                _ => &[],
+            };
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| (*candidate).to_owned())
+                .collect()
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            matches!((code, text), ("ui", "试") | ("ub", "手"))
+        }
+    }
+
+    struct CodeFamilyCandidateProvider;
+
+    impl CandidateProvider for CodeFamilyCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            let candidates: &[&str] = match code {
+                "jdjd" => &["讲讲", "将将"],
+                "jdj" => &["简单", "降价", "讲讲"],
+                "jd" => &["讲", "将"],
+                _ => &[],
+            };
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| (*candidate).to_owned())
+                .collect()
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            code == "jdjd" && text == "讲讲"
+        }
+    }
+
+    struct PersonalContextCandidateProvider;
+
+    impl CandidateProvider for PersonalContextCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if code != "ab" || limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            [
+                "吧", "八", "巴", "爸", "疤", "芭", "罢", "坝", "拔", "把", "霸", "靶",
+            ]
+            .into_iter()
+            .take(limit)
+            .map(str::to_owned)
+            .collect()
+        }
+    }
+
+    struct ProtectedSelectionCandidateProvider;
+
+    impl CandidateProvider for ProtectedSelectionCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            SelectionCandidateProvider.candidates(code, limit, view)
+        }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            usize::from(code == "ab" && view == InteractiveCandidateView::Primary)
+        }
+    }
+
+    struct PagedProtectedCandidateProvider;
+
+    impl CandidateProvider for PagedProtectedCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if code != "ab" || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            (1..=12)
+                .take(limit)
+                .map(|rank| format!("候选{rank}"))
+                .collect()
+        }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            if code == "ab" && view == InteractiveCandidateView::Primary {
+                CANDIDATE_PAGE_SIZE
+            } else {
+                0
+            }
         }
     }
 
@@ -6317,9 +10207,17 @@ mod tests {
     #[test]
     fn development_provider_decodes_public_fixture_and_preserves_unknown_input() {
         let provider = development_candidate_provider().unwrap();
-        let candidates =
-            provider.candidates("nihk", CANDIDATE_LIMIT, InteractiveCandidateView::Primary);
+        let core = provider.candidates_with_provenance(
+            "nihk",
+            CANDIDATE_LIMIT,
+            InteractiveCandidateView::Primary,
+        );
+        let candidates = core.candidates;
         assert_eq!(candidates.first().map(String::as_str), Some("你好"));
+        assert_eq!(
+            core.provenance.first().map(|item| item.source()),
+            Some(NativeCandidateSource::CoreExact)
+        );
         assert!(candidates.len() <= CANDIDATE_LIMIT);
         assert!(
             provider
@@ -6332,19 +10230,712 @@ mod tests {
         );
         for (code, expected) in [
             ("wuwa", "呜哇"),
+            ("rbrb", "揉揉"),
             ("yidair", "一大串"),
             ("duuuyu", "独属于"),
             ("bugfub", "不跟手"),
+            ("jmpn", "简拼"),
         ] {
+            let output =
+                provider.candidates_with_provenance(code, 7, InteractiveCandidateView::Primary);
             assert_eq!(
-                provider
-                    .candidates(code, 7, InteractiveCandidateView::Primary)
-                    .first()
-                    .map(String::as_str),
+                output.candidates.first().map(String::as_str),
                 Some(expected),
                 "an exact project overlay entry must precede snapshot fallbacks for {code}"
             );
+            assert_eq!(
+                output.provenance.first().map(|item| item.source()),
+                Some(NativeCandidateSource::ProjectOverlay)
+            );
         }
+    }
+
+    #[test]
+    fn snapshot_provider_labels_character_pairs_decoder_and_recovery_without_reordering() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+只\tzhi\t100\n\
+动\tdong\t90\n\
+什么\tshen me\t80\n\
+神\tshen\t70\n\
+恶魔\te mo\t60\n";
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-provenance-core-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 5,
+            })
+            .unwrap(),
+        );
+        let provider = SnapshotCandidateProvider::new(snapshot, None, None);
+
+        let pair =
+            provider.candidates_with_provenance("vids", 7, InteractiveCandidateView::Primary);
+        let pair_index = pair
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "只动")
+            .expect("the bounded character-pair lane should stay visible");
+        assert_eq!(
+            pair.provenance[pair_index].source(),
+            NativeCandidateSource::CharacterPair
+        );
+
+        let decoder =
+            provider.candidates_with_provenance("zzzzzzzz", 1, InteractiveCandidateView::Primary);
+        assert_eq!(decoder.candidates, ["zzzzzzzz"]);
+        assert_eq!(
+            decoder.provenance[0].source(),
+            NativeCandidateSource::Decoder
+        );
+
+        let recovery = provider.candidates_with_provenance(
+            "ufem",
+            1,
+            InteractiveCandidateView::TranspositionRecovery,
+        );
+        assert!(
+            recovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "什么")
+        );
+        assert!(recovery.provenance.iter().all(|item| {
+            item.source() == NativeCandidateSource::TranspositionRecovery
+                && !item.session_promoted()
+        }));
+    }
+
+    #[test]
+    fn snapshot_provider_reuses_the_pinned_stroke_index_for_explicit_shape_filtering() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+却\tque\t300\n\
+缺\tque\t200\n\
+雀\tque\t100\n\
+魂\thun\t90\n";
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-shape-core-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 4,
+            })
+            .unwrap(),
+        );
+        let provider = SnapshotCandidateProvider::new(snapshot, None, None);
+
+        assert_eq!(provider.shape_candidates("qt", "", 6), ["却", "缺", "雀"]);
+        assert_eq!(provider.shape_candidates("qt", "s", 6), ["雀"]);
+        assert_eq!(provider.shape_candidates("hp", "", 6), ["魂"]);
+        assert!(provider.shape_candidates("qthp", "", 6).is_empty());
+        assert!(provider.shape_candidates("qt", "a", 6).is_empty());
+    }
+
+    fn reversed_single_pair_provider() -> SnapshotCandidateProvider {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+俺们\tan men\t1000\n\
+马\tma\t900\n";
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-fast-reversed-pair-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 2,
+            })
+            .unwrap(),
+        );
+        SnapshotCandidateProvider::new(snapshot, None, None)
+    }
+
+    fn reversed_adjacent_pair_provider() -> SnapshotCandidateProvider {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+什么\tshen me\t1000\n\
+发射\tfa she\t900\n";
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-fast-reversed-adjacent-pairs-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 2,
+            })
+            .unwrap(),
+        );
+        SnapshotCandidateProvider::new(snapshot, None, None)
+    }
+
+    fn reversed_single_pair_request(
+        tier: AutomaticTranspositionTier,
+    ) -> AutomaticTranspositionRequest {
+        AutomaticTranspositionRequest {
+            primary: AutomaticTranspositionAttempt {
+                pattern: AutomaticTranspositionPattern::single(0),
+                cold_tier: tier,
+                tier,
+                pair_gap_ms: match tier {
+                    AutomaticTranspositionTier::Primary => {
+                        u32::try_from(AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS).unwrap()
+                    }
+                    AutomaticTranspositionTier::Secondary => {
+                        u32::try_from(AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS + 1).unwrap()
+                    }
+                    AutomaticTranspositionTier::Shadow => {
+                        u32::try_from(AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS).unwrap()
+                    }
+                },
+            },
+            fallback: None,
+        }
+    }
+
+    #[test]
+    fn candidate_cache_keeps_one_automatic_reversed_pair_until_the_code_changes() {
+        let provider = reversed_single_pair_provider();
+        let mut cache = CandidateCache::default();
+        let ordinary = cache.load(&provider, "am", 6, InteractiveCandidateView::Primary);
+        assert_eq!(
+            ordinary.candidates.first().map(String::as_str),
+            Some("俺们")
+        );
+
+        let promoted = cache.load_with_automatic_transposition(
+            &provider,
+            "am",
+            6,
+            InteractiveCandidateView::Primary,
+            Some(reversed_single_pair_request(
+                AutomaticTranspositionTier::Primary,
+            )),
+        );
+        assert_eq!(promoted.candidates.first().map(String::as_str), Some("马"));
+        assert_eq!(
+            promoted.provenance[0].source(),
+            NativeCandidateSource::TranspositionRecovery
+        );
+        assert_eq!(
+            cache
+                .load(&provider, "am", 6, InteractiveCandidateView::Primary,)
+                .candidates
+                .first()
+                .map(String::as_str),
+            Some("马"),
+            "Space or paging must see the same promoted candidate order"
+        );
+
+        let exact = cache.load_with_automatic_transposition(
+            &provider,
+            "ma",
+            6,
+            InteractiveCandidateView::Primary,
+            Some(reversed_single_pair_request(
+                AutomaticTranspositionTier::Primary,
+            )),
+        );
+        assert_eq!(exact.candidates.first().map(String::as_str), Some("马"));
+        assert_eq!(
+            exact.provenance[0].source(),
+            NativeCandidateSource::CoreExact,
+            "an exact observed code must never be relabeled as recovery"
+        );
+        assert_eq!(
+            cache.automatic_transposition_outcome,
+            AutomaticTranspositionOutcome::Suppressed(AutomaticTranspositionTier::Primary)
+        );
+    }
+
+    #[test]
+    fn timing_score_separates_primary_secondary_shadow_and_ignored_pairs() {
+        assert_eq!(
+            automatic_transposition_tier(AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS),
+            Some(AutomaticTranspositionTier::Primary)
+        );
+        assert_eq!(
+            automatic_transposition_tier(AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS + 1),
+            Some(AutomaticTranspositionTier::Secondary)
+        );
+        assert_eq!(
+            automatic_transposition_tier(AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS - 1),
+            Some(AutomaticTranspositionTier::Secondary)
+        );
+        assert_eq!(
+            automatic_transposition_tier(AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS),
+            Some(AutomaticTranspositionTier::Shadow)
+        );
+        assert_eq!(
+            automatic_transposition_tier(AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS - 1),
+            Some(AutomaticTranspositionTier::Shadow)
+        );
+        assert_eq!(
+            automatic_transposition_tier(AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS),
+            None
+        );
+    }
+
+    #[test]
+    fn adjacent_fast_pair_evidence_is_retained_until_the_next_pair_completes() {
+        let first = completed_pair_timing_after_key(2, true, Some(31), None).unwrap();
+        assert_eq!(
+            first,
+            CompletedPairTiming {
+                syllable_index: 0,
+                pair_gap_ms: 31
+            }
+        );
+        assert_eq!(
+            completed_pair_timing_after_key(3, true, None, Some(first)),
+            Some(first),
+            "the odd frame must retain the preceding completed pair"
+        );
+        assert_eq!(
+            completed_pair_timing_after_key(4, true, Some(42), Some(first)),
+            Some(CompletedPairTiming {
+                syllable_index: 1,
+                pair_gap_ms: 42
+            }),
+            "the newest completed pair becomes the next adjacency anchor"
+        );
+        assert_eq!(
+            completed_pair_timing_after_key(0, false, None, Some(first)),
+            None,
+            "commit, cancellation and host keys break the timing chain"
+        );
+    }
+
+    #[test]
+    fn timed_adjacent_pair_fallback_recovers_fu_em_as_shen_me() {
+        let provider = reversed_adjacent_pair_provider();
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("fuem".to_owned()));
+        let request = automatic_transposition_request(
+            &CompositionInput::Letters("m".to_owned()),
+            &session,
+            AutomaticTranspositionTimingEvidence {
+                current_pair_gap_ms: Some(42),
+                previous_pair: Some(CompletedPairTiming {
+                    syllable_index: 0,
+                    pair_gap_ms: 31,
+                }),
+            },
+        )
+        .expect("two adjacent measured pairs should create a bounded fallback");
+        assert_eq!(
+            request.primary.pattern,
+            AutomaticTranspositionPattern::single(1)
+        );
+        assert_eq!(
+            request.fallback.map(|attempt| attempt.pattern),
+            Some(AutomaticTranspositionPattern::adjacent_pair(0))
+        );
+
+        let mut cache = CandidateCache::default();
+        let batch = cache.load_with_automatic_transposition(
+            &provider,
+            "fuem",
+            6,
+            InteractiveCandidateView::Primary,
+            Some(request),
+        );
+        assert_eq!(batch.candidates.first().map(String::as_str), Some("什么"));
+        assert_eq!(
+            batch.provenance.first().map(|item| item.source()),
+            Some(NativeCandidateSource::TranspositionRecovery)
+        );
+        let decision = batch
+            .automatic_transposition
+            .expect("the feedback frame should retain the two-pair decision");
+        assert_eq!(decision.syllable_index(), 0);
+        assert_eq!(decision.syllable_count(), 2);
+        assert_eq!(decision.pair_gap_ms(), 42);
+        assert_eq!(decision.visible_rank(), Some(1));
+        assert_eq!(decision.recovered_text(), Some("什么"));
+    }
+
+    #[test]
+    fn tsf_plan_exposes_shen_me_for_two_timed_reversed_pairs() {
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            reversed_adjacent_pair_provider(),
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("fue".to_owned()));
+        let plan = service
+            .plan_key_with_transposition_timing(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'm' - b'a'))),
+                KeyModifiers::default(),
+                AutomaticTranspositionTimingEvidence {
+                    current_pair_gap_ms: Some(42),
+                    previous_pair: Some(CompletedPairTiming {
+                        syllable_index: 0,
+                        pair_gap_ms: 31,
+                    }),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(plan.after.phonetic(), "fuem");
+        assert_eq!(
+            plan.candidate_display
+                .as_ref()
+                .and_then(|display| display.visible().first())
+                .map(String::as_str),
+            Some("什么")
+        );
+        let Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            automatic_transposition: Some(decision),
+            ..
+        }) = plan.feedback_after_success
+        else {
+            panic!("the two-pair recovery should remain visible to wish feedback");
+        };
+        assert_eq!(decision.syllable_count(), 2);
+        assert_eq!(decision.recovered_text(), Some("什么"));
+    }
+
+    #[test]
+    fn timed_adjacent_pair_fallback_uses_the_slower_pair_for_exposure() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("fuem".to_owned()));
+        let request = automatic_transposition_request(
+            &CompositionInput::Letters("m".to_owned()),
+            &session,
+            AutomaticTranspositionTimingEvidence {
+                current_pair_gap_ms: Some(32),
+                previous_pair: Some(CompletedPairTiming {
+                    syllable_index: 0,
+                    pair_gap_ms: 55,
+                }),
+            },
+        )
+        .unwrap();
+        let fallback = request.fallback.unwrap();
+        assert_eq!(fallback.pair_gap_ms, 55);
+        assert_eq!(fallback.tier, AutomaticTranspositionTier::Secondary);
+
+        assert!(
+            automatic_transposition_request(
+                &CompositionInput::Letters("m".to_owned()),
+                &session,
+                AutomaticTranspositionTimingEvidence {
+                    current_pair_gap_ms: Some(32),
+                    previous_pair: Some(CompletedPairTiming {
+                        syllable_index: 0,
+                        pair_gap_ms: 96,
+                    }),
+                },
+            )
+            .unwrap()
+            .fallback
+            .is_none(),
+            "one slow pair must disable the combined automatic recovery"
+        );
+    }
+
+    #[test]
+    fn candidate_cache_places_secondary_recovery_after_primary_and_keeps_shadow_hidden() {
+        let provider = reversed_single_pair_provider();
+
+        let mut secondary_cache = CandidateCache::default();
+        let secondary = secondary_cache.load_with_automatic_transposition(
+            &provider,
+            "am",
+            6,
+            InteractiveCandidateView::Primary,
+            Some(reversed_single_pair_request(
+                AutomaticTranspositionTier::Secondary,
+            )),
+        );
+        assert_eq!(&secondary.candidates[..2], ["俺们", "马"]);
+        assert_eq!(
+            secondary.provenance[1].source(),
+            NativeCandidateSource::TranspositionRecovery
+        );
+        assert_eq!(
+            secondary_cache.automatic_transposition_outcome,
+            AutomaticTranspositionOutcome::RecoveryAvailable(AutomaticTranspositionTier::Secondary)
+        );
+        assert_eq!(
+            &secondary_cache
+                .load(&provider, "am", 6, InteractiveCandidateView::Primary)
+                .candidates[..2],
+            ["俺们", "马"],
+            "Space and paging must keep the same secondary placement"
+        );
+
+        let mut shadow_cache = CandidateCache::default();
+        let ordinary = shadow_cache.load(&provider, "am", 6, InteractiveCandidateView::Primary);
+        let shadow = shadow_cache.load_with_automatic_transposition(
+            &provider,
+            "am",
+            6,
+            InteractiveCandidateView::Primary,
+            Some(reversed_single_pair_request(
+                AutomaticTranspositionTier::Shadow,
+            )),
+        );
+        assert_eq!(shadow.candidates, ordinary.candidates);
+        assert_eq!(shadow.provenance, ordinary.provenance);
+        assert_eq!(
+            shadow_cache.automatic_transposition_outcome,
+            AutomaticTranspositionOutcome::RecoveryAvailable(AutomaticTranspositionTier::Shadow)
+        );
+    }
+
+    #[test]
+    fn delivered_pair_tiers_change_exposure_without_rewriting_the_observed_code() {
+        let _guard = test_lock();
+        let fast_service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(reversed_single_pair_provider()),
+        )));
+        fast_service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("a".to_owned()));
+        let fast = fast_service
+            .plan_key_with_pair_gap(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'm' - b'a'))),
+                KeyModifiers::default(),
+                Some(AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fast.candidate_display
+                .as_ref()
+                .and_then(|display| display.visible().first())
+                .map(String::as_str),
+            Some("马")
+        );
+        let Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            automatic_transposition: Some(fast_decision),
+            ..
+        }) = fast.feedback_after_success.as_ref()
+        else {
+            panic!("the promoted frame should carry its automatic decision");
+        };
+        assert_eq!(fast_decision.pair_gap_ms(), 48);
+        assert_eq!(
+            fast_decision.tier(),
+            NativeAutomaticTranspositionTier::Primary
+        );
+        assert_eq!(
+            fast_decision.outcome(),
+            NativeAutomaticTranspositionOutcome::RecoveryAvailable
+        );
+        assert_eq!(fast_decision.recovered_text(), Some("马"));
+        assert_eq!(fast_decision.visible_rank(), Some(1));
+        *fast_service.composition.borrow_mut() = fast.after;
+        let confirmation = fast_service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            confirmation.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "马"
+        ));
+
+        let secondary_service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(reversed_single_pair_provider()),
+        )));
+        secondary_service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("a".to_owned()));
+        let secondary = secondary_service
+            .plan_key_with_pair_gap(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'm' - b'a'))),
+                KeyModifiers::default(),
+                Some(AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS + 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &secondary.candidate_display.as_ref().unwrap().visible()[..2],
+            ["俺们", "马"]
+        );
+        let Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            automatic_transposition: Some(secondary_decision),
+            ..
+        }) = secondary.feedback_after_success.as_ref()
+        else {
+            panic!("the secondary frame should carry its automatic decision");
+        };
+        assert_eq!(secondary_decision.pair_gap_ms(), 49);
+        assert_eq!(secondary_decision.visible_rank(), Some(2));
+
+        let shadow_service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(reversed_single_pair_provider()),
+        )));
+        shadow_service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("a".to_owned()));
+        let shadow = shadow_service
+            .plan_key_with_pair_gap(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'm' - b'a'))),
+                KeyModifiers::default(),
+                Some(AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shadow
+                .candidate_display
+                .as_ref()
+                .and_then(|display| display.visible().first())
+                .map(String::as_str),
+            Some("俺们")
+        );
+        assert_eq!(
+            shadow_service
+                .candidate_cache
+                .borrow()
+                .automatic_transposition_outcome,
+            AutomaticTranspositionOutcome::RecoveryAvailable(AutomaticTranspositionTier::Shadow)
+        );
+        let Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            automatic_transposition: Some(shadow_decision),
+            ..
+        }) = shadow.feedback_after_success.as_ref()
+        else {
+            panic!("the shadow frame should carry its automatic decision");
+        };
+        assert_eq!(shadow_decision.pair_gap_ms(), 64);
+        assert_eq!(
+            shadow_decision.tier(),
+            NativeAutomaticTranspositionTier::Shadow
+        );
+        assert_eq!(shadow_decision.recovered_text(), Some("马"));
+        assert_eq!(shadow_decision.visible_rank(), None);
+
+        let ignored_service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(reversed_single_pair_provider()),
+        )));
+        ignored_service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("a".to_owned()));
+        let ignored = ignored_service
+            .plan_key_with_pair_gap(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'm' - b'a'))),
+                KeyModifiers::default(),
+                Some(AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ignored
+                .candidate_display
+                .as_ref()
+                .and_then(|display| display.visible().first())
+                .map(String::as_str),
+            Some("俺们")
+        );
+        assert!(matches!(
+            ignored.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                automatic_transposition: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            ignored_service
+                .candidate_cache
+                .borrow()
+                .automatic_transposition_outcome,
+            AutomaticTranspositionOutcome::NotRequested
+        );
+    }
+
+    #[test]
+    fn supplemental_provider_rescues_exact_words_without_displacing_core_exact_top_one() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+属于是\tshu yu shi\t100000\n\
+什么\tshen me\t100\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+属于\tshu yu\t100\n\
+甚么\tshen me\t100000\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            Arc::new(
+                CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                    schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                    revision,
+                    contains_private_text: false,
+                    lexicon_tsv: lexicon,
+                    expected_payload_bytes: lexicon.len(),
+                    expected_payload_fingerprint: crate::candidate_payload_fingerprint(
+                        lexicon.as_bytes(),
+                    ),
+                    expected_entry_count,
+                })
+                .unwrap(),
+            )
+        };
+        let core = load("tsf-supplemental-core-v1", CORE, 2);
+        let supplemental = load("tsf-supplemental-public-v1", SUPPLEMENTAL, 2);
+
+        let core_only = SnapshotCandidateProvider::new(Arc::clone(&core), None, None);
+        assert_eq!(
+            core_only
+                .candidates("uuyu", 2, InteractiveCandidateView::Primary)
+                .first()
+                .map(String::as_str),
+            Some("属于是")
+        );
+
+        let layered = SnapshotCandidateProvider::new(
+            core,
+            Some((
+                supplemental,
+                crate::SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )),
+            None,
+        );
+        assert_eq!(
+            layered.candidates("uuyu", 3, InteractiveCandidateView::Primary),
+            ["属于"]
+        );
+        assert_eq!(
+            layered.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "甚么"]
+        );
+        let provenance =
+            layered.candidates_with_provenance("ufme", 3, InteractiveCandidateView::Primary);
+        assert_eq!(provenance.candidates, ["什么", "甚么"]);
+        assert_eq!(
+            provenance
+                .provenance
+                .iter()
+                .map(|item| item.source())
+                .collect::<Vec<_>>(),
+            [
+                NativeCandidateSource::CoreExact,
+                NativeCandidateSource::SupplementalExact
+            ]
+        );
+        assert_eq!(
+            layered.candidates("ufme", 1, InteractiveCandidateView::Primary),
+            ["什么"]
+        );
+        assert!(
+            layered
+                .candidates("uuyu", 0, InteractiveCandidateView::Primary)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6572,6 +11163,448 @@ mod tests {
     }
 
     #[test]
+    fn real_key_callbacks_learn_and_reuse_one_adjacent_personal_phrase() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(PersonalPhraseCandidateProvider),
+        )));
+        assert!(
+            !service_object
+                .native_feedback
+                .lock()
+                .unwrap()
+                .is_accepting(),
+            "the optional recorder stays stopped while input-scope classification gates learning"
+        );
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        let press = |vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool(),
+                "OnTestKeyDown did not route virtual key {vkey}"
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool(),
+                "OnKeyDown did not handle virtual key {vkey}"
+            );
+        };
+
+        press(VK_A.0 + u16::from(b'u' - b'a'));
+        press(VK_A.0 + u16::from(b'i' - b'a'));
+        press(VK_1.0 + 1);
+        assert_eq!(read_context_text(&context, client_id), "试");
+        assert!(service_object.pending_personal_selection.borrow().is_some());
+        assert!(
+            service_object
+                .personal_phrase_composer
+                .borrow()
+                .previous
+                .as_ref()
+                .is_some_and(|component| component.code == "ui" && component.text == "试")
+        );
+
+        press(VK_A.0 + u16::from(b'u' - b'a'));
+        assert!(service_object.pending_personal_selection.borrow().is_none());
+        assert!(
+            service_object
+                .personal_phrase_composer
+                .borrow()
+                .previous
+                .as_ref()
+                .is_some_and(|component| component.code == "ui" && component.text == "试")
+        );
+        press(VK_A.0 + u16::from(b'b' - b'a'));
+        press(VK_1.0 + 1);
+        assert_eq!(read_context_text(&context, client_id), "试手");
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("uiub"),
+            Some("试手")
+        );
+
+        for letter in b"uiub" {
+            press(VK_A.0 + u16::from(*letter - b'a'));
+        }
+        press(VK_SPACE.0);
+        assert_eq!(read_context_text(&context, client_id), "试手试手");
+        assert_eq!(
+            service_object
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            Some("试手")
+        );
+        assert!(
+            service_object
+                .personal_context_ranking
+                .borrow()
+                .has_evidence("试", "ub")
+        );
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+    }
+
+    #[test]
+    fn advised_key_sink_retracts_learning_but_returns_backspace_to_the_host() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(SelectionCandidateProvider),
+        )));
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        service_object
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service_object
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ab", "丙");
+        service_object.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        let backspace = WPARAM(usize::from(VK_BACK.0));
+        let lparam = LPARAM(0);
+        assert!(
+            unsafe { key_sink.OnTestKeyDown(&context, backspace, lparam) }
+                .unwrap()
+                .as_bool(),
+            "pending learning must route the real Backspace callback"
+        );
+        assert!(
+            !unsafe { key_sink.OnKeyDown(&context, backspace, lparam) }
+                .unwrap()
+                .as_bool(),
+            "the host must still receive the Backspace after learning is retracted"
+        );
+        assert!(service_object.pending_personal_selection.borrow().is_none());
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("ab"),
+            Some("丙")
+        );
+        assert_eq!(
+            service_object
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            None
+        );
+
+        service_object.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        let host_key = WPARAM(usize::from(VK_CAPITAL.0));
+        assert!(
+            unsafe { key_sink.OnTestKeyDown(&context, host_key, lparam) }
+                .unwrap()
+                .as_bool(),
+            "an otherwise unhandled key must reach OnKeyDown as a confirmation boundary"
+        );
+        assert!(
+            !unsafe { key_sink.OnKeyDown(&context, host_key, lparam) }
+                .unwrap()
+                .as_bool(),
+            "the confirmation boundary must return an otherwise unhandled key to the host"
+        );
+        assert_eq!(
+            service_object
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("乙")
+        );
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+    }
+
+    #[test]
+    fn advised_key_sink_forgets_and_restores_without_editing_the_active_preedit() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(SelectionCandidateProvider),
+        )));
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        service_object
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ab", "乙");
+        let lparam = LPARAM(0);
+        let press = |vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool(),
+                "OnTestKeyDown did not route virtual key {vkey}"
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool(),
+                "OnKeyDown did not handle virtual key {vkey}"
+            );
+        };
+
+        press(VK_A.0);
+        press(VK_A.0 + 1);
+        assert_eq!(read_context_text(&context, client_id), "ab");
+
+        service_object.synthetic_key_modifiers.set(KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        });
+        press(VK_DELETE.0);
+        service_object
+            .synthetic_key_modifiers
+            .set(KeyModifiers::default());
+        assert_eq!(read_context_text(&context, client_id), "ab");
+        assert!(matches!(
+            &*service_object.candidate_forget_state.borrow(),
+            CandidateForgetState::Choosing(CandidateForgetMessage::Select)
+        ));
+
+        press(VK_1.0);
+        assert_eq!(read_context_text(&context, client_id), "ab");
+        assert!(
+            service_object
+                .personal_ranking
+                .borrow()
+                .is_suppressed("ab", "乙")
+        );
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("ab"),
+            None
+        );
+
+        press(VK_BACK.0);
+        assert_eq!(read_context_text(&context, client_id), "ab");
+        assert!(
+            !service_object
+                .personal_ranking
+                .borrow()
+                .is_suppressed("ab", "乙")
+        );
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("ab"),
+            Some("乙")
+        );
+
+        press(VK_BACK.0);
+        assert_eq!(
+            read_context_text(&context, client_id),
+            "a",
+            "only the immediate first Backspace belongs to the undo transaction"
+        );
+        press(VK_ESCAPE.0);
+        assert_eq!(read_context_text(&context, client_id), "");
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+    }
+
+    #[test]
+    fn advised_key_sink_commits_an_inherited_anchored_tail_candidate() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(CodeFamilyCandidateProvider),
+        )));
+        service_object
+            .selection_memory
+            .borrow_mut()
+            .remember_text("jdjd", "讲讲");
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        let press = |vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+        };
+        press(VK_A.0 + 9);
+        press(VK_A.0 + 3);
+        press(VK_A.0 + 9);
+        assert_eq!(read_context_text(&context, client_id), "jdj");
+        press(VK_SPACE.0);
+        assert_eq!(read_context_text(&context, client_id), "讲讲");
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+    }
+
+    #[test]
     fn process_test_native_feedback_orders_present_commit_recovery_and_cancel_events() {
         let _guard = test_lock();
         let _apartment = ComApartment::enter();
@@ -6662,7 +11695,7 @@ mod tests {
             assert_eq!(events.len(), 9);
             assert!(matches!(
                 &events[0],
-                NativeFeedbackEvent::CandidatesPresented {
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                     code,
                     view: NativeCandidateView::Ordinary,
                     page_start: 0,
@@ -6692,7 +11725,7 @@ mod tests {
             ));
             assert!(matches!(
                 &events[5],
-                NativeFeedbackEvent::CandidatesPresented {
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                     view: NativeCandidateView::TranspositionRecovery,
                     ..
                 }
@@ -7299,6 +12332,12 @@ mod tests {
             ))
         );
         assert_eq!(
+            decode_virtual_key(VK_6.0, shifted, InputMode::Chinese),
+            Some(CompositionInput::Punctuation(
+                CompositionPunctuation::Ellipsis
+            ))
+        );
+        assert_eq!(
             decode_virtual_key(VK_1.0 + 1, shifted, InputMode::Chinese),
             None,
             "shifted digits without an assigned Chinese punctuation must not select candidates"
@@ -7408,6 +12447,22 @@ mod tests {
             NativeFeedbackContext::Unknown
         );
         assert_eq!(classify_input_scopes(&[]), NativeFeedbackContext::Unknown);
+    }
+
+    #[test]
+    fn foreground_hosts_keep_a_bounded_memory_only_wish_buffer_ready() {
+        let foreground = native_feedback_session_for_mode(KeyAdviceMode::Foreground);
+        assert_eq!(
+            foreground.summary().lifecycle,
+            NativeFeedbackLifecycle::Recording
+        );
+        assert_eq!(foreground.summary().events, 0);
+
+        let synthetic = native_feedback_session_for_mode(KeyAdviceMode::SyntheticHost);
+        assert_eq!(
+            synthetic.summary().lifecycle,
+            NativeFeedbackLifecycle::Disabled
+        );
     }
 
     #[test]
@@ -7909,6 +12964,10 @@ mod tests {
             "Shift+1 is handled as a Chinese exclamation mark"
         );
         assert!(
+            !service.direct_input_needs_commit(VK_6.0, shifted).unwrap(),
+            "Shift+6 is handled as a Chinese ellipsis"
+        );
+        assert!(
             !service
                 .direct_input_needs_commit(VK_OEM_1.0, KeyModifiers::default())
                 .unwrap(),
@@ -7957,6 +13016,47 @@ mod tests {
         let clipped = CandidateDisplay::from_candidates(vec![long], 0).native_text();
         assert!(clipped.ends_with('…'));
         assert_eq!(clipped.chars().count(), 3 + CANDIDATE_DISPLAY_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn inline_wish_notice_is_a_short_rankless_acknowledgement() {
+        let notice = inline_wish_notice(
+            InlineWishOperation::Capture {
+                scope: WishCaptureScope::RecentEpisodes,
+                category: WishCategory::Other,
+            },
+            true,
+        );
+        assert_eq!(notice.visible(), ["已经保存"]);
+        assert_eq!(notice.action_detail(), Some("可以继续输入"));
+        assert!(notice.is_notice());
+        assert_eq!(notice.notice_icon(), CandidateNoticeIcon::WishReceived);
+        let plain_notice = CandidateDisplay::notice("已经保存", "可以继续输入");
+        let icon_metrics = candidate_popup_metrics(&notice, 96, 1_920);
+        let plain_metrics = candidate_popup_metrics(&plain_notice, 96, 1_920);
+        assert_eq!(
+            icon_metrics.width - plain_metrics.width,
+            POPUP_NOTICE_ICON_SIZE_LOGICAL + POPUP_NOTICE_ICON_GAP_LOGICAL
+        );
+
+        let failure = inline_wish_notice(
+            InlineWishOperation::Capture {
+                scope: WishCaptureScope::RecentEpisodes,
+                category: WishCategory::Other,
+            },
+            false,
+        );
+        assert_eq!(failure.notice_icon(), CandidateNoticeIcon::None);
+
+        let lifecycle = inline_wish_notice(InlineWishOperation::Command(WishCommand::Start), true);
+        assert_eq!(lifecycle.notice_icon(), CandidateNoticeIcon::None);
+
+        let mut ui = CandidateUiController::new_headless();
+        assert!(ui.show_notice(notice));
+        assert_eq!(
+            ui.state.borrow().display.as_ref().unwrap().visible(),
+            ["已经保存"]
+        );
     }
 
     #[test]
@@ -8018,6 +13118,7 @@ mod tests {
             (CompositionPunctuation::Semicolon, "；"),
             (CompositionPunctuation::Colon, "："),
             (CompositionPunctuation::ExclamationMark, "！"),
+            (CompositionPunctuation::Ellipsis, "……"),
             (CompositionPunctuation::LeftParenthesis, "（"),
             (CompositionPunctuation::RightParenthesis, "）"),
             (CompositionPunctuation::QuestionMark, "？"),
@@ -8041,6 +13142,9 @@ mod tests {
         for (code, expected) in [
             ("siyn", "丝印"),
             ("udpn", "双拼"),
+            ("ugmu", "声母"),
+            ("ypmu", "韵母"),
+            ("hbxrxd", "候选项"),
             ("oumu", "欧姆"),
             ("wlqr", "外圈"),
             ("wuwa", "呜哇"),
@@ -8053,6 +13157,11 @@ mod tests {
             ("gdmn", "光敏"),
             ("gdmnxy", "光敏性"),
             ("vijcjuxy", "直角矩形"),
+            ("dmsl", "电赛"),
+            ("dagoyici", "打过一次"),
+            ("ubxrxd", "首选项"),
+            ("uivd", "实装"),
+            ("ubpi", "手癖"),
         ] {
             let candidates = project_overlay_decoder()
                 .decode_exact_full_code(code, 7)
@@ -8113,7 +13222,7 @@ mod tests {
         assert_eq!(next_page.after.candidate_page_start(), 6);
         assert!(matches!(
             next_page.feedback_after_success.as_ref(),
-            Some(NativeFeedbackEvent::CandidatesPresented {
+            Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                 page_start: 6,
                 candidates,
                 ..
@@ -8135,6 +13244,177 @@ mod tests {
                 ..
             }) if text == "候选8"
         ));
+    }
+
+    #[test]
+    fn confirmed_same_pair_feedback_can_raise_secondary_to_primary_in_memory() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(reversed_single_pair_provider())),
+            NativeFeedbackLimits::default(),
+        ));
+        {
+            let mut feedback = service.native_feedback.lock().unwrap();
+            for index in 0..8_u64 {
+                assert_eq!(
+                    feedback.record_at(
+                        NativeFeedbackContext::Eligible,
+                        NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                            code: "am".to_owned(),
+                            view: NativeCandidateView::Ordinary,
+                            page_start: 0,
+                            candidates: vec!["俺们".to_owned(), "马".to_owned()],
+                            provenance: vec![
+                                NativeCandidateProvenance::new(
+                                    NativeCandidateSource::Decoder,
+                                    false,
+                                ),
+                                NativeCandidateProvenance::new(
+                                    NativeCandidateSource::TranspositionRecovery,
+                                    false,
+                                ),
+                            ],
+                            automatic_transposition: Some(
+                                NativeAutomaticTranspositionDecision::new(
+                                    0,
+                                    55,
+                                    NativeAutomaticTranspositionTier::Secondary,
+                                    NativeAutomaticTranspositionTier::Secondary,
+                                    NativeAutomaticTranspositionOutcome::RecoveryAvailable,
+                                    Some("马".to_owned()),
+                                    Some(2),
+                                ),
+                            ),
+                            may_have_more: false,
+                        },
+                        index.saturating_mul(10),
+                    ),
+                    NativeFeedbackRecordResult::Recorded
+                );
+                assert_eq!(
+                    feedback.record_at(
+                        NativeFeedbackContext::Eligible,
+                        NativeFeedbackEvent::CandidateCommitted {
+                            code: "am".to_owned(),
+                            text: "马".to_owned(),
+                            view: NativeCandidateView::Ordinary,
+                            source: NativeSelectionSource::Numeric,
+                            absolute_rank: 2,
+                            visible_rank: 2,
+                        },
+                        index.saturating_mul(10).saturating_add(1),
+                    ),
+                    NativeFeedbackRecordResult::Recorded
+                );
+            }
+        }
+
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("a".to_owned()));
+        let plan = service
+            .plan_key_with_pair_gap(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'm' - b'a'))),
+                KeyModifiers::default(),
+                Some(55),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.candidate_display
+                .as_ref()
+                .and_then(|display| display.visible().first())
+                .map(String::as_str),
+            Some("马")
+        );
+        let Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            automatic_transposition: Some(decision),
+            ..
+        }) = plan.feedback_after_success.as_ref()
+        else {
+            panic!("the calibrated frame should retain its decision evidence");
+        };
+        assert_eq!(
+            decision.cold_tier(),
+            NativeAutomaticTranspositionTier::Secondary
+        );
+        assert_eq!(decision.tier(), NativeAutomaticTranspositionTier::Primary);
+    }
+
+    #[test]
+    fn space_and_punctuation_confirm_the_first_candidate_on_the_visible_page() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            CountingCandidateProvider {
+                calls: AtomicUsize::new(0),
+                total: 12,
+            },
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+
+        let next_page = service
+            .plan_key(WPARAM(usize::from(VK_OEM_PLUS.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        *service.composition.borrow_mut() = next_page.after;
+
+        let space = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            space.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "候选7"
+        ));
+        assert!(matches!(
+            space.feedback_after_success.as_ref(),
+            Some(NativeFeedbackEvent::CandidateCommitted {
+                text,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 7,
+                visible_rank: 1,
+                ..
+            }) if text == "候选7"
+        ));
+        let remembered = space
+            .selection_to_remember
+            .as_ref()
+            .expect("a page change makes Space an explicit non-first selection");
+        assert_eq!(
+            (remembered.code.as_str(), remembered.text.as_str()),
+            ("ab", "候选7")
+        );
+
+        let punctuation = service
+            .plan_key(WPARAM(usize::from(VK_OEM_COMMA.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            punctuation.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "候选7，"
+        ));
+        assert!(matches!(
+            punctuation.feedback_after_success.as_ref(),
+            Some(NativeFeedbackEvent::CandidateCommitted {
+                text,
+                source: NativeSelectionSource::Punctuation,
+                absolute_rank: 7,
+                visible_rank: 1,
+                ..
+            }) if text == "候选7"
+        ));
+        let remembered = punctuation
+            .selection_to_remember
+            .as_ref()
+            .expect("punctuation on a later page confirms an explicit non-first selection");
+        assert_eq!(
+            (remembered.code.as_str(), remembered.text.as_str()),
+            ("ab", "候选7")
+        );
     }
 
     #[test]
@@ -8177,6 +13457,832 @@ mod tests {
         let display = primary.candidate_display.as_ref().unwrap();
         assert_eq!(display.view(), InteractiveCandidateView::Primary);
         assert_eq!(display.visible(), ["普通候选"]);
+    }
+
+    #[test]
+    fn ordinary_tab_enters_shape_filter_without_changing_preedit_or_learning_the_choice() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("qt".to_owned()));
+
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("an exact two-key pool should enter shape mode");
+        assert!(enter.edit.is_none());
+        assert!(enter.after.tab_mode());
+        assert_eq!(enter.after.phonetic(), "qt");
+        assert_eq!(enter.after.stroke_prefix(), "");
+        assert_eq!(
+            enter.candidate_display.as_ref().unwrap().visible(),
+            ["却", "缺", "雀"]
+        );
+        assert_eq!(
+            enter.candidate_display.as_ref().unwrap().mode(),
+            CandidateDisplayMode::Shape
+        );
+        assert!(matches!(
+            enter.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                view: NativeCandidateView::Shape,
+                ..
+            })
+        ));
+        *service.composition.borrow_mut() = enter.after;
+
+        let filtered = service
+            .plan_key(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'u' - b'a'))),
+                KeyModifiers::default(),
+            )
+            .unwrap()
+            .expect("the natural-code vertical-stroke key should refresh the frozen shape pool");
+        assert!(filtered.edit.is_none());
+        assert!(filtered.after.tab_mode());
+        assert_eq!(filtered.after.phonetic(), "qt");
+        assert_eq!(filtered.after.stroke_prefix(), "s");
+        assert_eq!(
+            filtered.candidate_display.as_ref().unwrap().visible(),
+            ["雀"]
+        );
+        *service.composition.borrow_mut() = filtered.after;
+
+        let commit = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Space should commit the first filtered character");
+        assert!(matches!(
+            commit.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "雀"
+        ));
+        assert!(matches!(
+            commit.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidateCommitted {
+                view: NativeCandidateView::Shape,
+                ..
+            })
+        ));
+        assert!(commit.selection_to_remember.is_none());
+        assert!(commit.after.phonetic().is_empty());
+        assert!(!commit.after.tab_mode());
+    }
+
+    #[test]
+    fn public_character_verification_covers_two_to_four_characters_without_partial_acceptance() {
+        assert!(provider_verifies_personal_character_composition(
+            &ShapeCandidateProvider,
+            "qthp",
+            "雀魂",
+        ));
+        assert!(provider_verifies_personal_character_composition(
+            &ShapeCandidateProvider,
+            "qthplm",
+            "雀魂练",
+        ));
+        assert!(provider_verifies_personal_character_composition(
+            &ShapeCandidateProvider,
+            "qthplmxi",
+            "雀魂练习",
+        ));
+        assert!(!provider_verifies_personal_character_composition(
+            &ShapeCandidateProvider,
+            "qthplmxi",
+            "雀魂练",
+        ));
+        assert!(!provider_verifies_personal_character_composition(
+            &ShapeCandidateProvider,
+            "qthplm",
+            "雀魂练习",
+        ));
+        assert!(!provider_verifies_personal_character_composition(
+            &ShapeCandidateProvider,
+            "qthplmxi",
+            "雀魂西习",
+        ));
+    }
+
+    #[test]
+    fn four_key_tab_assembles_two_shape_characters_and_learns_only_the_whole_word() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("qthp".to_owned()));
+
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("two complete single-character pools should enter staged shape mode");
+        assert!(enter.edit.is_none());
+        assert_eq!(enter.after.phonetic(), "qthp");
+        assert_eq!(enter.after.shape_pinyin(), Some("qt"));
+        assert_eq!(
+            enter.after.tab_assembly_stage(),
+            Some(TabAssemblyStage::First)
+        );
+        let display = enter.candidate_display.as_ref().unwrap();
+        assert_eq!(display.visible(), ["却", "缺", "雀"]);
+        assert_eq!(display.mode(), CandidateDisplayMode::ShapeAssemblyFirst);
+        assert_eq!(candidate_popup_mode_label(display), Some("找第 1 字"));
+        *service.composition.borrow_mut() = enter.after;
+
+        let first = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("selecting the first character should advance without editing the document");
+        assert!(first.edit.is_none());
+        assert!(first.selection_to_remember.is_none());
+        assert_eq!(first.after.phonetic(), "qthp");
+        assert_eq!(first.after.shape_pinyin(), Some("hp"));
+        assert_eq!(
+            first.after.tab_assembly_stage(),
+            Some(TabAssemblyStage::Second)
+        );
+        let display = first.candidate_display.as_ref().unwrap();
+        assert_eq!(display.visible(), ["很", "和", "魂"]);
+        assert_eq!(display.mode(), CandidateDisplayMode::ShapeAssemblySecond);
+        assert_eq!(candidate_popup_mode_label(display), Some("雀 → 第 2 字"));
+        assert!(matches!(
+            first.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code,
+                view: NativeCandidateView::Shape,
+                ..
+            }) if code == "qthp"
+        ));
+        *service.composition.borrow_mut() = first.after;
+
+        let complete = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("selecting the second character should commit the assembled word");
+        assert!(matches!(
+            complete.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "雀魂"
+        ));
+        let remembered = complete
+            .selection_to_remember
+            .as_ref()
+            .expect("only the complete explicit assembly should enter personal learning")
+            .clone();
+        assert_eq!(
+            (remembered.code.as_str(), remembered.text.as_str()),
+            ("qthp", "雀魂")
+        );
+        assert!(remembered.retractable_by_immediate_backspace);
+        assert!(matches!(
+            complete.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidateCommitted {
+                code,
+                text,
+                view: NativeCandidateView::Shape,
+                source: NativeSelectionSource::Numeric,
+                absolute_rank: 3,
+                visible_rank: 3,
+            }) if code == "qthp" && text == "雀魂"
+        ));
+        assert!(complete.after.phonetic().is_empty());
+        assert!(!complete.after.tab_mode());
+
+        service.remember_selection_after_success_in_context(
+            remembered,
+            NativeFeedbackContext::Eligible,
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("qthp"),
+            Some("雀魂"),
+            "the completed path must be recalled immediately in this host"
+        );
+        let immediate = service
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            immediate.candidates.first().map(String::as_str),
+            Some("雀魂")
+        );
+        assert_eq!(immediate.personalized.first(), Some(&true));
+
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+        let persistent = service
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            persistent.candidates.first().map(String::as_str),
+            Some("雀魂"),
+            "confirmed assembly evidence must remain recallable without session memory"
+        );
+        assert_eq!(
+            persistent.personalized.first(),
+            Some(&true),
+            "persistent Tab recall should retain its quiet personal-memory marker"
+        );
+
+        let mut ordinary = CompositionSession::default();
+        ordinary.apply(CompositionInput::Letters("qthp".to_owned()));
+        *service.composition.borrow_mut() = ordinary;
+        let enter_forget = service
+            .plan_key(
+                WPARAM(usize::from(VK_DELETE.0)),
+                KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .unwrap()
+            .expect("the recalled Tab word should enter forget selection");
+        service.apply_candidate_forget_action(
+            enter_forget
+                .candidate_forget_action_after_success
+                .expect("forget entry should carry an action"),
+        );
+        let choose = service
+            .plan_key(WPARAM(usize::from(VK_1.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the recalled Tab word should be forgettable");
+        service.apply_candidate_forget_action(
+            choose
+                .candidate_forget_action_after_success
+                .expect("forget selection should carry a suppression"),
+        );
+        assert!(
+            service
+                .personal_ranking
+                .borrow()
+                .is_suppressed("qthp", "雀魂")
+        );
+        let forgotten = service
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert!(forgotten.candidates.is_empty());
+        assert!(forgotten.personalized.is_empty());
+
+        let undo = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Backspace should restore the forgotten Tab word");
+        service.apply_candidate_forget_action(
+            undo.candidate_forget_action_after_success
+                .expect("forget undo should carry a restore"),
+        );
+        let restored = service
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            restored.candidates.first().map(String::as_str),
+            Some("雀魂")
+        );
+        assert_eq!(restored.personalized.first(), Some(&true));
+    }
+
+    #[test]
+    fn eight_key_tab_path_shows_progress_and_learns_only_the_complete_word() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("qthplmxi".to_owned()));
+
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("four complete single-character pools should enter staged Tab mode");
+        assert_eq!(
+            enter.after.tab_assembly_stage(),
+            Some(TabAssemblyStage::First)
+        );
+        assert_eq!(
+            candidate_popup_mode_label(enter.candidate_display.as_ref().unwrap()),
+            Some("找第 1 字")
+        );
+        *service.composition.borrow_mut() = enter.after;
+
+        for (expected_stage, expected_label) in [
+            (TabAssemblyStage::Second, "雀 → 第 2 字"),
+            (TabAssemblyStage::Later(3), "雀魂 → 第 3 字"),
+            (TabAssemblyStage::Later(4), "雀魂练 → 第 4 字"),
+        ] {
+            let advance = service
+                .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+                .unwrap()
+                .expect("each explicit character should advance exactly one stage");
+            assert!(advance.edit.is_none());
+            assert!(advance.selection_to_remember.is_none());
+            assert_eq!(advance.after.tab_assembly_stage(), Some(expected_stage));
+            assert_eq!(
+                candidate_popup_mode_label(advance.candidate_display.as_ref().unwrap()),
+                Some(expected_label)
+            );
+            *service.composition.borrow_mut() = advance.after;
+        }
+
+        let complete = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("the fourth explicit character should commit the complete word");
+        assert!(matches!(
+            complete.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "雀魂练习"
+        ));
+        let learned = complete
+            .selection_to_remember
+            .expect("only the complete four-character path should enter learning");
+        assert_eq!(learned.code, "qthplmxi");
+        assert_eq!(learned.text, "雀魂练习");
+        service
+            .remember_selection_after_success_in_context(learned, NativeFeedbackContext::Eligible);
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+
+        let recalled = service
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "qthplmxi",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            recalled.candidates.first().map(String::as_str),
+            Some("雀魂练习")
+        );
+        assert_eq!(recalled.personalized.first(), Some(&true));
+    }
+
+    #[test]
+    fn immediate_backspace_retracts_an_unconfirmed_tab_assembled_word() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("qthp".to_owned()));
+        assert!(session.enter_tab_path(&["qt", "hp"]));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("雀"),
+            Some(TabAssemblySelection::Advanced)
+        );
+        let complete = plan_tab_assembly_selection(
+            &session,
+            &CompositionInput::Select(3),
+            Some("魂".to_owned()),
+        )
+        .expect("the second Tab character should complete one word");
+        let selection = complete
+            .selection_to_remember
+            .expect("the complete Tab word should be eligible for learning");
+        service.remember_selection_after_success_in_context(
+            selection,
+            NativeFeedbackContext::Eligible,
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("qthp"),
+            Some("雀魂")
+        );
+
+        assert_eq!(
+            service
+                .resolve_pending_personal_selection_for_key(VK_BACK.0, KeyModifiers::default(),)
+                .unwrap(),
+            PendingPersonalKeyResolution::Retracted
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("qthp"),
+            None
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("qthp"),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_tab_assembled_word_survives_a_new_service_with_its_personal_marker() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-tab-assembly-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+
+        let first = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        first
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root.clone())));
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("qthp".to_owned()));
+        assert!(session.enter_tab_path(&["qt", "hp"]));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("雀"),
+            Some(TabAssemblySelection::Advanced)
+        );
+        let complete = plan_tab_assembly_selection(
+            &session,
+            &CompositionInput::Select(3),
+            Some("魂".to_owned()),
+        )
+        .expect("the explicit Tab path should complete");
+        first.remember_selection_after_success_in_context(
+            complete
+                .selection_to_remember
+                .expect("the complete Tab path should learn only the whole word"),
+            NativeFeedbackContext::Eligible,
+        );
+        assert!(first.confirm_pending_personal_selection());
+        assert!(first.personal_ranking.borrow_mut().flush());
+        drop(first);
+
+        let second = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        second
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root)));
+        let recalled = second
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            recalled.candidates.first().map(String::as_str),
+            Some("雀魂")
+        );
+        assert_eq!(recalled.personalized.first(), Some(&true));
+        drop(second);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn repeated_tab_word_enters_a_guarded_and_forgettable_short_code_lane() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalShortRecallCandidateProvider,
+        ))));
+        assert!(service.personal_ranking.borrow_mut().record("qthp", "雀魂"));
+
+        let once = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(once.candidates, ["固定", "其他", "雀跃", "去向"]);
+        assert!(once.personalized.iter().all(|personalized| !personalized));
+
+        let full = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(full.candidates, ["雀魂"]);
+        assert_eq!(full.personalized, [true]);
+        let mut full_session = CompositionSession::default();
+        full_session.apply(CompositionInput::Letters("qthp".to_owned()));
+        *service.composition.borrow_mut() = full_session;
+        let reuse = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("confirming a recalled personal whole word should be observable");
+        let repeated_evidence = reuse
+            .selection_to_remember
+            .expect("a verified personal whole-word reuse should strengthen its evidence");
+        assert_eq!(repeated_evidence.code, "qthp");
+        assert_eq!(repeated_evidence.text, "雀魂");
+        service.remember_selection_after_success_in_context(
+            repeated_evidence,
+            NativeFeedbackContext::Eligible,
+        );
+        assert!(service.confirm_pending_personal_selection());
+
+        let discovered = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(discovered.candidates, ["固定", "其他", "雀魂", "雀跃"]);
+        assert_eq!(discovered.personalized, [false, false, true, false]);
+
+        let mut short_session = CompositionSession::default();
+        short_session.apply(CompositionInput::Letters("qth".to_owned()));
+        *service.composition.borrow_mut() = short_session;
+        let enter_forget = service
+            .plan_key(
+                WPARAM(usize::from(VK_DELETE.0)),
+                KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .unwrap()
+            .expect("the discovered short-code candidate should enter forget mode");
+        service.apply_candidate_forget_action(
+            enter_forget
+                .candidate_forget_action_after_success
+                .expect("forget entry should carry an action"),
+        );
+        let forget = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("the third visible candidate should be forgettable");
+        service.apply_candidate_forget_action(
+            forget
+                .candidate_forget_action_after_success
+                .expect("short-code forget should carry a suppression"),
+        );
+        let hidden = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(hidden.candidates, ["固定", "其他", "雀跃", "去向"]);
+        let full_still_available = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qthp",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(full_still_available.candidates, ["雀魂"]);
+
+        let undo = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Backspace should restore only the short-code view");
+        service.apply_candidate_forget_action(
+            undo.candidate_forget_action_after_success
+                .expect("forget undo should carry a restore"),
+        );
+        let restored = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(restored.candidates, ["固定", "其他", "雀魂", "雀跃"]);
+
+        let choose_short = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("an explicit short-code choice should use the ordinary learning path");
+        let exact_short_evidence = choose_short
+            .selection_to_remember
+            .expect("the explicit discovery choice should establish exact short-code evidence");
+        assert_eq!(exact_short_evidence.code, "qth");
+        assert_eq!(exact_short_evidence.text, "雀魂");
+        service.remember_selection_after_success_in_context(
+            exact_short_evidence,
+            NativeFeedbackContext::Eligible,
+        );
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+        let adopted = service
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(adopted.candidates, ["固定", "雀魂", "其他", "雀跃"]);
+        assert_eq!(adopted.personalized, [false, true, false, false]);
+    }
+
+    #[test]
+    fn repeated_personal_short_code_discovery_survives_a_new_service() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-short-discovery-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+
+        let first = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalShortRecallCandidateProvider,
+        ))));
+        first
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root.clone())));
+        assert!(first.personal_ranking.borrow_mut().record("qthp", "雀魂"));
+        assert!(first.personal_ranking.borrow_mut().record("qthp", "雀魂"));
+        assert!(first.personal_ranking.borrow_mut().flush());
+        drop(first);
+
+        let second = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalShortRecallCandidateProvider,
+        ))));
+        second
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root)));
+        let discovered = second
+            .load_candidate_batch(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(discovered.candidates, ["固定", "其他", "雀魂", "雀跃"]);
+        assert_eq!(discovered.personalized, [false, false, true, false]);
+        drop(second);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn automatic_transposition_never_opens_the_personal_short_code_discovery_lane() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalShortRecallCandidateProvider,
+        ))));
+        assert!(service.personal_ranking.borrow_mut().record("qthp", "雀魂"));
+        assert!(service.personal_ranking.borrow_mut().record("qthp", "雀魂"));
+
+        let batch = service
+            .load_candidate_batch_with_automatic_transposition(
+                &PersonalShortRecallCandidateProvider,
+                "qth",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+                Some(reversed_single_pair_request(
+                    AutomaticTranspositionTier::Primary,
+                )),
+            )
+            .unwrap();
+        assert_eq!(batch.candidates, ["固定", "其他", "雀跃", "去向"]);
+        assert!(
+            batch.personalized.iter().all(|personalized| !personalized),
+            "one automatic correction request must not be treated as an explicit personal discovery"
+        );
+    }
+
+    #[test]
+    fn real_key_callbacks_recall_a_tab_assembled_word_with_feedback_stopped() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(ShapeCandidateProvider),
+        )));
+        assert!(
+            !service_object
+                .native_feedback
+                .lock()
+                .unwrap()
+                .is_accepting()
+        );
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        let press = |vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool(),
+                "OnTestKeyDown did not route virtual key {vkey}"
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool(),
+                "OnKeyDown did not handle virtual key {vkey}"
+            );
+        };
+        let type_code = || {
+            for letter in b"qthp" {
+                press(VK_A.0 + u16::from(*letter - b'a'));
+            }
+        };
+
+        type_code();
+        press(VK_TAB.0);
+        press(VK_1.0 + 2);
+        assert_eq!(
+            service_object
+                .composition
+                .borrow()
+                .tab_assembly_selected_text()
+                .as_deref(),
+            Some("雀"),
+        );
+        press(VK_1.0 + 2);
+        assert_eq!(read_context_text(&context, client_id), "雀魂");
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("qthp"),
+            Some("雀魂")
+        );
+        assert!(service_object.pending_personal_selection.borrow().is_some());
+
+        type_code();
+        press(VK_SPACE.0);
+        assert_eq!(read_context_text(&context, client_id), "雀魂雀魂");
+        assert_eq!(
+            service_object
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("qthp"),
+            Some("雀魂")
+        );
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
     }
 
     #[test]
@@ -8238,13 +14344,15 @@ mod tests {
         assert!(!confirm.after.wish_prompt());
         assert_eq!(
             confirm.action_after_success,
-            Some(PlannedAction::Wish(WishCommand::Start))
+            Some(PlannedAction::Wish(InlineWishOperation::Command(
+                WishCommand::Start
+            )))
         );
         assert!(confirm.feedback_after_success.is_none());
     }
 
     #[test]
-    fn recording_xuy_prompt_offers_a_bounded_snapshot_and_backspace_returns_to_text() {
+    fn recording_xuy_tab_immediately_captures_recent_episodes() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
             Some(Arc::new(SelectionCandidateProvider)),
@@ -8258,15 +14366,47 @@ mod tests {
             .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
             .unwrap()
             .unwrap();
+        assert!(matches!(prompt.edit, Some(PendingDocumentEdit::Cancel)));
+        assert!(prompt.candidate_display.is_none());
+        assert!(prompt.after.phonetic().is_empty());
+        assert!(!prompt.after.wish_prompt());
         assert_eq!(
-            prompt.candidate_display.as_ref().unwrap().visible(),
-            ["向猫猫许愿"]
+            prompt.action_after_success,
+            Some(PlannedAction::Wish(InlineWishOperation::Capture {
+                scope: WishCaptureScope::RecentEpisodes,
+                category: WishCategory::Other,
+            }))
         );
+    }
+
+    #[test]
+    fn an_open_wish_prompt_still_allows_the_bounded_window_fallback() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(SelectionCandidateProvider)),
+            NativeFeedbackLimits::default(),
+        ));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("xuy".to_owned()));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::EnterWish);
+
+        let fallback = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 1)), KeyModifiers::default())
+            .unwrap()
+            .expect("the second visible wish action should be selectable");
+        assert!(matches!(fallback.edit, Some(PendingDocumentEdit::Cancel)));
         assert_eq!(
-            prompt.candidate_display.as_ref().unwrap().action_detail(),
-            Some("近30秒")
+            fallback.action_after_success,
+            Some(PlannedAction::Wish(InlineWishOperation::Capture {
+                scope: WishCaptureScope::RecentWindow,
+                category: WishCategory::Other,
+            }))
         );
-        *service.composition.borrow_mut() = prompt.after;
 
         let back = service
             .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
@@ -8313,6 +14453,261 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_delete_enters_candidate_forget_mode_only_for_an_ordinary_composition() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        let shortcut = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        assert!(
+            service
+                .plan_key(WPARAM(usize::from(VK_DELETE.0)), shortcut)
+                .unwrap()
+                .is_none()
+        );
+
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_DELETE.0)), shortcut)
+            .unwrap()
+            .expect("Ctrl+Delete should enter explicit candidate selection");
+        assert_eq!(enter.before, enter.after);
+        assert!(enter.edit.is_none());
+        assert_eq!(
+            enter.candidate_display.as_ref().unwrap().mode(),
+            CandidateDisplayMode::ForgetSelecting
+        );
+        assert!(matches!(
+            enter.candidate_forget_action_after_success,
+            Some(PlannedCandidateForgetAction::Enter)
+        ));
+        assert_eq!(
+            service.personal_ranking.borrow().suppressions.entry_count(),
+            0,
+            "entering the mode must not write a suppression"
+        );
+
+        let shifted_shortcut = KeyModifiers {
+            shift: true,
+            control: true,
+            ..KeyModifiers::default()
+        };
+        assert!(
+            service
+                .plan_key(WPARAM(usize::from(VK_DELETE.0)), shifted_shortcut)
+                .unwrap()
+                .is_none()
+        );
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::EnterRecovery);
+        assert!(
+            service
+                .plan_key(WPARAM(usize::from(VK_DELETE.0)), shortcut)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn candidate_forget_requires_personal_evidence_and_protects_fixed_prefixes() {
+        let _guard = test_lock();
+        let shortcut = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_DELETE.0)), shortcut)
+            .unwrap()
+            .unwrap();
+        service.apply_candidate_forget_action(enter.candidate_forget_action_after_success.unwrap());
+        let public_only = service
+            .plan_key(WPARAM(usize::from(VK_1.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            public_only.candidate_display.as_ref().unwrap().mode(),
+            CandidateDisplayMode::ForgetNotPersonal
+        );
+        assert!(matches!(
+            public_only.candidate_forget_action_after_success,
+            Some(PlannedCandidateForgetAction::Message(
+                CandidateForgetMessage::NotPersonal
+            ))
+        ));
+        assert_eq!(
+            service.personal_ranking.borrow().suppressions.entry_count(),
+            0
+        );
+
+        let protected = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ProtectedSelectionCandidateProvider,
+        ))));
+        protected
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        assert!(protected.personal_ranking.borrow_mut().record("ab", "甲"));
+        let enter = protected
+            .plan_key(WPARAM(usize::from(VK_DELETE.0)), shortcut)
+            .unwrap()
+            .unwrap();
+        protected
+            .apply_candidate_forget_action(enter.candidate_forget_action_after_success.unwrap());
+        let fixed = protected
+            .plan_key(WPARAM(usize::from(VK_1.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixed.candidate_display.as_ref().unwrap().mode(),
+            CandidateDisplayMode::ForgetProtected
+        );
+        assert!(matches!(
+            fixed.candidate_forget_action_after_success,
+            Some(PlannedCandidateForgetAction::Message(
+                CandidateForgetMessage::Protected
+            ))
+        ));
+        assert!(
+            !protected
+                .personal_ranking
+                .borrow()
+                .is_suppressed("ab", "甲")
+        );
+    }
+
+    #[test]
+    fn candidate_forget_suppresses_session_evidence_and_backspace_restores_it() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ab", "乙");
+        let shortcut = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_DELETE.0)), shortcut)
+            .unwrap()
+            .unwrap();
+        service.apply_candidate_forget_action(enter.candidate_forget_action_after_success.unwrap());
+        let suppress = service
+            .plan_key(WPARAM(usize::from(VK_1.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the session-promoted first candidate should be forgettable");
+        let action = suppress.candidate_forget_action_after_success.unwrap();
+        assert!(matches!(
+            &action,
+            PlannedCandidateForgetAction::Suppress {
+                code,
+                text,
+                restore_session: true,
+            } if code == "ab" && text == "乙"
+        ));
+        let forgotten = service
+            .apply_candidate_forget_action(action)
+            .expect("forgetting should immediately rebuild the visible page");
+        assert_eq!(forgotten.mode(), CandidateDisplayMode::ForgetUndo);
+        assert_eq!(forgotten.visible(), ["甲", "乙", "丙"]);
+        assert!(service.personal_ranking.borrow().is_suppressed("ab", "乙"));
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            None
+        );
+        assert!(matches!(
+            &*service.candidate_forget_state.borrow(),
+            CandidateForgetState::UndoAvailable { .. }
+        ));
+
+        let restore = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the first Backspace should undo the forget action");
+        assert_eq!(restore.before, restore.after);
+        assert!(restore.edit.is_none());
+        let restored = service
+            .apply_candidate_forget_action(restore.candidate_forget_action_after_success.unwrap())
+            .expect("restoring should immediately rebuild the visible page");
+        assert_eq!(restored.mode(), CandidateDisplayMode::ForgetRestored);
+        assert_eq!(restored.visible(), ["乙", "甲", "丙"]);
+        assert!(!service.personal_ranking.borrow().is_suppressed("ab", "乙"));
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            Some("乙")
+        );
+        assert!(matches!(
+            &*service.candidate_forget_state.borrow(),
+            CandidateForgetState::Inactive
+        ));
+    }
+
+    #[test]
+    fn candidate_forget_numeric_selection_uses_the_current_page_absolute_index() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PagedProtectedCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        assert!(service.personal_ranking.borrow_mut().record("ab", "候选7"));
+        let enter = service
+            .plan_key(
+                WPARAM(usize::from(VK_DELETE.0)),
+                KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        service.apply_candidate_forget_action(enter.candidate_forget_action_after_success.unwrap());
+        let next = service
+            .plan_key(WPARAM(usize::from(VK_NEXT.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("paging should remain available in forget mode");
+        assert_eq!(next.after.candidate_page_start(), CANDIDATE_PAGE_SIZE);
+        *service.composition.borrow_mut() = next.after;
+        service.apply_candidate_forget_action(next.candidate_forget_action_after_success.unwrap());
+
+        let selected = service
+            .plan_key(WPARAM(usize::from(VK_1.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            selected.candidate_forget_action_after_success,
+            Some(PlannedCandidateForgetAction::Suppress {
+                ref code,
+                ref text,
+                restore_session: false,
+            }) if code == "ab" && text == "候选7"
+        ));
+    }
+
+    #[test]
     fn only_explicit_primary_selection_enters_service_session_memory() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
@@ -8345,6 +14740,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(promoted.candidates, ["乙", "甲", "丙"]);
+        assert!(promoted.provenance[0].session_promoted());
+        assert_eq!(
+            promoted.provenance[0].source(),
+            NativeCandidateSource::SupplementalExact
+        );
+        assert!(
+            promoted.provenance[1..]
+                .iter()
+                .all(|item| !item.session_promoted())
+        );
 
         let confirmation = service
             .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
@@ -8360,6 +14765,11 @@ mod tests {
                 ..
             })
         ));
+        let punctuation = service
+            .plan_key(WPARAM(usize::from(VK_OEM_COMMA.0)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert!(punctuation.selection_to_remember.is_none());
         let enter_confirmation = service
             .plan_key(WPARAM(usize::from(VK_RETURN.0)), KeyModifiers::default())
             .unwrap()
@@ -8394,6 +14804,992 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recovery.candidates, ["换序甲", "换序乙", "换序丙"]);
+    }
+
+    #[test]
+    fn complete_code_personal_evidence_inherits_only_into_its_verified_anchored_tail() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            CodeFamilyCandidateProvider,
+        ))));
+        assert!(service.personal_ranking.borrow_mut().record("jdjd", "讲讲"));
+
+        let inherited = service
+            .load_candidate_batch(
+                &CodeFamilyCandidateProvider,
+                "jdj",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(inherited.candidates, ["讲讲", "简单", "降价"]);
+        assert!(
+            inherited
+                .provenance
+                .iter()
+                .all(|item| !item.session_promoted())
+        );
+
+        let unrelated = service
+            .load_candidate_batch(
+                &CodeFamilyCandidateProvider,
+                "jd",
+                2,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(unrelated.candidates, ["讲", "将"]);
+
+        assert!(service.personal_ranking.borrow_mut().record("jdj", "降价"));
+        let exact = service
+            .load_candidate_batch(
+                &CodeFamilyCandidateProvider,
+                "jdj",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(exact.candidates, ["降价", "简单", "讲讲"]);
+    }
+
+    #[test]
+    fn inherited_session_choice_can_be_forgotten_and_restored_only_for_the_short_code() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            CodeFamilyCandidateProvider,
+        ))));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("jdjd", "讲讲");
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("jdj".to_owned()));
+
+        let inherited = service
+            .load_candidate_batch(
+                &CodeFamilyCandidateProvider,
+                "jdj",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(inherited.candidates, ["讲讲", "简单", "降价"]);
+        assert!(inherited.provenance[0].session_promoted());
+
+        let enter = service
+            .plan_key(
+                WPARAM(usize::from(VK_DELETE.0)),
+                KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        service.apply_candidate_forget_action(enter.candidate_forget_action_after_success.unwrap());
+        let suppress = service
+            .plan_key(WPARAM(usize::from(VK_1.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the inherited session candidate should be forgettable");
+        let action = suppress.candidate_forget_action_after_success.unwrap();
+        assert!(matches!(
+            &action,
+            PlannedCandidateForgetAction::Suppress {
+                code,
+                text,
+                restore_session: false,
+            } if code == "jdj" && text == "讲讲"
+        ));
+        let forgotten = service
+            .apply_candidate_forget_action(action)
+            .expect("forgetting the inherited view should rebuild the page");
+        assert_eq!(forgotten.visible(), ["简单", "降价", "讲讲"]);
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("jdjd"),
+            Some("讲讲")
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("jdj"),
+            None
+        );
+
+        let restore = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Backspace should restore only the abbreviated-code inheritance");
+        let restored = service
+            .apply_candidate_forget_action(restore.candidate_forget_action_after_success.unwrap())
+            .expect("restoring the inherited view should rebuild the page");
+        assert_eq!(restored.visible(), ["讲讲", "简单", "降价"]);
+        assert!(
+            !service
+                .personal_ranking
+                .borrow()
+                .is_suppressed("jdj", "讲讲")
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("jdjd"),
+            Some("讲讲")
+        );
+    }
+
+    #[test]
+    fn persistent_personal_ranking_requires_an_eligible_input_scope() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        let selection = PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        };
+
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Password);
+        service.remember_selection_after_success(PlannedSelection {
+            code: selection.code.clone(),
+            text: selection.text.clone(),
+            retractable_by_immediate_backspace: true,
+        });
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            None
+        );
+
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(selection);
+        assert!(service.pending_personal_selection.borrow().is_some());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            None
+        );
+        assert!(service.confirm_pending_personal_selection());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("乙")
+        );
+
+        service.selection_memory.borrow_mut().clear();
+        let promoted = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(promoted.candidates, ["乙", "甲", "丙"]);
+        assert!(!promoted.provenance[0].session_promoted());
+    }
+
+    #[test]
+    fn adjacent_explicit_single_character_choices_form_a_personal_phrase_once() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ui", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ui".to_owned(),
+            text: "试".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ub", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ub".to_owned(),
+            text: "手".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("uiub"),
+            Some("试手"),
+            "the phrase should be available in the current host immediately"
+        );
+        assert!(
+            service
+                .pending_personal_selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.phrase.is_some())
+        );
+        let immediate = service
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiub",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            immediate.candidates.first().map(String::as_str),
+            Some("试手")
+        );
+
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            Some("试手"),
+            "one surviving adjacent use should be enough to persist the phrase"
+        );
+        let persistent = service
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiub",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            persistent.candidates.first().map(String::as_str),
+            Some("试手")
+        );
+        assert!(!persistent.provenance[0].session_promoted());
+    }
+
+    #[test]
+    fn confirmed_left_context_overrides_global_recency_only_for_the_matching_context() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalContextCandidateProvider,
+        ))));
+
+        service.set_personal_left_context("请");
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "把".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        service.set_personal_left_context("把");
+        assert!(service.confirm_pending_personal_selection());
+
+        service.set_personal_left_context("好");
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "吧".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        service.set_personal_left_context("吧");
+        assert!(service.confirm_pending_personal_selection());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("吧")
+        );
+
+        service.set_personal_left_context("请");
+        let matching = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ab",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(matching.candidates.len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(matching.candidates[0], "把");
+        assert!(matching.may_have_more);
+        assert!(matching.provenance[0].session_promoted());
+
+        service.set_personal_left_context("无关");
+        let unrelated = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ab",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(unrelated.candidates[0], "吧");
+    }
+
+    #[test]
+    fn explicit_later_selection_overrules_only_the_first_unprotected_candidate() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ProtectedSelectionCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+
+        let plan = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.selection_to_remember
+                .as_ref()
+                .map(|selection| selection.text.as_str()),
+            Some("丙")
+        );
+        assert_eq!(plan.overruled_text_to_remember.as_deref(), Some("乙"));
+        assert_ne!(
+            plan.overruled_text_to_remember.as_deref(),
+            Some("甲"),
+            "the protected fixed candidate must never become negative evidence"
+        );
+    }
+
+    #[test]
+    fn repeated_context_overrides_are_gentle_and_immediate_backspace_retracts_them() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalContextCandidateProvider,
+        ))));
+        for _ in 0..4 {
+            assert!(service.personal_ranking.borrow_mut().record("ab", "吧"));
+            service
+                .personal_context_ranking
+                .borrow_mut()
+                .record("请", "ab", "吧")
+                .unwrap();
+        }
+        service.set_personal_left_context("请");
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+        let plan = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 1)), KeyModifiers::default())
+            .unwrap()
+            .unwrap();
+        let selection = plan.selection_to_remember.unwrap();
+        let overruled = plan.overruled_text_to_remember;
+        assert_eq!(selection.text, "八");
+        assert_eq!(overruled.as_deref(), Some("吧"));
+
+        service.remember_selection_after_success_in_context_with_overrule(
+            selection.clone(),
+            NativeFeedbackContext::Eligible,
+            overruled.clone(),
+        );
+        service.set_personal_left_context("八");
+        assert!(service.retract_pending_personal_selection());
+        service.set_personal_left_context("请");
+        let after_retraction = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ab",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(after_retraction.candidates[0], "吧");
+
+        for expected in ["吧", "八"] {
+            service.set_personal_left_context("请");
+            service.remember_selection_after_success_in_context_with_overrule(
+                selection.clone(),
+                NativeFeedbackContext::Eligible,
+                overruled.clone(),
+            );
+            service.set_personal_left_context("八");
+            assert!(service.confirm_pending_personal_selection());
+            service.set_personal_left_context("请");
+            let reranked = service
+                .load_candidate_batch(
+                    service.candidate_provider.as_ref().unwrap().as_ref(),
+                    "ab",
+                    CANDIDATE_PAGE_SIZE,
+                    InteractiveCandidateView::Primary,
+                )
+                .unwrap();
+            assert_eq!(reranked.candidates[0], expected);
+        }
+    }
+
+    #[test]
+    fn immediate_retraction_restores_left_context_without_training_the_context_table() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalContextCandidateProvider,
+        ))));
+        service.set_personal_left_context("请");
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "把".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        service.set_personal_left_context("把");
+
+        assert!(service.retract_pending_personal_selection());
+        assert_eq!(
+            service.personal_left_context.borrow().as_deref(),
+            Some("请")
+        );
+        assert!(
+            !service
+                .personal_context_ranking
+                .borrow()
+                .has_evidence("请", "ab")
+        );
+    }
+
+    #[test]
+    fn exact_forget_suppression_wins_over_matching_context_evidence() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalContextCandidateProvider,
+        ))));
+        service.set_personal_left_context("请");
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "把".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        service.set_personal_left_context("把");
+        assert!(service.confirm_pending_personal_selection());
+        service
+            .personal_ranking
+            .borrow_mut()
+            .suppressions
+            .suppress("ab", "把")
+            .unwrap();
+
+        service.set_personal_left_context("请");
+        let suppressed = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ab",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(suppressed.candidates[0], "吧");
+    }
+
+    #[test]
+    fn personal_phrase_requires_verified_complete_single_character_components() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ui", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ui".to_owned(),
+            text: "是".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ub", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ub".to_owned(),
+            text: "手".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("uiub"),
+            None
+        );
+        assert!(
+            service
+                .pending_personal_selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.phrase.is_none())
+        );
+        assert!(service.confirm_pending_personal_selection());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            None
+        );
+    }
+
+    #[test]
+    fn immediate_backspace_retracts_a_new_personal_phrase_but_keeps_its_first_component() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ui", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ui".to_owned(),
+            text: "试".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ub", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ub".to_owned(),
+            text: "手".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        assert_eq!(
+            service
+                .resolve_pending_personal_selection_for_key(VK_BACK.0, KeyModifiers::default())
+                .unwrap(),
+            PendingPersonalKeyResolution::Retracted
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("uiub"),
+            None
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            None
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ui"),
+            Some("试"),
+            "the first component crossed its own confirmation boundary"
+        );
+        assert!(
+            service
+                .personal_phrase_composer
+                .borrow()
+                .previous
+                .as_ref()
+                .is_some_and(|component| component.code == "ui" && component.text == "试")
+        );
+    }
+
+    #[test]
+    fn focus_loss_confirms_a_personal_phrase_and_breaks_the_adjacency_chain() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        for (code, text) in [("ui", "试"), ("ub", "手")] {
+            service
+                .native_feedback_context
+                .lock()
+                .unwrap()
+                .remember(code, NativeFeedbackContext::Eligible);
+            service.remember_selection_after_success(PlannedSelection {
+                code: code.to_owned(),
+                text: text.to_owned(),
+                retractable_by_immediate_backspace: true,
+            });
+        }
+
+        service.cleanup_after_focus_loss().unwrap();
+        assert!(service.pending_personal_selection.borrow().is_none());
+        assert!(service.personal_phrase_composer.borrow().previous.is_none());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            Some("试手")
+        );
+    }
+
+    #[test]
+    fn one_confirmed_personal_phrase_survives_a_new_service() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-phrase-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+
+        let first = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+        first
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root.clone())));
+        for (code, text) in [("ui", "试"), ("ub", "手")] {
+            first
+                .native_feedback_context
+                .lock()
+                .unwrap()
+                .remember(code, NativeFeedbackContext::Eligible);
+            first.remember_selection_after_success(PlannedSelection {
+                code: code.to_owned(),
+                text: text.to_owned(),
+                retractable_by_immediate_backspace: true,
+            });
+        }
+        assert!(first.confirm_pending_personal_selection());
+        assert!(first.personal_ranking.borrow_mut().flush());
+        drop(first);
+
+        let second = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+        second
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root)));
+        let promoted = second
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiub",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            promoted.candidates.first().map(String::as_str),
+            Some("试手")
+        );
+        assert!(!promoted.provenance[0].session_promoted());
+        drop(second);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn immediate_backspace_retracts_pending_personal_evidence_and_session_override() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ab", "丙");
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        assert!(service.should_route_pending_personal_key_down().unwrap());
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            Some("乙")
+        );
+        assert_eq!(
+            service
+                .resolve_pending_personal_selection_for_key(VK_BACK.0, KeyModifiers::default())
+                .unwrap(),
+            PendingPersonalKeyResolution::Retracted
+        );
+        assert!(service.pending_personal_selection.borrow().is_none());
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            Some("丙")
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_following_key_confirms_pending_personal_evidence() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        assert_eq!(
+            service
+                .resolve_pending_personal_selection_for_key(VK_A.0, KeyModifiers::default())
+                .unwrap(),
+            PendingPersonalKeyResolution::Confirmed
+        );
+        assert!(service.pending_personal_selection.borrow().is_none());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("乙")
+        );
+    }
+
+    #[test]
+    fn confirmed_support_drops_one_incidental_session_override_but_allows_repetition() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        {
+            let mut ranking = service.personal_ranking.borrow_mut();
+            assert!(ranking.record("ab", "甲"));
+            assert!(ranking.record("ab", "甲"));
+        }
+
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            Some("乙"),
+            "the successful choice should take effect before its confirmation boundary"
+        );
+        assert!(service.confirm_pending_personal_selection());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("甲")
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            None
+        );
+
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        assert!(service.confirm_pending_personal_selection());
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("乙"),
+            "repeated deliberate choices must still be able to change the preference"
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("ab"),
+            Some("乙")
+        );
+    }
+
+    #[test]
+    fn focus_loss_confirms_pending_personal_evidence() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service.set_personal_left_context("前");
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        *service.candidate_forget_state.borrow_mut() = CandidateForgetState::UndoAvailable {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            restore_session: false,
+        };
+
+        service.cleanup_after_focus_loss().unwrap();
+        assert!(service.pending_personal_selection.borrow().is_none());
+        assert!(matches!(
+            &*service.candidate_forget_state.borrow(),
+            CandidateForgetState::Inactive
+        ));
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("乙")
+        );
+        assert!(service.personal_left_context.borrow().is_none());
+        assert!(
+            service
+                .personal_context_ranking
+                .borrow()
+                .has_evidence("前", "ab")
+        );
+    }
+
+    #[test]
+    fn backspace_after_punctuation_confirmation_keeps_candidate_evidence() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: false,
+        });
+
+        assert_eq!(
+            service
+                .resolve_pending_personal_selection_for_key(VK_BACK.0, KeyModifiers::default())
+                .unwrap(),
+            PendingPersonalKeyResolution::Confirmed
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            Some("乙")
+        );
+    }
+
+    #[test]
+    fn eligible_selection_survives_a_new_service_without_a_session_provenance_tag() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-service-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+
+        let first = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        first
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root.clone())));
+        first
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        first.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        assert!(first.confirm_pending_personal_selection());
+        assert!(first.personal_ranking.borrow_mut().flush());
+        drop(first);
+
+        let second = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        second
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root)));
+        let promoted = second
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(promoted.candidates, ["乙", "甲", "丙"]);
+        assert!(!promoted.provenance[0].session_promoted());
+        drop(second);
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -8557,7 +15953,8 @@ mod tests {
 
     #[test]
     fn inline_action_uses_a_compact_dedicated_row_without_ellipsis_pressure() {
-        let display = CandidateDisplay::action("向猫猫许愿", "近30秒");
+        let actions = inline_wish_actions(NativeFeedbackSummary::default());
+        let display = CandidateDisplay::actions(&actions);
         let metrics = candidate_popup_metrics(&display, 96, 1920);
         assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
         assert_eq!(metrics.height, 46);
@@ -8565,8 +15962,28 @@ mod tests {
 
         let widths = horizontal_candidate_widths(&display, 96, metrics.width);
         assert_eq!(widths, [metrics.width - POPUP_OUTER_PADDING_LOGICAL * 2]);
-        assert_eq!(display.visible(), ["向猫猫许愿"]);
-        assert_eq!(display.action_detail(), Some("近30秒"));
+        assert_eq!(display.visible(), ["开始反馈"]);
+        assert_eq!(display.action_detail(), Some("暂不保存"));
+    }
+
+    #[test]
+    fn focused_wish_actions_fit_one_bounded_two_item_row() {
+        let actions = inline_wish_actions(NativeFeedbackSummary {
+            lifecycle: NativeFeedbackLifecycle::Recording,
+            ..NativeFeedbackSummary::default()
+        });
+        let display = CandidateDisplay::actions(&actions);
+        let metrics = candidate_popup_metrics(&display, 96, 1920);
+        let widths = horizontal_candidate_widths(&display, 96, metrics.width);
+
+        assert_eq!(display.visible().len(), 2);
+        assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
+        assert!(metrics.width <= POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+        assert_eq!(widths.len(), 2);
+        assert_eq!(
+            widths.iter().sum::<i32>(),
+            metrics.width - POPUP_OUTER_PADDING_LOGICAL * 2
+        );
     }
 
     #[test]
@@ -8620,7 +16037,15 @@ mod tests {
         assert_eq!(display.visible().len(), CANDIDATE_PAGE_SIZE);
         let metrics = candidate_popup_metrics(&display, 96, 1920);
         assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
-        assert_eq!(metrics.width, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+        let expected_width = POPUP_OUTER_PADDING_LOGICAL * 2
+            + display
+                .visible()
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| horizontal_candidate_logical_width(candidate, index == 0))
+                .sum::<i32>();
+        assert_eq!(metrics.width, expected_width);
+        assert!(metrics.width < POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
 
         let widths = horizontal_candidate_widths(&display, 96, metrics.width);
         for (index, (candidate, width)) in display.visible().iter().zip(widths).enumerate() {
@@ -8670,22 +16095,52 @@ mod tests {
     }
 
     #[test]
-    fn candidate_label_metadata_shares_a_stable_visual_baseline() {
+    fn candidate_label_metadata_shares_one_measured_baseline() {
         let content = RECT {
             left: 10,
             top: 8,
             right: 110,
             bottom: 44,
         };
-        let (rank, text) = candidate_label_rects(content, 96);
+        let rank_metrics = PopupFontMetrics {
+            height: 14,
+            ascent: 11,
+        };
+        let text_metrics = PopupFontMetrics {
+            height: 17,
+            ascent: 13,
+        };
+        let (rank, text) = baseline_aligned_label_rects(content, 96, rank_metrics, text_metrics);
 
         assert_eq!(rank.left, 10);
         assert_eq!(rank.right, 26);
-        assert_eq!(rank.top, 10);
-        assert_eq!(rank.bottom, 46);
+        assert_eq!(rank.top, 19);
+        assert_eq!(rank.bottom, 33);
         assert_eq!(text.left, 30);
-        assert_eq!(text.top, 8);
-        assert_eq!(text.bottom, 44);
+        assert_eq!(text.top, 17);
+        assert_eq!(text.bottom, 34);
+        assert_eq!(
+            rank.top + rank_metrics.ascent,
+            text.top + text_metrics.ascent
+        );
+    }
+
+    #[test]
+    fn personal_memory_marker_stays_inside_the_rank_column_without_reflow() {
+        let rank = RECT {
+            left: 10,
+            top: 19,
+            right: 26,
+            bottom: 33,
+        };
+        let mark = candidate_personal_mark_rect(rank, 96).unwrap();
+
+        assert_eq!(mark.left, rank.left);
+        assert_eq!(mark.right - mark.left, POPUP_PERSONAL_MARK_SIZE_LOGICAL);
+        assert_eq!(mark.bottom - mark.top, POPUP_PERSONAL_MARK_SIZE_LOGICAL);
+        assert!(mark.top >= rank.top);
+        assert!(mark.bottom <= rank.bottom);
+        assert!(mark.right <= rank.right);
     }
 
     #[test]
@@ -8696,16 +16151,45 @@ mod tests {
             right: 100,
             bottom: POPUP_ROW_HEIGHT_LOGICAL,
         };
-        let (selected, accent) = candidate_selection_rects(item, 96);
+        let selected_text_metrics = PopupFontMetrics {
+            height: 17,
+            ascent: 13,
+        };
+        let (selected, accent) = candidate_selection_rects(item, 96, Some(selected_text_metrics));
 
         assert_eq!(selected.left, 1);
         assert_eq!(selected.top, 4);
         assert_eq!(selected.right, 95);
         assert_eq!(selected.bottom, 32);
         assert_eq!(accent.left, 6);
-        assert_eq!(accent.top, 11);
+        assert_eq!(accent.top, 9);
         assert_eq!(accent.right, 9);
-        assert_eq!(accent.bottom, 25);
+        assert_eq!(accent.bottom, 26);
+        assert!(
+            (accent.top + accent.bottom - selected.top - selected.bottom).abs() <= 1,
+            "odd font heights may land half a pixel above the even selection surface"
+        );
+        let (_, text) = baseline_aligned_label_rects(
+            item,
+            96,
+            PopupFontMetrics {
+                height: 14,
+                ascent: 11,
+            },
+            selected_text_metrics,
+        );
+        assert_eq!((accent.top, accent.bottom), (text.top, text.bottom));
+    }
+
+    #[test]
+    fn candidate_widths_are_the_sum_of_visible_gutters_and_text() {
+        assert_eq!(horizontal_candidate_logical_width("输入法", true), 94);
+        assert_eq!(horizontal_candidate_logical_width("输入法", false), 88);
+        assert_eq!(
+            horizontal_candidate_logical_width("输入法", true)
+                - horizontal_candidate_logical_width("输入法", false),
+            POPUP_SELECTED_TEXT_INSET_LOGICAL - POPUP_TEXT_PADDING_LOGICAL
+        );
     }
 
     #[test]
@@ -8718,12 +16202,52 @@ mod tests {
     }
 
     #[test]
+    fn shape_feedback_overrides_visible_candidate_sources_without_changing_text() {
+        let display = CandidateDisplay::from_batch(
+            CandidateBatch {
+                candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                provenance: vec![
+                    NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
+                    NativeCandidateProvenance::new(NativeCandidateSource::Decoder, true),
+                ],
+                personalized: vec![false, true],
+                automatic_transposition: None,
+                may_have_more: false,
+                view: InteractiveCandidateView::Primary,
+            },
+            0,
+        );
+
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            candidates,
+            provenance,
+            view,
+            ..
+        } = display.feedback_event("ab", true)
+        else {
+            panic!("shape feedback must include provenance");
+        };
+        assert_eq!(candidates, ["甲", "乙"]);
+        assert_eq!(view, NativeCandidateView::Shape);
+        assert!(
+            provenance
+                .iter()
+                .all(|item| item.source() == NativeCandidateSource::Shape)
+        );
+        assert!(!provenance[0].session_promoted());
+        assert!(provenance[1].session_promoted());
+    }
+
+    #[test]
     fn recovery_mode_and_page_number_have_separate_footer_space() {
         let candidates = (0..10).map(|index| format!("候选{index}")).collect();
         let ordinary = CandidateDisplay::from_candidates(candidates, 0);
         let recovery = CandidateDisplay::from_batch(
             CandidateBatch {
                 candidates: ordinary.candidates.clone(),
+                provenance: ordinary.provenance.clone(),
+                personalized: ordinary.personalized.clone(),
+                automatic_transposition: None,
                 may_have_more: true,
                 view: InteractiveCandidateView::TranspositionRecovery,
             },
@@ -8732,15 +16256,31 @@ mod tests {
         let recovery_one_page = CandidateDisplay::from_batch(
             CandidateBatch {
                 candidates: vec!["换序候选".to_owned()],
+                provenance: vec![NativeCandidateProvenance::new(
+                    NativeCandidateSource::TranspositionRecovery,
+                    false,
+                )],
+                personalized: vec![false],
+                automatic_transposition: None,
                 may_have_more: false,
                 view: InteractiveCandidateView::TranspositionRecovery,
             },
             0,
         );
+        let forget_one_page = CandidateDisplay::from_candidates(
+            vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()],
+            0,
+        )
+        .with_mode(CandidateDisplayMode::ForgetSelecting);
 
         assert_eq!(candidate_popup_footer_logical_width(&ordinary), 62);
         assert_eq!(candidate_popup_footer_logical_width(&recovery), 108);
         assert_eq!(candidate_popup_footer_logical_width(&recovery_one_page), 60);
+        assert_eq!(
+            candidate_popup_mode_label(&forget_one_page),
+            Some("忘记 · 数字选择")
+        );
+        assert!(candidate_popup_footer_logical_width(&forget_one_page) > 60);
     }
 
     #[test]
@@ -8772,17 +16312,15 @@ mod tests {
         );
         assert_eq!(
             widths[0],
-            horizontal_candidate_logical_width(&long.visible()[0])
+            horizontal_candidate_logical_width(&long.visible()[0], true)
         );
         assert!(
             widths[1..]
                 .iter()
                 .all(|width| *width >= POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL)
         );
-        assert!(
-            widths
-                .iter()
-                .any(|width| *width < horizontal_candidate_logical_width(&long.visible()[0]))
-        );
+        assert!(widths.iter().any(|width| {
+            *width < horizontal_candidate_logical_width(&long.visible()[0], false)
+        }));
     }
 }

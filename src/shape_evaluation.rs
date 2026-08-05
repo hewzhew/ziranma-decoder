@@ -222,8 +222,8 @@ mod tests {
 
     use super::{SHAPE_COURSE_VISIBLE_LIMIT, audit_shape_refinement_course};
     use crate::{
-        CharacterShape, CharacterShapeIndex, KeySequence, LexiconEntry, parse_rime_lexicon,
-        parse_stroke_sequence_tsv,
+        CharacterShape, CharacterShapeIndex, KeySequence, LexiconEntry,
+        parse_simplified_rime_lexicon as parse_rime_lexicon, parse_stroke_sequence_tsv,
     };
 
     fn entry(text: char, frequency: u64) -> LexiconEntry {
@@ -323,18 +323,18 @@ mod tests {
         .unwrap();
 
         let report = audit_shape_refinement_course(&lexicon.entries, &shapes);
-        assert_eq!(report.single_character_entries, 17_038);
+        assert_eq!(report.single_character_entries, 14_679);
         assert_eq!(report.phonetic_pools, 410);
-        assert_eq!(report.hard_pools, 342);
-        assert_eq!(report.maximum_pool_size, 312);
-        assert_eq!(report.hard_targets, 13_285);
+        assert_eq!(report.hard_pools, 333);
+        assert_eq!(report.maximum_pool_size, 282);
+        assert_eq!(report.hard_targets, 10_969);
         assert_eq!(report.hard_targets_without_stroke_data, 0);
-        assert_eq!(report.prefixes[0].target_visible_attempts, 15_410);
-        assert_eq!(report.prefixes[1].target_visible_attempts, 24_796);
-        assert_eq!(report.prefixes[2].target_visible_attempts, 28_292);
+        assert_eq!(report.prefixes[0].target_visible_attempts, 13_729);
+        assert_eq!(report.prefixes[1].target_visible_attempts, 20_896);
+        assert_eq!(report.prefixes[2].target_visible_attempts, 23_331);
         assert_eq!(
             report.prefixes[2].targets_visible_with_all_sequences,
-            12_589
+            10_523
         );
     }
 }

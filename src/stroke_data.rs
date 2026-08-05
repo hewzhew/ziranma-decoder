@@ -420,7 +420,7 @@ mod tests {
     use super::{StrokeDataParseError, audit_lexicon_shape_coverage, parse_stroke_sequence_tsv};
     use crate::{
         CharacterShapeIndex, ShapeMatchEvidence, TabShapeQuery, parse_lexicon_tsv,
-        parse_rime_lexicon,
+        parse_simplified_rime_lexicon as parse_rime_lexicon,
     };
 
     #[test]
@@ -547,12 +547,12 @@ mod tests {
         let lexicon = parse_rime_lexicon(&rime_input).unwrap();
 
         let stats = audit_lexicon_shape_coverage(&lexicon.entries, &shapes);
-        assert_eq!(stats.distinct_eligible_characters, 16_469);
-        assert_eq!(stats.covered_distinct_characters, 16_469);
+        assert_eq!(stats.distinct_eligible_characters, 14_118);
+        assert_eq!(stats.covered_distinct_characters, 14_118);
         assert_eq!(stats.uncovered_distinct_characters, 0);
-        assert_eq!(stats.eligible_character_occurrences, 133_827);
-        assert_eq!(stats.covered_character_occurrences, 133_827);
-        assert_eq!(stats.single_character_entries, 17_038);
-        assert_eq!(stats.covered_single_character_entries, 17_038);
+        assert_eq!(stats.eligible_character_occurrences, 131_468);
+        assert_eq!(stats.covered_character_occurrences, 131_468);
+        assert_eq!(stats.single_character_entries, 14_679);
+        assert_eq!(stats.covered_single_character_entries, 14_679);
     }
 }

@@ -1,3 +1,9 @@
 #define IDI_WISHPAD 101
+#define IDI_WISHPAD_LISTENING 102
+#define IDI_WISHPAD_HOLDING 103
+#define IDI_WISHPAD_ORGANIZING 104
 
-IDI_WISHPAD ICON "meditating-cat.ico"
+IDI_WISHPAD ICON "app-cat.ico"
+IDI_WISHPAD_LISTENING ICON "listening-cat.ico"
+IDI_WISHPAD_HOLDING ICON "holding-wish-cat.ico"
+IDI_WISHPAD_ORGANIZING ICON "organizing-cat.ico"

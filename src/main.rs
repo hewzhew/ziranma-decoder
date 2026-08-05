@@ -26,11 +26,12 @@ use ziranma_core::{
     evaluate_character_context_oracle, evaluate_context_oracle, evaluate_continuous_composition,
     evaluate_labeled_recall, evaluate_labeled_rejection_shadow, evaluate_oov_cases,
     evaluate_rejection_shadow, evaluate_sentence_cases, evaluate_synthetic, parse_lexicon_tsv,
-    parse_rime_lexicon, parse_stroke_sequence_tsv, parse_ud_conllu, rerank_frozen_sentence_pool,
-    rerank_frozen_sentence_pool_conservative_top1, rerank_frozen_sentence_pool_hybrid,
-    rerank_frozen_sentence_pool_hybrid_with_variants, select_public_bigram_training_sequences,
-    select_public_calibration_cases, select_public_continuous_composition_cases,
-    select_public_protocol_audit_cases, select_shape_course_tasks,
+    parse_simplified_rime_lexicon as parse_rime_lexicon, parse_stroke_sequence_tsv,
+    parse_ud_conllu, rerank_frozen_sentence_pool, rerank_frozen_sentence_pool_conservative_top1,
+    rerank_frozen_sentence_pool_hybrid, rerank_frozen_sentence_pool_hybrid_with_variants,
+    select_public_bigram_training_sequences, select_public_calibration_cases,
+    select_public_continuous_composition_cases, select_public_protocol_audit_cases,
+    select_shape_course_tasks,
 };
 
 mod benchmark;
@@ -787,6 +788,10 @@ fn run_public_index_stats(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  上游数据行：{}", stats.source_rows);
     println!("  导入词条：{}", stats.imported_entries);
     println!("  零权重升至 1：{}", stats.zero_weights_floored);
+    println!(
+        "  省略的繁体单字读音：{}",
+        stats.shadowed_traditional_single_character_rows
+    );
     println!("  跳过的不支持拼音：{}", stats.unsupported_pinyin_rows);
     println!("  跳过的超长词条：{}", stats.too_many_syllable_rows);
     println!("  跳过的重复词条：{}", stats.duplicate_rows);
@@ -1131,6 +1136,7 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             .then_some(phonetic_cache.candidates.as_slice());
         match session.apply(input) {
             TypingLabEffect::Continue => {}
+            TypingLabEffect::CommittedBackspace => {}
             TypingLabEffect::Confirm => select_typing_candidate(
                 &mut session,
                 &mut selection_memory,

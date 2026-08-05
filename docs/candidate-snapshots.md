@@ -82,6 +82,11 @@ Rime 导入不会扫描配方、用户目录或相邻词典，也不会执行 YA
 是操作者明确点名的普通文件。输出顺序与规范频率由同一个解析器确定，因此同一
 源字节、版本和来源声明会得到同一候选载荷：
 
+当来源身份与 SHA-256 同时匹配仓库固定的 `rime-pinyin-simp` 快照时，
+`build-rime` 还会应用同目录下的可审计简体清单。它只省略已有同拼音、
+等高或更高权重简体对应项的繁体单字读音，并在构建摘要中报告数量；多字词、
+其他读音和任何非固定来源继续走通用 Rime 解析器。
+
 ```powershell
 cargo run --release --bin candidatectl -- build-rime `
   --source .local/sources/pinyin_simp.dict.yaml `
@@ -93,6 +98,107 @@ cargo run --release --bin candidatectl -- build-rime `
   --source-sha256 <固定源文件的 SHA-256> `
   --public
 ```
+
+大于普通快照输入上限、且使用 Unicode 声调的公开 Rime 词表只能走显式的
+`build-rime-slice`。它仍先核对完整 64 MB 以内源文件的 SHA-256，再逐行去调、
+交给中央 codec 编码，并按调用者明确给出的词条数和文字长度上限构造有界前沿：
+
+```powershell
+cargo run --release --bin candidatectl -- build-rime-slice `
+  --source .local/public-audit/wanxiang-fdda7afb/jichu.dict.yaml `
+  --output .local/public-audit/wanxiang-fdda7afb/package-top100k-v1 `
+  --revision wanxiang-jichu-fdda7afb-top100k-v1 `
+  --source-id wanxiang-jichu `
+  --source-license CC-BY-4.0 `
+  --source-url https://github.com/amzxyz/rime_wanxiang `
+  --source-sha256 9d14c0c49588d63b16c554df4711bed5da822c63de9d50f4759c53542138ac00 `
+  --max-entries 100000 `
+  --max-text-characters 8 `
+  --public
+```
+
+该命令只生成一个单来源实验包，不把它 stage、promote 或安装。异常字段、
+非正权重、文字范围、拼音、字音数量、音节长度、上限外词条和所选重复均分项
+计数。两个已经生成的公开 TSV 可进一步做不显示候选文字的只读对照：
+
+```powershell
+cargo run --release --bin candidatectl -- compare `
+  --base-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --challenger-payload .local/public-audit/wanxiang-fdda7afb/package-top100k-v1/lexicon.tsv
+```
+
+对照只报告词形、文字/规范码身份、共同规范码和同码首选变化的聚合计数，
+不声称两个来源的原始权重可以直接合并。
+
+两个独立公开载荷还可以运行纯完整词层审计。它不调用 TSF，不写槽位，也不
+比较跨来源权重；核心已有完整码时固定保留核心首选，补充层只允许明确数量的
+新完整词进入，其自由简拼和句子候选完全不参与。实际补进新词时，交互页保留
+核心/补充完整词及受限的四键双字组合，不再以核心自由简拼句子补齐空位：
+
+```powershell
+cargo run --release --bin candidatectl -- layer-audit `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top100k-v1/lexicon.tsv `
+  --frontier-limit 6 `
+  --exact-promotions 1
+```
+
+报告只给出规范码、可用/进入前沿的新完整词、核心首选是否保持和单码实际
+影响上限等聚合计数，不显示候选文字。`frontier-limit` 固定在 1～50；
+`exact-promotions` 固定在 0～50。该审计只证明合并规则和静态完整词覆盖，
+不代表交互延迟、句子排序或真实选择成本已经通过。
+
+同一组固定公开完整码和音节边界前缀可以做 release 热路径对照。命令会先
+预热，再分别计时核心候选和启用补充后的前六候选；不显示文字、不写文件：
+
+```powershell
+cargo run --release --bin candidatectl -- layer-benchmark `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top100k-v1/lexicon.tsv `
+  --repetitions 5 `
+  --exact-promotions 1
+```
+
+本机一次 120 样本结果为核心 median 4.924 ms、启用补充 5.083 ms，median
+增量 0.159 ms；核心/补充索引构建分别约 174/352 ms。绝对耗时只是同机诊断。
+TSF 在一个宿主进程中只加载一次不可变候选蓝图，避免重复建立 100k 补充索引；
+新包或启停状态由新打开的宿主观察。
+
+## 独立公开补充根
+
+日用 TSF 的补充根固定在跨 DLL 版本共享的
+`.local/tsf-alpha/user-data/public-supplement`。它使用现有公开候选包、来源、
+SHA-256、预检和三槽机制，但另有严格四行的 `supplemental.zcl` 显式开关。
+根或开关不存在时默认关闭；状态损坏、所绑定包不再是 current、包或预检失效
+时，补充层失败关闭，核心候选快照继续工作。
+
+首次准备仍需可信发布摘要：
+
+```powershell
+$SupplementRoot = '.local\tsf-alpha\user-data\public-supplement'
+
+.\target\release\candidatectl.exe adopt `
+  --root $SupplementRoot `
+  --package .local\public-audit\wanxiang-fdda7afb\package-top100k-v1 `
+  --expected-sha256 ae268a35f8e0125598a98205a3ce1c057f7567d08bec84e148804b70e7330eb7
+
+.\target\release\candidatectl.exe supplement-enable `
+  --root $SupplementRoot `
+  --exact-promotions 1
+
+.\target\release\candidatectl.exe supplement-status --root $SupplementRoot
+```
+
+关闭只原子改写小状态文件，保留已验证候选包，之后可再次启用：
+
+```powershell
+.\target\release\candidatectl.exe supplement-disable --root $SupplementRoot
+```
+
+启用、关闭、提升或回退后，需要重新打开待验证的应用，让它建立新的 TSF
+宿主；已经运行的宿主持有原来的不可变内存快照。补充根中的 current 提升后，
+旧 `supplemental.zcl` 与新 current 不一致，运行时会先回退到仅核心候选，必须
+再次显式运行 `supplement-enable` 才接受新包。
 
 输出目录已存在时一律拒绝覆盖。载荷、清单先写，来源侧车最后写；中途失败最多
 留下一个无法通过完整加载的不完整目录，不会冒充有效包。当前命令刻意不提供
@@ -234,7 +340,10 @@ cargo run --release --bin candidatectl -- adopt `
 1～131,072。字节数、指纹或实际词条数任一不符都会拒绝；候选接口最多接受
 第 1～50 名。交互宿主应先请求两页所需的浅层结果，再随用户翻页逐步扩大，
 不应在每次组合更新时固定计算 Top-50。交互快照先列出任意长度的完整、零纠错、
-不简写词典项，再追加连续句子解码结果并按文字去重；因此准确完整码不会被大量
+不简写词典项。恰为四键、两个完整音节时，还会从每个音节的前 24 个单字中按
+词频分组成最多 50 个临时双字候选，并随宿主翻页深度按需暴露，再追加连续句子
+解码结果并按文字去重；它让
+“只动”一类无需入词的组合保持可见，但不会扩散到长句。准确完整码不会被大量
 高频自由简写路径挤出可见边界。例如 `cj` 同时可以解释为完整的 `can` 与
 `c + j` 简拼，前者先显示，后者仍保留。无歧义的 `ju` / `qu` / `xu` / `yu`
 拼音写法还允许第二键 `u` 沿用规范自然码的 `v` 词条，不占用纠错预算。

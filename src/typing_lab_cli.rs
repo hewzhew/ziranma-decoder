@@ -71,6 +71,7 @@ impl TypingLabInput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypingLabEffect {
     Continue,
+    CommittedBackspace,
     Confirm,
     Select(usize),
     PreviousPage,
@@ -170,7 +171,20 @@ impl TypingLabSession {
         true
     }
 
+    pub fn backspace_committed(&mut self) -> bool {
+        if !self.composition.phonetic().is_empty()
+            || self.composition.tab_mode()
+            || self.composition.recovery_mode()
+        {
+            return false;
+        }
+        self.committed.pop().is_some()
+    }
+
     pub fn apply(&mut self, input: TypingLabInput) -> TypingLabEffect {
+        if matches!(input, TypingLabInput::Backspace) && self.backspace_committed() {
+            return TypingLabEffect::CommittedBackspace;
+        }
         let exit_on_pass_through = matches!(input, TypingLabInput::Escape);
         let Some(input) = input.into_composition() else {
             return TypingLabEffect::Quit;
@@ -332,15 +346,25 @@ pub fn render_typing_lab_screen(
                 .expect("writing to String cannot fail");
         }
     } else if direct_keys {
+        let backspace = if session.phonetic().is_empty() && !session.committed().is_empty() {
+            "退格删末字"
+        } else {
+            "退格修改"
+        };
         writeln!(
             output,
-            "空格首选　数字选择　-前页　+后页　Shift+Tab换序　Tab找字　退格修改　Esc清空/退出"
+            "空格首选　数字选择　-前页　+后页　Shift+Tab换序　Tab找字　{backspace}　Esc清空/退出"
         )
         .expect("writing to String cannot fail");
     } else {
+        let backspace = if session.phonetic().is_empty() && !session.committed().is_empty() {
+            ":back删末字"
+        } else {
+            ":back退格"
+        };
         writeln!(
             output,
-            "空行首选　数字选择　-前页　+后页　:recover换序　:tab找字　:back退格　:esc清空　:quit退出"
+            "空行首选　数字选择　-前页　+后页　:recover换序　:tab找字　{backspace}　:esc清空　:quit退出"
         )
         .expect("writing to String cannot fail");
     }
@@ -415,7 +439,7 @@ mod tests {
         assert_eq!(session.stroke_prefix(), "nh");
         session.apply(TypingLabInput::Letters("a".to_owned()));
         assert_eq!(session.stroke_prefix(), "nh");
-        assert_eq!(session.notice(), Some("笔画只用 h s p n z"));
+        assert_eq!(session.notice(), Some("笔画用 h u p n v"));
         session.apply(TypingLabInput::Escape);
         assert!(!session.tab_mode());
         assert_eq!(
@@ -437,6 +461,27 @@ mod tests {
         );
         assert!(session.phonetic().is_empty());
         assert_eq!(session.apply(TypingLabInput::Escape), TypingLabEffect::Quit);
+    }
+
+    #[test]
+    fn idle_backspace_can_trim_the_last_committed_character_for_practice() {
+        let mut session = TypingLabSession::default();
+        assert!(session.commit("线束缚"));
+        assert_eq!(
+            session.apply(TypingLabInput::Backspace),
+            TypingLabEffect::CommittedBackspace
+        );
+        assert_eq!(session.committed(), "线束");
+        let screen = render_typing_lab_screen(&session, &[], 0, true);
+        assert!(screen.contains("退格删末字"));
+
+        session.apply(TypingLabInput::Letters("xm".to_owned()));
+        assert_eq!(
+            session.apply(TypingLabInput::Backspace),
+            TypingLabEffect::Continue
+        );
+        assert_eq!(session.phonetic(), "x");
+        assert_eq!(session.committed(), "线束");
     }
 
     #[test]

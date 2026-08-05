@@ -37,6 +37,43 @@ pub fn encode_pinyin_phrase(pinyin: &str) -> Result<EncodedPinyin, PinyinEncodeE
     })
 }
 
+/// Removes Unicode tone marks from space-separated Hanyu Pinyin.
+///
+/// The returned spelling is suitable for [`encode_pinyin_phrase`]. Umlaut
+/// vowels use the codec's canonical `v` spelling. Unexpected characters are
+/// rejected instead of being silently discarded.
+pub fn normalize_pinyin_tone_marks(pinyin: &str) -> Result<String, PinyinEncodeError> {
+    let mut normalized_syllables = Vec::new();
+    for syllable in pinyin.split_whitespace() {
+        let mut normalized = String::with_capacity(syllable.len());
+        for character in syllable.chars() {
+            let base = match character {
+                'a' | 'ā' | 'á' | 'ǎ' | 'à' => 'a',
+                'e' | 'ē' | 'é' | 'ě' | 'è' | 'ê' => 'e',
+                'i' | 'ī' | 'í' | 'ǐ' | 'ì' => 'i',
+                'o' | 'ō' | 'ó' | 'ǒ' | 'ò' => 'o',
+                'u' | 'ū' | 'ú' | 'ǔ' | 'ù' => 'u',
+                'ü' | 'ǖ' | 'ǘ' | 'ǚ' | 'ǜ' => 'v',
+                'n' | 'ń' | 'ň' | 'ǹ' => 'n',
+                'm' | 'ḿ' => 'm',
+                ':' => ':',
+                character if character.is_ascii_lowercase() => character,
+                _ => {
+                    return Err(PinyinEncodeError::InvalidCharacters {
+                        syllable: syllable.to_owned(),
+                    });
+                }
+            };
+            normalized.push(base);
+        }
+        normalized_syllables.push(normalized);
+    }
+    if normalized_syllables.is_empty() {
+        return Err(PinyinEncodeError::EmptyPhrase);
+    }
+    Ok(normalized_syllables.join(" "))
+}
+
 /// Encodes one tone-free pinyin syllable as two Ziranma keys.
 pub fn encode_pinyin_syllable(syllable: &str) -> Result<KeySequence, PinyinEncodeError> {
     let normalized = normalize_syllable(syllable)?;
@@ -194,7 +231,7 @@ impl Error for PinyinEncodeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_pinyin_phrase, encode_pinyin_syllable};
+    use super::{encode_pinyin_phrase, encode_pinyin_syllable, normalize_pinyin_tone_marks};
 
     #[test]
     fn encodes_every_mapped_final_family() {
@@ -303,5 +340,16 @@ mod tests {
         assert!(encode_pinyin_syllable("nǐ").is_err());
         assert!(encode_pinyin_syllable("xyz").is_err());
         assert!(encode_pinyin_phrase("   ").is_err());
+    }
+
+    #[test]
+    fn normalizes_unicode_tones_without_guessing_at_other_characters() {
+        assert_eq!(
+            normalize_pinyin_tone_marks("shéng mǔ lüe ǹ").unwrap(),
+            "sheng mu lve n"
+        );
+        assert_eq!(normalize_pinyin_tone_marks("nǐ hǎo").unwrap(), "ni hao");
+        assert!(normalize_pinyin_tone_marks("qíng gē\u{200b}").is_err());
+        assert!(normalize_pinyin_tone_marks("zǐ bèi wěi 𫛚").is_err());
     }
 }

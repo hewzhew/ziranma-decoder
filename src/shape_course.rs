@@ -133,8 +133,8 @@ mod tests {
 
     use super::{ShapeCourseDifficulty, select_shape_course_tasks};
     use crate::{
-        CharacterShape, CharacterShapeIndex, KeySequence, LexiconEntry, parse_rime_lexicon,
-        parse_stroke_sequence_tsv,
+        CharacterShape, CharacterShapeIndex, KeySequence, LexiconEntry,
+        parse_simplified_rime_lexicon as parse_rime_lexicon, parse_stroke_sequence_tsv,
     };
 
     fn pool(pinyin: &str, code: &str, base: u32, strokes: [&str; 11]) -> Vec<LexiconEntry> {
@@ -250,7 +250,7 @@ mod tests {
                     task.minimum_prefix_keys
                 ))
                 .collect::<Vec<_>>(),
-            vec![('嘧', "mi", 1), ('閎', "hong", 2), ('慾', "yu", 3)]
+            vec![('嘧', "mi", 1), ('氀', "shu", 2), ('匷', "qu", 3)]
         );
     }
 }

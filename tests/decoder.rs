@@ -199,20 +199,24 @@ fn parser_generates_canonical_codes_from_pinyin() {
 
 #[test]
 fn pinned_public_rime_snapshot_has_stable_import_accounting() {
-    let imported = ziranma_core::parse_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap();
+    let imported = ziranma_core::parse_simplified_rime_lexicon(PUBLIC_RIME_LEXICON).unwrap();
 
     assert_eq!(imported.stats.source_rows, 65_125);
-    assert_eq!(imported.stats.imported_entries, 65_116);
+    assert_eq!(imported.stats.imported_entries, 62_757);
     assert_eq!(imported.stats.zero_weights_floored, 1_714);
-    assert_eq!(imported.stats.unsupported_pinyin_rows, 8);
+    assert_eq!(imported.stats.unsupported_pinyin_rows, 7);
     assert_eq!(imported.stats.too_many_syllable_rows, 0);
     assert_eq!(imported.stats.duplicate_rows, 1);
+    assert_eq!(
+        imported.stats.shadowed_traditional_single_character_rows,
+        2_360
+    );
     assert_eq!(imported.entries.len(), imported.stats.imported_entries);
 
     let decoder = Decoder::new(imported.entries);
     let index = decoder.index_stats();
     assert_eq!(index.terminal_node_count, 39_027);
-    assert_eq!(index.maximum_terminal_fanout, 312);
+    assert_eq!(index.maximum_terminal_fanout, 282);
     let (candidates, stats) = decoder.decode_sentence_with_stats("zrmurf", 10).unwrap();
     assert!(!candidates.is_empty());
     assert!(stats.trie_subtree_prunes > 0);

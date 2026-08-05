@@ -18,6 +18,15 @@ from that commit. The decoder does not rewrite the snapshot. At import time
 it floors zero weights to one and reports every skipped unsupported,
 overlong, or duplicate row.
 
+`shadowed-traditional-single-character-readings.txt` is a deterministic audit
+artifact used only by the simplified-Rime importer. It compares this exact
+snapshot with OpenCC `TSCharacters.txt` at commit
+`6b1538b5a1ad15c9025be0306a17b95ac897fa5e` (Apache-2.0; source SHA-256 and
+the complete derivation rule are recorded in the file). A traditional
+single-character reading is omitted only when OpenCC's primary simplified
+mapping exists at the same pinyin with an equal or greater Rime weight.
+Unrelated readings and every multi-character entry remain available.
+
 The dictionary header states that it was derived from the Android Open Source
 Project Pinyin IME. The upstream `AUTHORS` file attributes that derived
 dictionary under Apache License 2.0.

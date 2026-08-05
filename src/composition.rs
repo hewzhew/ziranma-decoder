@@ -8,11 +8,12 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use crate::SentenceCandidate;
+use crate::{SentenceCandidate, personal_ranking::is_anchored_suffix_abbreviation};
 
 const MAX_COMPOSITION_KEYS: usize = 64;
 const MAX_SESSION_SELECTIONS: usize = 128;
 const MAX_SESSION_SELECTION_TEXT_CHARACTERS: usize = 128;
+pub(crate) const MAX_TAB_ASSEMBLY_CHARACTERS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompositionPunctuation {
@@ -21,6 +22,7 @@ pub enum CompositionPunctuation {
     Semicolon,
     Colon,
     ExclamationMark,
+    Ellipsis,
     LeftParenthesis,
     RightParenthesis,
     QuestionMark,
@@ -34,6 +36,7 @@ impl CompositionPunctuation {
             Self::Semicolon => "；",
             Self::Colon => "：",
             Self::ExclamationMark => "！",
+            Self::Ellipsis => "……",
             Self::LeftParenthesis => "（",
             Self::RightParenthesis => "）",
             Self::QuestionMark => "？",
@@ -72,11 +75,31 @@ pub enum CompositionEffect {
     PassThrough,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TabAssembly {
+    pinyin_segments: Vec<String>,
+    selected: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TabAssemblyStage {
+    First,
+    Second,
+    Later(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TabAssemblySelection {
+    Advanced,
+    Complete(String),
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompositionSession {
     phonetic: String,
     shape_pinyin: Option<String>,
     stroke_prefix: String,
+    tab_assembly: Option<TabAssembly>,
     wish_prompt: bool,
     recovery_mode: bool,
     candidate_page_start: usize,
@@ -107,6 +130,33 @@ impl SessionSelectionMemory {
 
     pub fn remember_text(&mut self, code: &str, text: &str) {
         self.remember_entry(code, text, None);
+    }
+
+    /// Returns the text currently remembered for one exact input code.
+    ///
+    /// The borrowed text cannot outlive this memory and is not copied into a
+    /// diagnostic or serialization surface.
+    pub fn remembered_text(&self, code: &str) -> Option<&str> {
+        self.selections
+            .iter()
+            .find(|selection| selection.code == code)
+            .map(|selection| selection.text.as_str())
+    }
+
+    /// Removes the current entry for `code` only when it still names `text`.
+    ///
+    /// This conditional form lets a retractable selection restore its prior
+    /// session value without overwriting a newer explicit choice.
+    pub fn forget_text(&mut self, code: &str, text: &str) -> bool {
+        let Some(index) = self
+            .selections
+            .iter()
+            .position(|selection| selection.code == code && selection.text == text)
+        else {
+            return false;
+        };
+        self.selections.remove(index);
+        true
     }
 
     fn remember_entry(&mut self, code: &str, text: &str, candidate: Option<SentenceCandidate>) {
@@ -162,6 +212,20 @@ impl SessionSelectionMemory {
     }
 
     pub fn promote_texts(&self, code: &str, candidates: &mut Vec<String>) -> bool {
+        self.promote_texts_after(code, candidates, 0)
+    }
+
+    /// Promotes the remembered text without crossing a caller-owned prefix.
+    ///
+    /// Interactive hosts use the prefix for explicit aliases that must remain
+    /// above transient session evidence. Callers without such a lane should
+    /// continue using [`Self::promote_texts`].
+    pub fn promote_texts_after(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> bool {
         let Some(preferred) = self
             .selections
             .iter()
@@ -169,21 +233,75 @@ impl SessionSelectionMemory {
         else {
             return false;
         };
+        let protected_prefix = protected_prefix.min(candidates.len());
         let Some(index) = candidates
             .iter()
             .position(|candidate| candidate == &preferred.text)
         else {
+            if protected_prefix > 0 && protected_prefix == candidates.len() {
+                return false;
+            }
             let original_len = candidates.len();
-            candidates.insert(0, preferred.text.clone());
+            candidates.insert(protected_prefix, preferred.text.clone());
             candidates.truncate(original_len.max(1));
             return true;
         };
-        if index == 0 {
+        if index <= protected_prefix {
             return true;
         }
         let candidate = candidates.remove(index);
-        candidates.insert(0, candidate);
+        candidates.insert(protected_prefix, candidate);
         true
+    }
+
+    /// Promotes the most recent session choice learned under a compatible,
+    /// caller-verified complete code into an anchored-tail abbreviation.
+    ///
+    /// Unlike exact session recall, this never injects an absent candidate.
+    /// The host owns both public-dictionary verification and suppression
+    /// policy through `eligible_source`.
+    pub(crate) fn promote_anchored_suffix_texts_after(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        mut eligible_source: impl FnMut(&str, &str) -> bool,
+    ) -> bool {
+        let Some(preferred) = self.selections.iter().find(|selection| {
+            is_anchored_suffix_abbreviation(&selection.code, code)
+                && candidates
+                    .iter()
+                    .any(|candidate| candidate == &selection.text)
+                && eligible_source(&selection.code, &selection.text)
+        }) else {
+            return false;
+        };
+        let protected_prefix = protected_prefix.min(candidates.len());
+        let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate == &preferred.text)
+        else {
+            return false;
+        };
+        if index <= protected_prefix {
+            return true;
+        }
+        let candidate = candidates.remove(index);
+        candidates.insert(protected_prefix, candidate);
+        true
+    }
+
+    pub(crate) fn has_anchored_suffix_evidence(
+        &self,
+        code: &str,
+        text: &str,
+        mut eligible_source: impl FnMut(&str, &str) -> bool,
+    ) -> bool {
+        self.selections.iter().any(|selection| {
+            selection.text == text
+                && is_anchored_suffix_abbreviation(&selection.code, code)
+                && eligible_source(&selection.code, &selection.text)
+        })
     }
 
     pub fn clear(&mut self) {
@@ -198,6 +316,31 @@ impl CompositionSession {
 
     pub fn tab_mode(&self) -> bool {
         self.shape_pinyin.is_some()
+    }
+
+    pub(crate) fn tab_assembly_mode(&self) -> bool {
+        self.tab_assembly.is_some()
+    }
+
+    pub(crate) fn tab_assembly_stage(&self) -> Option<TabAssemblyStage> {
+        self.tab_assembly
+            .as_ref()
+            .map(|assembly| match assembly.selected.len() {
+                0 => TabAssemblyStage::First,
+                1 => TabAssemblyStage::Second,
+                selected => TabAssemblyStage::Later(selected.saturating_add(1)),
+            })
+    }
+
+    pub(crate) fn tab_assembly_selected_text(&self) -> Option<String> {
+        let assembly = self.tab_assembly.as_ref()?;
+        (!assembly.selected.is_empty()).then(|| assembly.selected.concat())
+    }
+
+    pub(crate) fn tab_assembly_position(&self) -> Option<usize> {
+        self.tab_assembly
+            .as_ref()
+            .map(|assembly| assembly.selected.len().saturating_add(1))
     }
 
     pub fn recovery_mode(&self) -> bool {
@@ -268,10 +411,64 @@ impl CompositionSession {
     pub fn enter_tab(&mut self, pinyin: impl Into<String>) {
         self.wish_prompt = false;
         self.recovery_mode = false;
+        self.tab_assembly = None;
         self.shape_pinyin = Some(pinyin.into());
         self.stroke_prefix.clear();
         self.candidate_page_start = 0;
         self.notice = None;
+    }
+
+    pub(crate) fn enter_tab_path(&mut self, pinyin_segments: &[&str]) -> bool {
+        if !(2..=MAX_TAB_ASSEMBLY_CHARACTERS).contains(&pinyin_segments.len())
+            || pinyin_segments
+                .iter()
+                .any(|pinyin| !valid_tab_assembly_pinyin(pinyin))
+        {
+            return false;
+        }
+        self.wish_prompt = false;
+        self.recovery_mode = false;
+        self.shape_pinyin = Some(pinyin_segments[0].to_owned());
+        self.stroke_prefix.clear();
+        self.tab_assembly = Some(TabAssembly {
+            pinyin_segments: pinyin_segments
+                .iter()
+                .map(|pinyin| (*pinyin).to_owned())
+                .collect(),
+            selected: Vec::with_capacity(pinyin_segments.len()),
+        });
+        self.candidate_page_start = 0;
+        self.notice = None;
+        true
+    }
+
+    pub(crate) fn accept_tab_assembly_candidate(
+        &mut self,
+        text: &str,
+    ) -> Option<TabAssemblySelection> {
+        let mut characters = text.chars();
+        let character = characters.next()?;
+        if characters.next().is_some() {
+            return None;
+        }
+        let text = character.to_string();
+        let assembly = self.tab_assembly.as_mut()?;
+        if assembly.selected.len().saturating_add(1) < assembly.pinyin_segments.len() {
+            assembly.selected.push(text);
+            self.shape_pinyin = assembly
+                .pinyin_segments
+                .get(assembly.selected.len())
+                .cloned();
+            self.stroke_prefix.clear();
+            self.candidate_page_start = 0;
+            self.notice = None;
+            Some(TabAssemblySelection::Advanced)
+        } else {
+            let mut combined = assembly.selected.concat();
+            combined.push(character);
+            self.finish_commit();
+            Some(TabAssemblySelection::Complete(combined))
+        }
     }
 
     /// Clears the active composition after the host has committed text.
@@ -319,15 +516,11 @@ impl CompositionSession {
                 self.set_notice("空格确认，退格返回");
             }
             CompositionInput::Letters(letters) if self.tab_mode() => {
-                if letters
-                    .as_bytes()
-                    .iter()
-                    .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z'))
-                {
-                    self.stroke_prefix.push_str(&letters);
+                if let Some(strokes) = canonical_stroke_letters(&letters) {
+                    self.stroke_prefix.push_str(&strokes);
                     self.candidate_page_start = 0;
                 } else {
-                    self.set_notice("笔画只用 h s p n z");
+                    self.set_notice("笔画用 h u p n v");
                 }
             }
             CompositionInput::Letters(letters)
@@ -339,6 +532,9 @@ impl CompositionSession {
             CompositionInput::Letters(_) | CompositionInput::Invalid => {
                 self.set_notice("没有这个操作");
             }
+            CompositionInput::Confirm | CompositionInput::Select(_) if self.tab_assembly_mode() => {
+                self.set_notice("请选择一个字");
+            }
             CompositionInput::Confirm if !self.phonetic.is_empty() => {
                 return CompositionEffect::Confirm;
             }
@@ -347,6 +543,9 @@ impl CompositionSession {
                 return CompositionEffect::CommitRaw;
             }
             CompositionInput::CommitRaw => return CompositionEffect::PassThrough,
+            CompositionInput::Punctuation(_) if self.tab_assembly_mode() => {
+                self.set_notice("选完整词后再输入标点");
+            }
             CompositionInput::Punctuation(punctuation) => {
                 return CompositionEffect::Punctuation(punctuation);
             }
@@ -356,7 +555,18 @@ impl CompositionSession {
             CompositionInput::Select(_) => return CompositionEffect::PassThrough,
             CompositionInput::Backspace if self.tab_mode() => {
                 if self.stroke_prefix.pop().is_none() {
-                    self.leave_tab();
+                    let previous_pinyin = self.tab_assembly.as_mut().and_then(|assembly| {
+                        assembly.selected.pop()?;
+                        assembly
+                            .pinyin_segments
+                            .get(assembly.selected.len())
+                            .cloned()
+                    });
+                    if previous_pinyin.is_some() {
+                        self.shape_pinyin = previous_pinyin;
+                    } else {
+                        self.leave_tab();
+                    }
                 }
                 self.candidate_page_start = 0;
             }
@@ -404,6 +614,7 @@ impl CompositionSession {
     fn leave_tab(&mut self) {
         self.shape_pinyin = None;
         self.stroke_prefix.clear();
+        self.tab_assembly = None;
     }
 
     fn append_phonetic_letters(&mut self, letters: &str) {
@@ -418,6 +629,24 @@ impl CompositionSession {
             self.set_notice("本轮最多输入 64 个字母");
         }
     }
+}
+
+fn valid_tab_assembly_pinyin(pinyin: &str) -> bool {
+    pinyin.len() == 2 && pinyin.as_bytes().iter().all(u8::is_ascii_lowercase)
+}
+
+fn canonical_stroke_letters(letters: &str) -> Option<String> {
+    letters
+        .bytes()
+        .map(|letter| match letter {
+            b'h' => Some('h'),
+            b'u' | b's' => Some('s'),
+            b'p' => Some('p'),
+            b'n' => Some('n'),
+            b'v' | b'z' => Some('z'),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -453,6 +682,144 @@ mod tests {
         session.enter_tab("ma");
         assert!(session.tab_mode());
         assert!(!session.recovery_mode());
+    }
+
+    #[test]
+    fn four_key_tab_assembly_advances_without_committing_a_partial_character() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("qthp".to_owned()));
+
+        assert!(session.enter_tab_path(&["qt", "hp"]));
+        assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::First));
+        assert_eq!(session.shape_pinyin(), Some("qt"));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("雀"),
+            Some(TabAssemblySelection::Advanced)
+        );
+        assert_eq!(session.phonetic(), "qthp");
+        assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::Second));
+        assert_eq!(session.shape_pinyin(), Some("hp"));
+
+        assert_eq!(
+            session.accept_tab_assembly_candidate("魂"),
+            Some(TabAssemblySelection::Complete("雀魂".to_owned()))
+        );
+        assert!(session.phonetic().is_empty());
+        assert!(!session.tab_mode());
+        assert!(!session.tab_assembly_mode());
+    }
+
+    #[test]
+    fn four_key_tab_assembly_backspace_rewinds_one_layer_and_escape_leaves_tab() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("qthp".to_owned()));
+        assert!(session.enter_tab_path(&["qt", "hp"]));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("雀"),
+            Some(TabAssemblySelection::Advanced)
+        );
+
+        session.apply(CompositionInput::Letters("u".to_owned()));
+        assert_eq!(
+            session.stroke_prefix(),
+            "s",
+            "the natural-code sh key must map to the canonical vertical stroke"
+        );
+        session.apply(CompositionInput::Backspace);
+        assert_eq!(session.stroke_prefix(), "");
+        assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::Second));
+
+        session.apply(CompositionInput::Backspace);
+        assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::First));
+        assert_eq!(session.shape_pinyin(), Some("qt"));
+        assert_eq!(session.phonetic(), "qthp");
+
+        session.apply(CompositionInput::Escape);
+        assert!(!session.tab_mode());
+        assert_eq!(session.phonetic(), "qthp");
+    }
+
+    #[test]
+    fn four_key_tab_assembly_rejects_invalid_segments_and_multi_character_steps() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("qthp".to_owned()));
+        assert!(!session.enter_tab_path(&["q", "hp"]));
+        assert!(!session.tab_mode());
+
+        assert!(session.enter_tab_path(&["qt", "hp"]));
+        assert_eq!(session.accept_tab_assembly_candidate("雀魂"), None);
+        assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::First));
+
+        assert_eq!(
+            session.apply(CompositionInput::Punctuation(CompositionPunctuation::Comma)),
+            CompositionEffect::Continue
+        );
+        assert_eq!(session.notice(), Some("选完整词后再输入标点"));
+        assert_eq!(session.phonetic(), "qthp");
+    }
+
+    #[test]
+    fn bounded_tab_path_advances_and_rewinds_one_character_at_a_time() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("qthplmxi".to_owned()));
+        assert!(session.enter_tab_path(&["qt", "hp", "lm", "xi"]));
+        assert!(!session.enter_tab_path(&["qt"]));
+        assert!(!session.enter_tab_path(&["qt", "hp", "lm", "xi", "ab"]));
+
+        for (text, stage, pinyin, selected) in [
+            ("雀", TabAssemblyStage::Second, "hp", "雀"),
+            ("魂", TabAssemblyStage::Later(3), "lm", "雀魂"),
+            ("练", TabAssemblyStage::Later(4), "xi", "雀魂练"),
+        ] {
+            assert_eq!(
+                session.accept_tab_assembly_candidate(text),
+                Some(TabAssemblySelection::Advanced)
+            );
+            assert_eq!(session.tab_assembly_stage(), Some(stage));
+            assert_eq!(session.shape_pinyin(), Some(pinyin));
+            assert_eq!(
+                session.tab_assembly_selected_text().as_deref(),
+                Some(selected)
+            );
+        }
+
+        for (stage, pinyin, selected) in [
+            (TabAssemblyStage::Later(3), "lm", Some("雀魂")),
+            (TabAssemblyStage::Second, "hp", Some("雀")),
+            (TabAssemblyStage::First, "qt", None),
+        ] {
+            session.apply(CompositionInput::Backspace);
+            assert_eq!(session.tab_assembly_stage(), Some(stage));
+            assert_eq!(session.shape_pinyin(), Some(pinyin));
+            assert_eq!(session.tab_assembly_selected_text().as_deref(), selected);
+        }
+
+        for text in ["雀", "魂", "练"] {
+            assert_eq!(
+                session.accept_tab_assembly_candidate(text),
+                Some(TabAssemblySelection::Advanced)
+            );
+        }
+        assert_eq!(
+            session.accept_tab_assembly_candidate("习"),
+            Some(TabAssemblySelection::Complete("雀魂练习".to_owned()))
+        );
+        assert!(session.phonetic().is_empty());
+        assert!(!session.tab_mode());
+
+        let mut three_character = CompositionSession::default();
+        three_character.apply(CompositionInput::Letters("qthplm".to_owned()));
+        assert!(three_character.enter_tab_path(&["qt", "hp", "lm"]));
+        for text in ["雀", "魂"] {
+            assert_eq!(
+                three_character.accept_tab_assembly_candidate(text),
+                Some(TabAssemblySelection::Advanced)
+            );
+        }
+        assert_eq!(
+            three_character.accept_tab_assembly_candidate("练"),
+            Some(TabAssemblySelection::Complete("雀魂练".to_owned()))
+        );
     }
 
     #[test]
@@ -524,6 +891,7 @@ mod tests {
             (CompositionPunctuation::Semicolon, "；"),
             (CompositionPunctuation::Colon, "："),
             (CompositionPunctuation::ExclamationMark, "！"),
+            (CompositionPunctuation::Ellipsis, "……"),
             (CompositionPunctuation::LeftParenthesis, "（"),
             (CompositionPunctuation::RightParenthesis, "）"),
             (CompositionPunctuation::QuestionMark, "？"),
@@ -572,5 +940,46 @@ mod tests {
         assert!(!memory.promote_texts("AB", &mut visible));
         memory.clear();
         assert!(!memory.promote_texts("ab", &mut visible));
+    }
+
+    #[test]
+    fn session_text_selection_memory_never_crosses_a_protected_prefix() {
+        let mut memory = SessionSelectionMemory::default();
+        memory.remember_text("ab", "乙");
+
+        let mut visible = vec![
+            "固定".to_owned(),
+            "甲".to_owned(),
+            "乙".to_owned(),
+            "丙".to_owned(),
+        ];
+        assert!(memory.promote_texts_after("ab", &mut visible, 1));
+        assert_eq!(visible, ["固定", "乙", "甲", "丙"]);
+
+        let mut shallow = vec!["固定".to_owned()];
+        assert!(!memory.promote_texts_after("ab", &mut shallow, 1));
+        assert_eq!(shallow, ["固定"]);
+    }
+
+    #[test]
+    fn session_selection_can_inherit_into_only_a_verified_visible_anchored_tail() {
+        let mut memory = SessionSelectionMemory::default();
+        memory.remember_text("jdjd", "讲讲");
+        memory.remember_text("abef", "旁路");
+        let mut candidates = vec!["固定".to_owned(), "简单".to_owned(), "讲讲".to_owned()];
+
+        assert!(memory.promote_anchored_suffix_texts_after(
+            "jdj",
+            &mut candidates,
+            1,
+            |code, text| code == "jdjd" && text == "讲讲",
+        ));
+        assert_eq!(candidates, ["固定", "讲讲", "简单"]);
+        assert!(memory.has_anchored_suffix_evidence("jdj", "讲讲", |_, _| true));
+        assert!(!memory.has_anchored_suffix_evidence("jd", "讲讲", |_, _| true));
+
+        let mut absent = vec!["简单".to_owned(), "降价".to_owned()];
+        assert!(!memory.promote_anchored_suffix_texts_after("jdj", &mut absent, 0, |_, _| true,));
+        assert_eq!(absent, ["简单", "降价"]);
     }
 }

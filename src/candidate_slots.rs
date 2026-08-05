@@ -56,7 +56,7 @@ impl CandidateSlotState {
 
     /// Sets the first known-good package. Existing state is never replaced.
     pub fn adopt(&mut self, package_id: &str) -> Result<(), CandidateSlotError> {
-        validate_package_id(package_id)?;
+        validate_candidate_package_id(package_id)?;
         if self.current.is_some() || self.candidate.is_some() || self.previous.is_some() {
             return Err(CandidateSlotError::AlreadyConfigured);
         }
@@ -66,7 +66,7 @@ impl CandidateSlotState {
 
     /// Places one independently validated package in the candidate slot.
     pub fn stage(&mut self, package_id: &str) -> Result<(), CandidateSlotError> {
-        validate_package_id(package_id)?;
+        validate_candidate_package_id(package_id)?;
         if self.current.is_none() {
             return Err(CandidateSlotError::NotConfigured);
         }
@@ -140,7 +140,7 @@ impl CandidateSlotState {
         ];
         for (index, package_id) in occupied.iter().enumerate() {
             if let Some(package_id) = package_id {
-                validate_package_id(package_id)?;
+                validate_candidate_package_id(package_id)?;
                 if occupied[index + 1..].contains(&Some(*package_id)) {
                     return Err(CandidateSlotError::DuplicatePackage);
                 }
@@ -214,11 +214,11 @@ fn optional_package_id(value: &str) -> Result<Option<String>, CandidateSlotError
     if value == "-" {
         return Ok(None);
     }
-    validate_package_id(value)?;
+    validate_candidate_package_id(value)?;
     Ok(Some(value.to_owned()))
 }
 
-fn validate_package_id(value: &str) -> Result<(), CandidateSlotError> {
+pub(crate) fn validate_candidate_package_id(value: &str) -> Result<(), CandidateSlotError> {
     let Some(rest) = value.strip_prefix("pkg-") else {
         return Err(CandidateSlotError::InvalidPackageId);
     };

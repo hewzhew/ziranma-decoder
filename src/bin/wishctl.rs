@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
-    DataProtector, NativeCancellationSource, NativeCandidateView, NativeFeedbackEvent,
-    NativeSelectionSource, WishCategory, WishCommand, WishCommandAckStatus, WishFeedbackError,
-    WishNote, dispatch_wish_command, list_wish_packages, load_wish_note, load_wish_snapshot,
-    move_wish_to_trash, save_wish_note,
+    DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateView,
+    NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope, WishCategory, WishCommand,
+    WishCommandAckStatus, WishEventRole, WishFeedbackError, WishNote, dispatch_wish_command,
+    list_wish_packages, load_wish_note, load_wish_snapshot, move_wish_to_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,10 +313,18 @@ fn show(
     let id = resolve_selector(root, selector)?;
     let snapshot = load_wish_snapshot(root, &id, protector)?;
     println!(
-        "许愿 {id} · 最近 {} ms · {} 条事件",
-        snapshot.lookback_ms(),
+        "许愿 {id} · {} · {} · {} 条事件",
+        capture_scope_label(snapshot.capture_scope(), snapshot.lookback_ms()),
+        category_label(snapshot.category()),
         snapshot.events().len()
     );
+    let focus = snapshot.focus_event_range();
+    println!(
+        "重点片段：第 {}–{} 条；之前为参考上下文，之后为许愿入口",
+        focus.start.saturating_add(1),
+        focus.end,
+    );
+    println!("时间跨度 {} ms", snapshot.lookback_ms(),);
     println!(
         "来源 {} 条；窗口前省略 {}，无时间省略 {}，容量省略 {}；完整：{}",
         snapshot.source_events(),
@@ -328,9 +337,25 @@ fn show(
             "否"
         }
     );
-    for event in snapshot.events() {
+    let mut previous_role = None;
+    let mut previous_completed_episode = false;
+    let mut context_segment = 0_usize;
+    for (index, event) in snapshot.events().iter().enumerate() {
+        let role = snapshot.event_role(index).ok_or("许愿事件角色无效")?;
+        if previous_role != Some(role)
+            || (role == WishEventRole::Context && previous_completed_episode)
+        {
+            if role == WishEventRole::Context {
+                context_segment = context_segment.saturating_add(1);
+                println!("\n【参考片段 {context_segment}】");
+            } else {
+                println!("\n【{}】", event_role_label(role));
+            }
+            previous_role = Some(role);
+        }
         print!("-{} ms  ", event.milliseconds_before_marker());
         print_event(event.event());
+        previous_completed_episode = event_completes_episode(event.event());
     }
     match load_wish_note(root, &id, protector) {
         Ok(note) => {
@@ -344,6 +369,43 @@ fn show(
     Ok(())
 }
 
+fn capture_scope_label(scope: WishCaptureScope, lookback_ms: u32) -> String {
+    match scope {
+        WishCaptureScope::LegacyWindow => format!("旧版时间窗 {lookback_ms} ms"),
+        WishCaptureScope::RecentEpisodes => "按输入片段截取".to_owned(),
+        WishCaptureScope::RecentWindow => format!("近 {lookback_ms} ms"),
+    }
+}
+
+fn category_label(category: WishCategory) -> &'static str {
+    match category {
+        WishCategory::Candidates => "候选",
+        WishCategory::Ranking => "候选排序",
+        WishCategory::Display => "显示界面",
+        WishCategory::Latency => "卡顿延迟",
+        WishCategory::InputMode => "按键模式",
+        WishCategory::Compatibility => "兼容性",
+        WishCategory::Other => "未分类",
+    }
+}
+
+fn event_role_label(role: WishEventRole) -> &'static str {
+    match role {
+        WishEventRole::Context => "参考上下文",
+        WishEventRole::Focus => "重点片段",
+        WishEventRole::Trigger => "许愿入口",
+    }
+}
+
+fn event_completes_episode(event: &NativeFeedbackEvent) -> bool {
+    matches!(
+        event,
+        NativeFeedbackEvent::CandidateCommitted { .. }
+            | NativeFeedbackEvent::RawCodeCommitted { .. }
+            | NativeFeedbackEvent::CompositionCancelled { .. }
+    )
+}
+
 fn print_event(event: &NativeFeedbackEvent) {
     match event {
         NativeFeedbackEvent::CandidatesPresented {
@@ -352,6 +414,14 @@ fn print_event(event: &NativeFeedbackEvent) {
             page_start,
             candidates,
             may_have_more,
+        }
+        | NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code,
+            view,
+            page_start,
+            candidates,
+            may_have_more,
+            ..
         } => {
             let candidates = candidates
                 .iter()
@@ -364,6 +434,13 @@ fn print_event(event: &NativeFeedbackEvent) {
                 view_label(*view),
                 if *may_have_more { " · …" } else { "" }
             );
+            if let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                automatic_transposition: Some(decision),
+                ..
+            } = event
+            {
+                println!("      {}", automatic_transposition_label(decision));
+            }
         }
         NativeFeedbackEvent::CandidateCommitted {
             code,
@@ -393,6 +470,55 @@ fn print_event(event: &NativeFeedbackEvent) {
                 ""
             }
         ),
+    }
+}
+
+fn automatic_transposition_label(decision: &NativeAutomaticTranspositionDecision) -> String {
+    let tier_name = |tier| match tier {
+        NativeAutomaticTranspositionTier::Primary => "高置信",
+        NativeAutomaticTranspositionTier::Secondary => "中置信",
+        NativeAutomaticTranspositionTier::Shadow => "影子",
+    };
+    let tier = if decision.cold_tier() == decision.tier() {
+        tier_name(decision.tier()).to_owned()
+    } else {
+        format!(
+            "{}→{}",
+            tier_name(decision.cold_tier()),
+            tier_name(decision.tier())
+        )
+    };
+    let action = if decision.syllable_count() == 1 {
+        "自动换序"
+    } else {
+        "双音节换序"
+    };
+    match decision.outcome() {
+        NativeAutomaticTranspositionOutcome::Suppressed => {
+            format!(
+                "{action}：{tier}，原码证据优先，{} ms",
+                decision.pair_gap_ms()
+            )
+        }
+        NativeAutomaticTranspositionOutcome::NoRecovery => {
+            format!(
+                "{action}：{tier}，没有唯一结果，{} ms",
+                decision.pair_gap_ms()
+            )
+        }
+        NativeAutomaticTranspositionOutcome::RecoveryAvailable => {
+            let text = decision.recovered_text().unwrap_or("候选");
+            match decision.visible_rank() {
+                Some(rank) => format!(
+                    "{action}：{tier}，“{text}”进入第 {rank} 项，{} ms",
+                    decision.pair_gap_ms()
+                ),
+                None => format!(
+                    "{action}：{tier}，后台命中“{text}”，{} ms",
+                    decision.pair_gap_ms()
+                ),
+            }
+        }
     }
 }
 

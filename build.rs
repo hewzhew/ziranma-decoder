@@ -4,7 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=assets/wishpad/meditating-cat.ico");
+    for asset in [
+        "app-cat.ico",
+        "listening-cat.ico",
+        "holding-wish-cat.ico",
+        "organizing-cat.ico",
+    ] {
+        println!("cargo:rerun-if-changed=assets/wishpad/{asset}");
+    }
     println!("cargo:rerun-if-changed=assets/wishpad/wishpad.rc");
 
     if env::var_os("CARGO_CFG_TARGET_OS").as_deref() != Some(std::ffi::OsStr::new("windows"))
@@ -18,13 +25,13 @@ fn main() {
         Ok("x86") => "x86",
         Ok("aarch64") => "arm64",
         _ => {
-            println!("cargo:warning=wishpad icon resource skipped for this target architecture");
+            println!("cargo:warning=cat image resources skipped for this target architecture");
             return;
         }
     };
     let Some(resource_compiler) = find_resource_compiler(architecture) else {
         println!(
-            "cargo:warning=Windows resource compiler not found; wishpad keeps its runtime fallback icon"
+            "cargo:warning=Windows resource compiler not found; cat illustrations keep their runtime fallbacks"
         );
         return;
     };
@@ -41,9 +48,10 @@ fn main() {
         .status()
         .expect("run the Windows resource compiler");
     if !status.success() {
-        panic!("Windows resource compiler failed for the wishpad icon");
+        panic!("Windows resource compiler failed for the wishpad image resources");
     }
     println!("cargo:rustc-link-arg-bin=wishpad={}", output.display());
+    println!("cargo:rustc-link-arg-cdylib={}", output.display());
 }
 
 fn find_resource_compiler(architecture: &str) -> Option<PathBuf> {

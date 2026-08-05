@@ -2,10 +2,11 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
+use std::hint::black_box;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -21,14 +22,25 @@ use ziranma_core::preflight_candidate_snapshot;
 use ziranma_core::{
     CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE,
     CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_PACKAGES_DIRECTORY,
-    CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CandidatePackageManifest,
-    CandidatePackageProvenance, CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot,
-    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
-    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
-    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
-    candidate_package_authentication_sha256, candidate_package_storage_id,
-    candidate_preflight_receipt_body, candidate_sha256_hex, parse_lexicon_tsv, parse_rime_lexicon,
+    CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CANDIDATE_SNAPSHOT_SCHEMA_V1,
+    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
+    CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
+    CandidateSupplementalState, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
+    MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
+    MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
+    PublicRimeSliceConfig, PublicRimeSliceImportStats, SupplementalCandidateLayerConfig,
+    audit_public_supplemental_layer, candidate_package_authentication_sha256,
+    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
+    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
+    parse_rime_lexicon, parse_simplified_rime_lexicon,
 };
+
+const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
+    "e341598343a0f0f2035bb1aafc34a7f3bb7887deeecb3f60796262aaa2983e6b";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -50,6 +62,39 @@ enum Options {
         revision: String,
         declaration: PublicSourceDeclaration,
     },
+    BuildRimeSlice {
+        source: PathBuf,
+        output: PathBuf,
+        revision: String,
+        declaration: PublicSourceDeclaration,
+        config: PublicRimeSliceConfig,
+    },
+    Compare {
+        base_payload: PathBuf,
+        challenger_payload: PathBuf,
+    },
+    LayerAudit {
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        frontier_limit: usize,
+        exact_promotions: usize,
+    },
+    LayerBenchmark {
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        repetitions: usize,
+        exact_promotions: usize,
+    },
+    SupplementStatus {
+        root: PathBuf,
+    },
+    SupplementEnable {
+        root: PathBuf,
+        exact_promotions: usize,
+    },
+    SupplementDisable {
+        root: PathBuf,
+    },
     Preflight {
         package: PathBuf,
     },
@@ -63,6 +108,9 @@ enum Options {
         trusted_public_key: String,
     },
     Status {
+        root: PathBuf,
+    },
+    RuntimeCheck {
         root: PathBuf,
     },
     Adopt {
@@ -142,6 +190,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             revision,
             declaration,
         } => build_rime_public_package(&source, &output, &revision, &declaration)?,
+        Options::BuildRimeSlice {
+            source,
+            output,
+            revision,
+            declaration,
+            config,
+        } => build_rime_slice_public_package(&source, &output, &revision, &declaration, config)?,
+        Options::Compare {
+            base_payload,
+            challenger_payload,
+        } => compare_payloads(&base_payload, &challenger_payload)?,
+        Options::LayerAudit {
+            core_payload,
+            supplemental_payload,
+            frontier_limit,
+            exact_promotions,
+        } => audit_candidate_layers(
+            &core_payload,
+            &supplemental_payload,
+            frontier_limit,
+            exact_promotions,
+        )?,
+        Options::LayerBenchmark {
+            core_payload,
+            supplemental_payload,
+            repetitions,
+            exact_promotions,
+        } => benchmark_candidate_layers(
+            &core_payload,
+            &supplemental_payload,
+            repetitions,
+            exact_promotions,
+        )?,
+        Options::SupplementStatus { root } => supplement_status(&root)?,
+        Options::SupplementEnable {
+            root,
+            exact_promotions,
+        } => supplement_enable(&root, exact_promotions)?,
+        Options::SupplementDisable { root } => supplement_disable(&root)?,
         Options::Preflight { package } => preflight(&package)?,
         Options::Verify {
             package,
@@ -153,6 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             trusted_public_key,
         } => verify_signature(&package, &signature, &trusted_public_key)?,
         Options::Status { root } => status(&root)?,
+        Options::RuntimeCheck { root } => runtime_check(&root)?,
         Options::Adopt {
             root,
             package,
@@ -198,6 +286,17 @@ fn parse_options(
         "inspect" => parse_inspect(arguments),
         "build" => parse_build(arguments, false),
         "build-rime" => parse_build(arguments, true),
+        "build-rime-slice" => parse_build_rime_slice(arguments),
+        "compare" => parse_compare(arguments),
+        "layer-audit" => parse_layer_audit(arguments),
+        "layer-benchmark" => parse_layer_benchmark(arguments),
+        "supplement-status" => Ok(Options::SupplementStatus {
+            root: parse_root_only(arguments, "supplement-status")?,
+        }),
+        "supplement-enable" => parse_supplement_enable(arguments),
+        "supplement-disable" => Ok(Options::SupplementDisable {
+            root: parse_root_only(arguments, "supplement-disable")?,
+        }),
         "preflight" => Ok(Options::Preflight {
             package: parse_package_only(arguments, "preflight")?,
         }),
@@ -212,6 +311,9 @@ fn parse_options(
         "verify-signature" => parse_verify_signature(arguments),
         "status" => Ok(Options::Status {
             root: parse_root_only(arguments, "status")?,
+        }),
+        "runtime-check" => Ok(Options::RuntimeCheck {
+            root: parse_root_only(arguments, "runtime-check")?,
         }),
         "adopt" => {
             let (root, package, expected_sha256) =
@@ -347,6 +449,202 @@ fn parse_build(
             revision,
             declaration,
         }
+    })
+}
+
+fn parse_build_rime_slice(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut output = None;
+    let mut revision = None;
+    let mut source_id = None;
+    let mut source_license = None;
+    let mut source_url = None;
+    let mut source_sha256 = None;
+    let mut max_entries = None;
+    let mut max_text_characters = None;
+    let mut public = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--output" => set_path(&mut output, &mut arguments, "--output")?,
+            "--revision" => set_value(&mut revision, &mut arguments, "--revision")?,
+            "--source-id" => set_value(&mut source_id, &mut arguments, "--source-id")?,
+            "--source-license" => {
+                set_value(&mut source_license, &mut arguments, "--source-license")?
+            }
+            "--source-url" => set_value(&mut source_url, &mut arguments, "--source-url")?,
+            "--source-sha256" => set_value(&mut source_sha256, &mut arguments, "--source-sha256")?,
+            "--max-entries" => set_usize(&mut max_entries, &mut arguments, "--max-entries")?,
+            "--max-text-characters" => set_usize(
+                &mut max_text_characters,
+                &mut arguments,
+                "--max-text-characters",
+            )?,
+            "--public" => {
+                if public {
+                    return Err("--public can be given only once".into());
+                }
+                public = true;
+            }
+            _ => return Err("unknown build-rime-slice argument; value was suppressed".into()),
+        }
+    }
+    if !public {
+        return Err("build-rime-slice requires explicit --public".into());
+    }
+    let config = PublicRimeSliceConfig {
+        max_entries: max_entries.ok_or("build-rime-slice requires --max-entries")?,
+        max_text_characters: max_text_characters
+            .ok_or("build-rime-slice requires --max-text-characters")?,
+    };
+    if config.max_entries == 0 || config.max_entries > MAX_PUBLIC_RIME_SLICE_ENTRIES {
+        return Err("build-rime-slice --max-entries is outside the fixed bound".into());
+    }
+    if config.max_text_characters == 0
+        || config.max_text_characters > MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS
+    {
+        return Err("build-rime-slice --max-text-characters is outside the fixed bound".into());
+    }
+    Ok(Options::BuildRimeSlice {
+        source: source.ok_or("build-rime-slice requires --source")?,
+        output: output.ok_or("build-rime-slice requires --output")?,
+        revision: revision.ok_or("build-rime-slice requires --revision")?,
+        declaration: PublicSourceDeclaration {
+            id: source_id.ok_or("build-rime-slice requires --source-id")?,
+            license: source_license.ok_or("build-rime-slice requires --source-license")?,
+            url: source_url.ok_or("build-rime-slice requires --source-url")?,
+            sha256: source_sha256.ok_or("build-rime-slice requires --source-sha256")?,
+        },
+        config,
+    })
+}
+
+fn parse_compare(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut base_payload = None;
+    let mut challenger_payload = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--challenger-payload" => set_path(
+                &mut challenger_payload,
+                &mut arguments,
+                "--challenger-payload",
+            )?,
+            _ => return Err("unknown compare argument; value was suppressed".into()),
+        }
+    }
+    Ok(Options::Compare {
+        base_payload: base_payload.ok_or("compare requires --base-payload")?,
+        challenger_payload: challenger_payload.ok_or("compare requires --challenger-payload")?,
+    })
+}
+
+fn parse_layer_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut frontier_limit = None;
+    let mut exact_promotions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            _ => return Err("unknown layer-audit argument; value was suppressed".into()),
+        }
+    }
+    let frontier_limit = frontier_limit.ok_or("layer-audit requires --frontier-limit")?;
+    let exact_promotions = exact_promotions.ok_or("layer-audit requires --exact-promotions")?;
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err("layer-audit --frontier-limit is outside the fixed bound".into());
+    }
+    if exact_promotions > MAX_CANDIDATE_SNAPSHOT_RANK {
+        return Err("layer-audit --exact-promotions is outside the fixed bound".into());
+    }
+    Ok(Options::LayerAudit {
+        core_payload: core_payload.ok_or("layer-audit requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("layer-audit requires --supplemental-payload")?,
+        frontier_limit,
+        exact_promotions,
+    })
+}
+
+fn parse_layer_benchmark(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut repetitions = None;
+    let mut exact_promotions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            _ => return Err("unknown layer-benchmark argument; value was suppressed".into()),
+        }
+    }
+    let repetitions = repetitions.ok_or("layer-benchmark requires --repetitions")?;
+    let exact_promotions = exact_promotions.ok_or("layer-benchmark requires --exact-promotions")?;
+    if !(1..=100).contains(&repetitions) {
+        return Err("layer-benchmark --repetitions is outside the fixed bound".into());
+    }
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&exact_promotions) {
+        return Err("layer-benchmark --exact-promotions is outside the fixed bound".into());
+    }
+    Ok(Options::LayerBenchmark {
+        core_payload: core_payload.ok_or("layer-benchmark requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("layer-benchmark requires --supplemental-payload")?,
+        repetitions,
+        exact_promotions,
+    })
+}
+
+fn parse_supplement_enable(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut root = None;
+    let mut exact_promotions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            _ => return Err("unknown supplement-enable argument; value was suppressed".into()),
+        }
+    }
+    let exact_promotions =
+        exact_promotions.ok_or("supplement-enable requires --exact-promotions")?;
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&exact_promotions) {
+        return Err("supplement-enable --exact-promotions is outside the fixed bound".into());
+    }
+    Ok(Options::SupplementEnable {
+        root: root.ok_or("supplement-enable requires --root")?,
+        exact_promotions,
     })
 }
 
@@ -520,6 +818,25 @@ fn set_value(
     Ok(())
 }
 
+fn set_usize(
+    slot: &mut Option<usize>,
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if slot.is_some() {
+        return Err(format!("{option} can be given only once").into());
+    }
+    let value = arguments
+        .next()
+        .ok_or_else(|| format!("{option} requires a value"))?;
+    *slot = Some(
+        value
+            .parse::<usize>()
+            .map_err(|_| format!("{option} requires a positive integer"))?,
+    );
+    Ok(())
+}
+
 fn canonical_expected_sha256(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     canonical_lowercase_hex(
         value,
@@ -572,12 +889,26 @@ fn print_usage() {
     eprintln!(
         "  build-rime --source <RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
+    eprintln!(
+        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..100000> --max-text-characters <1..12> --public"
+    );
+    eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
+    eprintln!(
+        "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
+    );
+    eprintln!(
+        "  layer-benchmark --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --repetitions <1..100> --exact-promotions <1..50>"
+    );
+    eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
+    eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
+    eprintln!("  supplement-disable --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!("  verify --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
         "  verify-signature --package <PACKAGE_DIR> --signature <STATEMENT> --trusted-public-key <ED25519_HEX>"
     );
     eprintln!("  status --root <SLOT_DIR>");
+    eprintln!("  runtime-check --root <SLOT_DIR>");
     eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
         "  adopt-signed|stage-signed --root <SLOT_DIR> --package <PACKAGE_DIR> --signature <STATEMENT> --trusted-public-key <ED25519_HEX>"
@@ -643,7 +974,12 @@ fn build_rime_public_package(
     if candidate_sha256_hex(source_text.as_bytes()) != declaration.sha256 {
         return Err("public Rime source SHA-256 does not match the explicit pin".into());
     }
-    let imported = parse_rime_lexicon(&source_text)?;
+    let imported = if uses_pinned_simplified_rime_import(declaration) {
+        parse_simplified_rime_lexicon(&source_text)?
+    } else {
+        parse_rime_lexicon(&source_text)?
+    };
+    let stats = imported.stats;
     let mut payload = String::from("text\tpinyin\tfrequency\n");
     for entry in imported.entries {
         writeln!(
@@ -652,7 +988,333 @@ fn build_rime_public_package(
             entry.text, entry.pinyin, entry.frequency
         )?;
     }
-    write_public_package(output, revision, declaration, &payload)
+    let mut report = write_public_package(output, revision, declaration, &payload)?;
+    if stats.shadowed_traditional_single_character_rows > 0 {
+        writeln!(
+            report,
+            "简体清理：省略 {} 条被同音高频简体字遮蔽的繁体单字读音",
+            stats.shadowed_traditional_single_character_rows
+        )?;
+    }
+    Ok(report)
+}
+
+fn uses_pinned_simplified_rime_import(declaration: &PublicSourceDeclaration) -> bool {
+    declaration.id == "rime-pinyin-simp" && declaration.sha256 == PINNED_RIME_PINYIN_SIMP_SHA256
+}
+
+fn build_rime_slice_public_package(
+    source: &Path,
+    output: &Path,
+    revision: &str,
+    declaration: &PublicSourceDeclaration,
+    config: PublicRimeSliceConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        source,
+        "large public Rime lexicon source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    if candidate_sha256_hex(source_text.as_bytes()) != declaration.sha256 {
+        return Err("large public Rime source SHA-256 does not match the explicit pin".into());
+    }
+    let imported = parse_public_rime_slice(&source_text, config)?;
+    let mut payload = String::from("text\tpinyin\tfrequency\n");
+    for entry in imported.entries {
+        writeln!(
+            payload,
+            "{}\t{}\t{}",
+            entry.text, entry.pinyin, entry.frequency
+        )?;
+    }
+    let mut report = write_public_package(output, revision, declaration, &payload)?;
+    write_slice_stats(&mut report, imported.stats);
+    Ok(report)
+}
+
+fn compare_payloads(
+    base_payload: &Path,
+    challenger_payload: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base_text = read_explicit_text(
+        base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let challenger_text = read_explicit_text(
+        challenger_payload,
+        "challenger public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let base = parse_lexicon_tsv(&base_text)?;
+    let challenger = parse_lexicon_tsv(&challenger_text)?;
+    let report = compare_public_lexicons(&base, &challenger);
+    Ok(format!(
+        "公开词表对照\n基线词条：{}\n对照词条：{}\n共同词形：{}\n仅基线词形：{}\n仅对照词形：{}\n共同文字与规范码：{}\n共同规范码：{}\n同码首选相同：{}\n同码首选不同：{}\n本次操作：只读\n",
+        report.base_entries,
+        report.challenger_entries,
+        report.shared_surface_texts,
+        report.base_only_surface_texts,
+        report.challenger_only_surface_texts,
+        report.shared_text_code_identities,
+        report.shared_codes,
+        report.same_top_text_codes,
+        report.changed_top_text_codes,
+    ))
+}
+
+fn audit_candidate_layers(
+    core_payload: &Path,
+    supplemental_payload: &Path,
+    frontier_limit: usize,
+    exact_promotions: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        supplemental_payload,
+        "supplemental public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let core = parse_lexicon_tsv(&core_text)?;
+    let supplemental = parse_lexicon_tsv(&supplemental_text)?;
+    let report = audit_public_supplemental_layer(
+        &core,
+        &supplemental,
+        frontier_limit,
+        SupplementalCandidateLayerConfig { exact_promotions },
+    )?;
+    if report.core_top_one_changed_codes != 0 {
+        return Err("supplemental layer changed a core exact Top-1".into());
+    }
+    let admitted_percent = if report.available_new_exact_candidates == 0 {
+        0.0
+    } else {
+        report.admitted_new_exact_candidates as f64 * 100.0
+            / report.available_new_exact_candidates as f64
+    };
+    Ok(format!(
+        "公开补充词层审计\n候选范围：前 {frontier_limit}；每码最多补 {exact_promotions} 个完整词\n补充规范码：{}（与核心共有 {}，仅补充层有 {}）\n新增完整词：可用 {}，进入候选范围 {}（{admitted_percent:.2}%）\n受益规范码：{}（已有核心词 {}，核心缺词 {}）\n核心完整码首选：保留 {}，变化 {}\n核心缺词码升为首选：{}\n单码最多实际补入：{}\n跨来源原始权重：未比较\n本次操作：只读\n",
+        report.supplemental_codes,
+        report.shared_exact_codes,
+        report.supplemental_only_codes,
+        report.available_new_exact_candidates,
+        report.admitted_new_exact_candidates,
+        report.codes_receiving_new_exact_candidates,
+        report.shared_codes_receiving_new_exact_candidates,
+        report.supplemental_only_codes_receiving_new_exact_candidates,
+        report.core_top_one_preserved_codes,
+        report.core_top_one_changed_codes,
+        report.supplemental_only_codes_promoted_to_top_one,
+        report.maximum_admitted_new_exact_candidates_per_code,
+    ))
+}
+
+fn benchmark_candidate_layers(
+    core_payload: &Path,
+    supplemental_payload: &Path,
+    repetitions: usize,
+    exact_promotions: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("layer-benchmark must run from a release build".into());
+    }
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        supplemental_payload,
+        "supplemental public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let core_started = Instant::now();
+    let core = benchmark_snapshot("layer-benchmark-core-v1", &core_text)?;
+    let core_build = core_started.elapsed();
+    let supplemental_started = Instant::now();
+    let supplemental = benchmark_snapshot("layer-benchmark-supplemental-v1", &supplemental_text)?;
+    let supplemental_build = supplemental_started.elapsed();
+    let config = SupplementalCandidateLayerConfig { exact_promotions };
+    let codes = layer_benchmark_codes()?;
+
+    for code in &codes {
+        black_box(core.candidate_texts(black_box(code), 6)?);
+        black_box(layered_candidate_texts(
+            &core,
+            &supplemental,
+            black_box(code),
+            6,
+            config,
+        )?);
+    }
+
+    let mut core_durations = Vec::with_capacity(repetitions * codes.len());
+    let mut layered_durations = Vec::with_capacity(repetitions * codes.len());
+    let mut checksum = 0usize;
+    for _ in 0..repetitions {
+        for code in &codes {
+            let started = Instant::now();
+            let candidates = core.candidate_texts(black_box(code), 6)?;
+            core_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+
+            let started = Instant::now();
+            let candidates =
+                layered_candidate_texts(&core, &supplemental, black_box(code), 6, config)?;
+            layered_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+        }
+    }
+
+    let mut core_top_changes = 0;
+    let mut query_order_changes = 0;
+    for code in &codes {
+        let core_candidates = core.candidate_texts(code, 6)?;
+        let layered = layered_candidate_texts(&core, &supplemental, code, 6, config)?;
+        if core_candidates != layered {
+            query_order_changes += 1;
+        }
+        if let Some(core_top) = core.exact_full_code_texts(code, 1)?.first()
+            && layered.first() != Some(core_top)
+        {
+            core_top_changes += 1;
+        }
+    }
+    if core_top_changes != 0 {
+        return Err("layer benchmark observed a changed core exact Top-1".into());
+    }
+    let core_latency = summarize_durations(&mut core_durations)
+        .ok_or("layer benchmark produced no core samples")?;
+    let layered_latency = summarize_durations(&mut layered_durations)
+        .ok_or("layer benchmark produced no layered samples")?;
+    let median_delta_ms = layered_latency.median.as_secs_f64() * 1_000.0
+        - core_latency.median.as_secs_f64() * 1_000.0;
+    Ok(format!(
+        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
+        codes.len(),
+        core_latency.samples,
+        duration_ms(core_build),
+        duration_ms(supplemental_build),
+        duration_ms(core_latency.median),
+        duration_ms(core_latency.p95),
+        duration_ms(core_latency.maximum),
+        duration_ms(layered_latency.median),
+        duration_ms(layered_latency.p95),
+        duration_ms(layered_latency.maximum),
+    ))
+}
+
+fn benchmark_snapshot(
+    revision: &str,
+    payload: &str,
+) -> Result<CandidateSnapshot, Box<dyn std::error::Error>> {
+    let expected_entry_count = parse_lexicon_tsv(payload)?.len();
+    Ok(CandidateSnapshot::load(CandidateSnapshotDescriptor {
+        schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+        revision,
+        contains_private_text: false,
+        lexicon_tsv: payload,
+        expected_payload_bytes: payload.len(),
+        expected_payload_fingerprint: candidate_payload_fingerprint(payload.as_bytes()),
+        expected_entry_count,
+    })?)
+}
+
+fn layer_benchmark_codes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut codes = Vec::new();
+    for phrase in [
+        "shen me",
+        "sheng mu",
+        "yun mu",
+        "du shu yu",
+        "you qi shi",
+        "sheng lue hao",
+        "yi da chuan",
+        "zhi jiao ju xing",
+        "ou mu",
+        "wai quan",
+        "jian ru",
+        "guang min xing",
+    ] {
+        let encoded = encode_pinyin_phrase(phrase)?;
+        let boundary = encoded.syllable_codes.len().div_ceil(2);
+        let prefix = encoded
+            .syllable_codes
+            .iter()
+            .take(boundary)
+            .map(|code| code.as_str())
+            .collect::<String>();
+        for code in [prefix, encoded.full_code.as_str().to_owned()] {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+    }
+    Ok(codes)
+}
+
+#[derive(Clone, Copy)]
+struct DurationSummary {
+    samples: usize,
+    median: Duration,
+    p95: Duration,
+    maximum: Duration,
+}
+
+fn summarize_durations(samples: &mut [Duration]) -> Option<DurationSummary> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let p95_index = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+    Some(DurationSummary {
+        samples: samples.len(),
+        median: samples[samples.len() / 2],
+        p95: samples[p95_index],
+        maximum: *samples.last()?,
+    })
+}
+
+fn update_candidate_text_checksum(mut checksum: usize, candidates: &[String]) -> usize {
+    for candidate in candidates {
+        checksum = checksum.wrapping_mul(31).wrapping_add(candidate.len());
+    }
+    checksum
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn write_slice_stats(output: &mut String, stats: PublicRimeSliceImportStats) {
+    writeln!(output, "源数据：{} 行", stats.source_rows).unwrap();
+    writeln!(
+        output,
+        "跳过：字段 {}，权重格式 {}，非正权重 {}，文字范围 {}，拼音 {}，字音不齐 {}，音节过长 {}",
+        stats.malformed_rows,
+        stats.invalid_weight_rows,
+        stats.nonpositive_weight_rows,
+        stats.text_shape_rows,
+        stats.unsupported_pinyin_rows,
+        stats.text_syllable_mismatch_rows,
+        stats.too_many_syllable_rows,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "裁剪：合格 {}，上限外 {}，所选重复 {}，最低保留权重 {}",
+        stats.eligible_rows,
+        stats.dropped_by_entry_cap,
+        stats.selected_duplicate_rows,
+        stats.minimum_selected_frequency,
+    )
+    .unwrap();
 }
 
 fn write_public_package(
@@ -704,6 +1366,69 @@ fn write_public_package(
 fn status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let state = read_slot_state(root)?;
     render_slot_report(root, &state)
+}
+
+fn runtime_check(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let snapshot =
+        load_current_candidate_snapshot(root)?.ok_or("candidate runtime root is not configured")?;
+    Ok(format!(
+        "候选运行时检查\n版本：{}\n词条：{}\n结果：通过\n本次操作：只读\n",
+        snapshot.revision(),
+        snapshot.entry_count()
+    ))
+}
+
+fn supplement_status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let slots = read_slot_state(root)?;
+    let state = read_supplemental_state(root)?;
+    let prepared_revision = slot_revision(root, slots.current())?;
+    let status = match state.package() {
+        None => format!(
+            "公开补充词层\n状态：关闭\n已准备：{}\n本次操作：只读\n",
+            prepared_revision.as_deref().unwrap_or("未配置")
+        ),
+        Some(package) if Some(package) != slots.current() => format!(
+            "公开补充词层\n状态：已回退，仅使用核心候选\n已准备：{}\n原因：当前包尚未重新确认\n本次操作：只读\n",
+            prepared_revision.as_deref().unwrap_or("未配置")
+        ),
+        Some(package) => {
+            let loaded = load_installed_package(root, package)?;
+            validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+            format!(
+                "公开补充词层\n状态：启用\n版本：{}\n每码最多补：{} 个完整词\n核心完整码首选：保持\n本次操作：只读\n",
+                loaded.snapshot.revision(),
+                state.exact_promotions(),
+            )
+        }
+    };
+    Ok(status)
+}
+
+fn supplement_enable(
+    root: &Path,
+    exact_promotions: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let slots = read_slot_state(root)?;
+    let package = slots
+        .current()
+        .ok_or("supplemental candidate package is not configured")?;
+    let loaded = load_installed_package(root, package)?;
+    validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+    let state = CandidateSupplementalState::enabled(package, exact_promotions)?;
+    write_supplemental_state(root, &state)?;
+    Ok(format!(
+        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n核心完整码首选：保持\n生效：新打开的输入法宿主\n",
+        loaded.snapshot.revision(),
+    ))
+}
+
+fn supplement_disable(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let state = read_supplemental_state(root)?;
+    if !state.is_enabled() {
+        return Ok("公开补充词层已经关闭\n写入：0 个文件\n现有输入法宿主：未改动\n".to_owned());
+    }
+    write_supplemental_state(root, &CandidateSupplementalState::default())?;
+    Ok("公开补充词层已关闭\n候选包：保留，可再次启用\n生效：新打开的输入法宿主\n".to_owned())
 }
 
 fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -1242,6 +1967,33 @@ fn read_slot_state(root: &Path) -> Result<CandidateSlotState, Box<dyn std::error
     }
 }
 
+fn read_supplemental_state(
+    root: &Path,
+) -> Result<CandidateSupplementalState, Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => ensure_regular_directory(root, "supplemental candidate slot root")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateSupplementalState::default());
+        }
+        Err(_) => return Err("cannot inspect supplemental candidate slot root".into()),
+    }
+    let path = root.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let contents = read_explicit_text(
+                &path,
+                "supplemental candidate state",
+                MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
+            )?;
+            Ok(CandidateSupplementalState::parse(&contents)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CandidateSupplementalState::default())
+        }
+        Err(_) => Err("cannot inspect supplemental candidate state".into()),
+    }
+}
+
 fn write_slot_state(
     root: &Path,
     state: &CandidateSlotState,
@@ -1253,6 +2005,23 @@ fn write_slot_state(
     let temporary = root.join(format!(".slots-{}-{stamp}.tmp", std::process::id()));
     write_new_synced(&temporary, body.as_bytes())?;
     let result = move_replace(&temporary, &root.join(CANDIDATE_SLOT_STATE_FILE));
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_supplemental_state(
+    root: &Path,
+    state: &CandidateSupplementalState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    prepare_slot_root(root)?;
+    let body = state.render();
+    CandidateSupplementalState::parse(&body)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temporary = root.join(format!(".supplemental-{}-{stamp}.tmp", std::process::id()));
+    write_new_synced(&temporary, body.as_bytes())?;
+    let result = move_replace(&temporary, &root.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE));
     if result.is_err() && temporary.exists() {
         let _ = fs::remove_file(&temporary);
     }
@@ -1485,6 +2254,171 @@ mod tests {
             .unwrap(),
             Options::BuildRime { .. }
         ));
+        assert!(matches!(
+            parse_options([
+                "build-rime-slice".to_owned(),
+                "--revision".to_owned(),
+                "wanxiang-slice-v1".to_owned(),
+                "--public".to_owned(),
+                "--source".to_owned(),
+                "jichu.dict.yaml".to_owned(),
+                "--output".to_owned(),
+                "package".to_owned(),
+                "--source-id".to_owned(),
+                "wanxiang-jichu".to_owned(),
+                "--source-license".to_owned(),
+                "CC-BY-4.0".to_owned(),
+                "--source-url".to_owned(),
+                "https://github.com/amzxyz/rime_wanxiang".to_owned(),
+                "--source-sha256".to_owned(),
+                "b".repeat(64),
+                "--max-entries".to_owned(),
+                "100000".to_owned(),
+                "--max-text-characters".to_owned(),
+                "8".to_owned(),
+            ])
+            .unwrap(),
+            Options::BuildRimeSlice {
+                config: PublicRimeSliceConfig {
+                    max_entries: 100_000,
+                    max_text_characters: 8,
+                },
+                ..
+            }
+        ));
+        assert!(
+            parse_options([
+                "build-rime-slice".to_owned(),
+                "--public".to_owned(),
+                "--max-entries".to_owned(),
+                "100001".to_owned(),
+                "--max-text-characters".to_owned(),
+                "8".to_owned(),
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            parse_options([
+                "compare".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+                "--challenger-payload".to_owned(),
+                "challenger.tsv".to_owned(),
+            ])
+            .unwrap(),
+            Options::Compare {
+                base_payload: PathBuf::from("base.tsv"),
+                challenger_payload: PathBuf::from("challenger.tsv"),
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "layer-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--frontier-limit".to_owned(),
+                "6".to_owned(),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+            ])
+            .unwrap(),
+            Options::LayerAudit {
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                frontier_limit: 6,
+                exact_promotions: 2,
+            }
+        );
+        assert!(
+            parse_options([
+                "layer-audit".to_owned(),
+                "--frontier-limit".to_owned(),
+                "51".to_owned(),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            parse_options([
+                "layer-benchmark".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--repetitions".to_owned(),
+                "3".to_owned(),
+                "--exact-promotions".to_owned(),
+                "1".to_owned(),
+            ])
+            .unwrap(),
+            Options::LayerBenchmark {
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                repetitions: 3,
+                exact_promotions: 1,
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "supplement-enable".to_owned(),
+                "--root".to_owned(),
+                "supplement".to_owned(),
+                "--exact-promotions".to_owned(),
+                "1".to_owned(),
+            ])
+            .unwrap(),
+            Options::SupplementEnable {
+                root: PathBuf::from("supplement"),
+                exact_promotions: 1,
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "supplement-disable".to_owned(),
+                "--root".to_owned(),
+                "supplement".to_owned(),
+            ])
+            .unwrap(),
+            Options::SupplementDisable {
+                root: PathBuf::from("supplement"),
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "supplement-status".to_owned(),
+                "--root".to_owned(),
+                "supplement".to_owned(),
+            ])
+            .unwrap(),
+            Options::SupplementStatus {
+                root: PathBuf::from("supplement"),
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "runtime-check".to_owned(),
+                "--root".to_owned(),
+                "slots".to_owned(),
+            ])
+            .unwrap(),
+            Options::RuntimeCheck {
+                root: PathBuf::from("slots"),
+            }
+        );
+        assert!(parse_options(["runtime-check".to_owned()]).is_err());
+        assert!(
+            parse_options([
+                "supplement-enable".to_owned(),
+                "--root".to_owned(),
+                "supplement".to_owned(),
+                "--exact-promotions".to_owned(),
+                "0".to_owned(),
+            ])
+            .is_err()
+        );
         assert_eq!(
             parse_options([
                 "inspect".to_owned(),
@@ -1665,6 +2599,116 @@ mod tests {
     }
 
     #[test]
+    fn only_the_exact_pinned_simplified_rime_source_enables_the_audit_filter() {
+        let pinned = PublicSourceDeclaration {
+            id: "rime-pinyin-simp".to_owned(),
+            license: "Apache-2.0".to_owned(),
+            url: "https://github.com/rime/rime-pinyin-simp".to_owned(),
+            sha256: PINNED_RIME_PINYIN_SIMP_SHA256.to_owned(),
+        };
+        assert!(uses_pinned_simplified_rime_import(&pinned));
+
+        let mut other_revision = pinned.clone();
+        other_revision.sha256 = candidate_sha256_hex(RIME_LEXICON.as_bytes());
+        assert!(!uses_pinned_simplified_rime_import(&other_revision));
+
+        let mut other_source = pinned;
+        other_source.id = "another-rime-source".to_owned();
+        assert!(!uses_pinned_simplified_rime_import(&other_source));
+    }
+
+    #[test]
+    fn toned_rime_slice_build_is_bounded_pinned_and_auditable() {
+        const TONED_RIME: &str = "---\nname: public\n...\n\
+什么\tshén me\t50\n\
+声母\tshēng mǔ\t40\n\
+缺权重\tquē quán zhòng\n\
+测试\tcè shì\t30\n";
+        let root = temporary_test_root();
+        let source = root.join("toned.dict.yaml");
+        let package = root.join("package");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, TONED_RIME).unwrap();
+        let declaration = PublicSourceDeclaration {
+            id: "public-toned-synthetic".to_owned(),
+            license: "CC-BY-4.0".to_owned(),
+            url: "https://example.com/public-toned".to_owned(),
+            sha256: candidate_sha256_hex(TONED_RIME.as_bytes()),
+        };
+
+        let report = build_rime_slice_public_package(
+            &source,
+            &package,
+            "toned-slice-v1",
+            &declaration,
+            PublicRimeSliceConfig {
+                max_entries: 2,
+                max_text_characters: 4,
+            },
+        )
+        .unwrap();
+        let loaded = load_public_package_directory(&package).unwrap();
+        assert_eq!(loaded.snapshot.entry_count(), 2);
+        assert!(loaded.payload_text.contains("什么\tshen me\t50\n"));
+        assert!(loaded.payload_text.contains("声母\tsheng mu\t40\n"));
+        assert!(!loaded.payload_text.contains("测试"));
+        assert!(report.contains("源数据：4 行"));
+        assert!(report.contains("字段 1"));
+        assert!(report.contains("上限外 1"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn payload_comparison_is_aggregate_only_and_read_only() {
+        let root = temporary_test_root();
+        let base = root.join("base.tsv");
+        let challenger = root.join("challenger.tsv");
+        fs::create_dir(&root).unwrap();
+        fs::write(&base, "text\tpinyin\tfrequency\n甲\tjia\t10\n").unwrap();
+        fs::write(
+            &challenger,
+            "text\tpinyin\tfrequency\n甲\tjia\t5\n钾\tjia\t20\n",
+        )
+        .unwrap();
+
+        let report = compare_payloads(&base, &challenger).unwrap();
+        assert!(report.contains("共同词形：1"));
+        assert!(report.contains("同码首选不同：1"));
+        assert!(report.contains("本次操作：只读"));
+        assert!(!report.contains('甲'));
+        assert!(!report.contains('钾'));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn layer_audit_is_aggregate_only_bounded_and_read_only() {
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let supplemental = root.join("supplemental.tsv");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, "text\tpinyin\tfrequency\n核心甲\tjia jia jia\t10\n").unwrap();
+        fs::write(
+            &supplemental,
+            "text\tpinyin\tfrequency\n补充甲\tjia jia jia\t20\n独词\tdu ci\t10\n",
+        )
+        .unwrap();
+
+        let report = audit_candidate_layers(&core, &supplemental, 6, 2).unwrap();
+        assert!(report.contains("核心完整码首选：保留 1，变化 0"));
+        assert!(report.contains("核心缺词码升为首选：1"));
+        assert!(report.contains("单码最多实际补入：1"));
+        assert!(report.contains("跨来源原始权重：未比较"));
+        assert!(report.contains("本次操作：只读"));
+        assert!(!report.contains("核心甲"));
+        assert!(!report.contains("补充甲"));
+        assert!(!report.contains("独词"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn report_is_compact_and_never_echoes_candidate_text_or_fingerprint() {
         let manifest = CandidatePackageManifest::parse(MANIFEST).unwrap();
         let snapshot = manifest.load_snapshot(LEXICON).unwrap();
@@ -1721,6 +2765,8 @@ mod tests {
             "候选数据槽\n当前：未配置\n待切换：无\n可回退：无\n本次操作：只读\n"
         );
         assert!(!slots.exists());
+        assert!(runtime_check(&slots).is_err());
+        assert!(!slots.exists());
 
         let wrong_sha256 = "0".repeat(64);
         assert!(verify(&package_a, &wrong_sha256).is_err());
@@ -1730,6 +2776,10 @@ mod tests {
         assert!(verified.contains("结果：与可信 SHA-256 一致"));
         assert!(!verified.contains(&package_a_sha256));
         adopt(&slots, &package_a, &package_a_sha256).unwrap();
+        assert_eq!(
+            runtime_check(&slots).unwrap(),
+            "候选运行时检查\n版本：public-a\n词条：50\n结果：通过\n本次操作：只读\n"
+        );
         let adopted_state = read_slot_state(&slots).unwrap();
         let receipt = fs::read_to_string(preflight_receipt_path(
             &slots,
@@ -1759,6 +2809,80 @@ mod tests {
         assert_eq!(
             status(&slots).unwrap(),
             "候选数据槽\n当前：public-a\n待切换：无\n可回退：public-b\n本次操作：只读\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supplemental_activation_is_explicit_bounded_and_reversible() {
+        let root = temporary_test_root();
+        let source = root.join("source.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let slots = root.join("supplement");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, LEXICON).unwrap();
+        assert_eq!(
+            supplement_status(&slots).unwrap(),
+            "公开补充词层\n状态：关闭\n已准备：未配置\n本次操作：只读\n"
+        );
+
+        let declaration = test_declaration(LEXICON);
+        build_public_package(&source, &package_a, "supplement-a", &declaration).unwrap();
+        build_public_package(&source, &package_b, "supplement-b", &declaration).unwrap();
+        let package_a_sha256 = package_sha256(&package_a);
+        let package_b_sha256 = package_sha256(&package_b);
+        adopt(&slots, &package_a, &package_a_sha256).unwrap();
+        assert!(supplement_status(&slots).unwrap().contains("状态：关闭"));
+        assert!(
+            supplement_status(&slots)
+                .unwrap()
+                .contains("已准备：supplement-a")
+        );
+
+        let enabled = supplement_enable(&slots, 1).unwrap();
+        assert!(enabled.contains("版本：supplement-a"));
+        assert!(enabled.contains("每码最多补：1 个完整词"));
+        assert_eq!(
+            CandidateSupplementalState::parse(
+                &fs::read_to_string(slots.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE)).unwrap()
+            )
+            .unwrap()
+            .exact_promotions(),
+            1
+        );
+        let active = supplement_status(&slots).unwrap();
+        assert!(active.contains("状态：启用"));
+        assert!(active.contains("核心完整码首选：保持"));
+
+        stage(&slots, &package_b, &package_b_sha256).unwrap();
+        promote(&slots).unwrap();
+        let drifted = supplement_status(&slots).unwrap();
+        assert!(drifted.contains("状态：已回退，仅使用核心候选"));
+        assert!(drifted.contains("已准备：supplement-b"));
+        supplement_enable(&slots, 1).unwrap();
+        assert!(
+            supplement_status(&slots)
+                .unwrap()
+                .contains("版本：supplement-b")
+        );
+
+        let package_count = fs::read_dir(slots.join(CANDIDATE_PACKAGES_DIRECTORY))
+            .unwrap()
+            .count();
+        assert!(supplement_disable(&slots).unwrap().contains("候选包：保留"));
+        assert!(supplement_status(&slots).unwrap().contains("状态：关闭"));
+        assert_eq!(
+            fs::read_dir(slots.join(CANDIDATE_PACKAGES_DIRECTORY))
+                .unwrap()
+                .count(),
+            package_count
+        );
+        assert!(
+            supplement_disable(&slots)
+                .unwrap()
+                .contains("写入：0 个文件")
         );
 
         fs::remove_dir_all(root).unwrap();

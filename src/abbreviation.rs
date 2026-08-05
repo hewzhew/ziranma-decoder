@@ -274,7 +274,7 @@ impl Error for AbbreviationAuditError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::{parse_lexicon_tsv, parse_rime_lexicon};
+    use crate::{parse_lexicon_tsv, parse_simplified_rime_lexicon as parse_rime_lexicon};
 
     use super::audit_abbreviation_codebook;
 

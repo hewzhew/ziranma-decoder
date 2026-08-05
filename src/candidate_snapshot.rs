@@ -25,6 +25,86 @@ pub const MAX_CANDIDATE_SNAPSHOT_ENTRIES: usize = 131_072;
 pub const MAX_CANDIDATE_SNAPSHOT_RANK: usize = 50;
 const MAX_CANDIDATE_SNAPSHOT_REVISION_BYTES: usize = 64;
 const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
+const AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH: usize = 6;
+const FULL_CODE_CHARACTER_PAIR_DEPTH: usize = 24;
+const MAX_FULL_CODE_CHARACTER_PAIRS: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InteractiveCandidateSource {
+    CoreExact,
+    SupplementalExact,
+    CharacterPair,
+    Decoder,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InteractiveCandidateText {
+    pub(crate) text: String,
+    pub(crate) source: InteractiveCandidateSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InteractiveCandidateQuery {
+    pub(crate) candidates: Vec<InteractiveCandidateText>,
+    pub(crate) automatic_transposition_blocked: bool,
+}
+
+/// A conservative, host-independent decision about one likely reversed
+/// double-pinyin pair.
+///
+/// The decision is advisory: interactive hosts do not consume it unless they
+/// opt in separately. This keeps policy experiments out of the primary
+/// candidate path while making every acceptance and rejection observable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomaticTranspositionDecision {
+    /// Keep the ordinary candidate order unchanged.
+    KeepPrimary(AutomaticTranspositionKeepReason),
+    /// One unique within-syllable swap produced exact whole-word evidence.
+    PromoteExactFullCode(AutomaticTranspositionPromotion),
+}
+
+/// Structural reason why automatic transposition did not change the order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticTranspositionKeepReason {
+    /// Automatic recovery only handles bounded, even-length full-code shapes.
+    UnsupportedInputShape,
+    /// The observed keys already name at least one exact whole-word entry.
+    OriginalHasExactFullCode,
+    /// The ordinary first sentence already uses complete, uncorrected pairs.
+    OriginalFirstCandidateIsComplete,
+    /// No within-syllable swap produced an exact whole-word entry.
+    NoExactFullCodeRecovery,
+    /// More than one syllable position produced exact whole-word evidence.
+    AmbiguousSwapLocations,
+}
+
+/// Exact evidence admitted by the automatic transposition gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomaticTranspositionPromotion {
+    /// Zero-based double-pinyin syllable whose two keys were reversed.
+    pub syllable_index: usize,
+    /// Corrected complete double-pinyin code.
+    pub intended_code: String,
+    /// Exact whole-word candidates in their ordinary lexicon order.
+    pub candidates: Vec<String>,
+}
+
+/// Explicit influence bound for one independent supplemental public lexicon.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SupplementalCandidateLayerConfig {
+    /// Maximum unique supplemental exact words admitted beside core exact
+    /// words. A core exact Top-1, when present, always stays first; once a new
+    /// supplemental exact word is admitted, permissive sentence paths do not
+    /// fill the rest of that result.
+    pub exact_promotions: usize,
+}
+
+/// Invalid configuration for the pure supplemental candidate merge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupplementalCandidateLayerError {
+    /// The requested promotion count exceeds the snapshot rank boundary.
+    PromotionLimit,
+}
 
 /// Metadata and payload supplied explicitly to the snapshot validator.
 #[derive(Clone, Copy, Debug)]
@@ -180,12 +260,40 @@ impl CandidateSnapshot {
         self.interactive_candidate_texts(code, limit)
     }
 
+    /// Returns exact whole-word candidates for a complete double-pinyin code.
+    ///
+    /// Unlike [`Self::candidate_texts`], this view does not include sentence
+    /// segmentation, abbreviations, corrections, or unresolved fallbacks.
+    pub fn exact_full_code_texts(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KeySequenceError> {
+        let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        self.decoder
+            .decode_exact_full_code(code, limit)
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.text)
+                    .collect()
+            })
+    }
+
     fn interactive_candidate_texts(
         &self,
         code: &str,
         limit: usize,
     ) -> Result<Vec<String>, KeySequenceError> {
         self.decoder.interactive_candidate_texts(code, limit)
+    }
+
+    pub(crate) fn interactive_candidate_query(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<InteractiveCandidateQuery, KeySequenceError> {
+        self.decoder.interactive_candidate_query(code, limit)
     }
 
     /// Returns the explicitly requested adjacent-transposition recovery view.
@@ -250,6 +358,257 @@ impl CandidateSnapshot {
         recovered.truncate(limit);
         Ok(recovered.into_iter().map(|(_, _, text)| text).collect())
     }
+
+    /// Evaluates the conservative automatic within-syllable transposition
+    /// gate without changing the snapshot's ordinary candidate order.
+    pub fn automatic_transposition_decision(
+        &self,
+        code: &str,
+    ) -> Result<AutomaticTranspositionDecision, KeySequenceError> {
+        self.decoder.automatic_transposition_decision(code)
+    }
+
+    pub(crate) fn automatic_transposition_recovery_after_primary(
+        &self,
+        code: &str,
+        syllable_index: usize,
+        limit: usize,
+    ) -> Result<Option<AutomaticTranspositionPromotion>, KeySequenceError> {
+        self.decoder
+            .automatic_transposition_recovery_after_primary(code, syllable_index, limit)
+    }
+
+    pub(crate) fn automatic_transposition_span_recovery_after_primary(
+        &self,
+        code: &str,
+        first_syllable_index: usize,
+        syllable_count: usize,
+        limit: usize,
+    ) -> Result<Option<AutomaticTranspositionPromotion>, KeySequenceError> {
+        // The TSF caller supplies the just-completed pair identified by its
+        // local delivery interval, or two adjacent completed pairs whose
+        // intervals both remain available. Unlike the host-independent decision
+        // above, this causal probe must not let an unrelated earlier swappable
+        // pair erase evidence for the requested location.
+        self.decoder
+            .automatic_transposition_span_recovery_after_primary(
+                code,
+                first_syllable_index,
+                syllable_count,
+                limit,
+            )
+    }
+}
+
+/// Merges one core and one supplemental public snapshot without comparing
+/// their unrelated raw frequency scales.
+///
+/// Supplemental exact whole words can precede permissive core sentence paths,
+/// but they never displace an existing core exact Top-1. Once a new
+/// supplemental exact word is admitted, the visible result stays within the
+/// exact whole-word lanes and the bounded two-character full-code lane instead
+/// of filling unused ranks with permissive core abbreviation paths. With no
+/// admitted supplemental word, the core result is preserved unchanged.
+pub fn layered_candidate_texts(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    config: SupplementalCandidateLayerConfig,
+) -> Result<Vec<String>, LayeredCandidateTextsError> {
+    layered_candidate_texts_with_sources(core, supplemental, code, limit, config).map(
+        |candidates| {
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .collect()
+        },
+    )
+}
+
+pub(crate) fn layered_candidate_texts_with_sources(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    config: SupplementalCandidateLayerConfig,
+) -> Result<Vec<InteractiveCandidateText>, LayeredCandidateTextsError> {
+    layered_candidate_query_with_sources(core, supplemental, code, limit, config)
+        .map(|query| query.candidates)
+}
+
+pub(crate) fn layered_candidate_query_with_sources(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    config: SupplementalCandidateLayerConfig,
+) -> Result<InteractiveCandidateQuery, LayeredCandidateTextsError> {
+    if limit == 0 {
+        KeySequence::new(code)?;
+        validate_supplemental_config(config)?;
+        return Ok(InteractiveCandidateQuery {
+            candidates: Vec::new(),
+            automatic_transposition_blocked: false,
+        });
+    }
+    let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+    let core_exact = core.exact_full_code_texts(code, limit)?;
+    let supplemental_exact = supplemental.exact_full_code_texts(code, limit)?;
+    let core_query = core.interactive_candidate_query(code, limit)?;
+    let automatic_transposition_blocked =
+        core_query.automatic_transposition_blocked || !supplemental_exact.is_empty();
+    let core_primary = core_query.candidates;
+    let core_primary_texts = core_primary
+        .iter()
+        .map(|candidate| candidate.text.clone())
+        .collect::<Vec<_>>();
+    let mut merged = merge_candidate_text_layers(
+        &core_exact,
+        &supplemental_exact,
+        &core_primary_texts,
+        limit,
+        config,
+    )?;
+    let mut seen = merged.iter().cloned().collect::<HashSet<_>>();
+    for candidate in core_primary
+        .iter()
+        .filter(|candidate| candidate.source == InteractiveCandidateSource::CharacterPair)
+        .map(|candidate| &candidate.text)
+    {
+        if merged.len() == limit {
+            break;
+        }
+        push_unique(&mut merged, &mut seen, candidate, limit);
+    }
+    let core_exact = core_exact.into_iter().collect::<HashSet<_>>();
+    let supplemental_exact = supplemental_exact.into_iter().collect::<HashSet<_>>();
+    Ok(InteractiveCandidateQuery {
+        candidates: merged
+            .into_iter()
+            .map(|text| {
+                let source = if core_exact.contains(&text) {
+                    InteractiveCandidateSource::CoreExact
+                } else if supplemental_exact.contains(&text) {
+                    InteractiveCandidateSource::SupplementalExact
+                } else {
+                    core_primary
+                        .iter()
+                        .find(|candidate| candidate.text == text)
+                        .map(|candidate| candidate.source)
+                        .unwrap_or(InteractiveCandidateSource::Decoder)
+                };
+                InteractiveCandidateText { text, source }
+            })
+            .collect(),
+        automatic_transposition_blocked,
+    })
+}
+
+/// Deterministically merges already decoded candidate lanes.
+pub fn merge_candidate_text_layers(
+    core_exact: &[String],
+    supplemental_exact: &[String],
+    core_primary: &[String],
+    limit: usize,
+    config: SupplementalCandidateLayerConfig,
+) -> Result<Vec<String>, SupplementalCandidateLayerError> {
+    validate_supplemental_config(config)?;
+    let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut merged = Vec::with_capacity(limit);
+    let mut seen = HashSet::new();
+    let core_exact_texts = core_exact
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Some(core_top) = core_exact.first() {
+        push_unique(&mut merged, &mut seen, core_top, limit);
+    }
+    let mut promoted = 0;
+    for candidate in supplemental_exact {
+        if promoted == config.exact_promotions || merged.len() == limit {
+            break;
+        }
+        if core_exact_texts.contains(candidate.as_str()) {
+            continue;
+        }
+        if push_unique(&mut merged, &mut seen, candidate, limit) {
+            promoted += 1;
+        }
+    }
+    for candidate in core_exact {
+        if merged.len() == limit {
+            break;
+        }
+        push_unique(&mut merged, &mut seen, candidate, limit);
+    }
+    if promoted == 0 {
+        for candidate in core_primary {
+            if merged.len() == limit {
+                break;
+            }
+            push_unique(&mut merged, &mut seen, candidate, limit);
+        }
+    }
+    Ok(merged)
+}
+
+fn validate_supplemental_config(
+    config: SupplementalCandidateLayerConfig,
+) -> Result<(), SupplementalCandidateLayerError> {
+    if config.exact_promotions > MAX_CANDIDATE_SNAPSHOT_RANK {
+        Err(SupplementalCandidateLayerError::PromotionLimit)
+    } else {
+        Ok(())
+    }
+}
+
+fn push_unique(
+    output: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    candidate: &str,
+    limit: usize,
+) -> bool {
+    if output.len() == limit || !seen.insert(candidate.to_owned()) {
+        return false;
+    }
+    output.push(candidate.to_owned());
+    true
+}
+
+/// Errors from decoding or configuring a layered candidate query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LayeredCandidateTextsError {
+    /// The observed code was not lowercase ASCII.
+    KeySequence(KeySequenceError),
+    /// The explicit supplemental influence bound was invalid.
+    Config(SupplementalCandidateLayerError),
+}
+
+impl fmt::Display for LayeredCandidateTextsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KeySequence(error) => error.fmt(formatter),
+            Self::Config(_) => write!(formatter, "补充候选层的影响上限无效"),
+        }
+    }
+}
+
+impl Error for LayeredCandidateTextsError {}
+
+impl From<KeySequenceError> for LayeredCandidateTextsError {
+    fn from(error: KeySequenceError) -> Self {
+        Self::KeySequence(error)
+    }
+}
+
+impl From<SupplementalCandidateLayerError> for LayeredCandidateTextsError {
+    fn from(error: SupplementalCandidateLayerError) -> Self {
+        Self::Config(error)
+    }
 }
 
 impl Decoder {
@@ -260,11 +619,37 @@ impl Decoder {
         code: &str,
         limit: usize,
     ) -> Result<Vec<String>, KeySequenceError> {
+        self.interactive_candidate_texts_with_sources(code, limit)
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.text)
+                    .collect()
+            })
+    }
+
+    fn interactive_candidate_texts_with_sources(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<InteractiveCandidateText>, KeySequenceError> {
+        self.interactive_candidate_query(code, limit)
+            .map(|query| query.candidates)
+    }
+
+    fn interactive_candidate_query(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<InteractiveCandidateQuery, KeySequenceError> {
         let exact = self.decode_exact_full_code(code, limit)?;
+        let original_has_exact_full_code = !exact.is_empty();
         let sentence_limit = limit
             .saturating_add(exact.len())
             .min(MAX_CANDIDATE_SNAPSHOT_RANK);
         let candidates = self.decode_sentence(code, sentence_limit)?;
+        let original_first_candidate_is_complete =
+            candidates.first().is_some_and(sentence_is_complete);
         let canonical_code = canonicalize_umlaut_full_code(code);
         let canonical_candidates = match canonical_code.as_deref() {
             Some(canonical) => self.decode_sentence(canonical, sentence_limit)?,
@@ -274,7 +659,26 @@ impl Decoder {
         let mut seen = HashSet::new();
         for candidate in exact {
             if seen.insert(candidate.text.clone()) {
-                visible.push(candidate.text);
+                visible.push(InteractiveCandidateText {
+                    text: candidate.text,
+                    source: InteractiveCandidateSource::CoreExact,
+                });
+            }
+        }
+
+        // Exactly two complete syllables may also be an ad-hoc character
+        // combination that no word dictionary should be expected to contain.
+        // Keep this lane deliberately narrow so longer sentence composition
+        // remains governed by the ordinary decoder.
+        for candidate in self.full_code_character_pair_texts(code)? {
+            if visible.len() == limit {
+                break;
+            }
+            if seen.insert(candidate.clone()) {
+                visible.push(InteractiveCandidateText {
+                    text: candidate,
+                    source: InteractiveCandidateSource::CharacterPair,
+                });
             }
         }
 
@@ -286,7 +690,10 @@ impl Decoder {
                 break;
             }
             if sentence_is_complete(candidate) && seen.insert(candidate.text.clone()) {
-                visible.push(candidate.text.clone());
+                visible.push(InteractiveCandidateText {
+                    text: candidate.text.clone(),
+                    source: InteractiveCandidateSource::Decoder,
+                });
             }
         }
         for (index, candidate) in candidates.into_iter().enumerate() {
@@ -295,16 +702,234 @@ impl Decoder {
             }
             if candidate.unresolved_key_count == 0 {
                 if seen.insert(candidate.text.clone()) {
-                    visible.push(candidate.text);
+                    visible.push(InteractiveCandidateText {
+                        text: candidate.text,
+                        source: InteractiveCandidateSource::Decoder,
+                    });
                 }
             } else if index == 0 && visible.is_empty() {
-                visible.push(code.to_owned());
+                visible.push(InteractiveCandidateText {
+                    text: code.to_owned(),
+                    source: InteractiveCandidateSource::Decoder,
+                });
                 break;
             } else {
                 break;
             }
         }
+        Ok(InteractiveCandidateQuery {
+            candidates: visible,
+            automatic_transposition_blocked: original_has_exact_full_code
+                || original_first_candidate_is_complete,
+        })
+    }
+
+    fn full_code_character_pair_texts(&self, code: &str) -> Result<Vec<String>, KeySequenceError> {
+        let observed = KeySequence::new(code)?;
+        let code = observed.as_str();
+        if code.len() != 4 {
+            return Ok(Vec::new());
+        }
+
+        let left = self
+            .decode_exact_full_code(&code[..2], FULL_CODE_CHARACTER_PAIR_DEPTH)?
+            .into_iter()
+            .filter(|candidate| candidate.text.chars().count() == 1)
+            .collect::<Vec<_>>();
+        let right = self
+            .decode_exact_full_code(&code[2..], FULL_CODE_CHARACTER_PAIR_DEPTH)?
+            .into_iter()
+            .filter(|candidate| candidate.text.chars().count() == 1)
+            .collect::<Vec<_>>();
+
+        let mut combinations = Vec::with_capacity(left.len().saturating_mul(right.len()));
+        for (left_rank, left_candidate) in left.iter().enumerate() {
+            for (right_rank, right_candidate) in right.iter().enumerate() {
+                combinations.push((
+                    format!("{}{}", left_candidate.text, right_candidate.text),
+                    left_candidate.score.total + right_candidate.score.total,
+                    left_rank,
+                    right_rank,
+                ));
+            }
+        }
+        combinations.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut visible = Vec::with_capacity(MAX_FULL_CODE_CHARACTER_PAIRS);
+        let mut seen = HashSet::new();
+        for (text, _, _, _) in combinations {
+            if seen.insert(text.clone()) {
+                visible.push(text);
+                if visible.len() == MAX_FULL_CODE_CHARACTER_PAIRS {
+                    break;
+                }
+            }
+        }
         Ok(visible)
+    }
+
+    fn automatic_transposition_decision(
+        &self,
+        code: &str,
+    ) -> Result<AutomaticTranspositionDecision, KeySequenceError> {
+        let observed = KeySequence::new(code)?;
+        let code = observed.as_str();
+        if code.len() < 2
+            || code.len() > MAX_TRANSPOSITION_RECOVERY_KEYS
+            || !code.len().is_multiple_of(2)
+        {
+            return Ok(AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::UnsupportedInputShape,
+            ));
+        }
+
+        if !self.decode_exact_full_code(code, 1)?.is_empty() {
+            return Ok(AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::OriginalHasExactFullCode,
+            ));
+        }
+
+        if self
+            .decode_sentence(code, 1)?
+            .first()
+            .is_some_and(sentence_is_complete)
+        {
+            return Ok(AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::OriginalFirstCandidateIsComplete,
+            ));
+        }
+
+        let original = code.as_bytes();
+        let mut recovery = None;
+        for syllable_index in 0..original.len() / 2 {
+            let swap_start = syllable_index * 2;
+            if original[swap_start] == original[swap_start + 1] {
+                continue;
+            }
+            let mut swapped = original.to_vec();
+            swapped.swap(swap_start, swap_start + 1);
+            let intended_code = std::str::from_utf8(&swapped)
+                .expect("a validated lowercase ASCII key sequence remains UTF-8 after swapping");
+            let exact = self
+                .decode_exact_full_code(intended_code, AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH)?;
+            if exact.is_empty() {
+                continue;
+            }
+            if recovery.is_some() {
+                return Ok(AutomaticTranspositionDecision::KeepPrimary(
+                    AutomaticTranspositionKeepReason::AmbiguousSwapLocations,
+                ));
+            }
+            let mut seen = HashSet::new();
+            let candidates = exact
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .filter(|text| seen.insert(text.clone()))
+                .collect();
+            recovery = Some(AutomaticTranspositionPromotion {
+                syllable_index,
+                intended_code: intended_code.to_owned(),
+                candidates,
+            });
+        }
+
+        Ok(recovery.map_or_else(
+            || {
+                AutomaticTranspositionDecision::KeepPrimary(
+                    AutomaticTranspositionKeepReason::NoExactFullCodeRecovery,
+                )
+            },
+            AutomaticTranspositionDecision::PromoteExactFullCode,
+        ))
+    }
+
+    fn automatic_transposition_recovery_after_primary(
+        &self,
+        code: &str,
+        requested_syllable_index: usize,
+        limit: usize,
+    ) -> Result<Option<AutomaticTranspositionPromotion>, KeySequenceError> {
+        self.automatic_transposition_span_recovery_after_primary(
+            code,
+            requested_syllable_index,
+            1,
+            limit,
+        )
+    }
+
+    fn automatic_transposition_span_recovery_after_primary(
+        &self,
+        code: &str,
+        first_syllable_index: usize,
+        syllable_count: usize,
+        limit: usize,
+    ) -> Result<Option<AutomaticTranspositionPromotion>, KeySequenceError> {
+        let observed = KeySequence::new(code)?;
+        let code = observed.as_str();
+        if limit == 0
+            || code.len() < 2
+            || code.len() > MAX_TRANSPOSITION_RECOVERY_KEYS
+            || !code.len().is_multiple_of(2)
+            || !(1..=2).contains(&syllable_count)
+            || first_syllable_index
+                .checked_add(syllable_count)
+                .is_none_or(|end| end > code.len() / 2)
+            || (syllable_count == 2 && (code.len() != 4 || first_syllable_index != 0))
+        {
+            return Ok(None);
+        }
+
+        let original = code.as_bytes();
+        for syllable_index in first_syllable_index..first_syllable_index + syllable_count {
+            let swap_start = syllable_index * 2;
+            if original[swap_start] == original[swap_start + 1] {
+                return Ok(None);
+            }
+            if syllable_count == 2 {
+                let mut singly_swapped = original.to_vec();
+                singly_swapped.swap(swap_start, swap_start + 1);
+                let singly_swapped_code = std::str::from_utf8(&singly_swapped).expect(
+                    "a validated lowercase ASCII key sequence remains UTF-8 after swapping",
+                );
+                if !self
+                    .decode_exact_full_code(singly_swapped_code, 1)?
+                    .is_empty()
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let mut swapped = original.to_vec();
+        for syllable_index in first_syllable_index..first_syllable_index + syllable_count {
+            let swap_start = syllable_index * 2;
+            swapped.swap(swap_start, swap_start + 1);
+        }
+        let intended_code = std::str::from_utf8(&swapped)
+            .expect("a validated lowercase ASCII key sequence remains UTF-8 after swapping");
+        let exact = self.decode_exact_full_code(
+            intended_code,
+            limit.min(AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH),
+        )?;
+        if exact.is_empty() {
+            return Ok(None);
+        }
+        let mut seen = HashSet::new();
+        Ok(Some(AutomaticTranspositionPromotion {
+            syllable_index: first_syllable_index,
+            intended_code: intended_code.to_owned(),
+            candidates: exact
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .filter(|text| seen.insert(text.clone()))
+                .collect(),
+        }))
     }
 }
 
@@ -435,6 +1060,10 @@ pub(crate) fn valid_candidate_snapshot_revision(revision: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::hint::black_box;
+    use std::time::Instant;
+
     use super::*;
 
     const DEMO_LEXICON: &str = include_str!("../tests/fixtures/public/demo_lexicon.tsv");
@@ -588,8 +1217,338 @@ mod tests {
     }
 
     #[test]
+    fn pinned_public_interactive_lane_keeps_an_arbitrary_full_code_character_pair_visible() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        let visible = decoder.interactive_candidate_texts("vids", 6).unwrap();
+        assert_eq!(visible.first().map(String::as_str), Some("制动"));
+        assert!(
+            visible.iter().any(|candidate| candidate == "只动"),
+            "zero-error full-code character composition should stay visible without becoming a lexicon word: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_simplified_lane_does_not_compose_shadowed_traditional_single_characters() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        let candidates = decoder.interactive_candidate_texts("biruuo", 10).unwrap();
+        assert_eq!(candidates.first().map(String::as_str), Some("比如说"));
+        assert!(
+            !candidates.iter().any(|candidate| candidate == "比如說"),
+            "a shadowed traditional single character must not be composed into the simplified lane: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_public_pair_frontier_keeps_reported_exact_character_compositions_reachable() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        for (code, expected) in [("qthp", "雀魂"), ("jmpn", "简拼"), ("ujzi", "删字")] {
+            let query = decoder
+                .interactive_candidate_query(code, MAX_CANDIDATE_SNAPSHOT_RANK)
+                .unwrap();
+            let index = query
+                .candidates
+                .iter()
+                .position(|candidate| candidate.text == expected)
+                .unwrap_or_else(|| panic!("{expected} should remain reachable for {code}"));
+            assert!(matches!(
+                query.candidates[index].source,
+                InteractiveCandidateSource::CoreExact | InteractiveCandidateSource::CharacterPair
+            ));
+            assert!(
+                query.candidates[..index]
+                    .iter()
+                    .all(|candidate| { candidate.source != InteractiveCandidateSource::Decoder })
+            );
+        }
+    }
+
+    #[test]
+    fn character_pair_lane_is_bounded_deterministic_and_deduplicated() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+制\tzhi\t1000\n\
+只\tzhi\t900\n\
+动\tdong\t800\n\
+懂\tdong\t700\n\
+制动\tzhi dong\t600\n";
+        let decoder = Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+
+        let first = decoder.full_code_character_pair_texts("vids").unwrap();
+        let second = decoder.full_code_character_pair_texts("vids").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, ["制动", "只动", "制懂", "只懂"]);
+        assert_eq!(first.iter().collect::<HashSet<_>>().len(), first.len());
+        assert!(first.len() <= MAX_FULL_CODE_CHARACTER_PAIRS);
+
+        let visible = decoder.interactive_candidate_texts("vids", 4).unwrap();
+        assert_eq!(visible, ["制动", "只动", "制懂", "只懂"]);
+    }
+
+    #[test]
+    fn character_pair_lane_does_not_expand_to_longer_input() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+只\tzhi\t1000\n\
+动\tdong\t900\n";
+        let decoder = Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+
+        assert!(
+            decoder
+                .full_code_character_pair_texts("vidsvi")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            decoder
+                .full_code_character_pair_texts("vid")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn supplemental_exact_word_suppresses_the_core_free_abbreviation_tail() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+属于是\tshu yu shi\t100000\n\
+属于说\tshu yu shuo\t90000\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+属于\tshu yu\t100\n";
+        let core = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-core-abbreviation-v1",
+            contains_private_text: false,
+            lexicon_tsv: CORE,
+            expected_payload_bytes: CORE.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(CORE.as_bytes()),
+            expected_entry_count: 2,
+        })
+        .unwrap();
+        let supplemental = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-supplemental-exact-v1",
+            contains_private_text: false,
+            lexicon_tsv: SUPPLEMENTAL,
+            expected_payload_bytes: SUPPLEMENTAL.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(SUPPLEMENTAL.as_bytes()),
+            expected_entry_count: 1,
+        })
+        .unwrap();
+
+        assert_eq!(core.candidate_texts("uuyu", 2).unwrap()[0], "属于是");
+        assert_eq!(
+            layered_candidate_texts(
+                &core,
+                &supplemental,
+                "uuyu",
+                3,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )
+            .unwrap(),
+            ["属于"]
+        );
+    }
+
+    #[test]
+    fn supplemental_exact_word_keeps_the_bounded_character_pair_lane() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+制\tzhi\t1000\n\
+只\tzhi\t900\n\
+动\tdong\t800\n\
+懂\tdong\t700\n\
+制动\tzhi dong\t600\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+制动\tzhi dong\t1000\n\
+只懂\tzhi dong\t900\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count,
+            })
+            .unwrap()
+        };
+        let core = load("pair-layer-core-v1", CORE, 5);
+        let supplemental = load("pair-layer-supplement-v1", SUPPLEMENTAL, 2);
+
+        let visible = layered_candidate_texts(
+            &core,
+            &supplemental,
+            "vids",
+            6,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(visible.first().map(String::as_str), Some("制动"));
+        assert_eq!(visible.get(1).map(String::as_str), Some("只懂"));
+        assert!(visible.iter().any(|candidate| candidate == "只动"));
+        assert_eq!(visible.iter().collect::<HashSet<_>>().len(), visible.len());
+    }
+
+    #[test]
+    fn a_duplicate_only_supplement_preserves_the_core_primary_lane() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+属于\tshu yu\t10\n\
+属于是\tshu yu shi\t100000\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+属于\tshu yu\t100\n";
+        let core = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-core-duplicate-v1",
+            contains_private_text: false,
+            lexicon_tsv: CORE,
+            expected_payload_bytes: CORE.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(CORE.as_bytes()),
+            expected_entry_count: 2,
+        })
+        .unwrap();
+        let supplemental = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-supplemental-duplicate-v1",
+            contains_private_text: false,
+            lexicon_tsv: SUPPLEMENTAL,
+            expected_payload_bytes: SUPPLEMENTAL.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(SUPPLEMENTAL.as_bytes()),
+            expected_entry_count: 1,
+        })
+        .unwrap();
+
+        let core_primary = core.candidate_texts("uuyu", 3).unwrap();
+        assert_eq!(
+            layered_candidate_texts(
+                &core,
+                &supplemental,
+                "uuyu",
+                3,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )
+            .unwrap(),
+            core_primary
+        );
+    }
+
+    #[test]
+    fn supplemental_collision_never_displaces_core_exact_top_one() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+什么\tshen me\t100\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+甚么\tshen me\t100000\n\
+什么\tshen me\t90000\n";
+        let core = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-core-top-v1",
+            contains_private_text: false,
+            lexicon_tsv: CORE,
+            expected_payload_bytes: CORE.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(CORE.as_bytes()),
+            expected_entry_count: 1,
+        })
+        .unwrap();
+        let supplemental = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-supplemental-collision-v1",
+            contains_private_text: false,
+            lexicon_tsv: SUPPLEMENTAL,
+            expected_payload_bytes: SUPPLEMENTAL.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(SUPPLEMENTAL.as_bytes()),
+            expected_entry_count: 2,
+        })
+        .unwrap();
+
+        assert_eq!(
+            layered_candidate_texts(
+                &core,
+                &supplemental,
+                "ufme",
+                3,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 2,
+                },
+            )
+            .unwrap(),
+            ["什么", "甚么"]
+        );
+    }
+
+    #[test]
+    fn supplemental_merge_is_deduplicated_bounded_and_rejects_invalid_config() {
+        let core_exact = ["核心首选".to_owned(), "重复".to_owned()];
+        let supplemental_exact = ["重复".to_owned(), "补一".to_owned(), "补二".to_owned()];
+        let core_primary = [
+            "核心首选".to_owned(),
+            "核心句".to_owned(),
+            "重复".to_owned(),
+        ];
+        let config = SupplementalCandidateLayerConfig {
+            exact_promotions: 2,
+        };
+
+        assert_eq!(
+            merge_candidate_text_layers(
+                &core_exact,
+                &supplemental_exact,
+                &core_primary,
+                4,
+                config,
+            )
+            .unwrap(),
+            ["核心首选", "补一", "补二", "重复"]
+        );
+        let many_supplemental = (0..60)
+            .map(|index| format!("补充{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            merge_candidate_text_layers(
+                &[],
+                &many_supplemental,
+                &[],
+                usize::MAX,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: MAX_CANDIDATE_SNAPSHOT_RANK,
+                },
+            )
+            .unwrap()
+            .len(),
+            MAX_CANDIDATE_SNAPSHOT_RANK,
+            "the fixed snapshot rank bound applies"
+        );
+        assert_eq!(
+            merge_candidate_text_layers(
+                &core_exact,
+                &supplemental_exact,
+                &core_primary,
+                6,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: MAX_CANDIDATE_SNAPSHOT_RANK + 1,
+                },
+            )
+            .unwrap_err(),
+            SupplementalCandidateLayerError::PromotionLimit
+        );
+    }
+
+    #[test]
     fn pinned_public_dictionary_accepts_standard_u_spelling_for_umlaut_syllables() {
-        let imported = crate::parse_rime_lexicon(include_str!(
+        let imported = crate::parse_simplified_rime_lexicon(include_str!(
             "../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml"
         ))
         .unwrap();
@@ -673,6 +1632,440 @@ mod tests {
                 .transposition_recovery_texts("kkjjceui", 0)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_rescues_a_reversed_double_pinyin_pair() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+什么\tshen me\t295403\n\
+神\tshen\t120000\n\
+恶魔\te mo\t80000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "synthetic-reversed-pair-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 3,
+        })
+        .unwrap();
+
+        let primary = snapshot.candidate_texts("ufem", 1).unwrap();
+        assert!(
+            !primary.iter().any(|candidate| candidate == "什么"),
+            "recovered text unexpectedly remained in the primary lane: {primary:?}"
+        );
+        let recovery = snapshot.transposition_recovery_texts("ufem", 1).unwrap();
+        assert_eq!(recovery.first().map(String::as_str), Some("什么"));
+    }
+
+    #[test]
+    fn automatic_gate_promotes_one_unique_reversed_pair_without_touching_primary() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+什么\tshen me\t295403\n\
+神\tshen\t120000\n\
+恶魔\te mo\t80000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "automatic-reversed-pair-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 3,
+        })
+        .unwrap();
+
+        let before = snapshot.candidate_texts("ufem", 3).unwrap();
+        let decision = snapshot.automatic_transposition_decision("ufem").unwrap();
+        assert_eq!(
+            decision,
+            AutomaticTranspositionDecision::PromoteExactFullCode(AutomaticTranspositionPromotion {
+                syllable_index: 1,
+                intended_code: "ufme".to_owned(),
+                candidates: vec!["什么".to_owned()],
+            })
+        );
+        assert!(
+            !snapshot
+                .interactive_candidate_query("ufem", 3)
+                .unwrap()
+                .automatic_transposition_blocked
+        );
+        assert_eq!(
+            snapshot
+                .automatic_transposition_recovery_after_primary("ufem", 1, 1)
+                .unwrap(),
+            Some(AutomaticTranspositionPromotion {
+                syllable_index: 1,
+                intended_code: "ufme".to_owned(),
+                candidates: vec!["什么".to_owned()],
+            })
+        );
+        assert_eq!(snapshot.candidate_texts("ufem", 3).unwrap(), before);
+    }
+
+    #[test]
+    fn automatic_gate_can_recover_one_reversed_complete_syllable() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n马\tma\t1000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "automatic-single-pair-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            snapshot.automatic_transposition_decision("am").unwrap(),
+            AutomaticTranspositionDecision::PromoteExactFullCode(AutomaticTranspositionPromotion {
+                syllable_index: 0,
+                intended_code: "ma".to_owned(),
+                candidates: vec!["马".to_owned()],
+            })
+        );
+        assert_eq!(
+            snapshot.automatic_transposition_decision("ma").unwrap(),
+            AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::OriginalHasExactFullCode
+            )
+        );
+    }
+
+    #[test]
+    fn pinned_public_gate_recovers_a_fast_reduplicated_syllable_pair() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        assert_eq!(
+            decoder.automatic_transposition_decision("wuuw").unwrap(),
+            AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::AmbiguousSwapLocations
+            ),
+            "the host-independent gate has no timing evidence for choosing a location"
+        );
+        let promotion = decoder
+            .automatic_transposition_recovery_after_primary("wuuw", 1, 6)
+            .unwrap()
+            .expect("the timed host request identifies the just-completed pair");
+        assert_eq!(promotion.syllable_index, 1);
+        assert_eq!(promotion.intended_code, "wuwu");
+        assert_eq!(
+            promotion.candidates.first().map(String::as_str),
+            Some("呜呜")
+        );
+        assert!(
+            !decoder
+                .interactive_candidate_query("wuuw", 6)
+                .unwrap()
+                .automatic_transposition_blocked
+        );
+    }
+
+    #[test]
+    fn pinned_public_gate_recovers_two_adjacent_reversed_syllables_only_as_one_span() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        assert!(
+            decoder
+                .automatic_transposition_recovery_after_primary("fuem", 0, 6)
+                .unwrap()
+                .is_none(),
+            "repairing only fu must not invent a whole-word recovery"
+        );
+        assert!(
+            decoder
+                .automatic_transposition_recovery_after_primary("fuem", 1, 6)
+                .unwrap()
+                .is_none(),
+            "repairing only em must not invent a whole-word recovery"
+        );
+        let promotion = decoder
+            .automatic_transposition_span_recovery_after_primary("fuem", 0, 2, 6)
+            .unwrap()
+            .expect("two measured adjacent pairs should expose the combined full-code recovery");
+        assert_eq!(promotion.syllable_index, 0);
+        assert_eq!(promotion.intended_code, "ufme");
+        assert_eq!(
+            promotion.candidates.first().map(String::as_str),
+            Some("什么")
+        );
+        assert!(
+            !decoder
+                .interactive_candidate_query("fuem", 6)
+                .unwrap()
+                .automatic_transposition_blocked
+        );
+    }
+
+    #[test]
+    fn automatic_gate_never_reinterprets_an_existing_exact_full_code() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+什么\tshen me\t295403\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "automatic-exact-block-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            snapshot.automatic_transposition_decision("ufme").unwrap(),
+            AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::OriginalHasExactFullCode
+            )
+        );
+        assert!(
+            snapshot
+                .interactive_candidate_query("ufme", 1)
+                .unwrap()
+                .automatic_transposition_blocked
+        );
+        assert_eq!(
+            snapshot.automatic_transposition_decision("ufe").unwrap(),
+            AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::UnsupportedInputShape
+            )
+        );
+    }
+
+    #[test]
+    fn automatic_gate_keeps_complete_sentences_and_ambiguous_swap_locations() {
+        const COMPLETE_SENTENCE_LEXICON: &str = "text\tpinyin\tfrequency\n\
+林\tlin\t1000\n\
+好\thao\t900\n\
+奶号\tnai hao\t800\n";
+        let complete_sentence = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "automatic-complete-sentence-block-v1",
+            contains_private_text: false,
+            lexicon_tsv: COMPLETE_SENTENCE_LEXICON,
+            expected_payload_bytes: COMPLETE_SENTENCE_LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(
+                COMPLETE_SENTENCE_LEXICON.as_bytes(),
+            ),
+            expected_entry_count: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            complete_sentence
+                .automatic_transposition_decision("lnhk")
+                .unwrap(),
+            AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::OriginalFirstCandidateIsComplete
+            )
+        );
+        assert!(
+            complete_sentence
+                .interactive_candidate_query("lnhk", 1)
+                .unwrap()
+                .automatic_transposition_blocked
+        );
+
+        const AMBIGUOUS_LEXICON: &str = "text\tpinyin\tfrequency\n\
+奶号\tnai hao\t1000\n\
+林康\tlin kang\t900\n";
+        let ambiguous = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "automatic-ambiguous-pair-v1",
+            contains_private_text: false,
+            lexicon_tsv: AMBIGUOUS_LEXICON,
+            expected_payload_bytes: AMBIGUOUS_LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(
+                AMBIGUOUS_LEXICON.as_bytes(),
+            ),
+            expected_entry_count: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            ambiguous.automatic_transposition_decision("lnhk").unwrap(),
+            AutomaticTranspositionDecision::KeepPrimary(
+                AutomaticTranspositionKeepReason::AmbiguousSwapLocations
+            )
+        );
+        assert_eq!(
+            ambiguous
+                .automatic_transposition_recovery_after_primary("lnhk", 1, 1)
+                .unwrap(),
+            Some(AutomaticTranspositionPromotion {
+                syllable_index: 1,
+                intended_code: "lnkh".to_owned(),
+                candidates: vec!["林康".to_owned()],
+            }),
+            "a timed host request may use the causally identified final pair"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit full public-dictionary collision audit"]
+    fn pinned_public_dictionary_transposition_collision_audit() {
+        let imported = crate::parse_simplified_rime_lexicon(include_str!(
+            "../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml"
+        ))
+        .unwrap();
+        let exact_codes = imported
+            .entries
+            .iter()
+            .map(|entry| entry.code.as_str().to_owned())
+            .collect::<HashSet<_>>();
+        let mut intended_codes_by_observed = HashMap::<String, HashSet<String>>::new();
+
+        for entry in &imported.entries {
+            let intended = entry.code.as_str();
+            if intended.len() < 2
+                || intended.len() > MAX_TRANSPOSITION_RECOVERY_KEYS
+                || !intended.len().is_multiple_of(2)
+            {
+                continue;
+            }
+            for syllable_index in 0..intended.len() / 2 {
+                let swap_start = syllable_index * 2;
+                if intended.as_bytes()[swap_start] == intended.as_bytes()[swap_start + 1] {
+                    continue;
+                }
+                let mut observed = intended.as_bytes().to_vec();
+                observed.swap(swap_start, swap_start + 1);
+                let observed = String::from_utf8(observed).unwrap();
+                intended_codes_by_observed
+                    .entry(observed)
+                    .or_default()
+                    .insert(intended.to_owned());
+            }
+        }
+
+        let exact_collisions = intended_codes_by_observed
+            .keys()
+            .filter(|observed| exact_codes.contains(*observed))
+            .count();
+        let unambiguous_non_collisions = intended_codes_by_observed
+            .iter()
+            .filter(|(observed, intended)| !exact_codes.contains(*observed) && intended.len() == 1)
+            .count();
+        let ambiguous_non_collisions = intended_codes_by_observed
+            .iter()
+            .filter(|(observed, intended)| !exact_codes.contains(*observed) && intended.len() > 1)
+            .count();
+
+        eprintln!(
+            "exact_codes={} observed_forms={} exact_collisions={} unambiguous_non_collisions={} ambiguous_non_collisions={}",
+            exact_codes.len(),
+            intended_codes_by_observed.len(),
+            exact_collisions,
+            unambiguous_non_collisions,
+            ambiguous_non_collisions,
+        );
+        assert!(!exact_codes.contains("ufem"));
+        assert!(!exact_codes.contains("am"));
+        assert_eq!(
+            intended_codes_by_observed
+                .get("am")
+                .expect("the public dictionary should expose ma through the reversed pair am"),
+            &HashSet::from(["ma".to_owned()])
+        );
+        assert_eq!(
+            intended_codes_by_observed
+                .get("ufem")
+                .expect("the public dictionary should expose 什么 through ufme"),
+            &HashSet::from(["ufme".to_owned()])
+        );
+
+        let decoder = Decoder::new(imported.entries);
+        assert!(matches!(
+            decoder.automatic_transposition_decision("ufem").unwrap(),
+            AutomaticTranspositionDecision::PromoteExactFullCode(
+                AutomaticTranspositionPromotion { ref candidates, .. }
+            ) if candidates.first().map(String::as_str) == Some("什么")
+        ));
+    }
+
+    #[test]
+    #[ignore = "explicit release-only public transposition hot-path benchmark"]
+    fn pinned_public_transposition_probe_reuses_the_primary_gate() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run this benchmark with cargo test --release"
+        );
+        let imported = crate::parse_simplified_rime_lexicon(include_str!(
+            "../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml"
+        ))
+        .unwrap();
+        let decoder = Decoder::new(imported.entries);
+        let observed_codes = [
+            "ufem",
+            "dmls",
+            "rbbr",
+            "ubxrdx",
+            "uidv",
+            "ubip",
+            "ugum",
+            "ypum",
+            "ouum",
+            "vijcjuyx",
+            "gdmnxy",
+            "buuidiyige",
+        ];
+        let eligible = observed_codes
+            .into_iter()
+            .filter(|code| {
+                !decoder
+                    .interactive_candidate_query(code, 7)
+                    .unwrap()
+                    .automatic_transposition_blocked
+            })
+            .collect::<Vec<_>>();
+        assert!(!eligible.is_empty());
+
+        for _ in 0..2 {
+            for code in &eligible {
+                black_box(decoder.automatic_transposition_decision(code).unwrap());
+                black_box(
+                    decoder
+                        .automatic_transposition_recovery_after_primary(code, code.len() / 2 - 1, 1)
+                        .unwrap(),
+                );
+            }
+        }
+
+        const REPETITIONS: usize = 20;
+        let legacy_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            for code in &eligible {
+                black_box(decoder.automatic_transposition_decision(code).unwrap());
+            }
+        }
+        let legacy = legacy_started.elapsed();
+        let reused_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            for code in &eligible {
+                black_box(
+                    decoder
+                        .automatic_transposition_recovery_after_primary(code, code.len() / 2 - 1, 1)
+                        .unwrap(),
+                );
+            }
+        }
+        let reused = reused_started.elapsed();
+        let samples = REPETITIONS * eligible.len();
+        println!(
+            "PUBLIC_TRANSPOSITION_PROBE eligible_codes={} samples={} repeated_gate_us={:.3} reused_gate_us={:.3}",
+            eligible.len(),
+            samples,
+            legacy.as_secs_f64() * 1_000_000.0 / samples as f64,
+            reused.as_secs_f64() * 1_000_000.0 / samples as f64,
         );
     }
 

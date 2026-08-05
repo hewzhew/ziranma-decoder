@@ -13,11 +13,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_PACKAGE_PROVENANCE_FILE, CandidatePackageError,
-    CandidatePackageManifest, CandidatePackageProvenance, CandidateProvenanceError,
-    CandidateSlotError, CandidateSlotState, CandidateSnapshot,
-    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
-    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_PACKAGE_PROVENANCE_FILE,
+    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageError, CandidatePackageManifest,
+    CandidatePackageProvenance, CandidateProvenanceError, CandidateSlotError, CandidateSlotState,
+    CandidateSnapshot, CandidateSupplementalState, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, SupplementalCandidateLayerConfig,
     candidate_package_authentication_sha256,
 };
 
@@ -39,6 +40,56 @@ pub const CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V2: &str = "ziranma-candidate-prefl
 pub const CANDIDATE_PREFLIGHT_HOST_V1: &str = "tsf-synthetic-context-v1";
 /// Maximum accepted size of one preflight receipt.
 pub const MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES: usize = 512;
+
+/// Immutable core snapshot plus an optional independently validated public
+/// exact-word supplement.
+#[derive(Clone, Debug)]
+pub struct CandidateRuntimeSnapshots {
+    core: Arc<CandidateSnapshot>,
+    supplemental: Option<CandidateRuntimeSupplemental>,
+    supplemental_fell_back: bool,
+}
+
+impl CandidateRuntimeSnapshots {
+    /// Returns the required core candidate snapshot.
+    pub fn core(&self) -> &Arc<CandidateSnapshot> {
+        &self.core
+    }
+
+    /// Returns the enabled, validated supplement when one is available.
+    pub fn supplemental(&self) -> Option<&CandidateRuntimeSupplemental> {
+        self.supplemental.as_ref()
+    }
+
+    /// Reports that an explicit supplemental configuration failed closed.
+    pub fn supplemental_fell_back(&self) -> bool {
+        self.supplemental_fell_back
+    }
+}
+
+/// Validated supplemental snapshot and its fixed candidate influence cap.
+#[derive(Clone, Debug)]
+pub struct CandidateRuntimeSupplemental {
+    snapshot: Arc<CandidateSnapshot>,
+    config: SupplementalCandidateLayerConfig,
+}
+
+impl CandidateRuntimeSupplemental {
+    /// Returns the immutable supplemental public snapshot.
+    pub fn snapshot(&self) -> &Arc<CandidateSnapshot> {
+        &self.snapshot
+    }
+
+    /// Returns the exact-word merge configuration bound by local state.
+    pub fn config(&self) -> SupplementalCandidateLayerConfig {
+        self.config
+    }
+}
+
+struct LoadedRuntimeCandidate {
+    package_id: String,
+    snapshot: Arc<CandidateSnapshot>,
+}
 
 /// Computes the internal immutable-package identifier from all exact package bytes.
 pub fn candidate_package_storage_id(
@@ -76,6 +127,38 @@ pub fn candidate_preflight_receipt_body(
 pub fn load_current_candidate_snapshot(
     root: &Path,
 ) -> Result<Option<Arc<CandidateSnapshot>>, CandidateRuntimeError> {
+    Ok(load_current_candidate_package(root)?.map(|loaded| loaded.snapshot))
+}
+
+/// Loads the required core root and an optional independent supplemental root.
+///
+/// Core configuration remains strict. A missing supplemental root or state is
+/// disabled; malformed, mismatched, or unreadable supplemental state falls
+/// back to the validated core snapshot without changing it.
+pub fn load_candidate_runtime_snapshots(
+    core_root: &Path,
+    supplemental_root: Option<&Path>,
+) -> Result<Option<CandidateRuntimeSnapshots>, CandidateRuntimeError> {
+    let Some(core) = load_current_candidate_package(core_root)? else {
+        return Ok(None);
+    };
+    let (supplemental, supplemental_fell_back) = match supplemental_root {
+        Some(root) => match load_supplemental_candidate(root) {
+            Ok(supplemental) => (supplemental, false),
+            Err(()) => (None, true),
+        },
+        None => (None, false),
+    };
+    Ok(Some(CandidateRuntimeSnapshots {
+        core: core.snapshot,
+        supplemental,
+        supplemental_fell_back,
+    }))
+}
+
+fn load_current_candidate_package(
+    root: &Path,
+) -> Result<Option<LoadedRuntimeCandidate>, CandidateRuntimeError> {
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(CandidateRuntimeError::RootUnavailable),
@@ -145,7 +228,47 @@ pub fn load_current_candidate_snapshot(
         return Err(CandidateRuntimeError::PreflightReceiptMismatch);
     }
 
-    Ok(Some(Arc::new(snapshot)))
+    Ok(Some(LoadedRuntimeCandidate {
+        package_id: package_id.to_owned(),
+        snapshot: Arc::new(snapshot),
+    }))
+}
+
+fn load_supplemental_candidate(root: &Path) -> Result<Option<CandidateRuntimeSupplemental>, ()> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return Err(()),
+        Ok(_) => {}
+    }
+    let state_path = root.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE);
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+        Ok(_) => {}
+    }
+    let state_text = read_regular_utf8(
+        &state_path,
+        MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
+        CandidateRuntimeError::SupplementalStateUnavailable,
+    )
+    .map_err(|_| ())?;
+    let state = CandidateSupplementalState::parse(&state_text).map_err(|_| ())?;
+    let Some(expected_package) = state.package() else {
+        return Ok(None);
+    };
+    let loaded = load_current_candidate_package(root)
+        .map_err(|_| ())?
+        .ok_or(())?;
+    if loaded.package_id != expected_package {
+        return Err(());
+    }
+    Ok(Some(CandidateRuntimeSupplemental {
+        snapshot: loaded.snapshot,
+        config: SupplementalCandidateLayerConfig {
+            exact_promotions: state.exact_promotions(),
+        },
+    }))
 }
 
 fn ensure_regular_directory(
@@ -227,6 +350,8 @@ pub enum CandidateRuntimeError {
     PreflightReceiptUnavailable,
     /// The preflight receipt does not bind the current package and host.
     PreflightReceiptMismatch,
+    /// The optional supplemental activation state could not be read safely.
+    SupplementalStateUnavailable,
 }
 
 impl fmt::Display for CandidateRuntimeError {
@@ -249,6 +374,7 @@ impl fmt::Display for CandidateRuntimeError {
             Self::InvalidPreflightStore => "候选包预检存储无效",
             Self::PreflightReceiptUnavailable => "当前候选包缺少预检凭据",
             Self::PreflightReceiptMismatch => "当前候选包预检凭据不符",
+            Self::SupplementalStateUnavailable => "补充词层状态不可用",
         };
         formatter.write_str(message)
     }
@@ -512,5 +638,116 @@ mod tests {
         );
         assert_eq!(first.revision(), "runtime-first");
         assert_eq!(second.revision(), "runtime-second");
+    }
+
+    #[test]
+    fn supplemental_root_is_default_off_and_loads_only_an_exact_bound_package() {
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n属于\tshu yu\t100\n";
+        let (core_root, _) = configured_root("runtime-core", false);
+        let supplemental_root = TestDirectory::new();
+        let supplemental_id = install_test_package(
+            supplemental_root.path(),
+            "runtime-supplemental",
+            false,
+            SUPPLEMENTAL,
+        );
+        let mut supplemental_slots = CandidateSlotState::default();
+        supplemental_slots.adopt(&supplemental_id).unwrap();
+        fs::write(
+            supplemental_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            supplemental_slots.render(),
+        )
+        .unwrap();
+
+        let disabled =
+            load_candidate_runtime_snapshots(core_root.path(), Some(supplemental_root.path()))
+                .unwrap()
+                .unwrap();
+        assert!(disabled.supplemental().is_none());
+        assert!(!disabled.supplemental_fell_back());
+
+        let state = CandidateSupplementalState::enabled(&supplemental_id, 1).unwrap();
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            state.render(),
+        )
+        .unwrap();
+        let enabled =
+            load_candidate_runtime_snapshots(core_root.path(), Some(supplemental_root.path()))
+                .unwrap()
+                .unwrap();
+        let supplemental = enabled.supplemental().unwrap();
+        assert_eq!(supplemental.snapshot().revision(), "runtime-supplemental");
+        assert_eq!(supplemental.config().exact_promotions, 1);
+        assert!(!enabled.supplemental_fell_back());
+        assert_eq!(enabled.core().revision(), "runtime-core");
+    }
+
+    #[test]
+    fn supplemental_damage_or_pointer_drift_falls_back_to_unchanged_core() {
+        const FIRST: &str = "text\tpinyin\tfrequency\n属于\tshu yu\t100\n";
+        const SECOND: &str = "text\tpinyin\tfrequency\n甚么\tshen me\t100\n";
+        let (core_root, _) = configured_root("runtime-fallback-core", false);
+        let supplemental_root = TestDirectory::new();
+        let first_id = install_test_package(
+            supplemental_root.path(),
+            "runtime-supplemental-first",
+            false,
+            FIRST,
+        );
+        let second_id = install_test_package(
+            supplemental_root.path(),
+            "runtime-supplemental-second",
+            false,
+            SECOND,
+        );
+        let mut slots = CandidateSlotState::default();
+        slots.adopt(&first_id).unwrap();
+        fs::write(
+            supplemental_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            CandidateSupplementalState::enabled(&first_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+
+        slots.stage(&second_id).unwrap();
+        slots.promote().unwrap();
+        fs::write(
+            supplemental_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+        let drifted =
+            load_candidate_runtime_snapshots(core_root.path(), Some(supplemental_root.path()))
+                .unwrap()
+                .unwrap();
+        assert!(drifted.supplemental().is_none());
+        assert!(drifted.supplemental_fell_back());
+        assert_eq!(drifted.core().revision(), "runtime-fallback-core");
+
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            "schema=damaged\n",
+        )
+        .unwrap();
+        let damaged =
+            load_candidate_runtime_snapshots(core_root.path(), Some(supplemental_root.path()))
+                .unwrap()
+                .unwrap();
+        assert!(damaged.supplemental().is_none());
+        assert!(damaged.supplemental_fell_back());
+        assert_eq!(damaged.core().revision(), "runtime-fallback-core");
     }
 }
