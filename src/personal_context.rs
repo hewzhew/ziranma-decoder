@@ -164,9 +164,29 @@ impl PersonalContextRanking {
     pub fn has_evidence(&self, previous_text: &str, code: &str) -> bool {
         valid_text(previous_text)
             && valid_code(code)
-            && self.entries.keys().any(|(entry_previous, entry_code, _)| {
-                entry_previous == previous_text && entry_code == code
-            })
+            && self
+                .entries_for_context(previous_text, code)
+                .next()
+                .is_some()
+    }
+
+    /// Returns whether this context has any positive preference that the
+    /// caller still permits.
+    ///
+    /// TSF uses this before widening its candidate search. Rejection-only,
+    /// explicitly suppressed, or otherwise ineligible evidence must not make
+    /// every ordinary key update decode a deeper page that cannot be promoted.
+    pub fn has_eligible_preference(
+        &self,
+        previous_text: &str,
+        code: &str,
+        mut allowed: impl FnMut(&str) -> bool,
+    ) -> bool {
+        valid_text(previous_text)
+            && valid_code(code)
+            && self
+                .entries_for_context(previous_text, code)
+                .any(|((_, _, text), evidence)| effective_support(evidence) > 0 && allowed(text))
     }
 
     /// Moves at most one already-visible candidate to the first unprotected
@@ -183,13 +203,9 @@ impl PersonalContextRanking {
             return false;
         }
         let preferred = self
-            .entries
-            .iter()
-            .filter(|((entry_previous, entry_code, text), _)| {
-                entry_previous == previous_text
-                    && entry_code == code
-                    && allowed(text)
-                    && candidates.iter().any(|candidate| candidate == text)
+            .entries_for_context(previous_text, code)
+            .filter(|((_, _, text), _)| {
+                allowed(text) && candidates.iter().any(|candidate| candidate == text)
             })
             .max_by(|((_, _, left_text), left), ((_, _, right_text), right)| {
                 effective_support(left)
@@ -220,6 +236,22 @@ impl PersonalContextRanking {
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
         true
+    }
+
+    fn entries_for_context<'a>(
+        &'a self,
+        previous_text: &str,
+        code: &str,
+    ) -> impl Iterator<Item = (&'a (String, String, String), &'a PersonalContextEvidence)> + 'a
+    {
+        let previous_text = previous_text.to_owned();
+        let code = code.to_owned();
+        let start = (previous_text.clone(), code.clone(), String::new());
+        self.entries
+            .range(start..)
+            .take_while(move |((entry_previous, entry_code, _), _)| {
+                entry_previous == &previous_text && entry_code == &code
+            })
     }
 }
 
@@ -337,6 +369,24 @@ mod tests {
         let mut unrelated = vec!["吧".to_owned(), "把".to_owned()];
         assert!(!ranking.promote_existing_text_after("好", "ba", &mut unrelated, 0, |_| true));
         assert_eq!(unrelated, ["吧", "把"]);
+    }
+
+    #[test]
+    fn deep_search_gate_requires_positive_and_allowed_context_evidence() {
+        let mut ranking = PersonalContextRanking::default();
+        ranking.record("请", "ba", "吧").unwrap();
+        ranking.record_choice("请", "ba", "把", Some("吧")).unwrap();
+
+        assert!(ranking.has_evidence("请", "ba"));
+        assert!(
+            !ranking.has_eligible_preference("请", "ba", |text| text == "吧"),
+            "one explicit rejection should cancel the stale one-count preference"
+        );
+        assert!(ranking.has_eligible_preference("请", "ba", |text| text == "把"));
+        assert!(
+            !ranking.has_eligible_preference("请", "ba", |_| false),
+            "caller suppression must close the deep-search gate"
+        );
     }
 
     #[test]

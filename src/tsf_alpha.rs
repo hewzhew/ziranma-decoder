@@ -7002,9 +7002,17 @@ impl TsfTextService_Impl {
         let contextual_search = view == InteractiveCandidateView::Primary
             && automatic_transposition_request.is_none()
             && left_context.as_deref().is_some_and(|previous| {
+                let Ok(personal_ranking) = self.personal_ranking.try_borrow() else {
+                    return false;
+                };
                 self.personal_context_ranking
                     .try_borrow()
-                    .map(|ranking| ranking.has_evidence(previous, code))
+                    .map(|ranking| {
+                        ranking.has_eligible_preference(previous, code, |text| {
+                            !personal_ranking.is_suppressed(code, text)
+                                && personal_ranking.has_evidence(code, text)
+                        })
+                    })
                     .unwrap_or(false)
             });
         let load_limit = if contextual_search {
@@ -15368,6 +15376,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(suppressed.candidates[0], "吧");
+        assert_eq!(
+            service.candidate_cache.borrow().requested_limit,
+            CANDIDATE_PAGE_SIZE,
+            "suppressed context evidence must not decode a deeper candidate page"
+        );
     }
 
     #[test]
