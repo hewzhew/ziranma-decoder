@@ -316,7 +316,11 @@ struct CandidateBatch {
     view: InteractiveCandidateView,
 }
 
-fn mirror_candidate_promotion(batch: &mut CandidateBatch, promotion: CandidateTextPromotion) {
+fn mirror_candidate_promotion(
+    batch: &mut CandidateBatch,
+    promotion: CandidateTextPromotion,
+    mark_personalized: bool,
+) {
     let final_len = batch.candidates.len();
     if !promotion.mirror_into(
         &mut batch.provenance,
@@ -324,6 +328,12 @@ fn mirror_candidate_promotion(batch: &mut CandidateBatch, promotion: CandidateTe
         final_len,
     ) {
         batch.provenance = vec![NativeCandidateProvenance::default(); final_len];
+    }
+    if !promotion.mirror_into(&mut batch.personalized, false, final_len) {
+        batch.personalized = vec![false; final_len];
+    }
+    if mark_personalized && let Some(marker) = batch.personalized.get_mut(promotion.index) {
+        *marker = true;
     }
 }
 
@@ -7059,14 +7069,13 @@ impl TsfTextService_Impl {
             let session_exact_text = selection_memory
                 .remembered_text(code)
                 .filter(|text| !personal_ranking.is_suppressed(code, text));
-            let mut personalized_texts = HashSet::new();
             let persistent_exact_promotion = personal_ranking.promote_texts_after_decision(
                 code,
                 &mut batch.candidates,
                 protected_prefix,
             );
             if let Some(promotion) = persistent_exact_promotion {
-                mirror_candidate_promotion(&mut batch, promotion);
+                mirror_candidate_promotion(&mut batch, promotion, true);
             }
             let persistent_anchored_promotion =
                 if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
@@ -7080,7 +7089,7 @@ impl TsfTextService_Impl {
                     None
                 };
             if let Some(promotion) = persistent_anchored_promotion {
-                mirror_candidate_promotion(&mut batch, promotion);
+                mirror_candidate_promotion(&mut batch, promotion, true);
             }
             let personal_discovery_promotion = if persistent_exact_promotion.is_none()
                 && persistent_anchored_promotion.is_none()
@@ -7097,17 +7106,7 @@ impl TsfTextService_Impl {
                 None
             };
             if let Some(promotion) = personal_discovery_promotion {
-                mirror_candidate_promotion(&mut batch, promotion);
-            }
-            if let Some(promotion) = persistent_exact_promotion.or(persistent_anchored_promotion)
-                && let Some(candidate) = batch.candidates.get(promotion.index)
-            {
-                personalized_texts.insert(candidate.clone());
-            }
-            if let Some(promotion) = personal_discovery_promotion
-                && let Some(candidate) = batch.candidates.get(promotion.index)
-            {
-                personalized_texts.insert(candidate.clone());
+                mirror_candidate_promotion(&mut batch, promotion, true);
             }
             let session_anchored_promotion =
                 if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
@@ -7125,7 +7124,7 @@ impl TsfTextService_Impl {
                     None
                 };
             if let Some(promotion) = session_anchored_promotion {
-                mirror_candidate_promotion(&mut batch, promotion);
+                mirror_candidate_promotion(&mut batch, promotion, true);
             }
             let session_exact_promotion = session_exact_text.and_then(|_| {
                 selection_memory.promote_texts_after_decision(
@@ -7135,14 +7134,9 @@ impl TsfTextService_Impl {
                 )
             });
             if let Some(promotion) = session_exact_promotion {
-                mirror_candidate_promotion(&mut batch, promotion);
+                mirror_candidate_promotion(&mut batch, promotion, true);
             }
             let session_promotion = session_exact_promotion.or(session_anchored_promotion);
-            if let Some(promotion) = session_promotion
-                && let Some(candidate) = batch.candidates.get(promotion.index)
-            {
-                personalized_texts.insert(candidate.clone());
-            }
             let mut session_changed = session_promotion.is_some_and(|promotion| promotion.changed);
             if automatic_transposition_request.is_none()
                 && let Some(previous) = left_context.as_deref()
@@ -7162,23 +7156,15 @@ impl TsfTextService_Impl {
                         },
                     );
                 if let Some(promotion) = context_promotion {
-                    mirror_candidate_promotion(&mut batch, promotion);
+                    mirror_candidate_promotion(&mut batch, promotion, promotion.changed);
                 }
                 let context_changed = context_promotion.is_some_and(|promotion| promotion.changed);
                 session_changed |= context_changed;
-                if context_changed && let Some(candidate) = batch.candidates.get(protected_prefix) {
-                    personalized_texts.insert(candidate.clone());
-                }
             }
             if session_changed && let Some(provenance) = batch.provenance.get_mut(protected_prefix)
             {
                 *provenance = NativeCandidateProvenance::new(provenance.source(), true);
             }
-            batch.personalized = batch
-                .candidates
-                .iter()
-                .map(|candidate| personalized_texts.contains(candidate))
-                .collect();
         }
         if batch.candidates.len() > limit {
             batch.may_have_more = true;
@@ -9246,6 +9232,34 @@ mod tests {
         ITfLangBarItemSink_Impl, TF_ES_READ, TF_POPF_ALL, TF_TF_MOVESTART,
     };
     use windows::core::ComObject;
+
+    #[test]
+    fn candidate_promotion_mirrors_existing_personal_markers_by_position() {
+        let mut batch = CandidateBatch {
+            candidates: vec!["丙".to_owned(), "甲".to_owned(), "乙".to_owned()],
+            provenance: vec![
+                NativeCandidateProvenance::default(),
+                NativeCandidateProvenance::default(),
+                NativeCandidateProvenance::default(),
+            ],
+            personalized: vec![false, true, false],
+            automatic_transposition: None,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+        };
+
+        mirror_candidate_promotion(
+            &mut batch,
+            CandidateTextPromotion {
+                index: 0,
+                source_index: Some(2),
+                changed: true,
+            },
+            true,
+        );
+
+        assert_eq!(batch.personalized, [true, false, true]);
+    }
 
     #[test]
     fn runtime_root_is_fixed_beside_the_loaded_module() {
