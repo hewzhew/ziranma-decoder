@@ -7089,10 +7089,9 @@ impl TsfTextService_Impl {
             {
                 personalized_texts.insert(candidate.clone());
             }
-            let candidates_before_session = batch.candidates.clone();
-            let session_anchored_index =
+            let session_anchored_promotion =
                 if persistent_exact_index.is_none() && session_exact_text.is_none() {
-                    selection_memory.promote_anchored_suffix_texts_after_index(
+                    selection_memory.promote_anchored_suffix_texts_after_decision(
                         code,
                         &mut batch.candidates,
                         protected_prefix,
@@ -7105,19 +7104,20 @@ impl TsfTextService_Impl {
                 } else {
                     None
                 };
-            let session_exact_index = session_exact_text.and_then(|_| {
-                selection_memory.promote_texts_after_index(
+            let session_exact_promotion = session_exact_text.and_then(|_| {
+                selection_memory.promote_texts_after_decision(
                     code,
                     &mut batch.candidates,
                     protected_prefix,
                 )
             });
-            if let Some(index) = session_exact_index.or(session_anchored_index)
-                && let Some(candidate) = batch.candidates.get(index)
+            let session_promotion = session_exact_promotion.or(session_anchored_promotion);
+            if let Some(promotion) = session_promotion
+                && let Some(candidate) = batch.candidates.get(promotion.index)
             {
                 personalized_texts.insert(candidate.clone());
             }
-            let mut session_changed = batch.candidates != candidates_before_session;
+            let mut session_changed = session_promotion.is_some_and(|promotion| promotion.changed);
             if automatic_transposition_request.is_none()
                 && let Some(previous) = left_context.as_deref()
             {

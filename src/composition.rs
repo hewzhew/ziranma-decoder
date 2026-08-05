@@ -123,6 +123,12 @@ struct SessionSelection {
     candidate: Option<SentenceCandidate>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextPromotion {
+    pub(crate) index: usize,
+    pub(crate) changed: bool,
+}
+
 impl SessionSelectionMemory {
     pub fn remember(&mut self, code: &str, candidate: &SentenceCandidate) {
         self.remember_entry(code, &candidate.text, Some(candidate.clone()));
@@ -226,16 +232,16 @@ impl SessionSelectionMemory {
         candidates: &mut Vec<String>,
         protected_prefix: usize,
     ) -> bool {
-        self.promote_texts_after_index(code, candidates, protected_prefix)
+        self.promote_texts_after_decision(code, candidates, protected_prefix)
             .is_some()
     }
 
-    pub(crate) fn promote_texts_after_index(
+    pub(crate) fn promote_texts_after_decision(
         &self,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-    ) -> Option<usize> {
+    ) -> Option<TextPromotion> {
         let preferred = self
             .selections
             .iter()
@@ -251,14 +257,23 @@ impl SessionSelectionMemory {
             let original_len = candidates.len();
             candidates.insert(protected_prefix, preferred.text.clone());
             candidates.truncate(original_len.max(1));
-            return (protected_prefix < candidates.len()).then_some(protected_prefix);
+            return (protected_prefix < candidates.len()).then_some(TextPromotion {
+                index: protected_prefix,
+                changed: true,
+            });
         };
         if index <= protected_prefix {
-            return Some(index);
+            return Some(TextPromotion {
+                index,
+                changed: false,
+            });
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        Some(protected_prefix)
+        Some(TextPromotion {
+            index: protected_prefix,
+            changed: true,
+        })
     }
 
     /// Promotes the most recent session choice learned under a compatible,
@@ -275,7 +290,7 @@ impl SessionSelectionMemory {
         protected_prefix: usize,
         mut eligible_source: impl FnMut(&str, &str) -> bool,
     ) -> bool {
-        self.promote_anchored_suffix_texts_after_index(
+        self.promote_anchored_suffix_texts_after_decision(
             code,
             candidates,
             protected_prefix,
@@ -284,13 +299,13 @@ impl SessionSelectionMemory {
         .is_some()
     }
 
-    pub(crate) fn promote_anchored_suffix_texts_after_index(
+    pub(crate) fn promote_anchored_suffix_texts_after_decision(
         &self,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
         mut eligible_source: impl FnMut(&str, &str) -> bool,
-    ) -> Option<usize> {
+    ) -> Option<TextPromotion> {
         let preferred = self.selections.iter().find(|selection| {
             is_anchored_suffix_abbreviation(&selection.code, code)
                 && candidates
@@ -303,11 +318,17 @@ impl SessionSelectionMemory {
             .iter()
             .position(|candidate| candidate == &preferred.text)?;
         if index <= protected_prefix {
-            return Some(index);
+            return Some(TextPromotion {
+                index,
+                changed: false,
+            });
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        Some(protected_prefix)
+        Some(TextPromotion {
+            index: protected_prefix,
+            changed: true,
+        })
     }
 
     pub(crate) fn has_anchored_suffix_evidence(
@@ -978,6 +999,30 @@ mod tests {
         let mut shallow = vec!["固定".to_owned()];
         assert!(!memory.promote_texts_after("ab", &mut shallow, 1));
         assert_eq!(shallow, ["固定"]);
+    }
+
+    #[test]
+    fn session_text_promotion_reports_change_without_a_second_candidate_copy() {
+        let mut memory = SessionSelectionMemory::default();
+        memory.remember_text("ab", "乙");
+
+        let mut moved = vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()];
+        assert_eq!(
+            memory.promote_texts_after_decision("ab", &mut moved, 0),
+            Some(TextPromotion {
+                index: 0,
+                changed: true,
+            })
+        );
+        assert_eq!(moved, ["乙", "甲", "丙"]);
+
+        assert_eq!(
+            memory.promote_texts_after_decision("ab", &mut moved, 0),
+            Some(TextPromotion {
+                index: 0,
+                changed: false,
+            })
+        );
     }
 
     #[test]
