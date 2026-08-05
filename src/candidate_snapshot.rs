@@ -650,11 +650,7 @@ impl Decoder {
         let candidates = self.decode_sentence(code, sentence_limit)?;
         let original_first_candidate_is_complete =
             candidates.first().is_some_and(sentence_is_complete);
-        let canonical_code = canonicalize_umlaut_full_code(code);
-        let canonical_candidates = match canonical_code.as_deref() {
-            Some(canonical) => self.decode_sentence(canonical, sentence_limit)?,
-            None => Vec::new(),
-        };
+        let complete_candidates = self.decode_complete_sentence(code, sentence_limit)?;
         let mut visible = Vec::with_capacity(limit);
         let mut seen = HashSet::new();
         for candidate in exact {
@@ -685,11 +681,11 @@ impl Decoder {
         // A complete two-key-per-syllable sentence is stronger interaction
         // evidence than a freely abbreviated path. Keep the research decoder's
         // ordinary order intact underneath this small host-facing lane.
-        for candidate in canonical_candidates.iter().chain(&candidates) {
+        for candidate in &complete_candidates {
             if visible.len() == limit {
                 break;
             }
-            if sentence_is_complete(candidate) && seen.insert(candidate.text.clone()) {
+            if seen.insert(candidate.text.clone()) {
                 visible.push(InteractiveCandidateText {
                     text: candidate.text.clone(),
                     source: InteractiveCandidateSource::Decoder,
@@ -931,24 +927,6 @@ impl Decoder {
                 .collect(),
         }))
     }
-}
-
-fn canonicalize_umlaut_full_code(code: &str) -> Option<String> {
-    if !code.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut bytes = code.as_bytes().to_vec();
-    let mut changed = false;
-    for chunk in bytes.chunks_exact_mut(2) {
-        if chunk[1] == b'u' && matches!(chunk[0], b'j' | b'q' | b'x' | b'y') {
-            chunk[1] = b'v';
-            changed = true;
-        }
-    }
-    changed.then(|| {
-        String::from_utf8(bytes)
-            .expect("lowercase ASCII remains valid UTF-8 after umlaut code normalization")
-    })
 }
 
 fn sentence_is_complete(candidate: &crate::SentenceCandidate) -> bool {
@@ -1601,6 +1579,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot.candidate_texts("cjjw", 2).unwrap()[0], "惨家");
+    }
+
+    #[test]
+    fn complete_sentence_frontier_survives_free_abbreviation_crowding() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+晚上\twan shang\t100000\n\
+无\twu\t100\n\
+误\twu\t90\n\
+提交\tti jiao\t100\n";
+        let decoder = Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+
+        let ordinary = decoder.decode_sentence("wutijc", 2).unwrap();
+        assert!(
+            ordinary.iter().all(|candidate| candidate.text != "误提交"),
+            "the fixture must reproduce free-abbreviation crowding: {ordinary:?}"
+        );
+
+        let complete = decoder.decode_complete_sentence("wutijc", 2).unwrap();
+        assert_eq!(
+            complete
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>(),
+            ["无提交", "误提交"]
+        );
+        assert!(
+            complete.iter().all(sentence_is_complete),
+            "the protected frontier must contain complete exact paths only"
+        );
+        assert_eq!(
+            decoder.interactive_candidate_texts("wutijc", 2).unwrap(),
+            ["无提交", "误提交"]
+        );
+    }
+
+    #[test]
+    fn pinned_public_complete_frontier_keeps_mistaken_submission_reachable() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        let complete = decoder
+            .decode_complete_sentence("wutijc", MAX_CANDIDATE_SNAPSHOT_RANK)
+            .unwrap();
+        assert!(
+            complete.iter().any(|candidate| candidate.text == "误提交"),
+            "a complete core composition must remain reachable: {complete:?}"
+        );
+        assert!(complete.iter().all(sentence_is_complete));
+
+        let question = decoder
+            .decode_complete_sentence("veuuyunayivs", MAX_CANDIDATE_SNAPSHOT_RANK)
+            .unwrap();
+        let question_rank = question
+            .iter()
+            .position(|candidate| candidate.text == "这属于哪一种")
+            .map(|index| index + 1);
+        assert_eq!(
+            question_rank,
+            Some(6),
+            "complete core components must preserve the interrogative composition"
+        );
+        assert!(question.iter().all(sentence_is_complete));
     }
 
     #[test]
