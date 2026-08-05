@@ -173,14 +173,89 @@ function Write-ReplacementSummary {
         [Parameter(Mandatory = $true)]
         [string]$Digest,
         [Parameter(Mandatory = $true)]
-        [string]$Result
+        [string]$Result,
+        [Parameter(Mandatory = $true)]
+        [object]$HostCacheState
     )
 
     Write-Host ''
     Write-Host $Result
-    Write-Host "DLL SHA-256: $Digest"
-    Write-Host "Current user enable requested: $([bool]$script:EnableCurrentUserAfterReplace)"
-    Write-Host 'Microsoft Pinyin and the default input method were unchanged'
+    Write-Host "版本：$Digest"
+    if ($script:EnableCurrentUserAfterReplace) {
+        Write-Host '当前用户：已启用'
+    } else {
+        Write-Host '当前用户：未请求启用'
+    }
+    if (-not $HostCacheState.ScanAvailable) {
+        Write-Host '应用：未能检查版本缓存'
+    } elseif ($HostCacheState.MatchingVersion -eq 0 -and
+        $HostCacheState.OtherVersions -eq 0) {
+        Write-Host '应用：暂未发现载入 Alpha 的可见进程'
+    } elseif ($HostCacheState.OtherVersions -eq 0) {
+        Write-Host (
+            "应用：{0} 个可见进程已载入新版，没有发现旧版缓存" -f
+                $HostCacheState.MatchingVersion
+        )
+    } elseif ($HostCacheState.MatchingVersion -eq 0) {
+        Write-Host (
+            "应用：{0} 个可见进程仍在使用旧版" -f
+                $HostCacheState.OtherVersions
+        )
+    } else {
+        Write-Host (
+            "应用：{0} 个可见进程已载入新版，{1} 个仍在使用旧版" -f
+                $HostCacheState.MatchingVersion,
+                $HostCacheState.OtherVersions
+        )
+    }
+    if ($HostCacheState.ScanAvailable -and
+        $HostCacheState.OtherVersions -gt 0) {
+        Write-Host '无需关闭这些应用；下次打开时会载入新版。'
+    } else {
+        Write-Host '无需进行其他操作。'
+    }
+    Write-Host '微软拼音和默认输入法未更改'
+}
+
+function Get-HostCacheState {
+    $stateOutput = [Collections.Generic.List[string]]::new()
+    $stateExitCode = Invoke-DevCtlCapture `
+        -Arguments @('host-cache-state', '--dll', $script:sourceDll) `
+        -Lines $stateOutput
+    if ($stateExitCode -ne 0) {
+        return [PSCustomObject]@{
+            ScanAvailable = $false
+            MatchingVersion = [uint32]0
+            OtherVersions = [uint32]0
+        }
+    }
+    $stateLines = @(
+        $stateOutput |
+            Where-Object { $_ -like 'TSF_HOST_CACHE_STATE *' }
+    )
+    if ($stateLines.Count -ne 1) {
+        return [PSCustomObject]@{
+            ScanAvailable = $false
+            MatchingVersion = [uint32]0
+            OtherVersions = [uint32]0
+        }
+    }
+    $stateMatch = [regex]::Match(
+        $stateLines[0],
+        '^TSF_HOST_CACHE_STATE schema=ziranma-tsf-host-cache-state-v1 scan_available=(true|false) matching_version=([0-9]+) other_versions=([0-9]+) writes=false$'
+    )
+    if (-not $stateMatch.Success) {
+        return [PSCustomObject]@{
+            ScanAvailable = $false
+            MatchingVersion = [uint32]0
+            OtherVersions = [uint32]0
+        }
+    }
+    return [PSCustomObject]@{
+        ScanAvailable = $stateMatch.Groups[1].Value -eq 'true'
+        MatchingVersion = [uint32]::Parse($stateMatch.Groups[2].Value)
+        OtherVersions = [uint32]::Parse($stateMatch.Groups[3].Value)
+    }
 }
 
 function Restore-RequestedCurrentUserEnablement {
@@ -372,9 +447,11 @@ if (-not $ForceReregister -and
         Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
         Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
         Invoke-DevCtl -Arguments @('inspect', '--dll', $sourceDll) -Quiet
+        $hostCacheState = Get-HostCacheState
         Write-ReplacementSummary `
             -Digest $sourceDigest `
-            -Result 'TSF Alpha is already current'
+            -Result '自然码 Alpha 已是最新版' `
+            -HostCacheState $hostCacheState
         exit 0
     } catch {
         Write-Host 'The existing TSF Alpha registration needs one compatibility refresh.'
@@ -452,6 +529,8 @@ if ($EnableCurrentUserAfterReplace) {
 }
 Invoke-DevCtl -Arguments @('inspect', '--dll', $sourceDll) -Quiet
 
+$hostCacheState = Get-HostCacheState
 Write-ReplacementSummary `
     -Digest $sourceDigest `
-    -Result 'TSF Alpha replacement completed'
+    -Result '自然码 Alpha 换代完成' `
+    -HostCacheState $hostCacheState

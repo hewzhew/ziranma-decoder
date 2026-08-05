@@ -43,6 +43,7 @@ const TSF_ENABLE_STABILITY_WINDOW: Duration = Duration::from_secs(1);
 enum Options {
     Help,
     Inspect { dll: PathBuf },
+    HostCacheState { dll: PathBuf },
     RegisterMachine { dll: PathBuf },
     UnregisterMachine,
     EnableCurrentUser,
@@ -241,6 +242,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match parse_options(std::env::args().skip(1))? {
         Options::Help => print_usage(),
         Options::Inspect { dll } => inspect(&dll)?,
+        Options::HostCacheState { dll } => host_cache_state(&dll)?,
         Options::RegisterMachine { dll } => register_machine(&dll)?,
         Options::UnregisterMachine => unregister_machine()?,
         Options::EnableCurrentUser => enable_current_user()?,
@@ -268,6 +270,9 @@ fn parse_options(
     }
     match command.as_str() {
         "inspect" => Ok(Options::Inspect {
+            dll: parse_dll_arguments(arguments, false)?,
+        }),
+        "host-cache-state" => Ok(Options::HostCacheState {
             dll: parse_dll_arguments(arguments, false)?,
         }),
         "register-machine" => Ok(Options::RegisterMachine {
@@ -371,6 +376,10 @@ fn print_usage() {
          target/release/ziranma_core.dll"
     );
     eprintln!(
+        "       cargo run --release --bin tsf-devctl -- host-cache-state --dll \
+         target/release/ziranma_core.dll"
+    );
+    eprintln!(
         "       cargo run --release --bin tsf-devctl -- register-machine --dll \
          target/release/ziranma_core.dll --confirm-machine-wide-development-alpha"
     );
@@ -408,6 +417,16 @@ fn inspect(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     print!(
         "{}",
         render_report(path, &image, registration, profile, loaded_hosts)
+    );
+    Ok(())
+}
+
+fn host_cache_state(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = read_explicit_dll(path)?;
+    validate_alpha_dll(&inspect_pe(&bytes)?)?;
+    print!(
+        "{}",
+        render_host_cache_state(inspect_loaded_hosts(&hex_sha256(&bytes)))
     );
     Ok(())
 }
@@ -1390,6 +1409,14 @@ fn render_loaded_hosts(status: LoadedHostStatus) -> String {
     format!(
         "此版本 {}，其他版本 {}（仅计可见进程）",
         status.matching_version, status.other_versions
+    )
+}
+
+fn render_host_cache_state(status: LoadedHostStatus) -> String {
+    format!(
+        "TSF_HOST_CACHE_STATE schema=ziranma-tsf-host-cache-state-v1 \
+         scan_available={} matching_version={} other_versions={} writes=false\n",
+        status.scan_available, status.matching_version, status.other_versions
     )
 }
 
@@ -2976,6 +3003,12 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_options(["host-cache-state", "--dll", "alpha.dll"].map(str::to_owned)).unwrap(),
+            Options::HostCacheState {
+                dll: PathBuf::from("alpha.dll")
+            }
+        );
+        assert_eq!(
             parse_options(
                 [
                     "register-machine",
@@ -3059,6 +3092,7 @@ mod tests {
             .is_err()
         );
         assert!(parse_options(["inspect"].map(str::to_owned)).is_err());
+        assert!(parse_options(["host-cache-state"].map(str::to_owned)).is_err());
         assert!(
             parse_options(["inspect", "--dll", "a.dll", "--dll", "b.dll"].map(str::to_owned))
                 .is_err()
@@ -3144,6 +3178,15 @@ mod tests {
             "未发现正在加载 Alpha 的应用"
         );
         assert_eq!(render_loaded_hosts(LoadedHostStatus::default()), "无法检查");
+        assert_eq!(
+            render_host_cache_state(LoadedHostStatus {
+                scan_available: true,
+                matching_version: 3,
+                other_versions: 4,
+            }),
+            "TSF_HOST_CACHE_STATE schema=ziranma-tsf-host-cache-state-v1 \
+             scan_available=true matching_version=3 other_versions=4 writes=false\n"
+        );
     }
 
     #[test]
