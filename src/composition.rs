@@ -8,7 +8,10 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use crate::{SentenceCandidate, personal_ranking::is_anchored_suffix_abbreviation};
+use crate::{
+    SentenceCandidate,
+    personal_ranking::{CandidateTextPromotion, is_anchored_suffix_abbreviation},
+};
 
 const MAX_COMPOSITION_KEYS: usize = 64;
 const MAX_SESSION_SELECTIONS: usize = 128;
@@ -123,12 +126,6 @@ struct SessionSelection {
     candidate: Option<SentenceCandidate>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TextPromotion {
-    pub(crate) index: usize,
-    pub(crate) changed: bool,
-}
-
 impl SessionSelectionMemory {
     pub fn remember(&mut self, code: &str, candidate: &SentenceCandidate) {
         self.remember_entry(code, &candidate.text, Some(candidate.clone()));
@@ -241,7 +238,7 @@ impl SessionSelectionMemory {
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-    ) -> Option<TextPromotion> {
+    ) -> Option<CandidateTextPromotion> {
         let preferred = self
             .selections
             .iter()
@@ -257,21 +254,24 @@ impl SessionSelectionMemory {
             let original_len = candidates.len();
             candidates.insert(protected_prefix, preferred.text.clone());
             candidates.truncate(original_len.max(1));
-            return (protected_prefix < candidates.len()).then_some(TextPromotion {
+            return (protected_prefix < candidates.len()).then_some(CandidateTextPromotion {
                 index: protected_prefix,
+                source_index: None,
                 changed: true,
             });
         };
         if index <= protected_prefix {
-            return Some(TextPromotion {
+            return Some(CandidateTextPromotion {
                 index,
+                source_index: Some(index),
                 changed: false,
             });
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        Some(TextPromotion {
+        Some(CandidateTextPromotion {
             index: protected_prefix,
+            source_index: Some(index),
             changed: true,
         })
     }
@@ -305,7 +305,7 @@ impl SessionSelectionMemory {
         candidates: &mut Vec<String>,
         protected_prefix: usize,
         mut eligible_source: impl FnMut(&str, &str) -> bool,
-    ) -> Option<TextPromotion> {
+    ) -> Option<CandidateTextPromotion> {
         let preferred = self.selections.iter().find(|selection| {
             is_anchored_suffix_abbreviation(&selection.code, code)
                 && candidates
@@ -318,15 +318,17 @@ impl SessionSelectionMemory {
             .iter()
             .position(|candidate| candidate == &preferred.text)?;
         if index <= protected_prefix {
-            return Some(TextPromotion {
+            return Some(CandidateTextPromotion {
                 index,
+                source_index: Some(index),
                 changed: false,
             });
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        Some(TextPromotion {
+        Some(CandidateTextPromotion {
             index: protected_prefix,
+            source_index: Some(index),
             changed: true,
         })
     }
@@ -1009,8 +1011,9 @@ mod tests {
         let mut moved = vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()];
         assert_eq!(
             memory.promote_texts_after_decision("ab", &mut moved, 0),
-            Some(TextPromotion {
+            Some(CandidateTextPromotion {
                 index: 0,
+                source_index: Some(1),
                 changed: true,
             })
         );
@@ -1018,8 +1021,9 @@ mod tests {
 
         assert_eq!(
             memory.promote_texts_after_decision("ab", &mut moved, 0),
-            Some(TextPromotion {
+            Some(CandidateTextPromotion {
                 index: 0,
+                source_index: Some(0),
                 changed: false,
             })
         );

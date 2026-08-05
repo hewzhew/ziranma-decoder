@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use crate::personal_ranking::CandidateTextPromotion;
+
 pub const MAX_PERSONAL_CONTEXT_ENTRIES: usize = 2_048;
 pub const MAX_PERSONAL_CONTEXT_CODE_KEYS: usize = 64;
 pub const MAX_PERSONAL_CONTEXT_TEXT_CHARACTERS: usize = 64;
@@ -197,10 +199,28 @@ impl PersonalContextRanking {
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-        mut allowed: impl FnMut(&str) -> bool,
+        allowed: impl FnMut(&str) -> bool,
     ) -> bool {
+        self.promote_existing_text_after_decision(
+            previous_text,
+            code,
+            candidates,
+            protected_prefix,
+            allowed,
+        )
+        .is_some_and(|promotion| promotion.changed)
+    }
+
+    pub(crate) fn promote_existing_text_after_decision(
+        &self,
+        previous_text: &str,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        mut allowed: impl FnMut(&str) -> bool,
+    ) -> Option<CandidateTextPromotion> {
         if !valid_text(previous_text) || !valid_code(code) || candidates.is_empty() {
-            return false;
+            return None;
         }
         let preferred = self
             .entries_for_context(previous_text, code)
@@ -220,22 +240,25 @@ impl PersonalContextRanking {
             .and_then(|((_, _, text), evidence)| {
                 (effective_support(evidence) > 0).then_some(text.as_str())
             });
-        let Some(preferred) = preferred else {
-            return false;
-        };
-        let Some(index) = candidates
+        let preferred = preferred?;
+        let index = candidates
             .iter()
-            .position(|candidate| candidate == preferred)
-        else {
-            return false;
-        };
+            .position(|candidate| candidate == preferred)?;
         let protected_prefix = protected_prefix.min(candidates.len());
         if index <= protected_prefix {
-            return false;
+            return Some(CandidateTextPromotion {
+                index,
+                source_index: Some(index),
+                changed: false,
+            });
         }
         let candidate = candidates.remove(index);
         candidates.insert(protected_prefix, candidate);
-        true
+        Some(CandidateTextPromotion {
+            index: protected_prefix,
+            source_index: Some(index),
+            changed: true,
+        })
     }
 
     fn entries_for_context<'a>(

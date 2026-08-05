@@ -21,6 +21,7 @@ use crate::candidate_snapshot::{
     InteractiveCandidateQuery, InteractiveCandidateSource, layered_candidate_query_with_sources,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
+use crate::personal_ranking::CandidateTextPromotion;
 use crate::{
     CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
     CandidateRuntimeError, CandidateSnapshot, CharacterShapeIndex, CompositionEffect,
@@ -313,6 +314,17 @@ struct CandidateBatch {
     automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
     may_have_more: bool,
     view: InteractiveCandidateView,
+}
+
+fn mirror_candidate_promotion(batch: &mut CandidateBatch, promotion: CandidateTextPromotion) {
+    let final_len = batch.candidates.len();
+    if !promotion.mirror_into(
+        &mut batch.provenance,
+        NativeCandidateProvenance::default(),
+        final_len,
+    ) {
+        batch.provenance = vec![NativeCandidateProvenance::default(); final_len];
+    }
 }
 
 #[derive(Default)]
@@ -6569,33 +6581,34 @@ impl PersonalRankingRuntime {
         candidates: &mut Vec<String>,
         protected_prefix: usize,
     ) -> bool {
-        self.promote_texts_after_index(code, candidates, protected_prefix)
+        self.promote_texts_after_decision(code, candidates, protected_prefix)
             .is_some()
     }
 
-    fn promote_texts_after_index(
+    fn promote_texts_after_decision(
         &self,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-    ) -> Option<usize> {
-        self.snapshot.promote_texts_after_with_suppressions_index(
-            code,
-            candidates,
-            protected_prefix,
-            &self.suppressions,
-        )
+    ) -> Option<CandidateTextPromotion> {
+        self.snapshot
+            .promote_texts_after_with_suppressions_decision(
+                code,
+                candidates,
+                protected_prefix,
+                &self.suppressions,
+            )
     }
 
-    fn promote_anchored_suffix_texts_after_index(
+    fn promote_anchored_suffix_texts_after_decision(
         &self,
         provider: &dyn CandidateProvider,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-    ) -> Option<usize> {
+    ) -> Option<CandidateTextPromotion> {
         self.snapshot
-            .promote_anchored_suffix_texts_after_with_suppressions_index(
+            .promote_anchored_suffix_texts_after_with_suppressions_decision(
                 code,
                 candidates,
                 protected_prefix,
@@ -6627,15 +6640,15 @@ impl PersonalRankingRuntime {
             )
     }
 
-    fn recall_repeated_anchored_suffix_text_after(
+    fn recall_repeated_anchored_suffix_text_after_decision(
         &self,
         provider: &dyn CandidateProvider,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
-    ) -> Option<usize> {
+    ) -> Option<CandidateTextPromotion> {
         self.snapshot
-            .recall_repeated_anchored_suffix_text_after_with_suppressions(
+            .recall_repeated_anchored_suffix_text_after_with_suppressions_decision(
                 code,
                 candidates,
                 protected_prefix,
@@ -7035,8 +7048,6 @@ impl TsfTextService_Impl {
             let protected_prefix = provider
                 .protected_candidate_prefix_len(code, view)
                 .min(batch.candidates.len());
-            let original_candidates = batch.candidates.clone();
-            let original_provenance = batch.provenance.clone();
             let personal_ranking = self
                 .personal_ranking
                 .try_borrow()
@@ -7049,14 +7060,17 @@ impl TsfTextService_Impl {
                 .remembered_text(code)
                 .filter(|text| !personal_ranking.is_suppressed(code, text));
             let mut personalized_texts = HashSet::new();
-            let persistent_exact_index = personal_ranking.promote_texts_after_index(
+            let persistent_exact_promotion = personal_ranking.promote_texts_after_decision(
                 code,
                 &mut batch.candidates,
                 protected_prefix,
             );
-            let persistent_anchored_index =
-                if persistent_exact_index.is_none() && session_exact_text.is_none() {
-                    personal_ranking.promote_anchored_suffix_texts_after_index(
+            if let Some(promotion) = persistent_exact_promotion {
+                mirror_candidate_promotion(&mut batch, promotion);
+            }
+            let persistent_anchored_promotion =
+                if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
+                    personal_ranking.promote_anchored_suffix_texts_after_decision(
                         provider,
                         code,
                         &mut batch.candidates,
@@ -7065,12 +7079,15 @@ impl TsfTextService_Impl {
                 } else {
                     None
                 };
-            let personal_discovery_index = if persistent_exact_index.is_none()
-                && persistent_anchored_index.is_none()
+            if let Some(promotion) = persistent_anchored_promotion {
+                mirror_candidate_promotion(&mut batch, promotion);
+            }
+            let personal_discovery_promotion = if persistent_exact_promotion.is_none()
+                && persistent_anchored_promotion.is_none()
                 && session_exact_text.is_none()
                 && automatic_transposition_request.is_none()
             {
-                personal_ranking.recall_repeated_anchored_suffix_text_after(
+                personal_ranking.recall_repeated_anchored_suffix_text_after_decision(
                     provider,
                     code,
                     &mut batch.candidates,
@@ -7079,18 +7096,21 @@ impl TsfTextService_Impl {
             } else {
                 None
             };
-            if let Some(index) = persistent_exact_index.or(persistent_anchored_index)
-                && let Some(candidate) = batch.candidates.get(index)
+            if let Some(promotion) = personal_discovery_promotion {
+                mirror_candidate_promotion(&mut batch, promotion);
+            }
+            if let Some(promotion) = persistent_exact_promotion.or(persistent_anchored_promotion)
+                && let Some(candidate) = batch.candidates.get(promotion.index)
             {
                 personalized_texts.insert(candidate.clone());
             }
-            if let Some(index) = personal_discovery_index
-                && let Some(candidate) = batch.candidates.get(index)
+            if let Some(promotion) = personal_discovery_promotion
+                && let Some(candidate) = batch.candidates.get(promotion.index)
             {
                 personalized_texts.insert(candidate.clone());
             }
             let session_anchored_promotion =
-                if persistent_exact_index.is_none() && session_exact_text.is_none() {
+                if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
                     selection_memory.promote_anchored_suffix_texts_after_decision(
                         code,
                         &mut batch.candidates,
@@ -7104,6 +7124,9 @@ impl TsfTextService_Impl {
                 } else {
                     None
                 };
+            if let Some(promotion) = session_anchored_promotion {
+                mirror_candidate_promotion(&mut batch, promotion);
+            }
             let session_exact_promotion = session_exact_text.and_then(|_| {
                 selection_memory.promote_texts_after_decision(
                     code,
@@ -7111,6 +7134,9 @@ impl TsfTextService_Impl {
                     protected_prefix,
                 )
             });
+            if let Some(promotion) = session_exact_promotion {
+                mirror_candidate_promotion(&mut batch, promotion);
+            }
             let session_promotion = session_exact_promotion.or(session_anchored_promotion);
             if let Some(promotion) = session_promotion
                 && let Some(candidate) = batch.candidates.get(promotion.index)
@@ -7121,11 +7147,11 @@ impl TsfTextService_Impl {
             if automatic_transposition_request.is_none()
                 && let Some(previous) = left_context.as_deref()
             {
-                let context_changed = self
+                let context_promotion = self
                     .personal_context_ranking
                     .try_borrow()
                     .map_err(|_| lifecycle_error(E_UNEXPECTED))?
-                    .promote_existing_text_after(
+                    .promote_existing_text_after_decision(
                         previous,
                         code,
                         &mut batch.candidates,
@@ -7135,29 +7161,18 @@ impl TsfTextService_Impl {
                                 && personal_ranking.has_evidence(code, text)
                         },
                     );
+                if let Some(promotion) = context_promotion {
+                    mirror_candidate_promotion(&mut batch, promotion);
+                }
+                let context_changed = context_promotion.is_some_and(|promotion| promotion.changed);
                 session_changed |= context_changed;
                 if context_changed && let Some(candidate) = batch.candidates.get(protected_prefix) {
                     personalized_texts.insert(candidate.clone());
                 }
             }
-            if batch.candidates != original_candidates {
-                batch.provenance = batch
-                    .candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(index, candidate)| {
-                        let base = original_candidates
-                            .iter()
-                            .position(|original| original == candidate)
-                            .and_then(|source_index| original_provenance.get(source_index).copied())
-                            .unwrap_or_default();
-                        if session_changed && index == protected_prefix {
-                            NativeCandidateProvenance::new(base.source(), true)
-                        } else {
-                            base
-                        }
-                    })
-                    .collect();
+            if session_changed && let Some(provenance) = batch.provenance.get_mut(protected_prefix)
+            {
+                *provenance = NativeCandidateProvenance::new(provenance.source(), true);
             }
             batch.personalized = batch
                 .candidates

@@ -91,6 +91,43 @@ pub(crate) fn is_anchored_suffix_abbreviation(full_code: &str, abbreviated_code:
         .all(|(observed, complete)| *observed == complete[0])
 }
 
+/// One already-applied candidate-list change that can be mirrored onto
+/// caller-owned parallel metadata without comparing or matching text again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateTextPromotion {
+    pub(crate) index: usize,
+    pub(crate) source_index: Option<usize>,
+    pub(crate) changed: bool,
+}
+
+impl CandidateTextPromotion {
+    pub(crate) fn mirror_into<T>(
+        self,
+        parallel: &mut Vec<T>,
+        inserted: T,
+        final_len: usize,
+    ) -> bool {
+        if !self.changed {
+            return parallel.len() == final_len && self.index < final_len;
+        }
+        match self.source_index {
+            Some(source_index) if source_index < parallel.len() => {
+                let value = parallel.remove(source_index);
+                if self.index > parallel.len() {
+                    return false;
+                }
+                parallel.insert(self.index, value);
+            }
+            None if self.index <= parallel.len() => {
+                parallel.insert(self.index, inserted);
+            }
+            _ => return false,
+        }
+        parallel.truncate(final_len);
+        parallel.len() == final_len
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersonalRankingSelection {
     code: String,
@@ -655,7 +692,7 @@ impl PersonalRankingSnapshot {
         let Some(preferred) = self.preferred_text(code) else {
             return false;
         };
-        promote_preferred_text_index(preferred, candidates, protected_prefix).is_some()
+        promote_preferred_text_decision(preferred, candidates, protected_prefix).is_some()
     }
 
     pub fn promote_texts_after_with_suppressions(
@@ -665,7 +702,7 @@ impl PersonalRankingSnapshot {
         protected_prefix: usize,
         suppressions: &PersonalRankingSuppressionSnapshot,
     ) -> bool {
-        self.promote_texts_after_with_suppressions_index(
+        self.promote_texts_after_with_suppressions_decision(
             code,
             candidates,
             protected_prefix,
@@ -674,15 +711,15 @@ impl PersonalRankingSnapshot {
         .is_some()
     }
 
-    pub(crate) fn promote_texts_after_with_suppressions_index(
+    pub(crate) fn promote_texts_after_with_suppressions_decision(
         &self,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
         suppressions: &PersonalRankingSuppressionSnapshot,
-    ) -> Option<usize> {
+    ) -> Option<CandidateTextPromotion> {
         let preferred = self.preferred_text_with_suppressions(code, suppressions)?;
-        promote_preferred_text_index(preferred, candidates, protected_prefix)
+        promote_preferred_text_decision(preferred, candidates, protected_prefix)
     }
 
     /// Promotes evidence learned under a verified complete code into one
@@ -702,7 +739,7 @@ impl PersonalRankingSnapshot {
         suppressions: &PersonalRankingSuppressionSnapshot,
         mut exact_full_code_candidate: impl FnMut(&str, &str) -> bool,
     ) -> bool {
-        self.promote_anchored_suffix_texts_after_with_suppressions_index(
+        self.promote_anchored_suffix_texts_after_with_suppressions_decision(
             code,
             candidates,
             protected_prefix,
@@ -712,21 +749,21 @@ impl PersonalRankingSnapshot {
         .is_some()
     }
 
-    pub(crate) fn promote_anchored_suffix_texts_after_with_suppressions_index(
+    pub(crate) fn promote_anchored_suffix_texts_after_with_suppressions_decision(
         &self,
         code: &str,
         candidates: &mut Vec<String>,
         protected_prefix: usize,
         suppressions: &PersonalRankingSuppressionSnapshot,
         mut exact_full_code_candidate: impl FnMut(&str, &str) -> bool,
-    ) -> Option<usize> {
+    ) -> Option<CandidateTextPromotion> {
         let preferred = self.preferred_anchored_suffix_text_where(
             code,
             candidates,
             suppressions,
             &mut exact_full_code_candidate,
         )?;
-        promote_preferred_text_index(preferred, candidates, protected_prefix)
+        promote_preferred_text_decision(preferred, candidates, protected_prefix)
     }
 
     pub(crate) fn has_anchored_suffix_evidence_with_suppressions(
@@ -755,6 +792,7 @@ impl PersonalRankingSnapshot {
     /// every complete-code character. It preserves the first unprotected
     /// ordinary candidate as a discovery guard; one explicit short-code
     /// selection can then establish normal exact-code evidence.
+    #[cfg(test)]
     pub(crate) fn recall_repeated_anchored_suffix_text_after_with_suppressions(
         &self,
         code: &str,
@@ -763,12 +801,30 @@ impl PersonalRankingSnapshot {
         suppressions: &PersonalRankingSuppressionSnapshot,
         mut eligible_character_composition: impl FnMut(&str, &str) -> bool,
     ) -> Option<usize> {
+        self.recall_repeated_anchored_suffix_text_after_with_suppressions_decision(
+            code,
+            candidates,
+            protected_prefix,
+            suppressions,
+            &mut eligible_character_composition,
+        )
+        .map(|promotion| promotion.index)
+    }
+
+    pub(crate) fn recall_repeated_anchored_suffix_text_after_with_suppressions_decision(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+        mut eligible_character_composition: impl FnMut(&str, &str) -> bool,
+    ) -> Option<CandidateTextPromotion> {
         let preferred = self.preferred_repeated_anchored_suffix_text_where(
             code,
             suppressions,
             &mut eligible_character_composition,
         )?;
-        recall_preferred_text_after_first_ordinary(preferred, candidates, protected_prefix)
+        recall_preferred_text_after_first_ordinary_decision(preferred, candidates, protected_prefix)
     }
 
     pub(crate) fn has_repeated_anchored_suffix_evidence_with_suppressions(
@@ -840,11 +896,11 @@ impl PersonalRankingSnapshot {
     }
 }
 
-fn promote_preferred_text_index(
+fn promote_preferred_text_decision(
     preferred: &str,
     candidates: &mut Vec<String>,
     protected_prefix: usize,
-) -> Option<usize> {
+) -> Option<CandidateTextPromotion> {
     let protected_prefix = protected_prefix.min(candidates.len());
     let Some(index) = candidates
         .iter()
@@ -856,21 +912,33 @@ fn promote_preferred_text_index(
         let original_len = candidates.len();
         candidates.insert(protected_prefix, preferred.to_owned());
         candidates.truncate(original_len.max(1));
-        return (protected_prefix < candidates.len()).then_some(protected_prefix);
+        return (protected_prefix < candidates.len()).then_some(CandidateTextPromotion {
+            index: protected_prefix,
+            source_index: None,
+            changed: true,
+        });
     };
     if index <= protected_prefix {
-        return Some(index);
+        return Some(CandidateTextPromotion {
+            index,
+            source_index: Some(index),
+            changed: false,
+        });
     }
     let candidate = candidates.remove(index);
     candidates.insert(protected_prefix, candidate);
-    Some(protected_prefix)
+    Some(CandidateTextPromotion {
+        index: protected_prefix,
+        source_index: Some(index),
+        changed: true,
+    })
 }
 
-fn recall_preferred_text_after_first_ordinary(
+fn recall_preferred_text_after_first_ordinary_decision(
     preferred: &str,
     candidates: &mut Vec<String>,
     protected_prefix: usize,
-) -> Option<usize> {
+) -> Option<CandidateTextPromotion> {
     let protected_prefix = protected_prefix.min(candidates.len());
     let Some(index) = candidates
         .iter()
@@ -878,7 +946,11 @@ fn recall_preferred_text_after_first_ordinary(
     else {
         if candidates.is_empty() {
             candidates.push(preferred.to_owned());
-            return Some(0);
+            return Some(CandidateTextPromotion {
+                index: 0,
+                source_index: None,
+                changed: true,
+            });
         }
         if protected_prefix == candidates.len() || candidates.len() < 2 {
             return None;
@@ -887,17 +959,29 @@ fn recall_preferred_text_after_first_ordinary(
         let discovery_index = protected_prefix.saturating_add(1).min(original_len);
         candidates.insert(discovery_index, preferred.to_owned());
         candidates.truncate(original_len);
-        return (discovery_index < candidates.len()).then_some(discovery_index);
+        return (discovery_index < candidates.len()).then_some(CandidateTextPromotion {
+            index: discovery_index,
+            source_index: None,
+            changed: true,
+        });
     };
     let discovery_index = protected_prefix
         .saturating_add(usize::from(protected_prefix < candidates.len()))
         .min(candidates.len().saturating_sub(1));
     if index <= discovery_index {
-        return Some(index);
+        return Some(CandidateTextPromotion {
+            index,
+            source_index: Some(index),
+            changed: false,
+        });
     }
     let candidate = candidates.remove(index);
     candidates.insert(discovery_index, candidate);
-    Some(discovery_index)
+    Some(CandidateTextPromotion {
+        index: discovery_index,
+        source_index: Some(index),
+        changed: true,
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2314,6 +2398,34 @@ mod tests {
         let mut candidates = vec!["固定".to_owned(), "甲".to_owned(), "乙".to_owned()];
         assert!(snapshot.promote_texts_after("ab", &mut candidates, 1));
         assert_eq!(candidates, ["固定", "丙", "甲"]);
+    }
+
+    #[test]
+    fn candidate_promotion_mirrors_parallel_metadata_without_text_lookup() {
+        let moved = CandidateTextPromotion {
+            index: 0,
+            source_index: Some(2),
+            changed: true,
+        };
+        let mut provenance = vec!["first", "second", "third"];
+        assert!(moved.mirror_into(&mut provenance, "inserted", 3));
+        assert_eq!(provenance, ["third", "first", "second"]);
+
+        let inserted = CandidateTextPromotion {
+            index: 1,
+            source_index: None,
+            changed: true,
+        };
+        assert!(inserted.mirror_into(&mut provenance, "personal", 3));
+        assert_eq!(provenance, ["third", "personal", "first"]);
+
+        let unchanged = CandidateTextPromotion {
+            index: 1,
+            source_index: Some(1),
+            changed: false,
+        };
+        assert!(unchanged.mirror_into(&mut provenance, "unused", 3));
+        assert_eq!(provenance, ["third", "personal", "first"]);
     }
 
     #[test]
