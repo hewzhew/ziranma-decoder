@@ -242,6 +242,9 @@ trait CandidateProvider: Send + Sync {
         view: InteractiveCandidateView,
     ) -> CandidateProviderOutput {
         let candidates = self.candidates(code, limit, view);
+        let protected_prefix_len = self
+            .protected_candidate_prefix_len(code, view)
+            .min(candidates.len());
         let source = match view {
             InteractiveCandidateView::Primary => NativeCandidateSource::Unknown,
             InteractiveCandidateView::TranspositionRecovery => {
@@ -252,6 +255,7 @@ trait CandidateProvider: Send + Sync {
         CandidateProviderOutput {
             candidates,
             provenance,
+            protected_prefix_len,
             automatic_transposition_blocked: false,
         }
     }
@@ -303,6 +307,7 @@ trait CandidateProvider: Send + Sync {
 struct CandidateProviderOutput {
     candidates: Vec<String>,
     provenance: Vec<NativeCandidateProvenance>,
+    protected_prefix_len: usize,
     automatic_transposition_blocked: bool,
 }
 
@@ -311,6 +316,7 @@ struct CandidateBatch {
     candidates: Vec<String>,
     provenance: Vec<NativeCandidateProvenance>,
     personalized: Vec<bool>,
+    protected_prefix_len: usize,
     automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
     may_have_more: bool,
     view: InteractiveCandidateView,
@@ -343,6 +349,7 @@ struct CandidateCache {
     view: InteractiveCandidateView,
     candidates: Vec<String>,
     provenance: Vec<NativeCandidateProvenance>,
+    protected_prefix_len: usize,
     requested_limit: usize,
     exhausted: bool,
     automatic_transposition_blocked: bool,
@@ -405,6 +412,7 @@ impl CandidateCache {
             self.requested_limit = requested_limit;
             self.candidates = output.candidates;
             self.provenance = output.provenance;
+            self.protected_prefix_len = output.protected_prefix_len.min(self.candidates.len());
             self.automatic_transposition_blocked = output.automatic_transposition_blocked;
             self.automatic_transposition_effective_attempt = None;
             self.automatic_transposition_outcome = AutomaticTranspositionOutcome::NotRequested;
@@ -420,6 +428,7 @@ impl CandidateCache {
             candidates: self.candidates.clone(),
             provenance: self.provenance.clone(),
             personalized: vec![false; self.candidates.len()],
+            protected_prefix_len: self.protected_prefix_len,
             automatic_transposition: self.automatic_transposition_decision(),
             may_have_more: !self.exhausted && self.requested_limit < CANDIDATE_LIMIT,
             view,
@@ -478,7 +487,7 @@ impl CandidateCache {
         self.automatic_transposition_visible_rank = None;
         if self.requested_limit == 0
             || self.automatic_transposition_blocked
-            || provider.protected_candidate_prefix_len(code, InteractiveCandidateView::Primary) > 0
+            || self.protected_prefix_len > 0
             || self
                 .provenance
                 .iter()
@@ -634,11 +643,13 @@ impl SnapshotCandidateProvider {
                 let mut candidates = Vec::new();
                 let mut provenance = Vec::new();
                 let mut seen = HashSet::new();
+                let mut protected_prefix_len = 0;
                 let mut automatic_transposition_blocked = false;
                 if let Some(alias) = self.aliases.as_ref().and_then(|aliases| aliases.text(code)) {
                     automatic_transposition_blocked = true;
                     seen.insert(alias.clone());
                     candidates.push(alias);
+                    protected_prefix_len = 1;
                     provenance.push(NativeCandidateProvenance::new(
                         NativeCandidateSource::ExplicitAlias,
                         false,
@@ -693,9 +704,11 @@ impl SnapshotCandidateProvider {
                 }
                 candidates.truncate(limit);
                 provenance.truncate(candidates.len());
+                protected_prefix_len = protected_prefix_len.min(candidates.len());
                 CandidateProviderOutput {
                     candidates,
                     provenance,
+                    protected_prefix_len,
                     automatic_transposition_blocked,
                 }
             }
@@ -714,6 +727,7 @@ impl SnapshotCandidateProvider {
                 CandidateProviderOutput {
                     candidates,
                     provenance,
+                    protected_prefix_len: 0,
                     automatic_transposition_blocked: true,
                 }
             }
@@ -869,6 +883,7 @@ impl CandidateProvider for SnapshotCandidateProvider {
         Some(CandidateProviderOutput {
             candidates,
             provenance,
+            protected_prefix_len: 0,
             automatic_transposition_blocked: true,
         })
     }
@@ -1107,6 +1122,7 @@ impl CandidateDisplay {
             CandidateBatch {
                 provenance: vec![NativeCandidateProvenance::default(); candidates.len()],
                 personalized: vec![false; candidates.len()],
+                protected_prefix_len: 0,
                 candidates,
                 automatic_transposition: None,
                 may_have_more: false,
@@ -1121,6 +1137,7 @@ impl CandidateDisplay {
             candidates,
             mut provenance,
             mut personalized,
+            protected_prefix_len: _,
             automatic_transposition,
             may_have_more,
             view,
@@ -7002,6 +7019,7 @@ impl TsfTextService_Impl {
                 candidates.len()
             ],
             personalized: vec![false; candidates.len()],
+            protected_prefix_len: 0,
             automatic_transposition: None,
             may_have_more: candidates.len() == limit && limit < CANDIDATE_LIMIT,
             candidates,
@@ -7055,9 +7073,7 @@ impl TsfTextService_Impl {
                 automatic_transposition_request,
             );
         if view == InteractiveCandidateView::Primary {
-            let protected_prefix = provider
-                .protected_candidate_prefix_len(code, view)
-                .min(batch.candidates.len());
+            let protected_prefix = batch.protected_prefix_len.min(batch.candidates.len());
             let personal_ranking = self
                 .personal_ranking
                 .try_borrow()
@@ -7172,6 +7188,7 @@ impl TsfTextService_Impl {
             batch.provenance.truncate(batch.candidates.len());
             batch.personalized.truncate(batch.candidates.len());
         }
+        batch.protected_prefix_len = batch.protected_prefix_len.min(batch.candidates.len());
         Ok(batch)
     }
 
@@ -7957,12 +7974,7 @@ impl TsfTextService_Impl {
                     PlannedCandidateForgetAction::Message(CandidateForgetMessage::Select),
                 )));
             };
-            let protected_prefix = provider
-                .protected_candidate_prefix_len(
-                    session.phonetic(),
-                    InteractiveCandidateView::Primary,
-                )
-                .min(batch.candidates.len());
+            let protected_prefix = batch.protected_prefix_len.min(batch.candidates.len());
             if absolute < protected_prefix {
                 let display = CandidateDisplay::from_batch(batch, session.candidate_page_start())
                     .with_mode(CandidateDisplayMode::ForgetProtected);
@@ -8471,11 +8483,8 @@ impl TsfTextService_Impl {
         let overruled_text_to_remember =
             (explicit_primary_selection && !session.recovery_mode() && !session.tab_mode())
                 .then(|| {
-                    let protected_prefix = provider
-                        .protected_candidate_prefix_len(
-                            session.phonetic(),
-                            InteractiveCandidateView::Primary,
-                        )
+                    let protected_prefix = existing_batch
+                        .protected_prefix_len
                         .min(existing_batch.candidates.len());
                     selected_absolute_index
                         .filter(|index| *index > protected_prefix)
@@ -9243,6 +9252,7 @@ mod tests {
                 NativeCandidateProvenance::default(),
             ],
             personalized: vec![false, true, false],
+            protected_prefix_len: 0,
             automatic_transposition: None,
             may_have_more: false,
             view: InteractiveCandidateView::Primary,
@@ -9658,6 +9668,7 @@ mod tests {
         let output =
             provider.candidates_with_provenance("aa", 2, InteractiveCandidateView::Primary);
         assert_eq!(output.candidates, candidates);
+        assert_eq!(output.protected_prefix_len, 1);
         assert_eq!(
             output
                 .provenance
@@ -9775,6 +9786,39 @@ mod tests {
         }
     }
 
+    struct CountingProtectedPrefixCandidateProvider {
+        candidate_calls: AtomicUsize,
+        protected_prefix_calls: AtomicUsize,
+    }
+
+    impl CandidateProvider for CountingProtectedPrefixCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            self.candidate_calls.fetch_add(1, Ordering::Relaxed);
+            if code != "ab" || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            ["固定", "甲", "乙"]
+                .into_iter()
+                .take(limit)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            self.protected_prefix_calls.fetch_add(1, Ordering::Relaxed);
+            usize::from(code == "ab" && view == InteractiveCandidateView::Primary)
+        }
+    }
+
     struct RecoveryCandidateProvider;
 
     impl CandidateProvider for RecoveryCandidateProvider {
@@ -9843,6 +9887,7 @@ mod tests {
             CandidateProviderOutput {
                 candidates,
                 provenance,
+                protected_prefix_len: 0,
                 automatic_transposition_blocked: view == InteractiveCandidateView::Primary
                     && sources
                         .into_iter()
@@ -15894,6 +15939,64 @@ mod tests {
     }
 
     #[test]
+    fn candidate_batch_reuses_the_decoded_protected_prefix_during_selection() {
+        let _guard = test_lock();
+        let provider = Arc::new(CountingProtectedPrefixCandidateProvider {
+            candidate_calls: AtomicUsize::new(0),
+            protected_prefix_calls: AtomicUsize::new(0),
+        });
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            provider.clone(),
+        )));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+
+        let first = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ab",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(first.protected_prefix_len, 1);
+        assert_eq!(provider.candidate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.protected_prefix_calls.load(Ordering::Relaxed), 1);
+
+        let repeated = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ab",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(repeated.protected_prefix_len, 1);
+        assert_eq!(provider.candidate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.protected_prefix_calls.load(Ordering::Relaxed), 1);
+
+        let selection = service
+            .plan_key(
+                WPARAM(usize::from(VK_1.0.saturating_add(2))),
+                KeyModifiers::default(),
+            )
+            .unwrap()
+            .expect("the third candidate should remain selectable");
+        assert_eq!(
+            selection
+                .selection_to_remember
+                .as_ref()
+                .map(|selection| selection.text.as_str()),
+            Some("乙")
+        );
+        assert_eq!(selection.overruled_text_to_remember.as_deref(), Some("甲"));
+        assert_eq!(provider.candidate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.protected_prefix_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn candidate_pages_expand_lazily_and_reuse_the_deepest_cached_frontier() {
         let provider = CountingCandidateProvider {
             calls: AtomicUsize::new(0),
@@ -16312,6 +16415,7 @@ mod tests {
                     NativeCandidateProvenance::new(NativeCandidateSource::Decoder, true),
                 ],
                 personalized: vec![false, true],
+                protected_prefix_len: 0,
                 automatic_transposition: None,
                 may_have_more: false,
                 view: InteractiveCandidateView::Primary,
@@ -16348,6 +16452,7 @@ mod tests {
                 candidates: ordinary.candidates.clone(),
                 provenance: ordinary.provenance.clone(),
                 personalized: ordinary.personalized.clone(),
+                protected_prefix_len: 0,
                 automatic_transposition: None,
                 may_have_more: true,
                 view: InteractiveCandidateView::TranspositionRecovery,
@@ -16362,6 +16467,7 @@ mod tests {
                     false,
                 )],
                 personalized: vec![false],
+                protected_prefix_len: 0,
                 automatic_transposition: None,
                 may_have_more: false,
                 view: InteractiveCandidateView::TranspositionRecovery,
