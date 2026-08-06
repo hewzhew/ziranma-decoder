@@ -642,6 +642,7 @@ struct CoreCompletePath {
     text: String,
     segment_lengths: Vec<usize>,
     edge_ranks: Vec<usize>,
+    segments: Vec<CoreCompleteSegment>,
 }
 
 impl CoreCompletePath {
@@ -650,13 +651,80 @@ impl CoreCompletePath {
             text: String::new(),
             segment_lengths: Vec::new(),
             edge_ranks: Vec::new(),
+            segments: Vec::new(),
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SupplementalCompleteComposition {
+struct CoreCompleteSegment {
     text: String,
+    syllable_count: usize,
+    local_rank: usize,
+}
+
+/// Source layer for one exact segment in a supplemental composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupplementalCompositionSegmentSource {
+    /// Exact segment supplied by the unchanged core snapshot.
+    Core,
+    /// The one exact multi-syllable segment supplied only by the supplemental snapshot.
+    Supplemental,
+}
+
+/// Explainable segment evidence for one bounded supplemental composition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplementalCompositionSegment {
+    text: String,
+    source: SupplementalCompositionSegmentSource,
+    syllable_count: usize,
+    local_rank: usize,
+}
+
+impl SupplementalCompositionSegment {
+    /// Returns the exact candidate text contributed by this segment.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Returns whether this segment came from the core or supplemental snapshot.
+    pub fn source(&self) -> SupplementalCompositionSegmentSource {
+        self.source
+    }
+
+    /// Returns the number of complete double-pinyin syllables consumed by this segment.
+    pub fn syllable_count(&self) -> usize {
+        self.syllable_count
+    }
+
+    /// Returns the one-based exact-candidate rank inside the segment's own source snapshot.
+    pub fn local_rank(&self) -> usize {
+        self.local_rank
+    }
+}
+
+/// One deduplicated mixed-layer composition with its exact word-boundary evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplementalCompositionCandidate {
+    text: String,
+    segments: Vec<SupplementalCompositionSegment>,
+}
+
+impl SupplementalCompositionCandidate {
+    /// Returns the complete text produced by concatenating every exact segment.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Returns the ordered, non-empty exact segments that form this candidate.
+    pub fn segments(&self) -> &[SupplementalCompositionSegment] {
+        &self.segments
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SupplementalCompleteComposition {
+    candidate: SupplementalCompositionCandidate,
     supplemental_syllables: usize,
     core_segment_count: usize,
     supplemental_rank: usize,
@@ -716,6 +784,28 @@ pub fn supplemental_complete_composition_texts_with_order(
     limit: usize,
     order: SupplementalCompositionOrder,
 ) -> Result<Vec<String>, KeySequenceError> {
+    Ok(
+        supplemental_complete_compositions_with_order(core, supplemental, code, limit, order)?
+            .into_iter()
+            .map(|candidate| candidate.text)
+            .collect(),
+    )
+}
+
+/// Builds the bounded mixed-layer lane with exact word-boundary evidence.
+///
+/// This is the explainable audit counterpart of
+/// [`supplemental_complete_composition_texts_with_order`]. It runs the same
+/// search, order, text deduplication, and limit; it only retains the already
+/// known segment boundaries and each source-local rank. It does not score or
+/// promote a candidate.
+pub fn supplemental_complete_compositions_with_order(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    order: SupplementalCompositionOrder,
+) -> Result<Vec<SupplementalCompositionCandidate>, KeySequenceError> {
     let observed = KeySequence::new(code)?;
     let code = observed.as_str();
     if limit == 0
@@ -769,8 +859,35 @@ pub fn supplemental_complete_composition_texts_with_order(
                 for suffix in &suffixes[supplemental_end] {
                     let mut core_edge_ranks = prefix.edge_ranks.clone();
                     core_edge_ranks.extend_from_slice(&suffix.edge_ranks);
+                    let mut segments = prefix
+                        .segments
+                        .iter()
+                        .map(|segment| SupplementalCompositionSegment {
+                            text: segment.text.clone(),
+                            source: SupplementalCompositionSegmentSource::Core,
+                            syllable_count: segment.syllable_count,
+                            local_rank: segment.local_rank,
+                        })
+                        .collect::<Vec<_>>();
+                    segments.push(SupplementalCompositionSegment {
+                        text: supplemental_text.clone(),
+                        source: SupplementalCompositionSegmentSource::Supplemental,
+                        syllable_count: supplemental_end - supplemental_start,
+                        local_rank: supplemental_rank + 1,
+                    });
+                    segments.extend(suffix.segments.iter().map(|segment| {
+                        SupplementalCompositionSegment {
+                            text: segment.text.clone(),
+                            source: SupplementalCompositionSegmentSource::Core,
+                            syllable_count: segment.syllable_count,
+                            local_rank: segment.local_rank,
+                        }
+                    }));
                     compositions.push(SupplementalCompleteComposition {
-                        text: format!("{}{}{}", prefix.text, supplemental_text, suffix.text),
+                        candidate: SupplementalCompositionCandidate {
+                            text: format!("{}{}{}", prefix.text, supplemental_text, suffix.text),
+                            segments,
+                        },
                         supplemental_syllables: supplemental_end - supplemental_start,
                         core_segment_count: prefix.segment_lengths.len()
                             + suffix.segment_lengths.len(),
@@ -787,8 +904,8 @@ pub fn supplemental_complete_composition_texts_with_order(
     let mut seen = HashSet::new();
     let mut visible = Vec::with_capacity(limit.min(compositions.len()));
     for composition in compositions {
-        if seen.insert(composition.text.clone()) {
-            visible.push(composition.text);
+        if seen.insert(composition.candidate.text.clone()) {
+            visible.push(composition.candidate);
             if visible.len() == limit {
                 break;
             }
@@ -805,7 +922,7 @@ fn supplemental_composition_order(
     let stable_tail = || {
         left.supplemental_start
             .cmp(&right.supplemental_start)
-            .then_with(|| left.text.cmp(&right.text))
+            .then_with(|| left.candidate.text.cmp(&right.candidate.text))
     };
     match order {
         SupplementalCompositionOrder::StructuralV1 => right
@@ -879,6 +996,11 @@ fn core_complete_boundary_paths(
                     path.text.push_str(edge_text);
                     path.segment_lengths.push(end - start);
                     path.edge_ranks.push(edge_rank);
+                    path.segments.push(CoreCompleteSegment {
+                        text: edge_text.clone(),
+                        syllable_count: end - start,
+                        local_rank: edge_rank + 1,
+                    });
                     retain_core_boundary_path(&mut prefixes[end], path);
                 }
             }
@@ -904,12 +1026,19 @@ fn core_complete_boundary_paths(
                     segment_lengths.extend_from_slice(&suffix.segment_lengths);
                     let mut edge_ranks = vec![edge_rank];
                     edge_ranks.extend_from_slice(&suffix.edge_ranks);
+                    let mut segments = vec![CoreCompleteSegment {
+                        text: edge_text.clone(),
+                        syllable_count: end - start,
+                        local_rank: edge_rank + 1,
+                    }];
+                    segments.extend_from_slice(&suffix.segments);
                     retain_core_boundary_path(
                         &mut suffixes[start],
                         CoreCompletePath {
                             text: format!("{edge_text}{}", suffix.text),
                             segment_lengths,
                             edge_ranks,
+                            segments,
                         },
                     );
                 }
@@ -1884,6 +2013,41 @@ mod tests {
             .unwrap(),
             "the explicit audit order must reproduce the runtime order"
         );
+        let explained = supplemental_complete_compositions_with_order(
+            &core,
+            &supplemental,
+            code,
+            8,
+            SupplementalCompositionOrder::StructuralV1,
+        )
+        .unwrap();
+        assert_eq!(
+            explained
+                .iter()
+                .map(SupplementalCompositionCandidate::text)
+                .collect::<Vec<_>>(),
+            structural.iter().map(String::as_str).collect::<Vec<_>>(),
+            "retaining boundaries must not change deduplication or order"
+        );
+        let mixed = explained
+            .iter()
+            .find(|candidate| candidate.text() == "整场处理")
+            .unwrap();
+        assert_eq!(mixed.segments().len(), 2);
+        assert_eq!(mixed.segments()[0].text(), "整场");
+        assert_eq!(
+            mixed.segments()[0].source(),
+            SupplementalCompositionSegmentSource::Supplemental
+        );
+        assert_eq!(mixed.segments()[0].syllable_count(), 2);
+        assert_eq!(mixed.segments()[0].local_rank(), 1);
+        assert_eq!(mixed.segments()[1].text(), "处理");
+        assert_eq!(
+            mixed.segments()[1].source(),
+            SupplementalCompositionSegmentSource::Core
+        );
+        assert_eq!(mixed.segments()[1].syllable_count(), 2);
+        assert_eq!(mixed.segments()[1].local_rank(), 1);
         for order in [
             SupplementalCompositionOrder::StructuralV1,
             SupplementalCompositionOrder::FewerSegmentsFirst,

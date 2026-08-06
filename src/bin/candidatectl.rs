@@ -1,6 +1,6 @@
 //! Explicit construction, inspection, and local slotting of candidate packages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
@@ -34,15 +34,17 @@ use ziranma_core::{
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
     PublicRimeSliceConfig, PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SupplementalCandidateLayerConfig, SupplementalCompositionOrder,
-    audit_public_supplemental_layer, candidate_package_authentication_sha256,
-    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
-    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
+    SupplementalCompositionOrder, audit_public_supplemental_layer,
+    candidate_package_authentication_sha256, candidate_package_storage_id,
+    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
+    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
     parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
-    select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    select_public_bigram_training_sequences, select_public_character_training_texts,
+    select_public_continuous_composition_cases, select_public_supplemental_composition_cases,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    supplemental_complete_compositions_with_order,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
@@ -1286,6 +1288,8 @@ struct CoreCompositionControlReport {
 struct CompositionOrderProfileReport {
     supplemental_probes: CompositionControlStrategyReport,
     core_controls: CompositionControlStrategyReport,
+    supplemental_composition_choice_changed: usize,
+    core_composition_choice_changed: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1352,6 +1356,129 @@ const CHARACTER_COMPOSITION_PROFILES: [CharacterCompositionProfile; 9] = [
         minimum_observed_ratio_milli: 1_000,
     },
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WordBoundaryCompositionProfile {
+    label: &'static str,
+    search_depth: usize,
+    minimum_average_gain: f64,
+    minimum_observed_ratio_milli: usize,
+}
+
+const WORD_BOUNDARY_COMPOSITION_PROFILES: [WordBoundaryCompositionProfile; 9] = [
+    WordBoundaryCompositionProfile {
+        label: "结构基线",
+        search_depth: 1,
+        minimum_average_gain: 0.0,
+        minimum_observed_ratio_milli: 0,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d4-g0.05-r0.50",
+        search_depth: 4,
+        minimum_average_gain: 0.05,
+        minimum_observed_ratio_milli: 500,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.05-r0.50",
+        search_depth: 8,
+        minimum_average_gain: 0.05,
+        minimum_observed_ratio_milli: 500,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.10-r0.50",
+        search_depth: 8,
+        minimum_average_gain: 0.10,
+        minimum_observed_ratio_milli: 500,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.25-r0.50",
+        search_depth: 8,
+        minimum_average_gain: 0.25,
+        minimum_observed_ratio_milli: 500,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.10-r0.75",
+        search_depth: 8,
+        minimum_average_gain: 0.10,
+        minimum_observed_ratio_milli: 750,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.25-r0.75",
+        search_depth: 8,
+        minimum_average_gain: 0.25,
+        minimum_observed_ratio_milli: 750,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.50-r0.75",
+        search_depth: 8,
+        minimum_average_gain: 0.50,
+        minimum_observed_ratio_milli: 750,
+    },
+    WordBoundaryCompositionProfile {
+        label: "词界-d8-g0.25-r1.00",
+        search_depth: 8,
+        minimum_average_gain: 0.25,
+        minimum_observed_ratio_milli: 1_000,
+    },
+];
+
+#[derive(Clone, Debug)]
+struct PublicWordBoundaryModel {
+    token_counts: HashMap<String, usize>,
+    token_instances: usize,
+    alpha: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PublicWordBoundaryScore {
+    log_probability: f64,
+    syllable_count: usize,
+    observed_syllables: usize,
+}
+
+impl PublicWordBoundaryModel {
+    fn from_sequences(sequences: &[Vec<String>]) -> Option<Self> {
+        let mut token_counts = HashMap::new();
+        let mut token_instances = 0_usize;
+        for token in sequences.iter().flatten() {
+            *token_counts.entry(token.clone()).or_insert(0) += 1;
+            token_instances += 1;
+        }
+        if token_counts.is_empty() {
+            return None;
+        }
+        Some(Self {
+            token_counts,
+            token_instances,
+            alpha: 0.5,
+        })
+    }
+
+    fn score(&self, candidate: &SupplementalCompositionCandidate) -> PublicWordBoundaryScore {
+        let denominator =
+            self.token_instances as f64 + self.alpha * (self.token_counts.len() as f64 + 1.0);
+        let mut log_probability = 0.0;
+        let mut syllable_count = 0;
+        let mut observed_syllables = 0;
+        for segment in candidate.segments() {
+            let count = self.token_counts.get(segment.text()).copied().unwrap_or(0);
+            log_probability += ((count as f64 + self.alpha) / denominator).ln();
+            syllable_count += segment.syllable_count();
+            if count > 0 {
+                observed_syllables += segment.syllable_count();
+            }
+        }
+        PublicWordBoundaryScore {
+            log_probability,
+            syllable_count,
+            observed_syllables,
+        }
+    }
+
+    fn observed_token_types(&self) -> usize {
+        self.token_counts.len()
+    }
+}
 
 fn audit_candidate_layer_compositions(
     core_payload: &Path,
@@ -1859,6 +1986,130 @@ fn evaluate_character_composition_profile(
     Ok(report)
 }
 
+fn evaluate_word_boundary_composition_profile(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    supplemental_probes: &[PublicSupplementalCompositionProbe],
+    core_controls: &[ContinuousCompositionProbe],
+    frontier_limit: usize,
+    model: &PublicWordBoundaryModel,
+    profile: WordBoundaryCompositionProfile,
+) -> Result<CompositionOrderProfileReport, Box<dyn std::error::Error>> {
+    let mut report = CompositionOrderProfileReport::default();
+    for probe in supplemental_probes {
+        let code = probe.observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let structural = supplemental_complete_composition_texts_with_order(
+            core,
+            supplemental,
+            code,
+            8,
+            SupplementalCompositionOrder::StructuralV1,
+        )?;
+        let compositions =
+            word_boundary_composition_texts(core, supplemental, code, model, profile)?;
+        report.supplemental_composition_choice_changed +=
+            usize::from(structural.first() != compositions.first());
+        let candidate = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        observe_composition_control_strategy(
+            &mut report.supplemental_probes,
+            &core_candidates,
+            &candidate,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    for probe in core_controls {
+        let code = probe.full_observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let structural = supplemental_complete_composition_texts_with_order(
+            core,
+            supplemental,
+            code,
+            8,
+            SupplementalCompositionOrder::StructuralV1,
+        )?;
+        let compositions =
+            word_boundary_composition_texts(core, supplemental, code, model, profile)?;
+        report.core_composition_choice_changed +=
+            usize::from(structural.first() != compositions.first());
+        let candidate = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        observe_composition_control_strategy(
+            &mut report.core_controls,
+            &core_candidates,
+            &candidate,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    Ok(report)
+}
+
+fn word_boundary_composition_texts(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    model: &PublicWordBoundaryModel,
+    profile: WordBoundaryCompositionProfile,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut compositions = supplemental_complete_compositions_with_order(
+        core,
+        supplemental,
+        code,
+        8,
+        SupplementalCompositionOrder::StructuralV1,
+    )?;
+    if compositions.len() >= 2 && profile.search_depth > 1 {
+        let depth = profile.search_depth.min(compositions.len());
+        let scores = compositions
+            .iter()
+            .take(depth)
+            .map(|candidate| model.score(candidate))
+            .collect::<Vec<_>>();
+        let leader_average = scores[0].log_probability / scores[0].syllable_count as f64;
+        let challenger = scores
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, score)| {
+                score.observed_syllables * 1_000
+                    >= profile.minimum_observed_ratio_milli * score.syllable_count
+            })
+            .max_by(|(left_index, left), (right_index, right)| {
+                let left_average = left.log_probability / left.syllable_count as f64;
+                let right_average = right.log_probability / right.syllable_count as f64;
+                left_average
+                    .total_cmp(&right_average)
+                    .then_with(|| right_index.cmp(left_index))
+            });
+        if let Some((index, score)) = challenger {
+            let challenger_average = score.log_probability / score.syllable_count as f64;
+            if challenger_average - leader_average >= profile.minimum_average_gain {
+                let challenger = compositions.remove(index);
+                compositions.insert(0, challenger);
+            }
+        }
+    }
+    Ok(compositions
+        .into_iter()
+        .map(|candidate| candidate.text().to_owned())
+        .collect())
+}
+
 fn character_context_composition_texts(
     core: &CandidateSnapshot,
     supplemental: &CandidateSnapshot,
@@ -1980,6 +2231,11 @@ fn audit_character_composition_context(
     let fit_corpus = parse_ud_conllu(&fit_corpus_text)?;
     let fit_corpus_sha256 = candidate_sha256_hex(fit_corpus_text.as_bytes());
     let heldout_corpus_sha256 = candidate_sha256_hex(heldout_corpus_text.as_bytes());
+    let mut boundary_lexicon = core_entries.to_vec();
+    boundary_lexicon.extend_from_slice(supplemental_entries);
+    let word_training = select_public_bigram_training_sequences(&fit_corpus, &boundary_lexicon);
+    let word_boundary_model = PublicWordBoundaryModel::from_sequences(&word_training.sequences)
+        .ok_or("public fit corpus produced no word-boundary training tokens")?;
     let training = select_public_character_training_texts(&fit_corpus);
     let language_model = CharacterBigramLanguageModel::from_text_sequences(&training.sequences)?;
     let fit_supplemental = select_public_supplemental_composition_cases(
@@ -2039,6 +2295,50 @@ fn audit_character_composition_context(
         )?
     };
 
+    let mut word_fit_reports = Vec::with_capacity(WORD_BOUNDARY_COMPOSITION_PROFILES.len());
+    for profile in WORD_BOUNDARY_COMPOSITION_PROFILES {
+        word_fit_reports.push(evaluate_word_boundary_composition_profile(
+            core,
+            supplemental,
+            &fit_supplemental.probes,
+            &fit_core_controls,
+            frontier_limit,
+            &word_boundary_model,
+            profile,
+        )?);
+    }
+    let mut word_selected_index = 0;
+    for index in 1..word_fit_reports.len() {
+        if composition_profile_precedes(
+            &word_fit_reports[index],
+            &word_fit_reports[word_selected_index],
+        ) {
+            word_selected_index = index;
+        }
+    }
+    let word_baseline_heldout = evaluate_word_boundary_composition_profile(
+        core,
+        supplemental,
+        heldout_supplemental_probes,
+        heldout_core_controls,
+        frontier_limit,
+        &word_boundary_model,
+        WORD_BOUNDARY_COMPOSITION_PROFILES[0],
+    )?;
+    let word_selected_heldout = if word_selected_index == 0 {
+        word_baseline_heldout
+    } else {
+        evaluate_word_boundary_composition_profile(
+            core,
+            supplemental,
+            heldout_supplemental_probes,
+            heldout_core_controls,
+            frontier_limit,
+            &word_boundary_model,
+            WORD_BOUNDARY_COMPOSITION_PROFILES[word_selected_index],
+        )?
+    };
+
     let training_stats = training.stats;
     let model_stats = language_model.stats();
     let mut output = format!(
@@ -2056,8 +2356,10 @@ fn audit_character_composition_context(
     for (profile, report) in CHARACTER_COMPOSITION_PROFILES.iter().zip(&fit_reports) {
         writeln!(
             output,
-            "拟合 {}：补充 Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+            "拟合 {}：补充 Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
             profile.label,
+            report.supplemental_probes.target.at_three,
+            report.supplemental_probes.target.at_five,
             report.supplemental_probes.target.visible,
             report.supplemental_probes.target_newly_visible,
             report.supplemental_probes.target_lost_visible,
@@ -2075,7 +2377,9 @@ fn audit_character_composition_context(
     )?;
     writeln!(
         output,
-        "保留评测结构基线：补充 Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+        "保留评测结构基线：补充 Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+        baseline_heldout.supplemental_probes.target.at_three,
+        baseline_heldout.supplemental_probes.target.at_five,
         baseline_heldout.supplemental_probes.target.visible,
         baseline_heldout.supplemental_probes.target_newly_visible,
         baseline_heldout.supplemental_probes.target_lost_visible,
@@ -2086,7 +2390,9 @@ fn audit_character_composition_context(
     )?;
     writeln!(
         output,
-        "保留评测拟合选择：补充 Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+        "保留评测拟合选择：补充 Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+        selected_heldout.supplemental_probes.target.at_three,
+        selected_heldout.supplemental_probes.target.at_five,
         selected_heldout.supplemental_probes.target.visible,
         selected_heldout.supplemental_probes.target_newly_visible,
         selected_heldout.supplemental_probes.target_lost_visible,
@@ -2097,6 +2403,84 @@ fn audit_character_composition_context(
     )?;
     output.push_str(
         "字境只在结构候选前八中允许一个具有足够公开转移覆盖和平均对数概率增益的挑战者；不创建路径，不读取保留答案来选档。\n",
+    );
+    let word_training_stats = word_training.stats;
+    writeln!(
+        output,
+        "\n公开词界拟合 / 保留评测\n训练：序列 {}，词次 {}（源词 {}，逐字回退 {}），可见词型 {}",
+        word_training_stats.training_sequences,
+        word_training_stats.training_words,
+        word_training_stats.exact_token_uses,
+        word_training_stats.character_fallback_uses,
+        word_boundary_model.observed_token_types(),
+    )?;
+    for (profile, report) in WORD_BOUNDARY_COMPOSITION_PROFILES
+        .iter()
+        .zip(&word_fit_reports)
+    {
+        writeln!(
+            output,
+            "拟合 {}：补充 Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}、组合首位变化 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}、组合首位变化 {}",
+            profile.label,
+            report.supplemental_probes.target.at_three,
+            report.supplemental_probes.target.at_five,
+            report.supplemental_probes.target.visible,
+            report.supplemental_probes.target_newly_visible,
+            report.supplemental_probes.target_lost_visible,
+            report.supplemental_composition_choice_changed,
+            report.core_controls.target.visible,
+            report.core_controls.target_lost_visible,
+            report.core_controls.target_rank_worsened,
+            report.core_controls.core_candidates_evicted,
+            report.core_composition_choice_changed,
+        )?;
+    }
+    let selected_word_profile = WORD_BOUNDARY_COMPOSITION_PROFILES[word_selected_index];
+    writeln!(
+        output,
+        "拟合选择：{}；沿用安全、补充 Top-{frontier_limit}/Top-5/Top-3、负对照降位与挤出次序，平局保留更早的保守档。",
+        selected_word_profile.label,
+    )?;
+    writeln!(
+        output,
+        "保留评测结构基线：补充 Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}、组合首位变化 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}、组合首位变化 {}",
+        word_baseline_heldout.supplemental_probes.target.at_three,
+        word_baseline_heldout.supplemental_probes.target.at_five,
+        word_baseline_heldout.supplemental_probes.target.visible,
+        word_baseline_heldout
+            .supplemental_probes
+            .target_newly_visible,
+        word_baseline_heldout
+            .supplemental_probes
+            .target_lost_visible,
+        word_baseline_heldout.supplemental_composition_choice_changed,
+        word_baseline_heldout.core_controls.target.visible,
+        word_baseline_heldout.core_controls.target_lost_visible,
+        word_baseline_heldout.core_controls.target_rank_worsened,
+        word_baseline_heldout.core_controls.core_candidates_evicted,
+        word_baseline_heldout.core_composition_choice_changed,
+    )?;
+    writeln!(
+        output,
+        "保留评测拟合选择：补充 Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}、组合首位变化 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}、组合首位变化 {}",
+        word_selected_heldout.supplemental_probes.target.at_three,
+        word_selected_heldout.supplemental_probes.target.at_five,
+        word_selected_heldout.supplemental_probes.target.visible,
+        word_selected_heldout
+            .supplemental_probes
+            .target_newly_visible,
+        word_selected_heldout
+            .supplemental_probes
+            .target_lost_visible,
+        word_selected_heldout.supplemental_composition_choice_changed,
+        word_selected_heldout.core_controls.target.visible,
+        word_selected_heldout.core_controls.target_lost_visible,
+        word_selected_heldout.core_controls.target_rank_worsened,
+        word_selected_heldout.core_controls.core_candidates_evicted,
+        word_selected_heldout.core_composition_choice_changed,
+    )?;
+    output.push_str(
+        "词界模型只累计拟合语料的公开分词词次，并按每音节平均词概率比较已生成路径；不读取保留答案，不创建路径，不接入运行时。\n",
     );
     Ok(output)
 }
@@ -4054,6 +4438,9 @@ mod tests {
         assert!(report.contains("拟合选择："));
         assert!(report.contains("保留评测结构基线"));
         assert!(report.contains("保留评测拟合选择"));
+        assert!(report.contains("公开词界拟合 / 保留评测"));
+        assert!(report.contains("可见词型"));
+        assert!(report.contains("词界模型只累计拟合语料的公开分词词次"));
         assert!(report.contains("本次操作：只读"));
         assert!(!report.contains("掰开"));
         assert!(!report.contains("揉碎"));
