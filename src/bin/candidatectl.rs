@@ -1379,6 +1379,9 @@ fn audit_candidate_layer_compositions(
     let core_entries = parse_lexicon_tsv(&core_text)?;
     let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
     let corpus = parse_ud_conllu(&corpus_text)?;
+    let core_payload_sha256 = candidate_sha256_hex(core_text.as_bytes());
+    let supplemental_payload_sha256 = candidate_sha256_hex(supplemental_text.as_bytes());
+    let heldout_corpus_sha256 = candidate_sha256_hex(corpus_text.as_bytes());
     let selection = select_public_supplemental_composition_cases(
         &corpus,
         &core_entries,
@@ -1470,7 +1473,12 @@ fn audit_candidate_layer_compositions(
         report.missing_probe_ids.join("、")
     };
     let mut output = format!(
-        "公开补充组合审计\n语料：{} 句；检查两词与三词相邻窗口\n筛选：窗口 {}；汉字与长度合格 {}；恰有一个补充多字词 {}；排除整词文字 {}、整词同码 {}；句形代表 {}\n样本：{}（两词 {}，三词 {}；补充词在前 {}、居中 {}、在后 {}）\n核心基线：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留核心首选模拟：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留首选并给两个组合位：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前召回变化：新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}\n保留首选模拟：新增可见 {}，原可见丢失 {}\n两个组合位模拟：新增可见 {}，原可见丢失 {}\n目标的结构组合排名：第 1 位 {}，第 2 位 {}，第 3～4 位 {}，第 5～8 位 {}，前 8 外 {}\n候选顺序：发生变化 {}；目标升为首选 {}；非目标首选变化 {}\n核心完整码首选：保留 {}，变化 {}\n当前仍未进入 Top-{frontier_limit}：补充边深度 {}，核心边深度 {}，竞争组合 {}\n样本编号（最多 12）：{missing}\n\n全核心短语负对照\n筛选：窗口 {}；核心整词覆盖 {}；句代表 {}；排除整词文字 {}、整词同码 {}；样本 {}\n核心基线目标：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 一个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 两个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n选择规则不读取解码结果；保留首选结果只是冻结候选上的审计模拟；跨来源原始权重未比较。\n",
+        "公开补充组合审计\n候选载荷：核心 {} 条 · SHA-256 {}；补充 {} 条 · SHA-256 {}\n保留语料：SHA-256 {}\n语料：{} 句；检查两词与三词相邻窗口\n筛选：窗口 {}；汉字与长度合格 {}；恰有一个补充多字词 {}；排除整词文字 {}、整词同码 {}；句形代表 {}\n样本：{}（两词 {}，三词 {}；补充词在前 {}、居中 {}、在后 {}）\n核心基线：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留核心首选模拟：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留首选并给两个组合位：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前召回变化：新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}\n保留首选模拟：新增可见 {}，原可见丢失 {}\n两个组合位模拟：新增可见 {}，原可见丢失 {}\n目标的结构组合排名：第 1 位 {}，第 2 位 {}，第 3～4 位 {}，第 5～8 位 {}，前 8 外 {}\n候选顺序：发生变化 {}；目标升为首选 {}；非目标首选变化 {}\n核心完整码首选：保留 {}，变化 {}\n当前仍未进入 Top-{frontier_limit}：补充边深度 {}，核心边深度 {}，竞争组合 {}\n样本编号（最多 12）：{missing}\n\n全核心短语负对照\n筛选：窗口 {}；核心整词覆盖 {}；句代表 {}；排除整词文字 {}、整词同码 {}；样本 {}\n核心基线目标：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 一个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 两个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n选择规则不读取解码结果；保留首选结果只是冻结候选上的审计模拟；跨来源原始权重未比较。\n",
+        core_entries.len(),
+        core_payload_sha256,
+        supplemental_entries.len(),
+        supplemental_payload_sha256,
+        heldout_corpus_sha256,
         corpus.stats.sentences,
         stats.source_windows,
         stats.han_length_eligible,
@@ -1970,6 +1978,8 @@ fn audit_character_composition_context(
         return Err("composition fit corpus must be distinct from held-out corpus".into());
     }
     let fit_corpus = parse_ud_conllu(&fit_corpus_text)?;
+    let fit_corpus_sha256 = candidate_sha256_hex(fit_corpus_text.as_bytes());
+    let heldout_corpus_sha256 = candidate_sha256_hex(heldout_corpus_text.as_bytes());
     let training = select_public_character_training_texts(&fit_corpus);
     let language_model = CharacterBigramLanguageModel::from_text_sequences(&training.sequences)?;
     let fit_supplemental = select_public_supplemental_composition_cases(
@@ -2032,7 +2042,9 @@ fn audit_character_composition_context(
     let training_stats = training.stats;
     let model_stats = language_model.stats();
     let mut output = format!(
-        "\n公开字境拟合 / 保留评测\n拟合语料：{} 句；保留汉字序列 {}，字符 {}；模型转移类型 {}\n拟合样本：补充组合 {}，全核心负对照 {}（句代表 {}）\n",
+        "\n公开字境拟合 / 保留评测\n语料指纹：拟合 SHA-256 {}；保留 SHA-256 {}\n拟合语料：{} 句；保留汉字序列 {}，字符 {}；模型转移类型 {}\n拟合样本：补充组合 {}，全核心负对照 {}（句代表 {}）\n",
+        fit_corpus_sha256,
+        heldout_corpus_sha256,
         fit_corpus.stats.sentences,
         training_stats.training_sequences,
         training_stats.training_characters,
@@ -4012,6 +4024,20 @@ mod tests {
             8,
         )
         .unwrap();
+        assert!(report.contains(&format!(
+            "候选载荷：核心 3 条 · SHA-256 {}；补充 2 条 · SHA-256 {}",
+            candidate_sha256_hex(CORE.as_bytes()),
+            candidate_sha256_hex(SUPPLEMENTAL.as_bytes()),
+        )));
+        assert!(report.contains(&format!(
+            "保留语料：SHA-256 {}",
+            candidate_sha256_hex(CORPUS.as_bytes()),
+        )));
+        assert!(report.contains(&format!(
+            "语料指纹：拟合 SHA-256 {}；保留 SHA-256 {}",
+            candidate_sha256_hex(FIT_CORPUS.as_bytes()),
+            candidate_sha256_hex(CORPUS.as_bytes()),
+        )));
         assert!(report.contains("样本：1（两词 1，三词 0"));
         assert!(report.contains("召回变化：新增可见 1，原可见丢失 0"));
         assert!(report.contains("非目标首选变化 0"));

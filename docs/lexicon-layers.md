@@ -224,9 +224,37 @@ Top-120k 补充层存在、其余词都由核心完整码覆盖；整句文字�
 完整词存在的样本会被排除。两词/三词以及补充词在前、中、后的五种结构按轮转
 取样，选样过程不查看解码结果。
 
+当前冻结口径使用日用 Rime 核心和万象 Top-120k 补充包；不要用两个万象切片
+代替这两个不同职责的载荷。完整复现命令为：
+
+```powershell
+cargo run --release --bin candidatectl -- layer-composition-audit `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top120k-v1/lexicon.tsv `
+  --corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu `
+  --fit-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu `
+  --frontier-limit 7 `
+  --sample-limit 128
+```
+
+报告会列出两个候选载荷及拟合/保留语料的内容 SHA-256；缺少这些指纹的历史
+数字不能与新结果直接比较。
+
+下列结果对应核心 65,116 条
+`fec5d5173127d568a047655b2f92a94c4e546c91565d7fd14808fbf71266b834`、
+补充 120,000 条
+`849aae039dfe503eb4dadfcb8529ddb74992a05b202e7cf6a69be932c73c8717`，
+拟合语料
+`956636fe612a1166e8b19e7413fee2e73d68231aca2f0455be2c616b947d629d`，
+保留语料
+`3af8046a6f32477b4d5cf3dd06bbf38682a380fe77aade3f68de97e51ab94900`。
+
 128 条正样本中，核心基线的目标 Top-7 为 29；窄组合路径提高到 83，新增可见
 54 条且没有丢失原可见目标。旧的“组合直接抢首选”会发生 47 次非目标首选
 变化；固定非字面回退的普通核心首选后，新增召回没有减少，首选变化降为 0。
+仍未进入 Top-7 的 45 条中，补充词边深度造成 0 条、核心边深度造成 6 条，
+其余 39 条都是已生成路径之间的竞争。扩大补充边前沿不是当前瓶颈；下一轮应
+研究可泛化的词级边界或组合内部排序，而不是继续增加搜索宽度。
 
 负对照从同一语料选择 128 条由两个核心完整词构成的自然短语，并排除整句文字
 和整串码碰撞。保留首选、开放一个组合位时，没有原可见目标掉出 Top-7；19 条
