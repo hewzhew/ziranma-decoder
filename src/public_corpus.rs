@@ -308,6 +308,28 @@ pub struct PublicBigramTrainingStats {
     pub character_fallback_uses: usize,
 }
 
+/// Train-only Han text sequences for a boundary-independent character model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicCharacterTrainingCorpus {
+    /// Non-punctuation sentence texts retained without decoder consultation.
+    pub sequences: Vec<String>,
+    /// Auditable filtering and size counts.
+    pub stats: PublicCharacterTrainingStats,
+}
+
+/// Filtering and size counts for public character-model training text.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicCharacterTrainingStats {
+    /// Source sentences examined.
+    pub source_sentences: usize,
+    /// Non-empty sentences whose non-punctuation text is entirely Han.
+    pub han_only_sentences: usize,
+    /// Retained sequences containing at least two characters.
+    pub training_sequences: usize,
+    /// Han character instances across retained sequences.
+    pub training_characters: usize,
+}
+
 /// Parses the integer-token layer of a CoNLL-U corpus.
 pub fn parse_ud_conllu(contents: &str) -> Result<UdCorpus, UdCorpusParseError> {
     let mut stats = UdCorpusImportStats {
@@ -1104,6 +1126,39 @@ fn conservative_tail_code(entry: &LexiconEntry) -> String {
     code
 }
 
+/// Selects public Han sentence text for a character bigram model.
+///
+/// Punctuation is omitted. A sentence is retained only when its remaining
+/// text contains at least two Han characters. No lexicon, decoder result, or
+/// held-out answer influences the selection.
+pub fn select_public_character_training_texts(corpus: &UdCorpus) -> PublicCharacterTrainingCorpus {
+    let mut stats = PublicCharacterTrainingStats {
+        source_sentences: corpus.stats.sentences,
+        ..PublicCharacterTrainingStats::default()
+    };
+    let mut sequences = Vec::new();
+    for sentence in &corpus.sentences {
+        let text = sentence
+            .tokens
+            .iter()
+            .filter(|token| token.upos != "PUNCT")
+            .map(|token| token.form.as_str())
+            .collect::<String>();
+        if text.is_empty() || !text.chars().all(is_han_character) {
+            continue;
+        }
+        stats.han_only_sentences += 1;
+        let character_count = text.chars().count();
+        if character_count < 2 {
+            continue;
+        }
+        stats.training_sequences += 1;
+        stats.training_characters += character_count;
+        sequences.push(text);
+    }
+    PublicCharacterTrainingCorpus { sequences, stats }
+}
+
 /// Maps the pinned train split into Rime word sequences for bigram training.
 ///
 /// Punctuation is omitted. Sentences containing non-Han text or an
@@ -1352,8 +1407,8 @@ mod tests {
         audit_anchored_tail_failures, audit_public_protocol_context, audit_public_protocols,
         parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
-        select_public_continuous_composition_cases, select_public_protocol_audit_cases,
-        select_public_supplemental_composition_cases,
+        select_public_character_training_texts, select_public_continuous_composition_cases,
+        select_public_protocol_audit_cases, select_public_supplemental_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -1371,6 +1426,27 @@ mod tests {
         assert_eq!(corpus.stats.syntactic_tokens, 98_614);
         assert_eq!(corpus.stats.punctuation_tokens, 13_627);
         assert_eq!(corpus.stats.special_token_rows, 0);
+
+        let character_training = select_public_character_training_texts(&corpus);
+        assert_eq!(character_training.stats.source_sentences, 3_997);
+        assert_eq!(
+            character_training.sequences.len(),
+            character_training.stats.training_sequences
+        );
+        assert_eq!(
+            character_training
+                .sequences
+                .iter()
+                .map(|sequence| sequence.chars().count())
+                .sum::<usize>(),
+            character_training.stats.training_characters
+        );
+        assert!(
+            character_training
+                .sequences
+                .iter()
+                .all(|sequence| sequence.chars().count() >= 2)
+        );
 
         let lexicon = parse_rime_lexicon(RIME).unwrap().entries;
         let first = select_public_bigram_training_sequences(&corpus, &lexicon);

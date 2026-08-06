@@ -291,13 +291,14 @@ pub use protocol_audit::{
 pub use public_corpus::{
     ContinuousCompositionProbe, ContinuousCompositionSelection,
     ContinuousCompositionSelectionStats, PublicBigramTrainingCorpus, PublicBigramTrainingStats,
-    PublicCalibrationSelection, PublicCalibrationSelectionStats, PublicProtocolProbe,
-    PublicProtocolSelection, PublicProtocolSelectionStats, PublicSupplementalCompositionProbe,
+    PublicCalibrationSelection, PublicCalibrationSelectionStats, PublicCharacterTrainingCorpus,
+    PublicCharacterTrainingStats, PublicProtocolProbe, PublicProtocolSelection,
+    PublicProtocolSelectionStats, PublicSupplementalCompositionProbe,
     PublicSupplementalCompositionSelection, PublicSupplementalCompositionSelectionStats, UdCorpus,
     UdCorpusImportStats, UdCorpusParseError, parse_ud_conllu,
     select_public_bigram_training_sequences, select_public_calibration_cases,
-    select_public_continuous_composition_cases, select_public_protocol_audit_cases,
-    select_public_supplemental_composition_cases,
+    select_public_character_training_texts, select_public_continuous_composition_cases,
+    select_public_protocol_audit_cases, select_public_supplemental_composition_cases,
 };
 pub use public_lexicon_slice::{
     MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,

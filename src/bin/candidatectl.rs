@@ -26,10 +26,10 @@ use ziranma_core::{
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CANDIDATE_SNAPSHOT_SCHEMA_V1,
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
-    CandidateSupplementalState, ContinuousCompositionProbe, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
-    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
-    MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    CandidateSupplementalState, CharacterBigramLanguageModel, ContinuousCompositionProbe,
+    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
+    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
+    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
     PublicRimeSliceConfig, PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
@@ -40,8 +40,9 @@ use ziranma_core::{
     candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
     parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
-    select_public_continuous_composition_cases, select_public_supplemental_composition_cases,
-    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    select_public_character_training_texts, select_public_continuous_composition_cases,
+    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
@@ -95,6 +96,7 @@ enum Options {
         core_payload: PathBuf,
         supplemental_payload: PathBuf,
         corpus: PathBuf,
+        fit_corpus: Option<PathBuf>,
         frontier_limit: usize,
         sample_limit: usize,
     },
@@ -240,12 +242,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             core_payload,
             supplemental_payload,
             corpus,
+            fit_corpus,
             frontier_limit,
             sample_limit,
         } => audit_candidate_layer_compositions(
             &core_payload,
             &supplemental_payload,
             &corpus,
+            fit_corpus.as_deref(),
             frontier_limit,
             sample_limit,
         )?,
@@ -656,6 +660,7 @@ fn parse_layer_composition_audit(
     let mut core_payload = None;
     let mut supplemental_payload = None;
     let mut corpus = None;
+    let mut fit_corpus = None;
     let mut frontier_limit = None;
     let mut sample_limit = None;
     while let Some(argument) = arguments.next() {
@@ -667,6 +672,7 @@ fn parse_layer_composition_audit(
                 "--supplemental-payload",
             )?,
             "--corpus" => set_path(&mut corpus, &mut arguments, "--corpus")?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
             "--frontier-limit" => {
                 set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
             }
@@ -692,6 +698,7 @@ fn parse_layer_composition_audit(
         supplemental_payload: supplemental_payload
             .ok_or("layer-composition-audit requires --supplemental-payload")?,
         corpus: corpus.ok_or("layer-composition-audit requires --corpus")?,
+        fit_corpus,
         frontier_limit,
         sample_limit,
     })
@@ -974,7 +981,7 @@ fn print_usage() {
         "  layer-benchmark --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --repetitions <1..100> --exact-promotions <1..50>"
     );
     eprintln!(
-        "  layer-composition-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --corpus <PUBLIC.conllu> --frontier-limit <1..50> --sample-limit <1..512>"
+        "  layer-composition-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --corpus <PUBLIC.conllu> [--fit-corpus <PUBLIC-TRAIN.conllu>] --frontier-limit <1..50> --sample-limit <1..512>"
     );
     eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
@@ -1281,10 +1288,76 @@ struct CompositionOrderProfileReport {
     core_controls: CompositionControlStrategyReport,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CharacterCompositionProfile {
+    label: &'static str,
+    search_depth: usize,
+    minimum_average_gain: f64,
+    minimum_observed_ratio_milli: usize,
+}
+
+const CHARACTER_COMPOSITION_PROFILES: [CharacterCompositionProfile; 9] = [
+    CharacterCompositionProfile {
+        label: "结构基线",
+        search_depth: 1,
+        minimum_average_gain: 0.0,
+        minimum_observed_ratio_milli: 0,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d4-g0.10-r0.50",
+        search_depth: 4,
+        minimum_average_gain: 0.10,
+        minimum_observed_ratio_milli: 500,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g0.10-r0.50",
+        search_depth: 8,
+        minimum_average_gain: 0.10,
+        minimum_observed_ratio_milli: 500,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g0.25-r0.50",
+        search_depth: 8,
+        minimum_average_gain: 0.25,
+        minimum_observed_ratio_milli: 500,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g0.50-r0.50",
+        search_depth: 8,
+        minimum_average_gain: 0.50,
+        minimum_observed_ratio_milli: 500,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g0.25-r0.75",
+        search_depth: 8,
+        minimum_average_gain: 0.25,
+        minimum_observed_ratio_milli: 750,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g0.50-r0.75",
+        search_depth: 8,
+        minimum_average_gain: 0.50,
+        minimum_observed_ratio_milli: 750,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g0.75-r0.75",
+        search_depth: 8,
+        minimum_average_gain: 0.75,
+        minimum_observed_ratio_milli: 750,
+    },
+    CharacterCompositionProfile {
+        label: "字境-d8-g1.00-r1.00",
+        search_depth: 8,
+        minimum_average_gain: 1.00,
+        minimum_observed_ratio_milli: 1_000,
+    },
+];
+
 fn audit_candidate_layer_compositions(
     core_payload: &Path,
     supplemental_payload: &Path,
     corpus: &Path,
+    fit_corpus: Option<&Path>,
     frontier_limit: usize,
     sample_limit: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1374,6 +1447,21 @@ fn audit_candidate_layer_compositions(
     }) {
         return Err("composition audit simulation diverged from the runtime candidate path".into());
     }
+    let character_context_output = match fit_corpus {
+        Some(fit_corpus_path) => audit_character_composition_context(
+            fit_corpus_path,
+            &corpus_text,
+            &core_entries,
+            &supplemental_entries,
+            &core,
+            &supplemental,
+            &selection.probes,
+            &control_probes,
+            frontier_limit,
+            sample_limit,
+        )?,
+        None => String::new(),
+    };
 
     let stats = selection.stats;
     let missing = if report.missing_probe_ids.is_empty() {
@@ -1534,9 +1622,9 @@ fn audit_candidate_layer_compositions(
             profile.core_controls.core_candidates_evicted,
         )?;
     }
-    output.push_str(
-        "排序对照只交换明确的结构或层内名次字段，不比较跨来源原始权重。\n本次操作：只读\n",
-    );
+    output.push_str("排序对照只交换明确的结构或层内名次字段，不比较跨来源原始权重。\n");
+    output.push_str(&character_context_output);
+    output.push_str("本次操作：只读\n");
     Ok(output)
 }
 
@@ -1706,6 +1794,299 @@ fn evaluate_composition_order_profile(
         );
     }
     Ok(report)
+}
+
+fn evaluate_character_composition_profile(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    supplemental_probes: &[PublicSupplementalCompositionProbe],
+    core_controls: &[ContinuousCompositionProbe],
+    frontier_limit: usize,
+    language_model: &CharacterBigramLanguageModel,
+    profile: CharacterCompositionProfile,
+) -> Result<CompositionOrderProfileReport, Box<dyn std::error::Error>> {
+    let mut report = CompositionOrderProfileReport::default();
+    for probe in supplemental_probes {
+        let code = probe.observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let compositions =
+            character_context_composition_texts(core, supplemental, code, language_model, profile)?;
+        let candidate = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        observe_composition_control_strategy(
+            &mut report.supplemental_probes,
+            &core_candidates,
+            &candidate,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    for probe in core_controls {
+        let code = probe.full_observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let compositions =
+            character_context_composition_texts(core, supplemental, code, language_model, profile)?;
+        let candidate = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        observe_composition_control_strategy(
+            &mut report.core_controls,
+            &core_candidates,
+            &candidate,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    Ok(report)
+}
+
+fn character_context_composition_texts(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    language_model: &CharacterBigramLanguageModel,
+    profile: CharacterCompositionProfile,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut compositions = supplemental_complete_composition_texts_with_order(
+        core,
+        supplemental,
+        code,
+        8,
+        SupplementalCompositionOrder::StructuralV1,
+    )?;
+    if compositions.len() < 2 || profile.search_depth <= 1 {
+        return Ok(compositions);
+    }
+    let depth = profile.search_depth.min(compositions.len());
+    let scores = compositions
+        .iter()
+        .take(depth)
+        .map(|candidate| language_model.score_text(candidate))
+        .collect::<Vec<_>>();
+    let leader_average = scores[0].log_probability / scores[0].pair_count as f64;
+    let challenger = scores
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, score)| {
+            score.observed_pairs * 1_000 >= profile.minimum_observed_ratio_milli * score.pair_count
+        })
+        .max_by(|(left_index, left), (right_index, right)| {
+            let left_average = left.log_probability / left.pair_count as f64;
+            let right_average = right.log_probability / right.pair_count as f64;
+            left_average
+                .total_cmp(&right_average)
+                .then_with(|| right_index.cmp(left_index))
+        });
+    if let Some((index, score)) = challenger {
+        let challenger_average = score.log_probability / score.pair_count as f64;
+        if challenger_average - leader_average >= profile.minimum_average_gain {
+            let challenger = compositions.remove(index);
+            compositions.insert(0, challenger);
+        }
+    }
+    Ok(compositions)
+}
+
+fn composition_profile_is_safe(report: &CompositionOrderProfileReport) -> bool {
+    report.supplemental_probes.target_lost_visible == 0
+        && report.core_controls.target_lost_visible == 0
+        && report.supplemental_probes.top_one_changed == 0
+        && report.core_controls.top_one_changed == 0
+}
+
+fn composition_profile_precedes(
+    challenger: &CompositionOrderProfileReport,
+    current: &CompositionOrderProfileReport,
+) -> bool {
+    composition_profile_is_safe(challenger)
+        .cmp(&composition_profile_is_safe(current))
+        .then_with(|| {
+            challenger
+                .supplemental_probes
+                .target
+                .visible
+                .cmp(&current.supplemental_probes.target.visible)
+        })
+        .then_with(|| {
+            challenger
+                .supplemental_probes
+                .target
+                .at_five
+                .cmp(&current.supplemental_probes.target.at_five)
+        })
+        .then_with(|| {
+            challenger
+                .supplemental_probes
+                .target
+                .at_three
+                .cmp(&current.supplemental_probes.target.at_three)
+        })
+        .then_with(|| {
+            current
+                .core_controls
+                .target_rank_worsened
+                .cmp(&challenger.core_controls.target_rank_worsened)
+        })
+        .then_with(|| {
+            current
+                .core_controls
+                .core_candidates_evicted
+                .cmp(&challenger.core_controls.core_candidates_evicted)
+        })
+        .is_gt()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_character_composition_context(
+    fit_corpus_path: &Path,
+    heldout_corpus_text: &str,
+    core_entries: &[ziranma_core::LexiconEntry],
+    supplemental_entries: &[ziranma_core::LexiconEntry],
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    heldout_supplemental_probes: &[PublicSupplementalCompositionProbe],
+    heldout_core_controls: &[ContinuousCompositionProbe],
+    frontier_limit: usize,
+    sample_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let fit_corpus_text = read_explicit_text(
+        fit_corpus_path,
+        "public composition fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    if fit_corpus_text == heldout_corpus_text {
+        return Err("composition fit corpus must be distinct from held-out corpus".into());
+    }
+    let fit_corpus = parse_ud_conllu(&fit_corpus_text)?;
+    let training = select_public_character_training_texts(&fit_corpus);
+    let language_model = CharacterBigramLanguageModel::from_text_sequences(&training.sequences)?;
+    let fit_supplemental = select_public_supplemental_composition_cases(
+        &fit_corpus,
+        core_entries,
+        supplemental_entries,
+        sample_limit,
+    );
+    let (fit_core_controls, fit_control_stats) = select_core_composition_controls(
+        &fit_corpus,
+        core_entries,
+        supplemental_entries,
+        sample_limit,
+    );
+    if fit_supplemental.probes.is_empty() || fit_core_controls.is_empty() {
+        return Err("public fit corpus produced no eligible composition probes".into());
+    }
+
+    let mut fit_reports = Vec::with_capacity(CHARACTER_COMPOSITION_PROFILES.len());
+    for profile in CHARACTER_COMPOSITION_PROFILES {
+        fit_reports.push(evaluate_character_composition_profile(
+            core,
+            supplemental,
+            &fit_supplemental.probes,
+            &fit_core_controls,
+            frontier_limit,
+            &language_model,
+            profile,
+        )?);
+    }
+    let mut selected_index = 0;
+    for index in 1..fit_reports.len() {
+        if composition_profile_precedes(&fit_reports[index], &fit_reports[selected_index]) {
+            selected_index = index;
+        }
+    }
+    let baseline_heldout = evaluate_character_composition_profile(
+        core,
+        supplemental,
+        heldout_supplemental_probes,
+        heldout_core_controls,
+        frontier_limit,
+        &language_model,
+        CHARACTER_COMPOSITION_PROFILES[0],
+    )?;
+    let selected_heldout = if selected_index == 0 {
+        baseline_heldout
+    } else {
+        evaluate_character_composition_profile(
+            core,
+            supplemental,
+            heldout_supplemental_probes,
+            heldout_core_controls,
+            frontier_limit,
+            &language_model,
+            CHARACTER_COMPOSITION_PROFILES[selected_index],
+        )?
+    };
+
+    let training_stats = training.stats;
+    let model_stats = language_model.stats();
+    let mut output = format!(
+        "\n公开字境拟合 / 保留评测\n拟合语料：{} 句；保留汉字序列 {}，字符 {}；模型转移类型 {}\n拟合样本：补充组合 {}，全核心负对照 {}（句代表 {}）\n",
+        fit_corpus.stats.sentences,
+        training_stats.training_sequences,
+        training_stats.training_characters,
+        model_stats.observed_pair_types,
+        fit_supplemental.stats.selected,
+        fit_control_stats.selected,
+        fit_control_stats.sentence_representatives,
+    );
+    for (profile, report) in CHARACTER_COMPOSITION_PROFILES.iter().zip(&fit_reports) {
+        writeln!(
+            output,
+            "拟合 {}：补充 Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+            profile.label,
+            report.supplemental_probes.target.visible,
+            report.supplemental_probes.target_newly_visible,
+            report.supplemental_probes.target_lost_visible,
+            report.core_controls.target.visible,
+            report.core_controls.target_lost_visible,
+            report.core_controls.target_rank_worsened,
+            report.core_controls.core_candidates_evicted,
+        )?;
+    }
+    let selected_profile = CHARACTER_COMPOSITION_PROFILES[selected_index];
+    writeln!(
+        output,
+        "拟合选择：{}；只按安全、补充 Top-{frontier_limit}/Top-5/Top-3、负对照降位与挤出依次比较，平局保留更早的保守档。",
+        selected_profile.label,
+    )?;
+    writeln!(
+        output,
+        "保留评测结构基线：补充 Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+        baseline_heldout.supplemental_probes.target.visible,
+        baseline_heldout.supplemental_probes.target_newly_visible,
+        baseline_heldout.supplemental_probes.target_lost_visible,
+        baseline_heldout.core_controls.target.visible,
+        baseline_heldout.core_controls.target_lost_visible,
+        baseline_heldout.core_controls.target_rank_worsened,
+        baseline_heldout.core_controls.core_candidates_evicted,
+    )?;
+    writeln!(
+        output,
+        "保留评测拟合选择：补充 Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；负对照 Top-{frontier_limit} {}，丢失 {}、降位 {}、挤出 {}",
+        selected_heldout.supplemental_probes.target.visible,
+        selected_heldout.supplemental_probes.target_newly_visible,
+        selected_heldout.supplemental_probes.target_lost_visible,
+        selected_heldout.core_controls.target.visible,
+        selected_heldout.core_controls.target_lost_visible,
+        selected_heldout.core_controls.target_rank_worsened,
+        selected_heldout.core_controls.core_candidates_evicted,
+    )?;
+    output.push_str(
+        "字境只在结构候选前八中允许一个具有足够公开转移覆盖和平均对数概率增益的挑战者；不创建路径，不读取保留答案来选档。\n",
+    );
+    Ok(output)
 }
 
 fn observe_composition_control_strategy(
@@ -3218,6 +3599,8 @@ mod tests {
                 "supplemental.tsv".to_owned(),
                 "--corpus".to_owned(),
                 "public.conllu".to_owned(),
+                "--fit-corpus".to_owned(),
+                "fit.conllu".to_owned(),
                 "--frontier-limit".to_owned(),
                 "7".to_owned(),
                 "--sample-limit".to_owned(),
@@ -3228,6 +3611,7 @@ mod tests {
                 core_payload: PathBuf::from("core.tsv"),
                 supplemental_payload: PathBuf::from("supplemental.tsv"),
                 corpus: PathBuf::from("public.conllu"),
+                fit_corpus: Some(PathBuf::from("fit.conllu")),
                 frontier_limit: 7,
                 sample_limit: 128,
             }
@@ -3601,17 +3985,33 @@ mod tests {
 # sent_id = public-two\n\
 1\t正常\t正常\tADJ\t_\t_\t0\troot\t_\t_\n\
 2\t处理\t处理\tVERB\t_\t_\t1\tdep\t_\t_\n";
+        const FIT_CORPUS: &str = "# sent_id = fit-one\n\
+1\t掰开\t掰开\tVERB\t_\t_\t0\troot\t_\t_\n\
+2\t揉碎\t揉碎\tVERB\t_\t_\t1\tdep\t_\t_\n\
+\n\
+# sent_id = fit-two\n\
+1\t正常\t正常\tADJ\t_\t_\t0\troot\t_\t_\n\
+2\t处理\t处理\tVERB\t_\t_\t1\tdep\t_\t_\n";
         let root = temporary_test_root();
         let core = root.join("core.tsv");
         let supplemental = root.join("supplemental.tsv");
         let corpus = root.join("public.conllu");
+        let fit_corpus = root.join("fit.conllu");
         fs::create_dir(&root).unwrap();
         fs::write(&core, CORE).unwrap();
         fs::write(&supplemental, SUPPLEMENTAL).unwrap();
         fs::write(&corpus, CORPUS).unwrap();
+        fs::write(&fit_corpus, FIT_CORPUS).unwrap();
 
-        let report =
-            audit_candidate_layer_compositions(&core, &supplemental, &corpus, 7, 8).unwrap();
+        let report = audit_candidate_layer_compositions(
+            &core,
+            &supplemental,
+            &corpus,
+            Some(&fit_corpus),
+            7,
+            8,
+        )
+        .unwrap();
         assert!(report.contains("样本：1（两词 1，三词 0"));
         assert!(report.contains("召回变化：新增可见 1，原可见丢失 0"));
         assert!(report.contains("非目标首选变化 0"));
@@ -3624,11 +4024,20 @@ mod tests {
         assert!(report.contains("结构 V1"));
         assert!(report.contains("少分段优先"));
         assert!(report.contains("层内名次优先"));
+        assert!(report.contains("公开字境拟合 / 保留评测"));
+        assert!(report.contains("拟合选择："));
+        assert!(report.contains("保留评测结构基线"));
+        assert!(report.contains("保留评测拟合选择"));
         assert!(report.contains("本次操作：只读"));
         assert!(!report.contains("掰开"));
         assert!(!report.contains("揉碎"));
         assert!(!report.contains("正常"));
         assert!(!report.contains("整场"));
+        assert!(
+            audit_candidate_layer_compositions(&core, &supplemental, &corpus, Some(&corpus), 7, 8,)
+                .is_err(),
+            "the held-out corpus must never be accepted as its own fit source"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
