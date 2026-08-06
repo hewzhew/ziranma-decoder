@@ -1070,6 +1070,13 @@ pub struct CapsuleReplayReport {
     pub personal_pair_frozen_vs_frozen_word: RankingReplayComparisonStats,
     pub personal_pair_causal_vs_frozen_word: RankingReplayComparisonStats,
     pub personal_pair_causal_vs_frozen_pair: RankingReplayComparisonStats,
+    pub personal_pair_history_any_evidence_windows: u64,
+    pub personal_pair_history_target_in_pool_windows: u64,
+    pub personal_pair_history_target_evidence_windows: u64,
+    pub personal_pair_history_target_extra_promotion_windows: u64,
+    pub personal_pair_history_target_word_cap_saturated_windows: u64,
+    pub personal_pair_history_competing_evidence_windows: u64,
+    pub personal_pair_history_evidence_candidates: u64,
 }
 
 impl CapsuleReplayReport {
@@ -1879,6 +1886,71 @@ impl CapsuleReplayReport {
             .map(|commit| commit.target.as_str())
             .collect::<String>();
         let pool = decoder.decode_sentence(&canonical, PERSONAL_CACHE_POOL_DEPTH)?;
+
+        let target_index = pool.iter().position(|candidate| candidate.text == target);
+        let mut any_pair_evidence = false;
+        let mut competing_pair_evidence = false;
+        for (candidate_index, candidate) in pool.iter().enumerate() {
+            let pair_evidence = personal_cache_evidence(
+                candidate,
+                frozen_state,
+                PersonalCacheKind::OrderedWordPairs,
+                &canonical,
+            );
+            if pair_evidence.prior_pair_occurrences == 0 {
+                continue;
+            }
+            any_pair_evidence = true;
+            self.personal_pair_history_evidence_candidates = self
+                .personal_pair_history_evidence_candidates
+                .saturating_add(1);
+            if Some(candidate_index) != target_index {
+                competing_pair_evidence = true;
+            }
+        }
+        if any_pair_evidence {
+            self.personal_pair_history_any_evidence_windows = self
+                .personal_pair_history_any_evidence_windows
+                .saturating_add(1);
+        }
+        if competing_pair_evidence {
+            self.personal_pair_history_competing_evidence_windows = self
+                .personal_pair_history_competing_evidence_windows
+                .saturating_add(1);
+        }
+        if let Some(target_index) = target_index {
+            self.personal_pair_history_target_in_pool_windows = self
+                .personal_pair_history_target_in_pool_windows
+                .saturating_add(1);
+            let target_candidate = &pool[target_index];
+            let word_evidence = personal_cache_evidence(
+                target_candidate,
+                frozen_state,
+                PersonalCacheKind::WordFrequency,
+                &canonical,
+            );
+            let pair_evidence = personal_cache_evidence(
+                target_candidate,
+                frozen_state,
+                PersonalCacheKind::OrderedWordPairs,
+                &canonical,
+            );
+            if pair_evidence.prior_pair_occurrences > 0 {
+                self.personal_pair_history_target_evidence_windows = self
+                    .personal_pair_history_target_evidence_windows
+                    .saturating_add(1);
+                if pair_evidence.promotion > word_evidence.promotion {
+                    self.personal_pair_history_target_extra_promotion_windows = self
+                        .personal_pair_history_target_extra_promotion_windows
+                        .saturating_add(1);
+                }
+                if word_evidence.promotion == PERSONAL_CACHE_MAX_PROMOTION {
+                    self.personal_pair_history_target_word_cap_saturated_windows = self
+                        .personal_pair_history_target_word_cap_saturated_windows
+                        .saturating_add(1);
+                }
+            }
+        }
 
         self.personal_pair_comparison_windows =
             self.personal_pair_comparison_windows.saturating_add(1);
@@ -2907,6 +2979,19 @@ impl CapsuleReplayReport {
                 self.personal_cache_revision_events_with_reversal,
                 self.personal_cache_revisions_not_reversed,
                 self.personal_cache_ambiguous_edits_not_applied
+            ),
+            format!(
+                "PAIR_EVIDENCE source=frozen_history any_evidence_windows={} \
+                 target_in_pool_windows={} target_evidence_windows={} \
+                 target_extra_promotion_windows={} target_word_cap_saturated_windows={} \
+                 competing_evidence_windows={} evidence_candidates={}",
+                self.personal_pair_history_any_evidence_windows,
+                self.personal_pair_history_target_in_pool_windows,
+                self.personal_pair_history_target_evidence_windows,
+                self.personal_pair_history_target_extra_promotion_windows,
+                self.personal_pair_history_target_word_cap_saturated_windows,
+                self.personal_pair_history_competing_evidence_windows,
+                self.personal_pair_history_evidence_candidates
             ),
             compact_strategy_line(
                 "window_unigram",
@@ -4892,6 +4977,17 @@ text\tpinyin\tfrequency
         assert_eq!(report.personal_pair_frozen_vs_frozen_word.comparisons, 1);
         assert_eq!(report.personal_pair_frozen_vs_frozen_word.rank_improved, 1);
         assert_eq!(report.personal_pair_causal_vs_frozen_word.rank_improved, 1);
+        assert_eq!(report.personal_pair_history_any_evidence_windows, 1);
+        assert_eq!(report.personal_pair_history_target_in_pool_windows, 1);
+        assert_eq!(report.personal_pair_history_target_evidence_windows, 1);
+        assert_eq!(
+            report.personal_pair_history_target_extra_promotion_windows,
+            1
+        );
+        assert_eq!(
+            report.personal_pair_history_target_word_cap_saturated_windows,
+            0
+        );
         assert_eq!(report.personal_cache_learning_word_pairs, 1);
         assert_eq!(report.personal_cache_reversed_word_pairs, 1);
         assert_eq!(causal_state.learned_word_pairs(), 1);
@@ -4904,6 +5000,7 @@ text\tpinyin\tfrequency
         assert!(compact.contains("scope=window_personal_pair_cache_frozen"));
         assert!(compact.contains("scope=window_personal_pair_cache_causal"));
         assert!(compact.contains("context=personal_pair_frozen_vs_frozen_word"));
+        assert!(compact.contains("PAIR_EVIDENCE source=frozen_history"));
         assert!(!compact.contains("在"));
         assert!(!compact.contains("猫"));
         assert!(!compact.contains("zai"));
