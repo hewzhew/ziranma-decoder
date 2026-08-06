@@ -1065,6 +1065,18 @@ pub struct CapsuleReplayReport {
     pub personal_code_causal_window_canonical_full: ReplayStrategyStats,
     pub personal_hybrid_window_canonical_full: ReplayStrategyStats,
     pub personal_hybrid_vs_frozen_word: RankingReplayComparisonStats,
+    pub personal_code_frozen_vs_unigram: RankingReplayComparisonStats,
+    pub personal_code_causal_vs_unigram: RankingReplayComparisonStats,
+    pub personal_code_causal_vs_frozen: RankingReplayComparisonStats,
+    pub personal_code_target_in_pool_windows: u64,
+    pub personal_code_frozen_any_evidence_windows: u64,
+    pub personal_code_frozen_target_evidence_windows: u64,
+    pub personal_code_frozen_competing_evidence_windows: u64,
+    pub personal_code_causal_any_evidence_windows: u64,
+    pub personal_code_causal_target_evidence_windows: u64,
+    pub personal_code_causal_competing_evidence_windows: u64,
+    pub personal_hybrid_target_extra_promotion_windows: u64,
+    pub personal_hybrid_target_word_cap_saturated_windows: u64,
     pub personal_pair_comparison_windows: u64,
     pub personal_pair_public_window_canonical_full: ReplayStrategyStats,
     pub personal_pair_frozen_word_window_canonical_full: ReplayStrategyStats,
@@ -2385,6 +2397,84 @@ impl CapsuleReplayReport {
         let baseline_rank = causal_baseline.unigram;
         if include_code_comparison {
             self.personal_code_cache_windows = self.personal_code_cache_windows.saturating_add(1);
+            let target_index = baseline_pool
+                .iter()
+                .position(|candidate| candidate.text == target);
+            let mut frozen_any_evidence = false;
+            let mut frozen_competing_evidence = false;
+            let mut causal_any_evidence = false;
+            let mut causal_competing_evidence = false;
+            for (candidate_index, candidate) in baseline_pool.iter().enumerate() {
+                if frozen_state.code_text_count(&canonical, &candidate.text) > 0 {
+                    frozen_any_evidence = true;
+                    if Some(candidate_index) != target_index {
+                        frozen_competing_evidence = true;
+                    }
+                }
+                if causal_state.code_text_count(&canonical, &candidate.text) > 0 {
+                    causal_any_evidence = true;
+                    if Some(candidate_index) != target_index {
+                        causal_competing_evidence = true;
+                    }
+                }
+            }
+            if frozen_any_evidence {
+                self.personal_code_frozen_any_evidence_windows = self
+                    .personal_code_frozen_any_evidence_windows
+                    .saturating_add(1);
+            }
+            if frozen_competing_evidence {
+                self.personal_code_frozen_competing_evidence_windows = self
+                    .personal_code_frozen_competing_evidence_windows
+                    .saturating_add(1);
+            }
+            if causal_any_evidence {
+                self.personal_code_causal_any_evidence_windows = self
+                    .personal_code_causal_any_evidence_windows
+                    .saturating_add(1);
+            }
+            if causal_competing_evidence {
+                self.personal_code_causal_competing_evidence_windows = self
+                    .personal_code_causal_competing_evidence_windows
+                    .saturating_add(1);
+            }
+            if let Some(target_index) = target_index {
+                self.personal_code_target_in_pool_windows =
+                    self.personal_code_target_in_pool_windows.saturating_add(1);
+                let target_candidate = &baseline_pool[target_index];
+                if frozen_state.code_text_count(&canonical, &target_candidate.text) > 0 {
+                    self.personal_code_frozen_target_evidence_windows = self
+                        .personal_code_frozen_target_evidence_windows
+                        .saturating_add(1);
+                }
+                if causal_state.code_text_count(&canonical, &target_candidate.text) > 0 {
+                    self.personal_code_causal_target_evidence_windows = self
+                        .personal_code_causal_target_evidence_windows
+                        .saturating_add(1);
+                    let word_evidence = personal_cache_evidence(
+                        target_candidate,
+                        frozen_state,
+                        PersonalCacheKind::WordFrequency,
+                        &canonical,
+                    );
+                    let hybrid_evidence = personal_hybrid_evidence(
+                        target_candidate,
+                        frozen_state,
+                        causal_state,
+                        &canonical,
+                    );
+                    if hybrid_evidence.promotion > word_evidence.promotion {
+                        self.personal_hybrid_target_extra_promotion_windows = self
+                            .personal_hybrid_target_extra_promotion_windows
+                            .saturating_add(1);
+                    }
+                    if word_evidence.promotion == PERSONAL_CACHE_MAX_PROMOTION {
+                        self.personal_hybrid_target_word_cap_saturated_windows = self
+                            .personal_hybrid_target_word_cap_saturated_windows
+                            .saturating_add(1);
+                    }
+                }
+            }
             let code_causal = observe_personal_strategy_from_pool(
                 &baseline_pool,
                 causal_state,
@@ -2412,6 +2502,12 @@ impl CapsuleReplayReport {
                 &mut self.personal_hybrid_window_canonical_full,
             );
             debug_assert_eq!(hybrid.unigram, baseline_rank);
+            self.personal_code_frozen_vs_unigram
+                .observe(baseline_rank, code_frozen.personal);
+            self.personal_code_causal_vs_unigram
+                .observe(baseline_rank, code_causal.personal);
+            self.personal_code_causal_vs_frozen
+                .observe(code_frozen.personal, code_causal.personal);
             self.personal_hybrid_vs_frozen_word
                 .observe(frozen_baseline.personal, hybrid.personal);
         }
@@ -3151,7 +3247,7 @@ impl CapsuleReplayReport {
     pub fn personal_code_comparison_terminal_report(&self) -> String {
         [
             format!(
-                "PERSONAL_CODE_COMPARISON schema=ziranma-personal-code-comparison-v2 \
+                "PERSONAL_CODE_COMPARISON schema=ziranma-personal-code-comparison-v3 \
                  contains_text=false contains_behavioral_metadata=true writes=false network=false \
                  evaluation_learning=frozen_and_causal_online \
                  code_identity=exact_observed_code_and_window_text decay=none \
@@ -3185,6 +3281,22 @@ impl CapsuleReplayReport {
                 self.personal_cache_learned_code_text_types,
                 self.personal_cache_reversed_code_text_tokens
             ),
+            format!(
+                "CODE_EVIDENCE target_in_pool_windows={} frozen_any_evidence_windows={} \
+                 frozen_target_evidence_windows={} frozen_competing_evidence_windows={} \
+                 causal_any_evidence_windows={} causal_target_evidence_windows={} \
+                 causal_competing_evidence_windows={} hybrid_target_extra_promotion_windows={} \
+                 hybrid_target_word_cap_saturated_windows={}",
+                self.personal_code_target_in_pool_windows,
+                self.personal_code_frozen_any_evidence_windows,
+                self.personal_code_frozen_target_evidence_windows,
+                self.personal_code_frozen_competing_evidence_windows,
+                self.personal_code_causal_any_evidence_windows,
+                self.personal_code_causal_target_evidence_windows,
+                self.personal_code_causal_competing_evidence_windows,
+                self.personal_hybrid_target_extra_promotion_windows,
+                self.personal_hybrid_target_word_cap_saturated_windows
+            ),
             compact_strategy_line(
                 "window_unigram",
                 "canonical_full",
@@ -3214,6 +3326,18 @@ impl CapsuleReplayReport {
                 "window_personal_hybrid_cache",
                 "canonical_full",
                 &self.personal_hybrid_window_canonical_full,
+            ),
+            compact_ranking_comparison_line(
+                "personal_code_frozen_vs_unigram",
+                &self.personal_code_frozen_vs_unigram,
+            ),
+            compact_ranking_comparison_line(
+                "personal_code_causal_vs_unigram",
+                &self.personal_code_causal_vs_unigram,
+            ),
+            compact_ranking_comparison_line(
+                "personal_code_causal_vs_frozen",
+                &self.personal_code_causal_vs_frozen,
             ),
             compact_ranking_comparison_line(
                 "personal_hybrid_vs_frozen_word",
@@ -5439,6 +5563,18 @@ text\tpinyin\tfrequency
         );
         assert_eq!(report.personal_hybrid_window_canonical_full.attempts, 1);
         assert_eq!(report.personal_hybrid_vs_frozen_word.comparisons, 1);
+        assert_eq!(report.personal_code_frozen_vs_unigram.comparisons, 1);
+        assert_eq!(report.personal_code_causal_vs_unigram.comparisons, 1);
+        assert_eq!(report.personal_code_causal_vs_frozen.comparisons, 1);
+        assert_eq!(report.personal_code_target_in_pool_windows, 1);
+        assert_eq!(report.personal_code_frozen_any_evidence_windows, 1);
+        assert_eq!(report.personal_code_frozen_target_evidence_windows, 1);
+        assert_eq!(report.personal_code_frozen_competing_evidence_windows, 0);
+        assert_eq!(report.personal_code_causal_any_evidence_windows, 1);
+        assert_eq!(report.personal_code_causal_target_evidence_windows, 1);
+        assert_eq!(report.personal_code_causal_competing_evidence_windows, 0);
+        assert_eq!(report.personal_hybrid_target_extra_promotion_windows, 1);
+        assert_eq!(report.personal_hybrid_target_word_cap_saturated_windows, 0);
         assert_eq!(report.personal_cache_history_code_text_tokens, 1);
         assert_eq!(report.personal_cache_history_code_text_types, 1);
         assert_eq!(report.personal_cache_learning_code_text_tokens, 1);
@@ -5447,12 +5583,17 @@ text\tpinyin\tfrequency
         assert_eq!(format!("{frozen_state:?}"), frozen_before);
 
         let compact = report.personal_code_comparison_terminal_report();
+        assert!(compact.contains("schema=ziranma-personal-code-comparison-v3"));
         assert!(compact.contains("code_identity=exact_observed_code_and_window_text"));
         assert!(compact.contains("decay=none"));
         assert!(compact.contains("combined_promotion=bounded_sum"));
         assert!(compact.contains("scope=window_personal_code_cache_frozen"));
         assert!(compact.contains("scope=window_personal_code_cache_causal"));
         assert!(compact.contains("scope=window_personal_hybrid_cache"));
+        assert!(compact.contains("CODE_EVIDENCE target_in_pool_windows=1"));
+        assert!(compact.contains("context=personal_code_frozen_vs_unigram"));
+        assert!(compact.contains("context=personal_code_causal_vs_unigram"));
+        assert!(compact.contains("context=personal_code_causal_vs_frozen"));
         assert!(compact.contains("context=personal_hybrid_vs_frozen_word"));
         assert!(!compact.contains("在"));
         assert!(!compact.contains("猫"));
