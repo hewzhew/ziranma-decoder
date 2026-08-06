@@ -422,7 +422,8 @@ cargo run --release --bin capsule-replay -- `
 命中、简写名次和窗口数不会合入最终成绩。随后才依次评测 `--input`
 点名的胶囊，因此输出中的 `capsules/events/commits` 只属于未来评测组。
 `--history-input` 只能和两个个人缓存模式之一、
-`--personal-word-comparison` 或 `--personal-code-comparison` 使用；
+`--personal-pair-comparison`、`--personal-word-comparison` 或
+`--personal-code-comparison` 使用；
 历史与评测路径合并
 后仍统一拒绝重复、符号链接、目录扫描和未点名文件。至少必须有一个
 评测 `--input`。
@@ -455,6 +456,26 @@ cargo run --release --bin capsule-replay -- `
 窗口严格先预测、后学习。公共排序、冻结词频和因果词频对同一策略码共享
 一次 Top-13 解码结果，再分别统计名次，不为两条个人路线重复运行句子
 搜索。输出是机器可读的脱敏聚合，不包含研究结论、原文或可持久化模型。
+
+若要直接隔离“有序词对相对词频到底增加了什么”，使用：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --history-session <旧会话号> `
+  --session <新会话号> `
+  --window-gap-ms 15000 `
+  --personal-pair-comparison `
+  --compact
+```
+
+该模式要求显式历史组、评测组和 `--compact`，并与其他排序模式互斥。
+每个合格完整码窗口只生成一次 Top-13 公共候选池，然后并列评估公共排序、
+冻结历史词频、冻结历史词频加词对，以及从相同历史起步的因果词对路线。
+两条冻结路线在评测期只计分；因果路线严格先计分、再学习，因此可以另看
+评测期新增证据，但不会让当前窗口偷看自己的答案。输出单列冻结词对相对
+冻结词频的 Top-1 得失、名次升降和 Top-10 进出，也列出历史词对
+token/type/repeated、因果学习与修订撤销计数。它不显示原文或码串，不写
+模型，也不联网。
 
 下一层 `--personal-code-comparison --compact` 仍使用同一历史/未来分组和
 同一 Top-13 搜索，但只观察完整码，并增加两条精确身份路线：

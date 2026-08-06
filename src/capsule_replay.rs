@@ -41,6 +41,9 @@ enum PersonalCacheWindowMode<'a> {
         kind: PersonalCacheKind,
         frozen_state: &'a PersonalCacheReplayState,
     },
+    FrozenWordPairAndCausalPair {
+        frozen_state: &'a PersonalCacheReplayState,
+    },
 }
 
 impl<'a> PersonalCacheWindowMode<'a> {
@@ -49,6 +52,7 @@ impl<'a> PersonalCacheWindowMode<'a> {
             Self::Causal(kind)
             | Self::FrozenAndCausal { kind, .. }
             | Self::FrozenCausalAndCode { kind, .. } => kind,
+            Self::FrozenWordPairAndCausalPair { .. } => PersonalCacheKind::OrderedWordPairs,
         }
     }
 
@@ -56,12 +60,17 @@ impl<'a> PersonalCacheWindowMode<'a> {
         match self {
             Self::Causal(_) => None,
             Self::FrozenAndCausal { frozen_state, .. }
-            | Self::FrozenCausalAndCode { frozen_state, .. } => Some(frozen_state),
+            | Self::FrozenCausalAndCode { frozen_state, .. }
+            | Self::FrozenWordPairAndCausalPair { frozen_state } => Some(frozen_state),
         }
     }
 
     fn includes_code_comparison(self) -> bool {
         matches!(self, Self::FrozenCausalAndCode { .. })
+    }
+
+    fn includes_pair_comparison(self) -> bool {
+        matches!(self, Self::FrozenWordPairAndCausalPair { .. })
     }
 }
 
@@ -1053,6 +1062,14 @@ pub struct CapsuleReplayReport {
     pub personal_code_causal_window_canonical_full: ReplayStrategyStats,
     pub personal_hybrid_window_canonical_full: ReplayStrategyStats,
     pub personal_hybrid_vs_frozen_word: RankingReplayComparisonStats,
+    pub personal_pair_comparison_windows: u64,
+    pub personal_pair_public_window_canonical_full: ReplayStrategyStats,
+    pub personal_pair_frozen_word_window_canonical_full: ReplayStrategyStats,
+    pub personal_pair_frozen_window_canonical_full: ReplayStrategyStats,
+    pub personal_pair_causal_window_canonical_full: ReplayStrategyStats,
+    pub personal_pair_frozen_vs_frozen_word: RankingReplayComparisonStats,
+    pub personal_pair_causal_vs_frozen_word: RankingReplayComparisonStats,
+    pub personal_pair_causal_vs_frozen_pair: RankingReplayComparisonStats,
 }
 
 impl CapsuleReplayReport {
@@ -1256,6 +1273,43 @@ impl CapsuleReplayReport {
         self.personal_cache_learned_code_text_types =
             u64::try_from(causal_state.learned_code_text_types()).unwrap_or(u64::MAX);
         self.personal_cache_retained_code_text_tokens = causal_state.learned_code_text_tokens();
+        Ok(())
+    }
+
+    pub fn observe_capsule_with_personal_pair_comparison(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        let kind = PersonalCacheKind::OrderedWordPairs;
+        if let Some(previous) = self.personal_cache_kind {
+            assert_eq!(
+                previous, kind,
+                "a replay report cannot mix personal cache models"
+            );
+        } else {
+            self.personal_cache_kind = Some(kind);
+        }
+        let prepared_windows = self.observe_capsule_internal(decoder, None, capsule, false)?;
+        self.observe_personal_cache_windows(
+            decoder,
+            causal_state,
+            PersonalCacheWindowMode::FrozenWordPairAndCausalPair { frozen_state },
+            capsule,
+            max_gap_ms,
+            &prepared_windows,
+        )?;
+        self.personal_cache_learned_word_types =
+            u64::try_from(causal_state.learned_word_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_tokens = causal_state.learned_word_tokens();
+        self.personal_cache_learned_word_pair_types =
+            u64::try_from(causal_state.learned_word_pair_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_word_pairs = causal_state.learned_word_pairs();
         Ok(())
     }
 
@@ -1781,19 +1835,91 @@ impl CapsuleReplayReport {
     ) -> Result<(), KeySequenceError> {
         if run.len() >= 2 {
             if let Some(frozen_state) = mode.frozen_state() {
-                self.observe_personal_cache_comparison_window(
-                    decoder,
-                    frozen_state,
-                    state,
-                    mode.kind(),
-                    run,
-                    mode.includes_code_comparison(),
-                )?;
+                if mode.includes_pair_comparison() {
+                    self.observe_personal_pair_comparison_window(
+                        decoder,
+                        frozen_state,
+                        state,
+                        run,
+                    )?;
+                } else {
+                    self.observe_personal_cache_comparison_window(
+                        decoder,
+                        frozen_state,
+                        state,
+                        mode.kind(),
+                        run,
+                        mode.includes_code_comparison(),
+                    )?;
+                }
             } else {
                 self.observe_personal_cache_window(decoder, state, mode.kind(), run)?;
             }
         }
         self.finish_personal_cache_learning(state, run, mode.includes_code_comparison());
+        Ok(())
+    }
+
+    fn observe_personal_pair_comparison_window(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &PersonalCacheReplayState,
+        run: &[WindowCommit],
+    ) -> Result<(), KeySequenceError> {
+        let canonical = run
+            .iter()
+            .map(|commit| commit.canonical_full.as_str())
+            .collect::<String>();
+        if canonical.len() > MAX_REPLAY_CODE_KEYS {
+            return Ok(());
+        }
+        let target = run
+            .iter()
+            .map(|commit| commit.target.as_str())
+            .collect::<String>();
+        let pool = decoder.decode_sentence(&canonical, PERSONAL_CACHE_POOL_DEPTH)?;
+
+        self.personal_pair_comparison_windows =
+            self.personal_pair_comparison_windows.saturating_add(1);
+        let public_rank = self.personal_pair_public_window_canonical_full.observe(
+            &canonical,
+            &target,
+            &pool[..pool.len().min(REPLAY_TOP_K)],
+        );
+        let frozen_word = observe_personal_strategy_from_pool(
+            &pool,
+            frozen_state,
+            PersonalCacheKind::WordFrequency,
+            &canonical,
+            &target,
+            &mut self.personal_pair_frozen_word_window_canonical_full,
+        );
+        let frozen_pair = observe_personal_strategy_from_pool(
+            &pool,
+            frozen_state,
+            PersonalCacheKind::OrderedWordPairs,
+            &canonical,
+            &target,
+            &mut self.personal_pair_frozen_window_canonical_full,
+        );
+        let causal_pair = observe_personal_strategy_from_pool(
+            &pool,
+            causal_state,
+            PersonalCacheKind::OrderedWordPairs,
+            &canonical,
+            &target,
+            &mut self.personal_pair_causal_window_canonical_full,
+        );
+        debug_assert_eq!(public_rank, frozen_word.unigram);
+        debug_assert_eq!(frozen_word.unigram, frozen_pair.unigram);
+        debug_assert_eq!(frozen_word.unigram, causal_pair.unigram);
+        self.personal_pair_frozen_vs_frozen_word
+            .observe(frozen_word.personal, frozen_pair.personal);
+        self.personal_pair_causal_vs_frozen_word
+            .observe(frozen_word.personal, causal_pair.personal);
+        self.personal_pair_causal_vs_frozen_pair
+            .observe(frozen_pair.personal, causal_pair.personal);
         Ok(())
     }
 
@@ -2725,6 +2851,97 @@ impl CapsuleReplayReport {
             ),
         ]);
         lines.join("\n")
+    }
+
+    pub fn personal_pair_comparison_terminal_report(&self) -> String {
+        [
+            format!(
+                "PERSONAL_PAIR_COMPARISON schema=ziranma-personal-pair-comparison-v1 \
+                 contains_text=false contains_behavioral_metadata=true writes=false network=false \
+                 frozen_evaluation_updates=0 causal_evaluation_learning=after_scoring \
+                 pair_identity=adjacent_lexicon_words decay=none candidate_pool_depth={} \
+                 max_promotion={}",
+                PERSONAL_CACHE_POOL_DEPTH, PERSONAL_CACHE_MAX_PROMOTION
+            ),
+            format!(
+                "HISTORY capsules={} events={} learning_commits={} word_tokens={} word_types={} \
+                 repeated_word_tokens={} pair_tokens={} pair_types={} repeated_pair_tokens={}",
+                self.personal_cache_history_capsules,
+                self.personal_cache_history_events,
+                self.personal_cache_history_learning_commits,
+                self.personal_cache_history_word_tokens,
+                self.personal_cache_history_word_types,
+                self.personal_cache_history_word_tokens
+                    .saturating_sub(self.personal_cache_history_word_types),
+                self.personal_cache_history_word_pairs,
+                self.personal_cache_history_word_pair_types,
+                self.personal_cache_history_word_pairs
+                    .saturating_sub(self.personal_cache_history_word_pair_types)
+            ),
+            format!(
+                "EVALUATION capsules={} events={} gap_ms={} eligible_commits={} \
+                 ineligible_commits={} windows={} comparison_windows={} window_commits={} \
+                 causal_learning_commits={} causal_learning_word_tokens={} \
+                 causal_learning_pair_sequences={} causal_learning_pair_tokens={} \
+                 causal_retained_pair_tokens={} causal_pair_types={} reversed_commits={} \
+                 reversed_word_tokens={} reversed_pair_sequences={} reversed_pair_tokens={} \
+                 revisions_with_reversal={} revisions_without_reversal={} ambiguous_edits={}",
+                self.capsules,
+                self.events,
+                display_optional(self.window_gap_limit_ms),
+                self.window_eligible_commits,
+                self.window_ineligible_commits,
+                self.continuous_windows,
+                self.personal_pair_comparison_windows,
+                self.continuous_window_commits,
+                self.personal_cache_learning_commits,
+                self.personal_cache_learning_word_tokens,
+                self.personal_cache_learning_pair_sequences,
+                self.personal_cache_learning_word_pairs,
+                self.personal_cache_retained_word_pairs,
+                self.personal_cache_learned_word_pair_types,
+                self.personal_cache_reversed_commits,
+                self.personal_cache_reversed_word_tokens,
+                self.personal_cache_reversed_pair_sequences,
+                self.personal_cache_reversed_word_pairs,
+                self.personal_cache_revision_events_with_reversal,
+                self.personal_cache_revisions_not_reversed,
+                self.personal_cache_ambiguous_edits_not_applied
+            ),
+            compact_strategy_line(
+                "window_unigram",
+                "canonical_full",
+                &self.personal_pair_public_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_word_cache_frozen",
+                "canonical_full",
+                &self.personal_pair_frozen_word_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_pair_cache_frozen",
+                "canonical_full",
+                &self.personal_pair_frozen_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_pair_cache_causal",
+                "canonical_full",
+                &self.personal_pair_causal_window_canonical_full,
+            ),
+            compact_ranking_comparison_line(
+                "personal_pair_frozen_vs_frozen_word",
+                &self.personal_pair_frozen_vs_frozen_word,
+            ),
+            compact_ranking_comparison_line(
+                "personal_pair_causal_vs_frozen_word",
+                &self.personal_pair_causal_vs_frozen_word,
+            ),
+            compact_ranking_comparison_line(
+                "personal_pair_causal_vs_frozen_pair",
+                &self.personal_pair_causal_vs_frozen_pair,
+            ),
+        ]
+        .join("\n")
     }
 
     pub fn personal_code_comparison_terminal_report(&self) -> String {
@@ -4617,6 +4834,76 @@ text\tpinyin\tfrequency
         assert!(compact.contains("scope=window_personal_word_cache_frozen name=canonical_full"));
         assert!(compact.contains("scope=window_personal_word_cache_causal name=canonical_full"));
         assert!(compact.contains("frozen_evaluation_updates=0"));
+        assert!(!compact.contains("在"));
+        assert!(!compact.contains("猫"));
+        assert!(!compact.contains("zai"));
+        assert!(!compact.contains("mao"));
+    }
+
+    #[test]
+    fn pair_comparison_shares_one_pool_and_scores_before_causal_learning() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let evaluation = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+            revision_event(300, 0, "在", ""),
+        ])
+        .unwrap();
+        let mut causal_state = PersonalCacheReplayState::new();
+        causal_state.learn_commit(0, 1, &["在".to_owned()]);
+        causal_state.learn_commit(1, 1, &["再".to_owned()]);
+        causal_state.learn_commit(2, 2, &["猫猫".to_owned()]);
+        assert_eq!(
+            causal_state.learn_pair_sequence(0, 3, &["在".to_owned(), "猫猫".to_owned()]),
+            1
+        );
+        let frozen_state = causal_state.fork_for_frozen_evaluation();
+        let frozen_before = format!("{frozen_state:?}");
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+
+        report
+            .observe_capsule_with_personal_pair_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &evaluation,
+            )
+            .unwrap();
+
+        assert_eq!(report.personal_pair_comparison_windows, 1);
+        assert_eq!(
+            report.personal_pair_public_window_canonical_full.attempts,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_pair_frozen_word_window_canonical_full
+                .attempts,
+            1
+        );
+        assert_eq!(
+            report.personal_pair_frozen_window_canonical_full.attempts,
+            1
+        );
+        assert_eq!(
+            report.personal_pair_causal_window_canonical_full.attempts,
+            1
+        );
+        assert_eq!(report.personal_pair_frozen_vs_frozen_word.comparisons, 1);
+        assert_eq!(report.personal_pair_frozen_vs_frozen_word.rank_improved, 1);
+        assert_eq!(report.personal_pair_causal_vs_frozen_word.rank_improved, 1);
+        assert_eq!(report.personal_cache_learning_word_pairs, 1);
+        assert_eq!(report.personal_cache_reversed_word_pairs, 1);
+        assert_eq!(causal_state.learned_word_pairs(), 1);
+        assert_eq!(format!("{frozen_state:?}"), frozen_before);
+
+        let compact = report.personal_pair_comparison_terminal_report();
+        assert!(compact.contains("schema=ziranma-personal-pair-comparison-v1"));
+        assert!(compact.contains("causal_evaluation_learning=after_scoring"));
+        assert!(compact.contains("scope=window_personal_word_cache_frozen"));
+        assert!(compact.contains("scope=window_personal_pair_cache_frozen"));
+        assert!(compact.contains("scope=window_personal_pair_cache_causal"));
+        assert!(compact.contains("context=personal_pair_frozen_vs_frozen_word"));
         assert!(!compact.contains("在"));
         assert!(!compact.contains("猫"));
         assert!(!compact.contains("zai"));

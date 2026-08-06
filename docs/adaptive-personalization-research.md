@@ -496,7 +496,12 @@ cargo run --release --bin adaptive-lab -- --details
 只有因果路线在窗口预测后更新。该工具只输出脱敏聚合，不选择配置，也不
 保存个人状态。分层衰减、code-aware 证据和覆盖召回仍是后续独立路线。
 
-第二层 `--personal-code-comparison --compact` 只加入精确
+第二步 `--personal-pair-comparison --compact` 把公共排序、冻结历史词频、
+冻结历史词频加有序词对和因果在线词对放进同一窗口的一份 Top-13 池。
+报告把冻结词对相对冻结词频的净名次变化单列出来，并保留在线学习及修订
+撤销计数；因此不会再用两次独立回放间接猜测词对收益。
+
+第三层 `--personal-code-comparison --compact` 只加入精确
 `实际窗口码 → 窗口文字` 身份，和公共、全局词频路线共享 Top-13 池。
 它保留三位提升上限、冻结/因果分叉和修订撤销，但固定 `decay=none`，
 也暂不参与反事实简写。报告同时增加“冻结全局词频 + 因果精确身份”的
