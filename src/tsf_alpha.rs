@@ -9897,6 +9897,30 @@ mod tests {
         }
     }
 
+    struct ExactIdentityAuditCandidateProvider;
+
+    impl CandidateProvider for ExactIdentityAuditCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            let candidates: &[&str] = match code {
+                "ab" | "cd" => &["甲词", "乙词", "丙词"],
+                _ => &[],
+            };
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| (*candidate).to_owned())
+                .collect()
+        }
+    }
+
     struct ShapeCandidateProvider;
 
     impl CandidateProvider for ShapeCandidateProvider {
@@ -15074,6 +15098,118 @@ mod tests {
             service.selection_memory.borrow().remembered_text("jdjd"),
             Some("讲讲")
         );
+    }
+
+    #[test]
+    fn exact_personal_runtime_is_causal_retractable_code_isolated_and_suppression_first() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ExactIdentityAuditCandidateProvider,
+        ))));
+
+        let baseline = service
+            .load_candidate_batch(
+                &ExactIdentityAuditCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(baseline.candidates, ["甲词", "乙词", "丙词"]);
+
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "丙词".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("ab"),
+            None,
+            "the successful choice must remain pending until a later boundary"
+        );
+        let next_same_code = service
+            .load_candidate_batch(
+                &ExactIdentityAuditCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(next_same_code.candidates, ["丙词", "甲词", "乙词"]);
+        assert!(next_same_code.personalized[0]);
+        let same_text_other_code = service
+            .load_candidate_batch(
+                &ExactIdentityAuditCandidateProvider,
+                "cd",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            same_text_other_code.candidates,
+            ["甲词", "乙词", "丙词"],
+            "session evidence must retain the exact code identity"
+        );
+
+        assert!(service.retract_pending_personal_selection());
+        let after_retraction = service
+            .load_candidate_batch(
+                &ExactIdentityAuditCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(after_retraction.candidates, ["甲词", "乙词", "丙词"]);
+
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "丙词".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+        let confirmed = service
+            .load_candidate_batch(
+                &ExactIdentityAuditCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(confirmed.candidates, ["丙词", "甲词", "乙词"]);
+        assert!(confirmed.personalized[0]);
+        assert!(
+            service.personal_phrase_composer.borrow().previous.is_none(),
+            "multi-character exact selections must not enter the adjacent-character phrase lane"
+        );
+
+        service
+            .personal_ranking
+            .borrow_mut()
+            .suppressions
+            .suppress("ab", "丙词")
+            .unwrap();
+        let suppressed = service
+            .load_candidate_batch(
+                &ExactIdentityAuditCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(suppressed.candidates, ["甲词", "乙词", "丙词"]);
+        assert_eq!(suppressed.personalized, [false, false, false]);
     }
 
     #[test]

@@ -5412,6 +5412,45 @@ text\tpinyin\tfrequency
     }
 
     #[test]
+    fn exact_code_comparison_scores_each_window_before_learning_its_identity() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let capsule = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "zl", "zai", "在"),
+            commit_event(200, 1, "mkmk", "mao'mao", "猫猫"),
+            commit_event(10_000, 3, "zl", "zai", "在"),
+            commit_event(10_100, 4, "mkmk", "mao'mao", "猫猫"),
+        ])
+        .unwrap();
+        let frozen_state = PersonalCacheReplayState::new().fork_for_frozen_evaluation();
+        let mut causal_state = PersonalCacheReplayState::new();
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+
+        report
+            .observe_capsule_with_personal_code_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &capsule,
+            )
+            .unwrap();
+
+        assert_eq!(report.personal_code_cache_windows, 2);
+        assert_eq!(report.personal_code_frozen_any_evidence_windows, 0);
+        assert_eq!(report.personal_code_frozen_target_evidence_windows, 0);
+        assert_eq!(
+            report.personal_code_causal_any_evidence_windows, 1,
+            "only the second window may observe the first window's identity"
+        );
+        assert_eq!(report.personal_code_causal_target_evidence_windows, 1);
+        assert_eq!(report.personal_code_causal_competing_evidence_windows, 0);
+        assert_eq!(report.personal_cache_learning_code_text_tokens, 2);
+        assert_eq!(report.personal_cache_retained_code_text_tokens, 2);
+        assert_eq!(report.personal_cache_learned_code_text_types, 1);
+        assert_eq!(report.personal_code_causal_vs_frozen.comparisons, 2);
+        assert_eq!(report.personal_code_causal_vs_frozen.rank_worsened, 0);
+    }
+
+    #[test]
     fn hybrid_personal_evidence_shares_one_promotion_budget() {
         let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
         let pool = decoder
