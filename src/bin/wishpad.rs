@@ -1308,6 +1308,7 @@ mod windows_app {
             WishCaptureScope::LegacyWindow => "旧版现场",
             WishCaptureScope::RecentEpisodes => "刚才的输入片段",
             WishCaptureScope::RecentWindow => "较长现场",
+            WishCaptureScope::ContinuousJournal => "持续研究批次",
         }
     }
 

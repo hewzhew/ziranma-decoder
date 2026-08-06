@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::ffi::{OsString, c_void};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -40,13 +41,13 @@ use crate::{
     PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
     PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
     PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
-    PersonalRankingSuppressionSnapshot, SessionSelectionMemory, WISH_ACK_COMPARTMENT_GUID,
-    WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
-    WishCommand, WishCommandAck, WishCommandAckStatus, WishSnapshot,
-    load_candidate_runtime_snapshots, load_current_explicit_alias_snapshot,
+    PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
+    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
+    WishSnapshot, load_candidate_runtime_snapshots, load_current_explicit_alias_snapshot,
     load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
     parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
-    refresh_personal_ranking_suppressions, save_personal_ranking_batch,
+    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
     save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
@@ -1505,6 +1506,10 @@ fn wish_root_for_module(module_path: &Path) -> Option<PathBuf> {
     installed_user_data_root_for_module(module_path, "wishes")
 }
 
+fn research_feedback_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, RESEARCH_FEEDBACK_DIRECTORY)
+}
+
 fn personal_ranking_root_for_module(module_path: &Path) -> Option<PathBuf> {
     installed_user_data_root_for_module(module_path, "personal-ranking")
 }
@@ -2920,7 +2925,7 @@ struct CandidatePopupPaintState {
     dpi: u32,
     layout: CandidatePopupLayout,
     original_window_proc: isize,
-    native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+    native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
     native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
     pending_timing: Option<PendingCandidatePopupTiming>,
     corner_strategy: CandidatePopupCornerStrategy,
@@ -3036,7 +3041,7 @@ struct CandidatePopup {
 impl CandidatePopup {
     fn attach_feedback(
         &mut self,
-        native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+        native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
         native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
     ) {
         self.paint.native_feedback = native_feedback;
@@ -4557,7 +4562,7 @@ impl CandidateUiController {
 
     fn attach_feedback(
         &mut self,
-        native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+        native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
         native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
     ) {
         if let Ok(mut popup) = self.popup.try_borrow_mut() {
@@ -4820,7 +4825,7 @@ struct TsfCompositionSink {
     document_composition: Weak<RefCell<DocumentCompositionState>>,
     logical_composition: Weak<RefCell<CompositionSession>>,
     candidate_ui: Weak<RefCell<CandidateUiController>>,
-    native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+    native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
     native_feedback_context: SyncWeak<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
     key_advice_mode: KeyAdviceMode,
@@ -4831,7 +4836,7 @@ impl TsfCompositionSink {
         document_composition: Weak<RefCell<DocumentCompositionState>>,
         logical_composition: Weak<RefCell<CompositionSession>>,
         candidate_ui: Weak<RefCell<CandidateUiController>>,
-        native_feedback: SyncWeak<Mutex<NativeFeedbackSession>>,
+        native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
         native_feedback_context: SyncWeak<Mutex<NativeFeedbackContextCache>>,
         native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
         key_advice_mode: KeyAdviceMode,
@@ -4962,7 +4967,7 @@ struct EditSessionShared {
     logical_composition: Rc<RefCell<CompositionSession>>,
     telemetry: Arc<Mutex<EditSessionTelemetry>>,
     candidate_ui: Rc<RefCell<CandidateUiController>>,
-    native_feedback: Arc<Mutex<NativeFeedbackSession>>,
+    native_feedback: Arc<Mutex<NativeFeedbackRuntime>>,
     native_feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
     key_advice_mode: KeyAdviceMode,
@@ -4986,7 +4991,7 @@ struct TsfDocumentEditSession {
     candidate_ui: Rc<RefCell<CandidateUiController>>,
     candidate_display: Option<CandidateDisplay>,
     feedback_after_success: Option<NativeFeedbackEvent>,
-    native_feedback: Arc<Mutex<NativeFeedbackSession>>,
+    native_feedback: Arc<Mutex<NativeFeedbackRuntime>>,
     native_feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
     key_advice_mode: KeyAdviceMode,
@@ -5396,7 +5401,7 @@ fn feedback_language_bar_icon(mode: InputMode, summary: NativeFeedbackSummary) -
 }
 
 struct NativeFeedbackLanguageBarState {
-    feedback: Arc<Mutex<NativeFeedbackSession>>,
+    feedback: Arc<Mutex<NativeFeedbackRuntime>>,
     feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     input_mode: Rc<Cell<InputMode>>,
     sink: RefCell<Option<ITfLangBarItemSink>>,
@@ -5417,7 +5422,7 @@ enum WishSaveStatus {
 
 impl NativeFeedbackLanguageBarState {
     fn new(
-        feedback: Arc<Mutex<NativeFeedbackSession>>,
+        feedback: Arc<Mutex<NativeFeedbackRuntime>>,
         feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
         input_mode: Rc<Cell<InputMode>>,
     ) -> Self {
@@ -5428,7 +5433,7 @@ impl NativeFeedbackLanguageBarState {
     }
 
     fn with_wish_root(
-        feedback: Arc<Mutex<NativeFeedbackSession>>,
+        feedback: Arc<Mutex<NativeFeedbackRuntime>>,
         feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
         input_mode: Rc<Cell<InputMode>>,
         wish_root: Option<PathBuf>,
@@ -5514,7 +5519,9 @@ impl NativeFeedbackLanguageBarState {
                             .ok()
                             .map(|frozen| (frozen, WishCaptureScope::RecentWindow))
                     }),
-                WishCaptureScope::LegacyWindow | WishCaptureScope::RecentWindow => feedback
+                WishCaptureScope::LegacyWindow
+                | WishCaptureScope::RecentWindow
+                | WishCaptureScope::ContinuousJournal => feedback
                     .freeze_recent(
                         authorization,
                         marker_ms,
@@ -5742,7 +5749,7 @@ fn feedback_language_bar_menu(
     items.push((
         FEEDBACK_MENU_STATUS + 1,
         TF_LBMENUF_GRAYED,
-        "反馈默认暂不保存；许愿才写当前用户加密文件；不联网".to_owned(),
+        "许愿保存重点现场；持续研究由独立设置控制；不联网".to_owned(),
     ));
     items
 }
@@ -6798,7 +6805,7 @@ struct TsfTextService {
     candidate_forget_state: RefCell<CandidateForgetState>,
     candidate_ui: Rc<RefCell<CandidateUiController>>,
     edit_telemetry: Arc<Mutex<EditSessionTelemetry>>,
-    native_feedback: Arc<Mutex<NativeFeedbackSession>>,
+    native_feedback: Arc<Mutex<NativeFeedbackRuntime>>,
     native_feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
     native_feedback_language_bar: RefCell<NativeFeedbackLanguageBarController>,
@@ -6819,16 +6826,237 @@ struct DeliveredLetterAnchor {
     code_len_after: usize,
 }
 
-fn native_feedback_session_for_mode(key_advice_mode: KeyAdviceMode) -> NativeFeedbackSession {
-    let mut feedback = NativeFeedbackSession::default();
-    if matches!(key_advice_mode, KeyAdviceMode::Foreground) {
-        let started = feedback.start_rolling_memory(
-            NativeFeedbackAuthorization::explicit_memory_only(),
-            NativeFeedbackLimits::default(),
-        );
-        debug_assert_eq!(started, NativeFeedbackStartResult::Started);
+const RESEARCH_FEEDBACK_BATCH_EVENTS: usize = 256;
+const RESEARCH_FEEDBACK_BATCH_EPISODES: usize = 8;
+const RESEARCH_FEEDBACK_BATCH_MAX_SPAN_MS: u64 = 60_000;
+const RESEARCH_FEEDBACK_CONSENT_POLL_MS: u64 = 1_000;
+
+struct ResearchFeedbackJournal {
+    root: Option<PathBuf>,
+    enabled: bool,
+    last_consent_check_ms: Option<u64>,
+    events: Vec<(u64, NativeFeedbackEvent)>,
+    completed_episodes: usize,
+}
+
+impl ResearchFeedbackJournal {
+    fn for_mode(key_advice_mode: KeyAdviceMode) -> Self {
+        let root = matches!(key_advice_mode, KeyAdviceMode::Foreground)
+            .then(|| {
+                module_path()
+                    .ok()
+                    .and_then(|module| research_feedback_root_for_module(&module))
+            })
+            .flatten();
+        let enabled = root
+            .as_deref()
+            .is_some_and(|root| research_feedback_enabled(root).unwrap_or(false));
+        Self {
+            root,
+            enabled,
+            last_consent_check_ms: None,
+            events: Vec::new(),
+            completed_episodes: 0,
+        }
     }
-    feedback
+
+    #[cfg(test)]
+    fn with_root(root: Option<PathBuf>) -> Self {
+        let enabled = root
+            .as_deref()
+            .is_some_and(|root| research_feedback_enabled(root).unwrap_or(false));
+        Self {
+            root,
+            enabled,
+            last_consent_check_ms: None,
+            events: Vec::new(),
+            completed_episodes: 0,
+        }
+    }
+
+    fn can_refresh(&self) -> bool {
+        self.root.is_some()
+    }
+
+    fn refresh_consent(&mut self, monotonic_ms: u64) -> bool {
+        let due = self.last_consent_check_ms.is_none_or(|previous| {
+            monotonic_ms < previous
+                || monotonic_ms.saturating_sub(previous) >= RESEARCH_FEEDBACK_CONSENT_POLL_MS
+        });
+        if !due {
+            return self.enabled;
+        }
+        self.last_consent_check_ms = Some(monotonic_ms);
+        self.enabled = self
+            .root
+            .as_deref()
+            .is_some_and(|root| research_feedback_enabled(root).unwrap_or(false));
+        if !self.enabled {
+            self.events.clear();
+            self.completed_episodes = 0;
+        }
+        self.enabled
+    }
+
+    fn record(&mut self, event: NativeFeedbackEvent, monotonic_ms: u64) {
+        let completes_episode = event.completes_input_episode();
+        if completes_episode {
+            if !self.refresh_consent(monotonic_ms) {
+                return;
+            }
+        } else if !self.enabled {
+            return;
+        }
+        self.events.push((monotonic_ms, event));
+        if completes_episode {
+            self.completed_episodes = self.completed_episodes.saturating_add(1);
+        }
+        let span_ms = self
+            .events
+            .first()
+            .map(|(first, _)| monotonic_ms.saturating_sub(*first))
+            .unwrap_or(0);
+        if self.events.len() >= RESEARCH_FEEDBACK_BATCH_EVENTS
+            || (completes_episode
+                && (self.completed_episodes >= RESEARCH_FEEDBACK_BATCH_EPISODES
+                    || span_ms >= RESEARCH_FEEDBACK_BATCH_MAX_SPAN_MS))
+        {
+            let _ = self.flush();
+        }
+    }
+
+    fn flush(&mut self) -> bool {
+        if self.events.is_empty() {
+            return true;
+        }
+        let Some(root) = self.root.as_deref() else {
+            self.events.clear();
+            self.completed_episodes = 0;
+            return false;
+        };
+        if research_feedback_enabled(root) != Ok(true) {
+            self.enabled = false;
+            self.events.clear();
+            self.completed_episodes = 0;
+            return false;
+        }
+        let Some(marker_ms) = self.events.last().map(|(timestamp, _)| *timestamp) else {
+            return true;
+        };
+        let saved =
+            crate::FrozenNativeFeedbackSnapshot::from_journal_events(marker_ms, &self.events)
+                .ok()
+                .and_then(|frozen| {
+                    WishSnapshot::from_frozen_with_metadata(
+                        &frozen,
+                        WishCaptureScope::ContinuousJournal,
+                        WishCategory::Other,
+                    )
+                    .ok()
+                })
+                .and_then(|snapshot| {
+                    save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector).ok()
+                })
+                .is_some();
+        if saved {
+            self.events.clear();
+            self.completed_episodes = 0;
+        } else {
+            // A malformed marker, unavailable DPAPI, or storage failure must
+            // never retain an unbounded private buffer inside the host.
+            self.root = None;
+            self.enabled = false;
+            self.events.clear();
+            self.completed_episodes = 0;
+        }
+        saved
+    }
+}
+
+struct NativeFeedbackRuntime {
+    session: NativeFeedbackSession,
+    research: ResearchFeedbackJournal,
+}
+
+impl NativeFeedbackRuntime {
+    fn for_mode(key_advice_mode: KeyAdviceMode) -> Self {
+        let mut session = NativeFeedbackSession::default();
+        if matches!(key_advice_mode, KeyAdviceMode::Foreground) {
+            let started = session.start_rolling_memory(
+                NativeFeedbackAuthorization::explicit_memory_only(),
+                NativeFeedbackLimits::default(),
+            );
+            debug_assert_eq!(started, NativeFeedbackStartResult::Started);
+        }
+        Self {
+            session,
+            research: ResearchFeedbackJournal::for_mode(key_advice_mode),
+        }
+    }
+
+    #[cfg(test)]
+    fn memory_only() -> Self {
+        Self {
+            session: NativeFeedbackSession::default(),
+            research: ResearchFeedbackJournal::with_root(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_research_root(root: PathBuf) -> Self {
+        Self {
+            session: NativeFeedbackSession::default(),
+            research: ResearchFeedbackJournal::with_root(Some(root)),
+        }
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.session.is_accepting() || self.research.can_refresh()
+    }
+
+    fn record_at(
+        &mut self,
+        context: NativeFeedbackContext,
+        event: NativeFeedbackEvent,
+        monotonic_ms: u64,
+    ) -> NativeFeedbackRecordResult {
+        let research_event = (context == NativeFeedbackContext::Eligible
+            && event.validate_and_measure().is_some())
+        .then(|| event.clone());
+        let result = self.session.record_at(context, event, monotonic_ms);
+        if let Some(event) = research_event {
+            self.research.record(event, monotonic_ms);
+        }
+        result
+    }
+
+    fn flush_research(&mut self) -> bool {
+        self.research.flush()
+    }
+}
+
+impl Deref for NativeFeedbackRuntime {
+    type Target = NativeFeedbackSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl DerefMut for NativeFeedbackRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
+impl Drop for NativeFeedbackRuntime {
+    fn drop(&mut self) {
+        let _ = self.flush_research();
+    }
+}
+
+fn native_feedback_runtime_for_mode(key_advice_mode: KeyAdviceMode) -> NativeFeedbackRuntime {
+    NativeFeedbackRuntime::for_mode(key_advice_mode)
 }
 
 impl TsfTextService {
@@ -6837,7 +7065,7 @@ impl TsfTextService {
         key_advice_mode: KeyAdviceMode,
     ) -> Self {
         object_created();
-        let native_feedback = Arc::new(Mutex::new(native_feedback_session_for_mode(
+        let native_feedback = Arc::new(Mutex::new(native_feedback_runtime_for_mode(
             key_advice_mode,
         )));
         let native_feedback_context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
@@ -8966,6 +9194,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         };
         let native_feedback_result = match self.native_feedback.lock() {
             Ok(mut feedback) => {
+                let _ = feedback.flush_research();
                 let _ = feedback.stop();
                 Ok(())
             }
@@ -9293,6 +9522,12 @@ mod tests {
         assert_eq!(
             wish_root_for_module(&module),
             Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\wishes"))
+        );
+        assert_eq!(
+            research_feedback_root_for_module(&module),
+            Some(PathBuf::from(
+                r"D:\repo\.local\tsf-alpha\user-data\research-inbox"
+            ))
         );
         assert_eq!(
             personal_ranking_root_for_module(&module),
@@ -12558,18 +12793,156 @@ mod tests {
 
     #[test]
     fn foreground_hosts_keep_a_bounded_memory_only_wish_buffer_ready() {
-        let foreground = native_feedback_session_for_mode(KeyAdviceMode::Foreground);
+        let foreground = native_feedback_runtime_for_mode(KeyAdviceMode::Foreground);
         assert_eq!(
             foreground.summary().lifecycle,
             NativeFeedbackLifecycle::Recording
         );
         assert_eq!(foreground.summary().events, 0);
 
-        let synthetic = native_feedback_session_for_mode(KeyAdviceMode::SyntheticHost);
+        let synthetic = native_feedback_runtime_for_mode(KeyAdviceMode::SyntheticHost);
         assert_eq!(
             synthetic.summary().lifecycle,
             NativeFeedbackLifecycle::Disabled
         );
+    }
+
+    #[test]
+    fn enabled_research_runtime_saves_non_overlapping_encrypted_episode_batches() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-research-feedback-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::set_research_feedback_enabled(&root, true).unwrap();
+        let mut runtime = NativeFeedbackRuntime::with_research_root(root.clone());
+        runtime.record_at(
+            NativeFeedbackContext::Password,
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "ab".to_owned(),
+                text: "合成敏感范围".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 1,
+                visible_rank: 1,
+            },
+            99,
+        );
+        assert!(runtime.research.events.is_empty());
+        for index in 0..RESEARCH_FEEDBACK_BATCH_EPISODES {
+            let result = runtime.record_at(
+                NativeFeedbackContext::Eligible,
+                NativeFeedbackEvent::CandidateCommitted {
+                    code: "ab".to_owned(),
+                    text: format!("候选{index}"),
+                    view: NativeCandidateView::Ordinary,
+                    source: NativeSelectionSource::FirstCandidate,
+                    absolute_rank: 1,
+                    visible_rank: 1,
+                },
+                u64::try_from(index).unwrap().saturating_add(100),
+            );
+            assert_eq!(result, NativeFeedbackRecordResult::Disabled);
+        }
+        assert!(runtime.research.events.is_empty());
+
+        let packages = crate::list_wish_packages(&root).unwrap();
+        assert_eq!(packages.len(), 1);
+        let snapshot =
+            crate::load_wish_snapshot(&root, packages[0].id(), &WindowsUserDataProtector).unwrap();
+        assert_eq!(
+            snapshot.capture_scope(),
+            WishCaptureScope::ContinuousJournal
+        );
+        assert_eq!(snapshot.events().len(), RESEARCH_FEEDBACK_BATCH_EPISODES);
+        assert_eq!(
+            snapshot.focus_event_range(),
+            0..RESEARCH_FEEDBACK_BATCH_EPISODES
+        );
+
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enabled_research_runtime_flushes_partial_batch_when_host_is_released() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-research-drop-flush-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::set_research_feedback_enabled(&root, true).unwrap();
+        {
+            let mut runtime = NativeFeedbackRuntime::with_research_root(root.clone());
+            runtime.record_at(
+                NativeFeedbackContext::Eligible,
+                NativeFeedbackEvent::RawCodeCommitted {
+                    code: "ab".to_owned(),
+                },
+                100,
+            );
+            assert_eq!(runtime.research.events.len(), 1);
+        }
+
+        assert_eq!(crate::list_wish_packages(&root).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loaded_research_runtime_observes_enable_and_disable_without_host_restart() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-research-consent-refresh-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut runtime = NativeFeedbackRuntime::with_research_root(root.clone());
+        let committed = |text: &str| NativeFeedbackEvent::CandidateCommitted {
+            code: "ab".to_owned(),
+            text: text.to_owned(),
+            view: NativeCandidateView::Ordinary,
+            source: NativeSelectionSource::FirstCandidate,
+            absolute_rank: 1,
+            visible_rank: 1,
+        };
+
+        runtime.record_at(
+            NativeFeedbackContext::Eligible,
+            committed("关闭时不保存"),
+            100,
+        );
+        assert!(runtime.research.events.is_empty());
+
+        crate::set_research_feedback_enabled(&root, true).unwrap();
+        runtime.record_at(
+            NativeFeedbackContext::Eligible,
+            committed("开启后进入内存批次"),
+            1_100,
+        );
+        assert_eq!(runtime.research.events.len(), 1);
+
+        crate::set_research_feedback_enabled(&root, false).unwrap();
+        assert!(!runtime.flush_research());
+        assert!(runtime.research.events.is_empty());
+        assert!(crate::list_wish_packages(&root).unwrap().is_empty());
+
+        crate::set_research_feedback_enabled(&root, true).unwrap();
+        for index in 0..RESEARCH_FEEDBACK_BATCH_EPISODES {
+            runtime.record_at(
+                NativeFeedbackContext::Eligible,
+                committed(&format!("再次开启{index}")),
+                u64::try_from(index).unwrap().saturating_add(2_200),
+            );
+        }
+        assert_eq!(crate::list_wish_packages(&root).unwrap().len(), 1);
+
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12583,7 +12956,7 @@ mod tests {
         assert_eq!(disabled[0].2, "开始反馈（暂不保存）");
         assert_eq!(
             disabled.last().unwrap().2,
-            "反馈默认暂不保存；许愿才写当前用户加密文件；不联网"
+            "许愿保存重点现场；持续研究由独立设置控制；不联网"
         );
 
         let recording = feedback_language_bar_menu(
@@ -12617,7 +12990,7 @@ mod tests {
         );
         assert_eq!(
             recording.last().unwrap().2,
-            "反馈默认暂不保存；许愿才写当前用户加密文件；不联网"
+            "许愿保存重点现场；持续研究由独立设置控制；不联网"
         );
 
         let stopped = feedback_language_bar_menu(
@@ -12663,7 +13036,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::memory_only()));
         let context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
         let mode = Rc::new(Cell::new(InputMode::Chinese));
         let state = NativeFeedbackLanguageBarState::with_wish_root(
@@ -12719,7 +13092,7 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&root, b"not a directory").unwrap();
-        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::memory_only()));
         let state = NativeFeedbackLanguageBarState::with_wish_root(
             Arc::clone(&feedback),
             Arc::new(Mutex::new(NativeFeedbackContextCache::default())),
@@ -12815,7 +13188,7 @@ mod tests {
     fn language_bar_item_explicitly_starts_stops_and_clears_memory_feedback() {
         let _guard = test_state_lock();
         let before = ACTIVE_COM_OBJECTS.load(Ordering::Acquire);
-        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::memory_only()));
         let context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
         let mode = Rc::new(Cell::new(InputMode::Chinese));
         let state = Rc::new(NativeFeedbackLanguageBarState::new(
@@ -12928,7 +13301,7 @@ mod tests {
         let _guard = test_lock();
         let _apartment = ComApartment::enter();
         let before = ACTIVE_COM_OBJECTS.load(Ordering::Acquire);
-        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::memory_only()));
         let context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
         let mode = Rc::new(Cell::new(InputMode::Chinese));
         let state = Rc::new(NativeFeedbackLanguageBarState::new(
@@ -12977,7 +13350,7 @@ mod tests {
     fn wish_command_controller_applies_only_new_test_compartment_words() {
         let _guard = test_lock();
         let _apartment = ComApartment::enter();
-        let feedback = Arc::new(Mutex::new(NativeFeedbackSession::default()));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::memory_only()));
         let state = Rc::new(NativeFeedbackLanguageBarState::new(
             Arc::clone(&feedback),
             Arc::new(Mutex::new(NativeFeedbackContextCache::default())),

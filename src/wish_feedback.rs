@@ -60,6 +60,7 @@ pub enum WishCaptureScope {
     LegacyWindow,
     RecentEpisodes,
     RecentWindow,
+    ContinuousJournal,
 }
 
 impl WishCaptureScope {
@@ -68,6 +69,7 @@ impl WishCaptureScope {
             Self::LegacyWindow => "legacy-window",
             Self::RecentEpisodes => "recent-episodes",
             Self::RecentWindow => "recent-window",
+            Self::ContinuousJournal => "continuous-journal",
         }
     }
 
@@ -76,6 +78,7 @@ impl WishCaptureScope {
             Self::LegacyWindow => 1,
             Self::RecentEpisodes => 2,
             Self::RecentWindow => 3,
+            Self::ContinuousJournal => 4,
         }
     }
 
@@ -84,6 +87,7 @@ impl WishCaptureScope {
             1 => Some(Self::LegacyWindow),
             2 => Some(Self::RecentEpisodes),
             3 => Some(Self::RecentWindow),
+            4 => Some(Self::ContinuousJournal),
             _ => None,
         }
     }
@@ -148,7 +152,11 @@ impl WishSnapshot {
         category: WishCategory,
     ) -> Result<Self, WishFeedbackError> {
         let (focus_event_start, focus_event_count) =
-            latest_completed_episode_range(snapshot.events());
+            if capture_scope == WishCaptureScope::ContinuousJournal {
+                (0, snapshot.events().len())
+            } else {
+                latest_completed_episode_range(snapshot.events())
+            };
         let value = Self {
             capture_scope,
             category,

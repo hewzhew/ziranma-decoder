@@ -48,6 +48,7 @@ mod private_session;
 mod protocol_audit;
 mod public_corpus;
 mod public_lexicon_slice;
+mod research_feedback;
 mod session_summary;
 mod shape_course;
 mod shape_evaluation;
@@ -309,6 +310,11 @@ pub use public_lexicon_slice::{
     PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats,
     PublicSupplementalLayerAudit, PublicSupplementalLayerAuditError,
     audit_public_supplemental_layer, compare_public_lexicons, parse_public_rime_slice,
+};
+pub use research_feedback::{
+    RESEARCH_FEEDBACK_CONSENT_FILE, RESEARCH_FEEDBACK_CONSENT_SCHEMA_V1,
+    RESEARCH_FEEDBACK_DIRECTORY, ResearchFeedbackError, research_feedback_enabled,
+    set_research_feedback_enabled,
 };
 pub use session_summary::{
     AggregatedSessionSummary, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryError,

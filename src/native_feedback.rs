@@ -420,7 +420,7 @@ impl NativeFeedbackEvent {
         }
     }
 
-    fn completes_input_episode(&self) -> bool {
+    pub(crate) fn completes_input_episode(&self) -> bool {
         matches!(
             self,
             Self::CandidateCommitted { .. }
@@ -564,6 +564,52 @@ impl FrozenNativeFeedbackSnapshot {
 
     pub fn events(&self) -> &[FrozenNativeFeedbackEvent] {
         &self.events
+    }
+
+    /// Builds one non-overlapping, host-owned journal batch from already
+    /// validated semantic events.
+    ///
+    /// This constructor performs no I/O and retains no absolute monotonic
+    /// timestamp. It is restricted to the crate so only a host that already
+    /// owns an explicitly enabled private feedback stream can use it.
+    pub(crate) fn from_journal_events(
+        marker_ms: u64,
+        events: &[(u64, NativeFeedbackEvent)],
+    ) -> Result<Self, NativeFeedbackFreezeError> {
+        if events.is_empty() || events.len() > DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS {
+            return Err(NativeFeedbackFreezeError::InvalidEventLimit);
+        }
+        let mut previous_timestamp = None;
+        let mut frozen = Vec::with_capacity(events.len());
+        for (timestamp, event) in events {
+            if *timestamp > marker_ms {
+                return Err(NativeFeedbackFreezeError::FutureTimestamp);
+            }
+            if previous_timestamp.is_some_and(|previous| *timestamp < previous)
+                || event.validate_and_measure().is_none()
+            {
+                return Err(NativeFeedbackFreezeError::InvalidEventLimit);
+            }
+            previous_timestamp = Some(*timestamp);
+            frozen.push(FrozenNativeFeedbackEvent {
+                milliseconds_before_marker: u32::try_from(marker_ms - *timestamp)
+                    .map_err(|_| NativeFeedbackFreezeError::InvalidLookback)?,
+                event: event.clone(),
+            });
+        }
+        let lookback_ms = frozen
+            .first()
+            .map(|event| event.milliseconds_before_marker.max(1))
+            .ok_or(NativeFeedbackFreezeError::InvalidEventLimit)?;
+        Ok(Self {
+            lookback_ms,
+            source_complete: true,
+            source_events: frozen.len(),
+            omitted_before_window: 0,
+            omitted_untimed: 0,
+            omitted_by_event_limit: 0,
+            events: frozen,
+        })
     }
 }
 

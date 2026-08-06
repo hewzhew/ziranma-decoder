@@ -374,6 +374,7 @@ fn capture_scope_label(scope: WishCaptureScope, lookback_ms: u32) -> String {
         WishCaptureScope::LegacyWindow => format!("旧版时间窗 {lookback_ms} ms"),
         WishCaptureScope::RecentEpisodes => "按输入片段截取".to_owned(),
         WishCaptureScope::RecentWindow => format!("近 {lookback_ms} ms"),
+        WishCaptureScope::ContinuousJournal => "持续研究批次".to_owned(),
     }
 }
 

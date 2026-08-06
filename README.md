@@ -195,6 +195,23 @@ Windows 11 现代输入指示器并不可靠展示第三方语言栏项目，因
 问题留言、事发前短时轨迹、证据预览与 DPAPI 本地包边界见
 [“向猫猫许愿”：本地反馈与现场快照](docs/wish-feedback.md)。
 
+若要让日常使用持续积累证据，而不是每次都主动许愿，可以单独开启
+[持续研究收件箱](docs/research-feedback.md)。它默认关闭，只记录猫猫输入法在普通
+输入域里已经产生的结构化事件；密码、PIN、私密、受限和未知 InputScope 继续
+fail closed。批次写入独立的 `research-inbox`，使用 Windows 当前用户 DPAPI，
+不联网、不自动训练，也不会自动进入 Codex 对话：
+
+```powershell
+cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchctl
+.\update-ime.cmd
+.\research-ime.cmd on
+.\research-ime.cmd status
+.\research-ime.cmd off
+```
+
+不带参数的 `research-ime.cmd` 等同于 `status`。开启或关闭后，已加载宿主会在后续
+输入中自动发现；关闭不会删除已有加密批次。
+
 本地许愿放在 Git 忽略的 `.local/tsf-alpha/user-data/wishes`。默认管理命令只显示
 数量和随机内容 ID；查看输入原文必须显式确认，说明另存为绑定同一 ID 的加密
 文件，移除则进入可恢复的本地 `trash`：
