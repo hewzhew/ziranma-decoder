@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::{KeySequence, LabeledSentenceProbe, LexiconEntry, ProbeSpellingMode};
+use crate::{
+    KeySequence, LabeledSentenceProbe, LexiconEntry, MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES,
+    ProbeSpellingMode,
+};
 
 /// Parsed public UD corpus and auditable row accounting.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +133,64 @@ pub struct ContinuousCompositionSelectionStats {
     pub selected_full_keys: usize,
     /// Tail-abbreviated keys across retained probes.
     pub selected_tail_keys: usize,
+}
+
+/// One natural public phrase with exactly one supplemental-only complete word.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicSupplementalCompositionProbe {
+    /// Stable upstream-derived identifier.
+    pub id: String,
+    /// Complete two-key spelling assembled from the selected source entries.
+    pub observed: KeySequence,
+    /// Concatenated public source text expected from the input.
+    pub expected_text: String,
+    /// Ordered UD tokens used to construct the phrase.
+    pub expected_segments: Vec<String>,
+    /// Complete source-selected code for each corresponding segment.
+    pub segment_codes: Vec<KeySequence>,
+    /// Zero-based segment supplied by the supplemental lexicon.
+    pub supplemental_segment_index: usize,
+}
+
+/// Deterministic public probes for the bounded mixed-layer candidate path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicSupplementalCompositionSelection {
+    /// Source-selected probes. Decoder output never influences this list.
+    pub probes: Vec<PublicSupplementalCompositionProbe>,
+    /// Auditable filtering and selection counts.
+    pub stats: PublicSupplementalCompositionSelectionStats,
+}
+
+/// Filtering and stratified-selection counts for mixed-layer probes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicSupplementalCompositionSelectionStats {
+    /// Adjacent two-token and three-token windows examined.
+    pub source_windows: usize,
+    /// Windows with 3 to 16 Han characters and at most 16 syllables.
+    pub han_length_eligible: usize,
+    /// Windows with exactly one supplemental-only multi-character token and
+    /// core coverage for every other token.
+    pub one_supplemental_word_eligible: usize,
+    /// Otherwise eligible windows already present as a whole word in either
+    /// source and therefore excluded from the composition audit.
+    pub whole_phrase_collisions: usize,
+    /// Otherwise eligible windows whose assembled full code already names at
+    /// least one whole word in either source.
+    pub whole_code_collisions: usize,
+    /// One-per-sentence-and-shape representatives before the sample cap.
+    pub sentence_shape_representatives: usize,
+    /// Representatives retained by round-robin shape sampling.
+    pub selected: usize,
+    /// Selected two-token phrases.
+    pub selected_two_token: usize,
+    /// Selected three-token phrases.
+    pub selected_three_token: usize,
+    /// Selected phrases whose supplemental word is first.
+    pub selected_supplemental_first: usize,
+    /// Selected phrases whose supplemental word is between two core words.
+    pub selected_supplemental_middle: usize,
+    /// Selected phrases whose supplemental word is last.
+    pub selected_supplemental_last: usize,
 }
 
 /// One held-out public phrase used to compare bounded abbreviation protocols.
@@ -581,6 +642,189 @@ pub fn select_public_continuous_composition_cases(
         .map(|probe| probe.tail_abbreviated_observed.as_str().len())
         .sum();
     ContinuousCompositionSelection { probes, stats }
+}
+
+/// Selects natural public phrases that exercise exactly one supplemental word.
+///
+/// Two-token and three-token windows are selected without consulting either
+/// decoder's output. A token already present in the core lexicon always stays
+/// a core token. Exactly one remaining token must be a multi-character exact
+/// supplemental word, while every other token must have core exact coverage.
+/// Whole-phrase entries in either lexicon are excluded so exact-word recall
+/// cannot be mistaken for mixed-layer composition. At most one representative
+/// per sentence and structural shape is retained, then five shapes are sampled
+/// round-robin under `limit`.
+pub fn select_public_supplemental_composition_cases(
+    corpus: &UdCorpus,
+    core: &[LexiconEntry],
+    supplemental: &[LexiconEntry],
+    limit: usize,
+) -> PublicSupplementalCompositionSelection {
+    const SHAPE_COUNT: usize = 5;
+
+    let core_by_text = best_entries_by_text(core);
+    let supplemental_by_text = best_entries_by_text(supplemental);
+    let core_whole_codes = core
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<HashSet<_>>();
+    let supplemental_whole_codes = supplemental
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<HashSet<_>>();
+    let mut stats = PublicSupplementalCompositionSelectionStats::default();
+    let mut representatives: [Vec<PublicSupplementalCompositionProbe>; SHAPE_COUNT] =
+        std::array::from_fn(|_| Vec::new());
+    let mut seen_text = HashSet::new();
+
+    for sentence in &corpus.sentences {
+        let tokens = sentence
+            .tokens
+            .iter()
+            .filter(|token| token.upos != "PUNCT")
+            .collect::<Vec<_>>();
+        let mut represented_shapes = [false; SHAPE_COUNT];
+
+        for window_len in [2_usize, 3] {
+            for (window_index, window) in tokens.windows(window_len).enumerate() {
+                stats.source_windows += 1;
+                let expected_text = window
+                    .iter()
+                    .map(|token| token.form.as_str())
+                    .collect::<String>();
+                let character_count = expected_text.chars().count();
+                if !(3..=MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES).contains(&character_count)
+                    || !expected_text.chars().all(is_han_character)
+                {
+                    continue;
+                }
+                stats.han_length_eligible += 1;
+
+                let mut selected_entries = Vec::with_capacity(window_len);
+                let mut supplemental_segment_index = None;
+                let mut coverable = true;
+                for (segment_index, token) in window.iter().enumerate() {
+                    if let Some(entry) = core_by_text.get(token.form.as_str()).copied() {
+                        selected_entries.push(entry);
+                        continue;
+                    }
+                    let supplemental_entry = supplemental_by_text
+                        .get(token.form.as_str())
+                        .copied()
+                        .filter(|entry| entry.syllable_codes.len() >= 2);
+                    let Some(entry) = supplemental_entry else {
+                        coverable = false;
+                        break;
+                    };
+                    if supplemental_segment_index.replace(segment_index).is_some() {
+                        coverable = false;
+                        break;
+                    }
+                    selected_entries.push(entry);
+                }
+                let syllable_count = selected_entries
+                    .iter()
+                    .map(|entry| entry.syllable_codes.len())
+                    .sum::<usize>();
+                if !coverable
+                    || supplemental_segment_index.is_none()
+                    || syllable_count > MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES
+                {
+                    continue;
+                }
+                stats.one_supplemental_word_eligible += 1;
+                if core_by_text.contains_key(expected_text.as_str())
+                    || supplemental_by_text.contains_key(expected_text.as_str())
+                {
+                    stats.whole_phrase_collisions += 1;
+                    continue;
+                }
+                let observed = selected_entries
+                    .iter()
+                    .map(|entry| entry.code.as_str())
+                    .collect::<String>();
+                if core_whole_codes.contains(observed.as_str())
+                    || supplemental_whole_codes.contains(observed.as_str())
+                {
+                    stats.whole_code_collisions += 1;
+                    continue;
+                }
+
+                let supplemental_segment_index =
+                    supplemental_segment_index.expect("one supplemental segment was checked above");
+                let shape = supplemental_composition_shape(window_len, supplemental_segment_index);
+                if represented_shapes[shape] || !seen_text.insert(expected_text.clone()) {
+                    continue;
+                }
+                represented_shapes[shape] = true;
+                representatives[shape].push(PublicSupplementalCompositionProbe {
+                    id: format!(
+                        "{}:supplemental-{window_len}-{}",
+                        sentence.id,
+                        window_index + 1
+                    ),
+                    observed: KeySequence::new(observed)
+                        .expect("public lexicon codes are lowercase ASCII"),
+                    expected_text,
+                    expected_segments: window.iter().map(|token| token.form.clone()).collect(),
+                    segment_codes: selected_entries
+                        .iter()
+                        .map(|entry| entry.code.clone())
+                        .collect(),
+                    supplemental_segment_index,
+                });
+            }
+        }
+    }
+
+    stats.sentence_shape_representatives = representatives.iter().map(Vec::len).sum();
+    let mut probes = Vec::with_capacity(limit.min(stats.sentence_shape_representatives));
+    let mut positions = [0_usize; SHAPE_COUNT];
+    while probes.len() < limit {
+        let mut advanced = false;
+        for shape in 0..SHAPE_COUNT {
+            let Some(probe) = representatives[shape].get(positions[shape]).cloned() else {
+                continue;
+            };
+            positions[shape] += 1;
+            probes.push(probe);
+            advanced = true;
+            if probes.len() == limit {
+                break;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+
+    stats.selected = probes.len();
+    for probe in &probes {
+        match probe.expected_segments.len() {
+            2 => stats.selected_two_token += 1,
+            3 => stats.selected_three_token += 1,
+            _ => unreachable!("the selector only constructs two- and three-token probes"),
+        }
+        if probe.supplemental_segment_index == 0 {
+            stats.selected_supplemental_first += 1;
+        } else if probe.supplemental_segment_index + 1 == probe.expected_segments.len() {
+            stats.selected_supplemental_last += 1;
+        } else {
+            stats.selected_supplemental_middle += 1;
+        }
+    }
+    PublicSupplementalCompositionSelection { probes, stats }
+}
+
+fn supplemental_composition_shape(window_len: usize, supplemental_index: usize) -> usize {
+    match (window_len, supplemental_index) {
+        (2, 0) => 0,
+        (2, 1) => 1,
+        (3, 0) => 2,
+        (3, 1) => 3,
+        (3, 2) => 4,
+        _ => unreachable!("only two- and three-token windows are considered"),
+    }
 }
 
 /// Builds a deterministic fit/dev comparison for bounded abbreviation protocols.
@@ -1104,11 +1348,12 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        BigramLanguageModel, CharacterBigramLanguageModel, audit_anchored_tail_failures,
-        audit_public_protocol_context, audit_public_protocols,
+        BigramLanguageModel, CharacterBigramLanguageModel, MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES,
+        audit_anchored_tail_failures, audit_public_protocol_context, audit_public_protocols,
         parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_continuous_composition_cases, select_public_protocol_audit_cases,
+        select_public_supplemental_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -1386,6 +1631,57 @@ mod tests {
                 && probe.tail_abbreviated_observed.as_str().len()
                     == probe.transposed_observed.as_str().len()
                 && probe.tail_abbreviated_observed != probe.transposed_observed
+        }));
+    }
+
+    #[test]
+    fn supplemental_composition_selection_is_source_only_stratified_and_bounded() {
+        const CORPUS: &str = "# sent_id = one\n\
+1\t这\t这\tPRON\t_\t_\t0\troot\t_\t_\n\
+2\t属于\t属于\tVERB\t_\t_\t1\tdep\t_\t_\n\
+3\t一种\t一种\tNOUN\t_\t_\t2\tdep\t_\t_\n\n\
+# sent_id = two\n\
+1\t揉碎\t揉碎\tVERB\t_\t_\t0\troot\t_\t_\n\
+2\t以后\t以后\tNOUN\t_\t_\t1\tdep\t_\t_\n";
+        let core = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+这\tzhe\t1000\n\
+一种\tyi zhong\t900\n\
+以后\tyi hou\t800\n",
+        )
+        .unwrap();
+        let supplemental = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+属于\tshu yu\t1000\n\
+揉碎\trou sui\t900\n\
+这属于\tzhe shu yu\t800\n",
+        )
+        .unwrap();
+        let corpus = parse_ud_conllu(CORPUS).unwrap();
+
+        let first = select_public_supplemental_composition_cases(&corpus, &core, &supplemental, 5);
+        let second = select_public_supplemental_composition_cases(&corpus, &core, &supplemental, 5);
+        assert_eq!(first, second);
+        assert_eq!(first.stats.source_windows, 4);
+        assert_eq!(first.stats.han_length_eligible, 4);
+        assert_eq!(first.stats.one_supplemental_word_eligible, 4);
+        assert_eq!(first.stats.whole_phrase_collisions, 1);
+        assert_eq!(first.stats.whole_code_collisions, 0);
+        assert_eq!(first.stats.sentence_shape_representatives, 3);
+        assert_eq!(first.stats.selected, 3);
+        assert_eq!(first.stats.selected_two_token, 2);
+        assert_eq!(first.stats.selected_three_token, 1);
+        assert_eq!(first.stats.selected_supplemental_first, 2);
+        assert_eq!(first.stats.selected_supplemental_middle, 1);
+        assert_eq!(first.stats.selected_supplemental_last, 0);
+        assert!(first.probes.iter().all(|probe| {
+            probe.observed.as_str().len().is_multiple_of(2)
+                && probe.observed.as_str().len() / 2 <= MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES
+                && probe.expected_segments.len() == probe.segment_codes.len()
+                && probe.expected_segments[probe.supplemental_segment_index]
+                    .chars()
+                    .count()
+                    >= 2
         }));
     }
 

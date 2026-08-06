@@ -1,5 +1,6 @@
 //! Explicit construction, inspection, and local slotting of candidate packages.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
@@ -25,22 +26,27 @@ use ziranma_core::{
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CANDIDATE_SNAPSHOT_SCHEMA_V1,
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
-    CandidateSupplementalState, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    CandidateSupplementalState, ContinuousCompositionProbe, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
     MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
     MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
     MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
-    PublicRimeSliceConfig, PublicRimeSliceImportStats, SupplementalCandidateLayerConfig,
-    audit_public_supplemental_layer, candidate_package_authentication_sha256,
-    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
-    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    PublicRimeSliceConfig, PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
+    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
+    SupplementalCandidateLayerConfig, audit_public_supplemental_layer,
+    candidate_package_authentication_sha256, candidate_package_storage_id,
+    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
+    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
-    parse_rime_lexicon, parse_simplified_rime_lexicon,
+    parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
+    select_public_continuous_composition_cases, select_public_supplemental_composition_cases,
+    supplemental_complete_composition_texts,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
     "e341598343a0f0f2035bb1aafc34a7f3bb7887deeecb3f60796262aaa2983e6b";
+const MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -84,6 +90,13 @@ enum Options {
         supplemental_payload: PathBuf,
         repetitions: usize,
         exact_promotions: usize,
+    },
+    LayerCompositionAudit {
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        corpus: PathBuf,
+        frontier_limit: usize,
+        sample_limit: usize,
     },
     SupplementStatus {
         root: PathBuf,
@@ -223,6 +236,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             repetitions,
             exact_promotions,
         )?,
+        Options::LayerCompositionAudit {
+            core_payload,
+            supplemental_payload,
+            corpus,
+            frontier_limit,
+            sample_limit,
+        } => audit_candidate_layer_compositions(
+            &core_payload,
+            &supplemental_payload,
+            &corpus,
+            frontier_limit,
+            sample_limit,
+        )?,
         Options::SupplementStatus { root } => supplement_status(&root)?,
         Options::SupplementEnable {
             root,
@@ -290,6 +316,7 @@ fn parse_options(
         "compare" => parse_compare(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
+        "layer-composition-audit" => parse_layer_composition_audit(arguments),
         "supplement-status" => Ok(Options::SupplementStatus {
             root: parse_root_only(arguments, "supplement-status")?,
         }),
@@ -623,6 +650,53 @@ fn parse_layer_benchmark(
     })
 }
 
+fn parse_layer_composition_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut corpus = None;
+    let mut frontier_limit = None;
+    let mut sample_limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--corpus" => set_path(&mut corpus, &mut arguments, "--corpus")?,
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            _ => {
+                return Err(
+                    "unknown layer-composition-audit argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let frontier_limit =
+        frontier_limit.ok_or("layer-composition-audit requires --frontier-limit")?;
+    let sample_limit = sample_limit.ok_or("layer-composition-audit requires --sample-limit")?;
+    if !(5..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err("layer-composition-audit --frontier-limit is outside the fixed bound".into());
+    }
+    if !(1..=512).contains(&sample_limit) {
+        return Err("layer-composition-audit --sample-limit is outside the fixed bound".into());
+    }
+    Ok(Options::LayerCompositionAudit {
+        core_payload: core_payload.ok_or("layer-composition-audit requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("layer-composition-audit requires --supplemental-payload")?,
+        corpus: corpus.ok_or("layer-composition-audit requires --corpus")?,
+        frontier_limit,
+        sample_limit,
+    })
+}
+
 fn parse_supplement_enable(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -899,6 +973,9 @@ fn print_usage() {
     eprintln!(
         "  layer-benchmark --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --repetitions <1..100> --exact-promotions <1..50>"
     );
+    eprintln!(
+        "  layer-composition-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --corpus <PUBLIC.conllu> --frontier-limit <1..50> --sample-limit <1..512>"
+    );
     eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
     eprintln!("  supplement-disable --root <SUPPLEMENTAL_SLOT_DIR>");
@@ -1113,6 +1190,648 @@ fn audit_candidate_layers(
     ))
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompositionRankCounts {
+    at_one: usize,
+    at_three: usize,
+    at_five: usize,
+    visible: usize,
+}
+
+impl CompositionRankCounts {
+    fn observe(&mut self, rank: Option<usize>) {
+        let Some(rank) = rank else {
+            return;
+        };
+        self.visible += 1;
+        self.at_one += usize::from(rank <= 1);
+        self.at_three += usize::from(rank <= 3);
+        self.at_five += usize::from(rank <= 5);
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompositionAuditReport {
+    total: usize,
+    core: CompositionRankCounts,
+    layered: CompositionRankCounts,
+    preserve_core_top: CompositionRankCounts,
+    preserve_core_top_two: CompositionRankCounts,
+    newly_visible: usize,
+    lost_visible: usize,
+    preserve_core_top_newly_visible: usize,
+    preserve_core_top_lost_visible: usize,
+    preserve_core_top_two_newly_visible: usize,
+    preserve_core_top_two_lost_visible: usize,
+    rank_improved: usize,
+    rank_unchanged: usize,
+    rank_worsened: usize,
+    candidate_order_changed: usize,
+    target_promoted_to_top_one: usize,
+    non_target_top_one_changes: usize,
+    core_exact_top_preserved: usize,
+    core_exact_top_changed: usize,
+    missing_supplemental_edge_depth: usize,
+    missing_core_edge_depth: usize,
+    missing_competing_composition: usize,
+    target_composition_rank_one: usize,
+    target_composition_rank_two: usize,
+    target_composition_rank_three_or_four: usize,
+    target_composition_rank_five_to_eight: usize,
+    target_composition_outside_eight: usize,
+    missing_probe_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CoreCompositionControlSelectionStats {
+    source_windows: usize,
+    exact_word_coverable: usize,
+    sentence_representatives: usize,
+    whole_phrase_collisions: usize,
+    whole_code_collisions: usize,
+    selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompositionControlStrategyReport {
+    target: CompositionRankCounts,
+    target_newly_visible: usize,
+    target_lost_visible: usize,
+    target_rank_improved: usize,
+    target_rank_unchanged: usize,
+    target_rank_worsened: usize,
+    top_one_changed: usize,
+    samples_evicting_core_candidates: usize,
+    core_candidates_evicted: usize,
+    maximum_core_candidates_evicted: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CoreCompositionControlReport {
+    total: usize,
+    core: CompositionRankCounts,
+    layered: CompositionControlStrategyReport,
+    preserve_core_top_one_slot: CompositionControlStrategyReport,
+    preserve_core_top_two_slots: CompositionControlStrategyReport,
+}
+
+fn audit_candidate_layer_compositions(
+    core_payload: &Path,
+    supplemental_payload: &Path,
+    corpus: &Path,
+    frontier_limit: usize,
+    sample_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        supplemental_payload,
+        "supplemental public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let corpus_text = read_explicit_text(
+        corpus,
+        "public composition audit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
+    let corpus = parse_ud_conllu(&corpus_text)?;
+    let selection = select_public_supplemental_composition_cases(
+        &corpus,
+        &core_entries,
+        &supplemental_entries,
+        sample_limit,
+    );
+    if selection.probes.is_empty() {
+        return Err("public corpus produced no eligible supplemental composition probes".into());
+    }
+    let (control_probes, control_selection_stats) = select_core_composition_controls(
+        &corpus,
+        &core_entries,
+        &supplemental_entries,
+        sample_limit,
+    );
+    if control_probes.is_empty() {
+        return Err("public corpus produced no eligible all-core composition controls".into());
+    }
+
+    let core = snapshot_from_payload("layer-composition-core-v1", &core_text)?;
+    let supplemental =
+        snapshot_from_payload("layer-composition-supplemental-v1", &supplemental_text)?;
+    let report = evaluate_candidate_layer_compositions(
+        &core,
+        &supplemental,
+        &selection.probes,
+        frontier_limit,
+    )?;
+    if report.core_exact_top_changed != 0 {
+        return Err("composition audit observed a changed core exact Top-1".into());
+    }
+    let control_report =
+        evaluate_core_composition_controls(&core, &supplemental, &control_probes, frontier_limit)?;
+
+    let stats = selection.stats;
+    let missing = if report.missing_probe_ids.is_empty() {
+        "无".to_owned()
+    } else {
+        report.missing_probe_ids.join("、")
+    };
+    Ok(format!(
+        "公开补充组合审计\n语料：{} 句；检查两词与三词相邻窗口\n筛选：窗口 {}；汉字与长度合格 {}；恰有一个补充多字词 {}；排除整词文字 {}、整词同码 {}；句形代表 {}\n样本：{}（两词 {}，三词 {}；补充词在前 {}、居中 {}、在后 {}）\n核心基线：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留核心首选模拟：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留首选并给两个组合位：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前召回变化：新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}\n保留首选模拟：新增可见 {}，原可见丢失 {}\n两个组合位模拟：新增可见 {}，原可见丢失 {}\n目标的结构组合排名：第 1 位 {}，第 2 位 {}，第 3～4 位 {}，第 5～8 位 {}，前 8 外 {}\n候选顺序：发生变化 {}；目标升为首选 {}；非目标首选变化 {}\n核心完整码首选：保留 {}，变化 {}\n当前仍未进入 Top-{frontier_limit}：补充边深度 {}，核心边深度 {}，竞争组合 {}\n样本编号（最多 12）：{missing}\n\n全核心短语负对照\n筛选：窗口 {}；核心整词覆盖 {}；句代表 {}；排除整词文字 {}、整词同码 {}；样本 {}\n核心基线目标：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 一个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 两个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n选择规则不读取解码结果；保留首选结果只是冻结候选上的审计模拟；跨来源原始权重未比较。\n本次操作：只读\n",
+        corpus.stats.sentences,
+        stats.source_windows,
+        stats.han_length_eligible,
+        stats.one_supplemental_word_eligible,
+        stats.whole_phrase_collisions,
+        stats.whole_code_collisions,
+        stats.sentence_shape_representatives,
+        stats.selected,
+        stats.selected_two_token,
+        stats.selected_three_token,
+        stats.selected_supplemental_first,
+        stats.selected_supplemental_middle,
+        stats.selected_supplemental_last,
+        report.core.at_one,
+        report.core.at_three,
+        report.core.at_five,
+        report.core.visible,
+        report.layered.at_one,
+        report.layered.at_three,
+        report.layered.at_five,
+        report.layered.visible,
+        report.preserve_core_top.at_one,
+        report.preserve_core_top.at_three,
+        report.preserve_core_top.at_five,
+        report.preserve_core_top.visible,
+        report.preserve_core_top_two.at_one,
+        report.preserve_core_top_two.at_three,
+        report.preserve_core_top_two.at_five,
+        report.preserve_core_top_two.visible,
+        report.newly_visible,
+        report.lost_visible,
+        report.rank_improved,
+        report.rank_unchanged,
+        report.rank_worsened,
+        report.preserve_core_top_newly_visible,
+        report.preserve_core_top_lost_visible,
+        report.preserve_core_top_two_newly_visible,
+        report.preserve_core_top_two_lost_visible,
+        report.target_composition_rank_one,
+        report.target_composition_rank_two,
+        report.target_composition_rank_three_or_four,
+        report.target_composition_rank_five_to_eight,
+        report.target_composition_outside_eight,
+        report.candidate_order_changed,
+        report.target_promoted_to_top_one,
+        report.non_target_top_one_changes,
+        report.core_exact_top_preserved,
+        report.core_exact_top_changed,
+        report.missing_supplemental_edge_depth,
+        report.missing_core_edge_depth,
+        report.missing_competing_composition,
+        control_selection_stats.source_windows,
+        control_selection_stats.exact_word_coverable,
+        control_selection_stats.sentence_representatives,
+        control_selection_stats.whole_phrase_collisions,
+        control_selection_stats.whole_code_collisions,
+        control_selection_stats.selected,
+        control_report.core.at_one,
+        control_report.core.at_three,
+        control_report.core.at_five,
+        control_report.core.visible,
+        control_report.layered.target.at_one,
+        control_report.layered.target.at_three,
+        control_report.layered.target.at_five,
+        control_report.layered.target.visible,
+        control_report.layered.target_newly_visible,
+        control_report.layered.target_lost_visible,
+        control_report.layered.target_rank_improved,
+        control_report.layered.target_rank_unchanged,
+        control_report.layered.target_rank_worsened,
+        control_report.layered.top_one_changed,
+        control_report.layered.core_candidates_evicted,
+        control_report.layered.samples_evicting_core_candidates,
+        control_report.layered.maximum_core_candidates_evicted,
+        control_report.preserve_core_top_one_slot.target.at_one,
+        control_report.preserve_core_top_one_slot.target.at_three,
+        control_report.preserve_core_top_one_slot.target.at_five,
+        control_report.preserve_core_top_one_slot.target.visible,
+        control_report
+            .preserve_core_top_one_slot
+            .target_newly_visible,
+        control_report
+            .preserve_core_top_one_slot
+            .target_lost_visible,
+        control_report
+            .preserve_core_top_one_slot
+            .target_rank_improved,
+        control_report
+            .preserve_core_top_one_slot
+            .target_rank_unchanged,
+        control_report
+            .preserve_core_top_one_slot
+            .target_rank_worsened,
+        control_report.preserve_core_top_one_slot.top_one_changed,
+        control_report
+            .preserve_core_top_one_slot
+            .core_candidates_evicted,
+        control_report
+            .preserve_core_top_one_slot
+            .samples_evicting_core_candidates,
+        control_report
+            .preserve_core_top_one_slot
+            .maximum_core_candidates_evicted,
+        control_report.preserve_core_top_two_slots.target.at_one,
+        control_report.preserve_core_top_two_slots.target.at_three,
+        control_report.preserve_core_top_two_slots.target.at_five,
+        control_report.preserve_core_top_two_slots.target.visible,
+        control_report
+            .preserve_core_top_two_slots
+            .target_newly_visible,
+        control_report
+            .preserve_core_top_two_slots
+            .target_lost_visible,
+        control_report
+            .preserve_core_top_two_slots
+            .target_rank_improved,
+        control_report
+            .preserve_core_top_two_slots
+            .target_rank_unchanged,
+        control_report
+            .preserve_core_top_two_slots
+            .target_rank_worsened,
+        control_report.preserve_core_top_two_slots.top_one_changed,
+        control_report
+            .preserve_core_top_two_slots
+            .core_candidates_evicted,
+        control_report
+            .preserve_core_top_two_slots
+            .samples_evicting_core_candidates,
+        control_report
+            .preserve_core_top_two_slots
+            .maximum_core_candidates_evicted,
+    ))
+}
+
+fn select_core_composition_controls(
+    corpus: &ziranma_core::UdCorpus,
+    core: &[ziranma_core::LexiconEntry],
+    supplemental: &[ziranma_core::LexiconEntry],
+    limit: usize,
+) -> (
+    Vec<ContinuousCompositionProbe>,
+    CoreCompositionControlSelectionStats,
+) {
+    let selection = select_public_continuous_composition_cases(corpus, core, usize::MAX);
+    let core_texts = core
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let supplemental_texts = supplemental
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let core_codes = core
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<HashSet<_>>();
+    let supplemental_codes = supplemental
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<HashSet<_>>();
+    let mut stats = CoreCompositionControlSelectionStats {
+        source_windows: selection.stats.source_windows,
+        exact_word_coverable: selection.stats.exact_word_coverable,
+        sentence_representatives: selection.stats.sentence_representatives,
+        ..CoreCompositionControlSelectionStats::default()
+    };
+    let mut probes = Vec::with_capacity(limit.min(selection.probes.len()));
+    for probe in selection.probes {
+        if core_texts.contains(probe.expected_text.as_str())
+            || supplemental_texts.contains(probe.expected_text.as_str())
+        {
+            stats.whole_phrase_collisions += 1;
+            continue;
+        }
+        if core_codes.contains(probe.full_observed.as_str())
+            || supplemental_codes.contains(probe.full_observed.as_str())
+        {
+            stats.whole_code_collisions += 1;
+            continue;
+        }
+        probes.push(probe);
+        if probes.len() == limit {
+            break;
+        }
+    }
+    stats.selected = probes.len();
+    (probes, stats)
+}
+
+fn evaluate_core_composition_controls(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    probes: &[ContinuousCompositionProbe],
+    frontier_limit: usize,
+) -> Result<CoreCompositionControlReport, Box<dyn std::error::Error>> {
+    let config = SupplementalCandidateLayerConfig {
+        exact_promotions: 1,
+    };
+    let mut report = CoreCompositionControlReport {
+        total: probes.len(),
+        ..CoreCompositionControlReport::default()
+    };
+    for probe in probes {
+        let code = probe.full_observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let layered = layered_candidate_texts(core, supplemental, code, frontier_limit, config)?;
+        let compositions = supplemental_complete_composition_texts(core, supplemental, code, 8)?;
+        let preserve_core_top_one_slot = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let preserve_core_top_two_slots = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            2,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        report.core.observe(core_rank);
+        observe_composition_control_strategy(
+            &mut report.layered,
+            &core_candidates,
+            &layered,
+            core_rank,
+            &probe.expected_text,
+        );
+        observe_composition_control_strategy(
+            &mut report.preserve_core_top_one_slot,
+            &core_candidates,
+            &preserve_core_top_one_slot,
+            core_rank,
+            &probe.expected_text,
+        );
+        observe_composition_control_strategy(
+            &mut report.preserve_core_top_two_slots,
+            &core_candidates,
+            &preserve_core_top_two_slots,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    Ok(report)
+}
+
+fn observe_composition_control_strategy(
+    report: &mut CompositionControlStrategyReport,
+    core: &[String],
+    candidate: &[String],
+    core_rank: Option<usize>,
+    expected: &str,
+) {
+    let candidate_rank = candidate_rank(candidate, expected);
+    report.target.observe(candidate_rank);
+    match (core_rank, candidate_rank) {
+        (None, Some(_)) => report.target_newly_visible += 1,
+        (Some(_), None) => report.target_lost_visible += 1,
+        (Some(core_rank), Some(candidate_rank)) if candidate_rank < core_rank => {
+            report.target_rank_improved += 1;
+        }
+        (Some(core_rank), Some(candidate_rank)) if candidate_rank > core_rank => {
+            report.target_rank_worsened += 1;
+        }
+        (Some(_), Some(_)) => report.target_rank_unchanged += 1,
+        (None, None) => {}
+    }
+    report.top_one_changed += usize::from(core.first() != candidate.first());
+    let evicted = core
+        .iter()
+        .filter(|core_candidate| !candidate.contains(core_candidate))
+        .count();
+    if evicted != 0 {
+        report.samples_evicting_core_candidates += 1;
+        report.core_candidates_evicted += evicted;
+        report.maximum_core_candidates_evicted =
+            report.maximum_core_candidates_evicted.max(evicted);
+    }
+}
+
+fn evaluate_candidate_layer_compositions(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    probes: &[PublicSupplementalCompositionProbe],
+    frontier_limit: usize,
+) -> Result<CompositionAuditReport, Box<dyn std::error::Error>> {
+    let config = SupplementalCandidateLayerConfig {
+        exact_promotions: 1,
+    };
+    let mut report = CompositionAuditReport {
+        total: probes.len(),
+        ..CompositionAuditReport::default()
+    };
+    for probe in probes {
+        let code = probe.observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let layered = layered_candidate_texts(core, supplemental, code, frontier_limit, config)?;
+        let composition_candidates =
+            supplemental_complete_composition_texts(core, supplemental, code, 8)?;
+        let preserve_core_top =
+            preserve_core_primary_top(&core_candidates, &layered, code, frontier_limit);
+        let preserve_core_top_two = merge_compositions_after_core_top(
+            &core_candidates,
+            &composition_candidates,
+            code,
+            2,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        let layered_rank = candidate_rank(&layered, &probe.expected_text);
+        let preserve_core_top_rank = candidate_rank(&preserve_core_top, &probe.expected_text);
+        let preserve_core_top_two_rank =
+            candidate_rank(&preserve_core_top_two, &probe.expected_text);
+        let composition_rank = candidate_rank(&composition_candidates, &probe.expected_text);
+        report.core.observe(core_rank);
+        report.layered.observe(layered_rank);
+        report.preserve_core_top.observe(preserve_core_top_rank);
+        report
+            .preserve_core_top_two
+            .observe(preserve_core_top_two_rank);
+        match composition_rank {
+            Some(1) => report.target_composition_rank_one += 1,
+            Some(2) => report.target_composition_rank_two += 1,
+            Some(3 | 4) => report.target_composition_rank_three_or_four += 1,
+            Some(5..=8) => report.target_composition_rank_five_to_eight += 1,
+            Some(_) | None => report.target_composition_outside_eight += 1,
+        }
+        match (core_rank, layered_rank) {
+            (None, Some(_)) => report.newly_visible += 1,
+            (Some(_), None) => report.lost_visible += 1,
+            (Some(core_rank), Some(layered_rank)) if layered_rank < core_rank => {
+                report.rank_improved += 1;
+            }
+            (Some(core_rank), Some(layered_rank)) if layered_rank > core_rank => {
+                report.rank_worsened += 1;
+            }
+            (Some(_), Some(_)) => report.rank_unchanged += 1,
+            (None, None) => {}
+        }
+        match (core_rank, preserve_core_top_rank) {
+            (None, Some(_)) => report.preserve_core_top_newly_visible += 1,
+            (Some(_), None) => report.preserve_core_top_lost_visible += 1,
+            _ => {}
+        }
+        match (core_rank, preserve_core_top_two_rank) {
+            (None, Some(_)) => report.preserve_core_top_two_newly_visible += 1,
+            (Some(_), None) => report.preserve_core_top_two_lost_visible += 1,
+            _ => {}
+        }
+        if core_candidates != layered {
+            report.candidate_order_changed += 1;
+        }
+        if core_candidates.first() != layered.first() {
+            if layered.first() == Some(&probe.expected_text) {
+                report.target_promoted_to_top_one += 1;
+            } else {
+                report.non_target_top_one_changes += 1;
+            }
+        }
+        if let Some(core_exact_top) = core.exact_full_code_texts(code, 1)?.first() {
+            if layered.first() == Some(core_exact_top) {
+                report.core_exact_top_preserved += 1;
+            } else {
+                report.core_exact_top_changed += 1;
+            }
+        }
+        if layered_rank.is_none() {
+            match classify_missing_composition(core, supplemental, probe)? {
+                MissingCompositionReason::SupplementalEdgeDepth => {
+                    report.missing_supplemental_edge_depth += 1;
+                }
+                MissingCompositionReason::CoreEdgeDepth => {
+                    report.missing_core_edge_depth += 1;
+                }
+                MissingCompositionReason::CompetingComposition => {
+                    report.missing_competing_composition += 1;
+                }
+            }
+            if report.missing_probe_ids.len() < 12 {
+                report.missing_probe_ids.push(probe.id.clone());
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn preserve_core_primary_top(
+    core: &[String],
+    layered: &[String],
+    code: &str,
+    frontier_limit: usize,
+) -> Vec<String> {
+    let Some(core_top) = core.first().filter(|candidate| candidate.as_str() != code) else {
+        return layered.to_vec();
+    };
+    std::iter::once(core_top.clone())
+        .chain(
+            layered
+                .iter()
+                .filter(|candidate| *candidate != core_top)
+                .cloned(),
+        )
+        .take(frontier_limit)
+        .collect()
+}
+
+fn merge_compositions_after_core_top(
+    core: &[String],
+    compositions: &[String],
+    code: &str,
+    composition_slots: usize,
+    frontier_limit: usize,
+) -> Vec<String> {
+    let mut merged = Vec::with_capacity(frontier_limit);
+    let mut push_unique = |candidate: &String| {
+        if merged.len() < frontier_limit && !merged.contains(candidate) {
+            merged.push(candidate.clone());
+        }
+    };
+    let core_top_is_preserved = core.first().is_some_and(|candidate| candidate != code);
+    if core_top_is_preserved {
+        let core_top = &core[0];
+        push_unique(core_top);
+    }
+    for composition in compositions.iter().take(composition_slots) {
+        push_unique(composition);
+    }
+    for candidate in core.iter().skip(usize::from(core_top_is_preserved)) {
+        push_unique(candidate);
+    }
+    merged
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingCompositionReason {
+    SupplementalEdgeDepth,
+    CoreEdgeDepth,
+    CompetingComposition,
+}
+
+fn classify_missing_composition(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    probe: &PublicSupplementalCompositionProbe,
+) -> Result<MissingCompositionReason, Box<dyn std::error::Error>> {
+    let supplemental_index = probe.supplemental_segment_index;
+    let supplemental_text = &probe.expected_segments[supplemental_index];
+    let supplemental_code = probe.segment_codes[supplemental_index].as_str();
+    let core_exact = core.exact_full_code_texts(supplemental_code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+    let supplemental_rank = supplemental
+        .exact_full_code_texts(supplemental_code, MAX_CANDIDATE_SNAPSHOT_RANK)?
+        .into_iter()
+        .filter(|candidate| !core_exact.contains(candidate))
+        .position(|candidate| candidate == supplemental_text.as_str())
+        .map(|index| index + 1);
+    if supplemental_rank.is_none_or(|rank| rank > SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH) {
+        return Ok(MissingCompositionReason::SupplementalEdgeDepth);
+    }
+
+    for (index, (segment, code)) in probe
+        .expected_segments
+        .iter()
+        .zip(&probe.segment_codes)
+        .enumerate()
+    {
+        if index == supplemental_index {
+            continue;
+        }
+        let rank = core
+            .exact_full_code_texts(code.as_str(), MAX_CANDIDATE_SNAPSHOT_RANK)?
+            .iter()
+            .position(|candidate| candidate == segment)
+            .map(|index| index + 1);
+        if rank.is_none_or(|rank| rank > SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH) {
+            return Ok(MissingCompositionReason::CoreEdgeDepth);
+        }
+    }
+    Ok(MissingCompositionReason::CompetingComposition)
+}
+
+fn candidate_rank(candidates: &[String], expected: &str) -> Option<usize> {
+    candidates
+        .iter()
+        .position(|candidate| candidate == expected)
+        .map(|index| index + 1)
+}
+
 fn benchmark_candidate_layers(
     core_payload: &Path,
     supplemental_payload: &Path,
@@ -1133,10 +1852,11 @@ fn benchmark_candidate_layers(
         MAX_CANDIDATE_SNAPSHOT_BYTES,
     )?;
     let core_started = Instant::now();
-    let core = benchmark_snapshot("layer-benchmark-core-v1", &core_text)?;
+    let core = snapshot_from_payload("layer-benchmark-core-v1", &core_text)?;
     let core_build = core_started.elapsed();
     let supplemental_started = Instant::now();
-    let supplemental = benchmark_snapshot("layer-benchmark-supplemental-v1", &supplemental_text)?;
+    let supplemental =
+        snapshot_from_payload("layer-benchmark-supplemental-v1", &supplemental_text)?;
     let supplemental_build = supplemental_started.elapsed();
     let config = SupplementalCandidateLayerConfig { exact_promotions };
     let codes = layer_benchmark_codes()?;
@@ -1210,7 +1930,7 @@ fn benchmark_candidate_layers(
     ))
 }
 
-fn benchmark_snapshot(
+fn snapshot_from_payload(
     revision: &str,
     payload: &str,
 ) -> Result<CandidateSnapshot, Box<dyn std::error::Error>> {
@@ -2365,6 +3085,39 @@ mod tests {
         );
         assert_eq!(
             parse_options([
+                "layer-composition-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--corpus".to_owned(),
+                "public.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "7".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+            ])
+            .unwrap(),
+            Options::LayerCompositionAudit {
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                corpus: PathBuf::from("public.conllu"),
+                frontier_limit: 7,
+                sample_limit: 128,
+            }
+        );
+        assert!(
+            parse_options([
+                "layer-composition-audit".to_owned(),
+                "--frontier-limit".to_owned(),
+                "4".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            parse_options([
                 "supplement-enable".to_owned(),
                 "--root".to_owned(),
                 "supplement".to_owned(),
@@ -2706,6 +3459,46 @@ mod tests {
         assert!(!report.contains("核心甲"));
         assert!(!report.contains("补充甲"));
         assert!(!report.contains("独词"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn layer_composition_audit_selects_public_structure_and_reports_rank_changes() {
+        const CORE: &str = "text\tpinyin\tfrequency\n掰开\tbai kai\t1000\n正常\tzheng chang\t900\n处理\tchu li\t800\n";
+        const SUPPLEMENTAL: &str =
+            "text\tpinyin\tfrequency\n揉碎\trou sui\t1000\n整场\tzheng chang\t900\n";
+        const CORPUS: &str = "# sent_id = public-one\n\
+1\t掰开\t掰开\tVERB\t_\t_\t0\troot\t_\t_\n\
+2\t揉碎\t揉碎\tVERB\t_\t_\t1\tdep\t_\t_\n\
+\n\
+# sent_id = public-two\n\
+1\t正常\t正常\tADJ\t_\t_\t0\troot\t_\t_\n\
+2\t处理\t处理\tVERB\t_\t_\t1\tdep\t_\t_\n";
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let supplemental = root.join("supplemental.tsv");
+        let corpus = root.join("public.conllu");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&supplemental, SUPPLEMENTAL).unwrap();
+        fs::write(&corpus, CORPUS).unwrap();
+
+        let report =
+            audit_candidate_layer_compositions(&core, &supplemental, &corpus, 7, 8).unwrap();
+        assert!(report.contains("样本：1（两词 1，三词 0"));
+        assert!(report.contains("召回变化：新增可见 1，原可见丢失 0"));
+        assert!(report.contains("非目标首选变化 0"));
+        assert!(report.contains("核心完整码首选：保留 0，变化 0"));
+        assert!(report.contains("全核心短语负对照"));
+        assert!(report.contains("排除整词文字 0、整词同码 0；样本 1"));
+        assert!(report.contains("保留首选 + 一个组合位"));
+        assert!(report.contains("保留首选 + 两个组合位"));
+        assert!(report.contains("本次操作：只读"));
+        assert!(!report.contains("掰开"));
+        assert!(!report.contains("揉碎"));
+        assert!(!report.contains("正常"));
+        assert!(!report.contains("整场"));
 
         fs::remove_dir_all(root).unwrap();
     }

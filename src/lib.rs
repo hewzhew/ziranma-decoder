@@ -153,8 +153,10 @@ pub use candidate_snapshot::{
     AutomaticTranspositionPromotion, CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot,
     CandidateSnapshotDescriptor, CandidateSnapshotError, LayeredCandidateTextsError,
     MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
-    SupplementalCandidateLayerConfig, SupplementalCandidateLayerError,
-    candidate_payload_fingerprint, layered_candidate_texts, merge_candidate_text_layers,
+    MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
+    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SupplementalCandidateLayerConfig,
+    SupplementalCandidateLayerError, candidate_payload_fingerprint, layered_candidate_texts,
+    merge_candidate_text_layers, supplemental_complete_composition_texts,
 };
 pub use capsule_replay::{
     CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
@@ -289,10 +291,12 @@ pub use public_corpus::{
     ContinuousCompositionProbe, ContinuousCompositionSelection,
     ContinuousCompositionSelectionStats, PublicBigramTrainingCorpus, PublicBigramTrainingStats,
     PublicCalibrationSelection, PublicCalibrationSelectionStats, PublicProtocolProbe,
-    PublicProtocolSelection, PublicProtocolSelectionStats, UdCorpus, UdCorpusImportStats,
-    UdCorpusParseError, parse_ud_conllu, select_public_bigram_training_sequences,
-    select_public_calibration_cases, select_public_continuous_composition_cases,
-    select_public_protocol_audit_cases,
+    PublicProtocolSelection, PublicProtocolSelectionStats, PublicSupplementalCompositionProbe,
+    PublicSupplementalCompositionSelection, PublicSupplementalCompositionSelectionStats, UdCorpus,
+    UdCorpusImportStats, UdCorpusParseError, parse_ud_conllu,
+    select_public_bigram_training_sequences, select_public_calibration_cases,
+    select_public_continuous_composition_cases, select_public_protocol_audit_cases,
+    select_public_supplemental_composition_cases,
 };
 pub use public_lexicon_slice::{
     MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,

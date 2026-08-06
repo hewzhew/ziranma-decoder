@@ -28,11 +28,17 @@ const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
 const AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH: usize = 6;
 const FULL_CODE_CHARACTER_PAIR_DEPTH: usize = 24;
 const MAX_FULL_CODE_CHARACTER_PAIRS: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
-const SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH: usize = 4;
+/// Per-span core exact candidates retained by the mixed-layer path search.
+pub const SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH: usize = 4;
 const SUPPLEMENTAL_COMPOSITION_PATHS_PER_BOUNDARY: usize = 4;
-const SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH: usize = 4;
+/// Supplemental-only exact candidates retained for one mixed-layer span.
+pub const SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH: usize = 4;
 const SUPPLEMENTAL_COMPOSITION_SEARCH_DEPTH: usize = 8;
-const MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES: usize = 16;
+/// Longest complete-code input considered by the extra mixed-layer lane.
+///
+/// Longer input keeps the ordinary core result and avoids an unbounded
+/// boundary matrix in an interactive host.
+pub const MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InteractiveCandidateSource {
@@ -488,10 +494,21 @@ pub(crate) fn layered_candidate_query_with_sources(
             .chain(&supplemental_exact)
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let insertion_index = merged
+        let whole_exact_prefix = merged
             .iter()
             .take_while(|text| whole_exact_texts.contains(text.as_str()))
             .count();
+        let core_primary_top_boundary = core_primary
+            .first()
+            .filter(|candidate| candidate.text != code)
+            .and_then(|candidate| {
+                merged
+                    .iter()
+                    .position(|text| text == &candidate.text)
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(0);
+        let insertion_index = whole_exact_prefix.max(core_primary_top_boundary);
         for candidate in composition_candidates {
             if whole_exact_texts.contains(candidate.as_str()) {
                 continue;
@@ -657,7 +674,7 @@ struct SupplementalCompleteComposition {
 /// Raw frequencies from the two snapshots are never compared. Structural
 /// specificity is considered first, followed by each layer's own candidate
 /// order. The caller may promote at most one result.
-fn supplemental_complete_composition_texts(
+pub fn supplemental_complete_composition_texts(
     core: &CandidateSnapshot,
     supplemental: &CandidateSnapshot,
     code: &str,
@@ -1743,6 +1760,45 @@ mod tests {
             .map(String::as_str),
             Some("这属于一种")
         );
+    }
+
+    #[test]
+    fn supplemental_composition_preserves_a_non_literal_core_primary_top() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+正常\tzheng chang\t1000\n\
+处理\tchu li\t900\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+整场\tzheng chang\t1000\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count,
+            })
+            .unwrap()
+        };
+        let core = load("mixed-layer-core-top-v1", CORE, 2);
+        let supplemental = load("mixed-layer-core-top-supplement-v1", SUPPLEMENTAL, 1);
+        let code = "vgihiuli";
+        let core_top = core.candidate_texts(code, 1).unwrap();
+        assert_eq!(core_top, ["正常处理"]);
+
+        let layered = layered_candidate_texts(
+            &core,
+            &supplemental,
+            code,
+            3,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(layered.first().map(String::as_str), Some("正常处理"));
+        assert_eq!(layered.get(1).map(String::as_str), Some("整场处理"));
     }
 
     #[test]
