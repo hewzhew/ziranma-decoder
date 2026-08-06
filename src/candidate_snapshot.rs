@@ -664,6 +664,21 @@ struct SupplementalCompleteComposition {
     supplemental_start: usize,
 }
 
+/// Fixed, frequency-scale-independent orders available to public audits.
+///
+/// The interactive path uses [`SupplementalCompositionOrder::StructuralV1`].
+/// The other variants let aggregate public audits test one ordering assumption
+/// at a time without changing the runtime policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupplementalCompositionOrder {
+    /// Prefer a longer supplemental span, then fewer surrounding core words.
+    StructuralV1,
+    /// Prefer fewer surrounding core words before supplemental span length.
+    FewerSegmentsFirst,
+    /// Prefer each source's bounded local candidate ranks before structure.
+    LocalRanksFirst,
+}
+
 /// Builds a deliberately narrow mixed-layer lane:
 ///
 /// - the observed input consists only of complete two-key syllables;
@@ -679,6 +694,27 @@ pub fn supplemental_complete_composition_texts(
     supplemental: &CandidateSnapshot,
     code: &str,
     limit: usize,
+) -> Result<Vec<String>, KeySequenceError> {
+    supplemental_complete_composition_texts_with_order(
+        core,
+        supplemental,
+        code,
+        limit,
+        SupplementalCompositionOrder::StructuralV1,
+    )
+}
+
+/// Builds the same bounded mixed-layer lane under one explicit audit order.
+///
+/// This function never compares raw weights across snapshots. Runtime callers
+/// should use [`supplemental_complete_composition_texts`]; alternate orders are
+/// intended for frozen public comparisons before any policy change.
+pub fn supplemental_complete_composition_texts_with_order(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    order: SupplementalCompositionOrder,
 ) -> Result<Vec<String>, KeySequenceError> {
     let observed = KeySequence::new(code)?;
     let code = observed.as_str();
@@ -747,16 +783,7 @@ pub fn supplemental_complete_composition_texts(
         }
     }
 
-    compositions.sort_by(|left, right| {
-        right
-            .supplemental_syllables
-            .cmp(&left.supplemental_syllables)
-            .then_with(|| left.core_segment_count.cmp(&right.core_segment_count))
-            .then_with(|| left.supplemental_rank.cmp(&right.supplemental_rank))
-            .then_with(|| left.core_edge_ranks.cmp(&right.core_edge_ranks))
-            .then_with(|| left.supplemental_start.cmp(&right.supplemental_start))
-            .then_with(|| left.text.cmp(&right.text))
-    });
+    compositions.sort_by(|left, right| supplemental_composition_order(left, right, order));
     let mut seen = HashSet::new();
     let mut visible = Vec::with_capacity(limit.min(compositions.len()));
     for composition in compositions {
@@ -768,6 +795,49 @@ pub fn supplemental_complete_composition_texts(
         }
     }
     Ok(visible)
+}
+
+fn supplemental_composition_order(
+    left: &SupplementalCompleteComposition,
+    right: &SupplementalCompleteComposition,
+    order: SupplementalCompositionOrder,
+) -> std::cmp::Ordering {
+    let stable_tail = || {
+        left.supplemental_start
+            .cmp(&right.supplemental_start)
+            .then_with(|| left.text.cmp(&right.text))
+    };
+    match order {
+        SupplementalCompositionOrder::StructuralV1 => right
+            .supplemental_syllables
+            .cmp(&left.supplemental_syllables)
+            .then_with(|| left.core_segment_count.cmp(&right.core_segment_count))
+            .then_with(|| left.supplemental_rank.cmp(&right.supplemental_rank))
+            .then_with(|| left.core_edge_ranks.cmp(&right.core_edge_ranks))
+            .then_with(stable_tail),
+        SupplementalCompositionOrder::FewerSegmentsFirst => left
+            .core_segment_count
+            .cmp(&right.core_segment_count)
+            .then_with(|| {
+                right
+                    .supplemental_syllables
+                    .cmp(&left.supplemental_syllables)
+            })
+            .then_with(|| left.supplemental_rank.cmp(&right.supplemental_rank))
+            .then_with(|| left.core_edge_ranks.cmp(&right.core_edge_ranks))
+            .then_with(stable_tail),
+        SupplementalCompositionOrder::LocalRanksFirst => left
+            .supplemental_rank
+            .cmp(&right.supplemental_rank)
+            .then_with(|| left.core_edge_ranks.cmp(&right.core_edge_ranks))
+            .then_with(|| left.core_segment_count.cmp(&right.core_segment_count))
+            .then_with(|| {
+                right
+                    .supplemental_syllables
+                    .cmp(&left.supplemental_syllables)
+            })
+            .then_with(stable_tail),
+    }
 }
 
 fn exact_core_edges(
@@ -1799,6 +1869,45 @@ mod tests {
         .unwrap();
         assert_eq!(layered.first().map(String::as_str), Some("正常处理"));
         assert_eq!(layered.get(1).map(String::as_str), Some("整场处理"));
+
+        let structural =
+            supplemental_complete_composition_texts(&core, &supplemental, code, 8).unwrap();
+        assert_eq!(
+            structural,
+            supplemental_complete_composition_texts_with_order(
+                &core,
+                &supplemental,
+                code,
+                8,
+                SupplementalCompositionOrder::StructuralV1,
+            )
+            .unwrap(),
+            "the explicit audit order must reproduce the runtime order"
+        );
+        for order in [
+            SupplementalCompositionOrder::StructuralV1,
+            SupplementalCompositionOrder::FewerSegmentsFirst,
+            SupplementalCompositionOrder::LocalRanksFirst,
+        ] {
+            let first = supplemental_complete_composition_texts_with_order(
+                &core,
+                &supplemental,
+                code,
+                8,
+                order,
+            )
+            .unwrap();
+            let second = supplemental_complete_composition_texts_with_order(
+                &core,
+                &supplemental,
+                code,
+                8,
+                order,
+            )
+            .unwrap();
+            assert_eq!(first, second);
+            assert!(first.len() <= 8);
+        }
     }
 
     #[test]

@@ -34,14 +34,14 @@ use ziranma_core::{
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
     PublicRimeSliceConfig, PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SupplementalCandidateLayerConfig, audit_public_supplemental_layer,
-    candidate_package_authentication_sha256, candidate_package_storage_id,
-    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
-    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    SupplementalCandidateLayerConfig, SupplementalCompositionOrder,
+    audit_public_supplemental_layer, candidate_package_authentication_sha256,
+    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
+    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
     parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
     select_public_continuous_composition_cases, select_public_supplemental_composition_cases,
-    supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
@@ -1275,6 +1275,12 @@ struct CoreCompositionControlReport {
     preserve_core_top_two_slots: CompositionControlStrategyReport,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompositionOrderProfileReport {
+    supplemental_probes: CompositionControlStrategyReport,
+    core_controls: CompositionControlStrategyReport,
+}
+
 fn audit_candidate_layer_compositions(
     core_payload: &Path,
     supplemental_payload: &Path,
@@ -1333,6 +1339,41 @@ fn audit_candidate_layer_compositions(
     }
     let control_report =
         evaluate_core_composition_controls(&core, &supplemental, &control_probes, frontier_limit)?;
+    let mut order_reports = Vec::new();
+    for (label, order) in [
+        ("结构 V1", SupplementalCompositionOrder::StructuralV1),
+        (
+            "少分段优先",
+            SupplementalCompositionOrder::FewerSegmentsFirst,
+        ),
+        (
+            "层内名次优先",
+            SupplementalCompositionOrder::LocalRanksFirst,
+        ),
+    ] {
+        order_reports.push((
+            label,
+            evaluate_composition_order_profile(
+                &core,
+                &supplemental,
+                &selection.probes,
+                &control_probes,
+                frontier_limit,
+                order,
+            )?,
+        ));
+    }
+    let structural_profile = order_reports.first().map(|(_, profile)| profile);
+    if structural_profile.is_none_or(|profile| {
+        profile.core_controls != control_report.layered
+            || profile.supplemental_probes.target != report.layered
+            || profile.supplemental_probes.target_newly_visible != report.newly_visible
+            || profile.supplemental_probes.target_lost_visible != report.lost_visible
+            || profile.supplemental_probes.top_one_changed
+                != report.target_promoted_to_top_one + report.non_target_top_one_changes
+    }) {
+        return Err("composition audit simulation diverged from the runtime candidate path".into());
+    }
 
     let stats = selection.stats;
     let missing = if report.missing_probe_ids.is_empty() {
@@ -1340,8 +1381,8 @@ fn audit_candidate_layer_compositions(
     } else {
         report.missing_probe_ids.join("、")
     };
-    Ok(format!(
-        "公开补充组合审计\n语料：{} 句；检查两词与三词相邻窗口\n筛选：窗口 {}；汉字与长度合格 {}；恰有一个补充多字词 {}；排除整词文字 {}、整词同码 {}；句形代表 {}\n样本：{}（两词 {}，三词 {}；补充词在前 {}、居中 {}、在后 {}）\n核心基线：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留核心首选模拟：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留首选并给两个组合位：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前召回变化：新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}\n保留首选模拟：新增可见 {}，原可见丢失 {}\n两个组合位模拟：新增可见 {}，原可见丢失 {}\n目标的结构组合排名：第 1 位 {}，第 2 位 {}，第 3～4 位 {}，第 5～8 位 {}，前 8 外 {}\n候选顺序：发生变化 {}；目标升为首选 {}；非目标首选变化 {}\n核心完整码首选：保留 {}，变化 {}\n当前仍未进入 Top-{frontier_limit}：补充边深度 {}，核心边深度 {}，竞争组合 {}\n样本编号（最多 12）：{missing}\n\n全核心短语负对照\n筛选：窗口 {}；核心整词覆盖 {}；句代表 {}；排除整词文字 {}、整词同码 {}；样本 {}\n核心基线目标：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 一个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 两个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n选择规则不读取解码结果；保留首选结果只是冻结候选上的审计模拟；跨来源原始权重未比较。\n本次操作：只读\n",
+    let mut output = format!(
+        "公开补充组合审计\n语料：{} 句；检查两词与三词相邻窗口\n筛选：窗口 {}；汉字与长度合格 {}；恰有一个补充多字词 {}；排除整词文字 {}、整词同码 {}；句形代表 {}\n样本：{}（两词 {}，三词 {}；补充词在前 {}、居中 {}、在后 {}）\n核心基线：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留核心首选模拟：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n保留首选并给两个组合位：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前召回变化：新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}\n保留首选模拟：新增可见 {}，原可见丢失 {}\n两个组合位模拟：新增可见 {}，原可见丢失 {}\n目标的结构组合排名：第 1 位 {}，第 2 位 {}，第 3～4 位 {}，第 5～8 位 {}，前 8 外 {}\n候选顺序：发生变化 {}；目标升为首选 {}；非目标首选变化 {}\n核心完整码首选：保留 {}，变化 {}\n当前仍未进入 Top-{frontier_limit}：补充边深度 {}，核心边深度 {}，竞争组合 {}\n样本编号（最多 12）：{missing}\n\n全核心短语负对照\n筛选：窗口 {}；核心整词覆盖 {}；句代表 {}；排除整词文字 {}、整词同码 {}；样本 {}\n核心基线目标：Top-1 {}，Top-3 {}，Top-5 {}，Top-{frontier_limit} {}\n当前组合：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 一个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n保留首选 + 两个组合位：目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；新增可见 {}，原可见丢失 {}；共同可见中升位 {}、不变 {}、降位 {}；普通首选变化 {}；挤出核心候选 {}（涉及 {} 条，单条最多 {}）\n选择规则不读取解码结果；保留首选结果只是冻结候选上的审计模拟；跨来源原始权重未比较。\n",
         corpus.stats.sentences,
         stats.source_windows,
         stats.han_length_eligible,
@@ -1474,7 +1515,29 @@ fn audit_candidate_layer_compositions(
         control_report
             .preserve_core_top_two_slots
             .maximum_core_candidates_evicted,
-    ))
+    );
+    output.push_str("\n单组合位排序冻结对照\n");
+    for (label, profile) in order_reports {
+        writeln!(
+            output,
+            "{label}：补充目标 Top-1 {}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}，新增可见 {}、原可见丢失 {}；全核心目标 Top-{frontier_limit} {}，原可见丢失 {}、降位 {}，普通首选变化 {}，挤出核心候选 {}",
+            profile.supplemental_probes.target.at_one,
+            profile.supplemental_probes.target.at_three,
+            profile.supplemental_probes.target.at_five,
+            profile.supplemental_probes.target.visible,
+            profile.supplemental_probes.target_newly_visible,
+            profile.supplemental_probes.target_lost_visible,
+            profile.core_controls.target.visible,
+            profile.core_controls.target_lost_visible,
+            profile.core_controls.target_rank_worsened,
+            profile.core_controls.top_one_changed,
+            profile.core_controls.core_candidates_evicted,
+        )?;
+    }
+    output.push_str(
+        "排序对照只交换明确的结构或层内名次字段，不比较跨来源原始权重。\n本次操作：只读\n",
+    );
+    Ok(output)
 }
 
 fn select_core_composition_controls(
@@ -1584,6 +1647,60 @@ fn evaluate_core_composition_controls(
             &mut report.preserve_core_top_two_slots,
             &core_candidates,
             &preserve_core_top_two_slots,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    Ok(report)
+}
+
+fn evaluate_composition_order_profile(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    supplemental_probes: &[PublicSupplementalCompositionProbe],
+    core_controls: &[ContinuousCompositionProbe],
+    frontier_limit: usize,
+    order: SupplementalCompositionOrder,
+) -> Result<CompositionOrderProfileReport, Box<dyn std::error::Error>> {
+    let mut report = CompositionOrderProfileReport::default();
+    for probe in supplemental_probes {
+        let code = probe.observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let compositions =
+            supplemental_complete_composition_texts_with_order(core, supplemental, code, 8, order)?;
+        let candidate = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        observe_composition_control_strategy(
+            &mut report.supplemental_probes,
+            &core_candidates,
+            &candidate,
+            core_rank,
+            &probe.expected_text,
+        );
+    }
+    for probe in core_controls {
+        let code = probe.full_observed.as_str();
+        let core_candidates = core.candidate_texts(code, frontier_limit)?;
+        let compositions =
+            supplemental_complete_composition_texts_with_order(core, supplemental, code, 8, order)?;
+        let candidate = merge_compositions_after_core_top(
+            &core_candidates,
+            &compositions,
+            code,
+            1,
+            frontier_limit,
+        );
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        observe_composition_control_strategy(
+            &mut report.core_controls,
+            &core_candidates,
+            &candidate,
             core_rank,
             &probe.expected_text,
         );
@@ -1762,6 +1879,9 @@ fn merge_compositions_after_core_top(
     let mut push_unique = |candidate: &String| {
         if merged.len() < frontier_limit && !merged.contains(candidate) {
             merged.push(candidate.clone());
+            true
+        } else {
+            false
         }
     };
     let core_top_is_preserved = core.first().is_some_and(|candidate| candidate != code);
@@ -1769,8 +1889,14 @@ fn merge_compositions_after_core_top(
         let core_top = &core[0];
         push_unique(core_top);
     }
-    for composition in compositions.iter().take(composition_slots) {
-        push_unique(composition);
+    let mut admitted_compositions = 0;
+    for composition in compositions {
+        if admitted_compositions == composition_slots {
+            break;
+        }
+        if push_unique(composition) {
+            admitted_compositions += 1;
+        }
     }
     for candidate in core.iter().skip(usize::from(core_top_is_preserved)) {
         push_unique(candidate);
@@ -3494,6 +3620,10 @@ mod tests {
         assert!(report.contains("排除整词文字 0、整词同码 0；样本 1"));
         assert!(report.contains("保留首选 + 一个组合位"));
         assert!(report.contains("保留首选 + 两个组合位"));
+        assert!(report.contains("单组合位排序冻结对照"));
+        assert!(report.contains("结构 V1"));
+        assert!(report.contains("少分段优先"));
+        assert!(report.contains("层内名次优先"));
         assert!(report.contains("本次操作：只读"));
         assert!(!report.contains("掰开"));
         assert!(!report.contains("揉碎"));

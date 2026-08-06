@@ -155,8 +155,9 @@ pub use candidate_snapshot::{
     MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
     SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SupplementalCandidateLayerConfig,
-    SupplementalCandidateLayerError, candidate_payload_fingerprint, layered_candidate_texts,
-    merge_candidate_text_layers, supplemental_complete_composition_texts,
+    SupplementalCandidateLayerError, SupplementalCompositionOrder, candidate_payload_fingerprint,
+    layered_candidate_texts, merge_candidate_text_layers, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
 };
 pub use capsule_replay::{
     CapsuleReplayConfigError, CapsuleReplayReport, ContextReplayComparisonStats,
