@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Decoder, KeySequence, KeySequenceError, parse_lexicon_tsv,
+    Decoder, KeySequence, KeySequenceError, MAX_LEXICON_SYLLABLES, parse_lexicon_tsv,
     spelling_is_complete_or_anchored_suffix,
 };
 
@@ -28,6 +28,11 @@ const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
 const AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH: usize = 6;
 const FULL_CODE_CHARACTER_PAIR_DEPTH: usize = 24;
 const MAX_FULL_CODE_CHARACTER_PAIRS: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
+const SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH: usize = 4;
+const SUPPLEMENTAL_COMPOSITION_PATHS_PER_BOUNDARY: usize = 4;
+const SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH: usize = 4;
+const SUPPLEMENTAL_COMPOSITION_SEARCH_DEPTH: usize = 8;
+const MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InteractiveCandidateSource {
@@ -456,7 +461,7 @@ pub(crate) fn layered_candidate_query_with_sources(
     let core_exact = core.exact_full_code_texts(code, limit)?;
     let supplemental_exact = supplemental.exact_full_code_texts(code, limit)?;
     let core_query = core.interactive_candidate_query(code, limit)?;
-    let automatic_transposition_blocked =
+    let mut automatic_transposition_blocked =
         core_query.automatic_transposition_blocked || !supplemental_exact.is_empty();
     let core_primary = core_query.candidates;
     let core_primary_texts = core_primary
@@ -470,6 +475,40 @@ pub(crate) fn layered_candidate_query_with_sources(
         limit,
         config,
     )?;
+    let mut promoted_composition = None;
+    if config.exact_promotions != 0 {
+        let composition_candidates = supplemental_complete_composition_texts(
+            core,
+            supplemental,
+            code,
+            SUPPLEMENTAL_COMPOSITION_SEARCH_DEPTH,
+        )?;
+        let whole_exact_texts = core_exact
+            .iter()
+            .chain(&supplemental_exact)
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let insertion_index = merged
+            .iter()
+            .take_while(|text| whole_exact_texts.contains(text.as_str()))
+            .count();
+        for candidate in composition_candidates {
+            if whole_exact_texts.contains(candidate.as_str()) {
+                continue;
+            }
+            if let Some(existing_index) = merged.iter().position(|text| text == &candidate) {
+                if existing_index < insertion_index {
+                    continue;
+                }
+                merged.remove(existing_index);
+            }
+            merged.insert(insertion_index.min(merged.len()), candidate.clone());
+            merged.truncate(limit);
+            promoted_composition = Some(candidate);
+            automatic_transposition_blocked = true;
+            break;
+        }
+    }
     let mut seen = merged.iter().cloned().collect::<HashSet<_>>();
     for candidate in core_primary
         .iter()
@@ -489,7 +528,9 @@ pub(crate) fn layered_candidate_query_with_sources(
             .map(|text| {
                 let source = if core_exact.contains(&text) {
                     InteractiveCandidateSource::CoreExact
-                } else if supplemental_exact.contains(&text) {
+                } else if supplemental_exact.contains(&text)
+                    || promoted_composition.as_ref() == Some(&text)
+                {
                     InteractiveCandidateSource::SupplementalExact
                 } else {
                     core_primary
@@ -577,6 +618,238 @@ fn push_unique(
     }
     output.push(candidate.to_owned());
     true
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreCompletePath {
+    text: String,
+    segment_lengths: Vec<usize>,
+    edge_ranks: Vec<usize>,
+}
+
+impl CoreCompletePath {
+    fn empty() -> Self {
+        Self {
+            text: String::new(),
+            segment_lengths: Vec::new(),
+            edge_ranks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SupplementalCompleteComposition {
+    text: String,
+    supplemental_syllables: usize,
+    core_segment_count: usize,
+    supplemental_rank: usize,
+    core_edge_ranks: Vec<usize>,
+    supplemental_start: usize,
+}
+
+/// Builds a deliberately narrow mixed-layer lane:
+///
+/// - the observed input consists only of complete two-key syllables;
+/// - exactly one multi-syllable word comes from the supplemental exact lane;
+/// - that word is absent from the bounded core exact lane for the same span;
+/// - every non-empty prefix and suffix is fully covered by core exact words.
+///
+/// Raw frequencies from the two snapshots are never compared. Structural
+/// specificity is considered first, followed by each layer's own candidate
+/// order. The caller may promote at most one result.
+fn supplemental_complete_composition_texts(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+) -> Result<Vec<String>, KeySequenceError> {
+    let observed = KeySequence::new(code)?;
+    let code = observed.as_str();
+    if limit == 0
+        || code.len() < 6
+        || !code.len().is_multiple_of(2)
+        || code.len() / 2 > MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES
+    {
+        return Ok(Vec::new());
+    }
+
+    let syllable_count = code.len() / 2;
+    let mut supplemental_spans = Vec::new();
+    for start in 0..syllable_count {
+        let maximum_end = syllable_count.min(start + MAX_LEXICON_SYLLABLES);
+        for end in start + 2..=maximum_end {
+            if start == 0 && end == syllable_count {
+                continue;
+            }
+            let span = &code[start * 2..end * 2];
+            let exact = supplemental.exact_full_code_texts(span, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+            if !exact.is_empty() {
+                supplemental_spans.push((start, end, exact));
+            }
+        }
+    }
+    if supplemental_spans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let core_edges = exact_core_edges(core, code, syllable_count)?;
+    let (prefixes, suffixes) = core_complete_boundary_paths(&core_edges, syllable_count);
+    let mut compositions = Vec::new();
+
+    for (supplemental_start, supplemental_end, supplemental_exact) in supplemental_spans {
+        if prefixes[supplemental_start].is_empty() || suffixes[supplemental_end].is_empty() {
+            continue;
+        }
+        let core_exact = core_edges[supplemental_start][supplemental_end]
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let supplemental_only = supplemental_exact
+            .into_iter()
+            .enumerate()
+            .filter(|(_, text)| !core_exact.contains(text.as_str()))
+            .take(SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH)
+            .collect::<Vec<_>>();
+
+        for prefix in &prefixes[supplemental_start] {
+            for (supplemental_rank, supplemental_text) in &supplemental_only {
+                for suffix in &suffixes[supplemental_end] {
+                    let mut core_edge_ranks = prefix.edge_ranks.clone();
+                    core_edge_ranks.extend_from_slice(&suffix.edge_ranks);
+                    compositions.push(SupplementalCompleteComposition {
+                        text: format!("{}{}{}", prefix.text, supplemental_text, suffix.text),
+                        supplemental_syllables: supplemental_end - supplemental_start,
+                        core_segment_count: prefix.segment_lengths.len()
+                            + suffix.segment_lengths.len(),
+                        supplemental_rank: *supplemental_rank,
+                        core_edge_ranks,
+                        supplemental_start,
+                    });
+                }
+            }
+        }
+    }
+
+    compositions.sort_by(|left, right| {
+        right
+            .supplemental_syllables
+            .cmp(&left.supplemental_syllables)
+            .then_with(|| left.core_segment_count.cmp(&right.core_segment_count))
+            .then_with(|| left.supplemental_rank.cmp(&right.supplemental_rank))
+            .then_with(|| left.core_edge_ranks.cmp(&right.core_edge_ranks))
+            .then_with(|| left.supplemental_start.cmp(&right.supplemental_start))
+            .then_with(|| left.text.cmp(&right.text))
+    });
+    let mut seen = HashSet::new();
+    let mut visible = Vec::with_capacity(limit.min(compositions.len()));
+    for composition in compositions {
+        if seen.insert(composition.text.clone()) {
+            visible.push(composition.text);
+            if visible.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(visible)
+}
+
+fn exact_core_edges(
+    core: &CandidateSnapshot,
+    code: &str,
+    syllable_count: usize,
+) -> Result<Vec<Vec<Vec<String>>>, KeySequenceError> {
+    let mut edges = vec![vec![Vec::new(); syllable_count + 1]; syllable_count + 1];
+    for start in 0..syllable_count {
+        let maximum_end = syllable_count.min(start + MAX_LEXICON_SYLLABLES);
+        for end in start + 1..=maximum_end {
+            edges[start][end] =
+                core.exact_full_code_texts(&code[start * 2..end * 2], MAX_CANDIDATE_SNAPSHOT_RANK)?;
+        }
+    }
+    Ok(edges)
+}
+
+fn core_complete_boundary_paths(
+    edges: &[Vec<Vec<String>>],
+    syllable_count: usize,
+) -> (Vec<Vec<CoreCompletePath>>, Vec<Vec<CoreCompletePath>>) {
+    let mut prefixes = vec![Vec::new(); syllable_count + 1];
+    prefixes[0].push(CoreCompletePath::empty());
+    for start in 0..syllable_count {
+        let starting_paths = prefixes[start].clone();
+        if starting_paths.is_empty() {
+            continue;
+        }
+        let maximum_end = syllable_count.min(start + MAX_LEXICON_SYLLABLES);
+        for end in start + 1..=maximum_end {
+            for (edge_rank, edge_text) in edges[start][end]
+                .iter()
+                .take(SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH)
+                .enumerate()
+            {
+                for prefix in &starting_paths {
+                    let mut path = prefix.clone();
+                    path.text.push_str(edge_text);
+                    path.segment_lengths.push(end - start);
+                    path.edge_ranks.push(edge_rank);
+                    retain_core_boundary_path(&mut prefixes[end], path);
+                }
+            }
+        }
+    }
+
+    let mut suffixes = vec![Vec::new(); syllable_count + 1];
+    suffixes[syllable_count].push(CoreCompletePath::empty());
+    for start in (0..syllable_count).rev() {
+        let maximum_end = syllable_count.min(start + MAX_LEXICON_SYLLABLES);
+        for end in start + 1..=maximum_end {
+            let ending_paths = suffixes[end].clone();
+            if ending_paths.is_empty() {
+                continue;
+            }
+            for (edge_rank, edge_text) in edges[start][end]
+                .iter()
+                .take(SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH)
+                .enumerate()
+            {
+                for suffix in &ending_paths {
+                    let mut segment_lengths = vec![end - start];
+                    segment_lengths.extend_from_slice(&suffix.segment_lengths);
+                    let mut edge_ranks = vec![edge_rank];
+                    edge_ranks.extend_from_slice(&suffix.edge_ranks);
+                    retain_core_boundary_path(
+                        &mut suffixes[start],
+                        CoreCompletePath {
+                            text: format!("{edge_text}{}", suffix.text),
+                            segment_lengths,
+                            edge_ranks,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    (prefixes, suffixes)
+}
+
+fn retain_core_boundary_path(paths: &mut Vec<CoreCompletePath>, candidate: CoreCompletePath) {
+    paths.push(candidate);
+    paths.sort_by(core_complete_path_order);
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.text.clone()));
+    paths.truncate(SUPPLEMENTAL_COMPOSITION_PATHS_PER_BOUNDARY);
+}
+
+fn core_complete_path_order(
+    left: &CoreCompletePath,
+    right: &CoreCompletePath,
+) -> std::cmp::Ordering {
+    left.segment_lengths
+        .len()
+        .cmp(&right.segment_lengths.len())
+        .then_with(|| right.segment_lengths.cmp(&left.segment_lengths))
+        .then_with(|| left.edge_ranks.cmp(&right.edge_ranks))
+        .then_with(|| left.text.cmp(&right.text))
 }
 
 /// Errors from decoding or configuring a layered candidate query.
@@ -1378,6 +1651,196 @@ mod tests {
         assert_eq!(visible.get(1).map(String::as_str), Some("只懂"));
         assert!(visible.iter().any(|candidate| candidate == "只动"));
         assert_eq!(visible.iter().collect::<HashSet<_>>().len(), visible.len());
+    }
+
+    #[test]
+    fn one_supplemental_multi_syllable_word_can_complete_a_core_prefix() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+掰开\tbai kai\t1000\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+揉碎\trou sui\t1000\n";
+        let load = |revision: &str, lexicon: &str| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count: 1,
+            })
+            .unwrap()
+        };
+        let core = load("mixed-layer-prefix-core-v1", CORE);
+        let supplemental = load("mixed-layer-prefix-supplement-v1", SUPPLEMENTAL);
+
+        let first = layered_candidate_query_with_sources(
+            &core,
+            &supplemental,
+            "blklrbsv",
+            6,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+        let second = layered_candidate_query_with_sources(
+            &core,
+            &supplemental,
+            "blklrbsv",
+            6,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(first, second, "the mixed-layer lane must be deterministic");
+        assert_eq!(
+            first.candidates.first(),
+            Some(&InteractiveCandidateText {
+                text: "掰开揉碎".to_owned(),
+                source: InteractiveCandidateSource::SupplementalExact,
+            })
+        );
+        assert!(first.candidates.len() <= 6);
+        assert!(first.automatic_transposition_blocked);
+    }
+
+    #[test]
+    fn one_supplemental_multi_syllable_word_can_appear_between_core_paths() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+这\tzhe\t1000\n\
+一种\tyi zhong\t900\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+属于\tshu yu\t1000\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count,
+            })
+            .unwrap()
+        };
+        let core = load("mixed-layer-middle-core-v1", CORE, 2);
+        let supplemental = load("mixed-layer-middle-supplement-v1", SUPPLEMENTAL, 1);
+
+        assert_eq!(
+            layered_candidate_texts(
+                &core,
+                &supplemental,
+                "veuuyuyivs",
+                3,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )
+            .unwrap()
+            .first()
+            .map(String::as_str),
+            Some("这属于一种")
+        );
+    }
+
+    #[test]
+    fn supplemental_composition_rejects_single_characters_and_two_supplemental_words() {
+        const SINGLE_CORE: &str = "text\tpinyin\tfrequency\n\
+掰开\tbai kai\t1000\n\
+碎\tsui\t900\n";
+        const SINGLE_SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+揉\trou\t1000\n";
+        const DOUBLE_CORE: &str = "text\tpinyin\tfrequency\n\
+和\the\t1000\n";
+        const DOUBLE_SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+掰开\tbai kai\t1000\n\
+揉碎\trou sui\t900\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count,
+            })
+            .unwrap()
+        };
+        let config = SupplementalCandidateLayerConfig {
+            exact_promotions: 1,
+        };
+        let single_core = load("mixed-layer-single-core-v1", SINGLE_CORE, 2);
+        let single_supplemental = load("mixed-layer-single-supplement-v1", SINGLE_SUPPLEMENTAL, 1);
+        assert!(
+            !layered_candidate_texts(&single_core, &single_supplemental, "blklrbsv", 6, config,)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate == "掰开揉碎")
+        );
+
+        let double_core = load("mixed-layer-double-core-v1", DOUBLE_CORE, 1);
+        let double_supplemental = load("mixed-layer-double-supplement-v1", DOUBLE_SUPPLEMENTAL, 2);
+        assert!(
+            !layered_candidate_texts(&double_core, &double_supplemental, "blklherbsv", 6, config,)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate == "掰开和揉碎")
+        );
+
+        let oversized = "bl".repeat(MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES + 1);
+        assert!(
+            supplemental_complete_composition_texts(
+                &double_core,
+                &double_supplemental,
+                &oversized,
+                1,
+            )
+            .unwrap()
+            .is_empty(),
+            "the extra mixed-layer search must stay inside its fixed syllable bound"
+        );
+    }
+
+    #[test]
+    fn supplemental_composition_never_displaces_a_core_whole_word_top_one() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+掰开揉碎\tbai kai rou sui\t1000\n\
+掰开\tbai kai\t900\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+揉碎\trou sui\t1000\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count,
+            })
+            .unwrap()
+        };
+        let core = load("mixed-layer-whole-core-v1", CORE, 2);
+        let supplemental = load("mixed-layer-whole-supplement-v1", SUPPLEMENTAL, 1);
+
+        assert_eq!(
+            layered_candidate_texts(
+                &core,
+                &supplemental,
+                "blklrbsv",
+                3,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )
+            .unwrap()
+            .first()
+            .map(String::as_str),
+            Some("掰开揉碎")
+        );
     }
 
     #[test]

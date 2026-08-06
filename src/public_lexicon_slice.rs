@@ -18,7 +18,10 @@ use crate::{
 /// Largest source file accepted by the explicit large-public-dictionary CLI.
 pub const MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// Conservative entry cap for one experimental public slice.
-pub const MAX_PUBLIC_RIME_SLICE_ENTRIES: usize = 100_000;
+///
+/// This remains below the validated snapshot ceiling while allowing a narrow
+/// cutoff-sensitivity experiment beyond the original Top-100k frontier.
+pub const MAX_PUBLIC_RIME_SLICE_ENTRIES: usize = 120_000;
 /// Longest Han-only entry accepted by the first slice experiment.
 pub const MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS: usize = 12;
 
@@ -632,6 +635,20 @@ A词\ta cí\t100\n\
     #[test]
     fn slice_rejects_unbounded_configuration_and_missing_markers() {
         let source = "---\n...\n词\tcí\t1\n";
+        assert!(
+            validate_config(PublicRimeSliceConfig {
+                max_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
+                max_text_characters: 1,
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            validate_config(PublicRimeSliceConfig {
+                max_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES + 1,
+                max_text_characters: 1,
+            }),
+            Err(PublicRimeSliceError::InvalidEntryLimit)
+        );
         assert_eq!(
             parse_public_rime_slice(
                 source,

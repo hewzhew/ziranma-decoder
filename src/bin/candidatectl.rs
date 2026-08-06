@@ -890,7 +890,7 @@ fn print_usage() {
         "  build-rime --source <RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
     eprintln!(
-        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..100000> --max-text-characters <1..12> --public"
+        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> --max-text-characters <1..12> --public"
     );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
@@ -1241,6 +1241,8 @@ fn layer_benchmark_codes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
         "wai quan",
         "jian ru",
         "guang min xing",
+        "bai kai rou sui",
+        "zhe shu yu na yi zhong",
     ] {
         let encoded = encode_pinyin_phrase(phrase)?;
         let boundary = encoded.syllable_codes.len().div_ceil(2);
@@ -2291,7 +2293,7 @@ mod tests {
                 "build-rime-slice".to_owned(),
                 "--public".to_owned(),
                 "--max-entries".to_owned(),
-                "100001".to_owned(),
+                "120001".to_owned(),
                 "--max-text-characters".to_owned(),
                 "8".to_owned(),
             ])
