@@ -18,6 +18,9 @@ pub const MAX_REPLAY_CODE_KEYS: usize = 64;
 const REPLAY_TOP_K: usize = 10;
 pub const PUBLIC_CONTEXT_REPLAY_POOL_DEPTH: usize = 50;
 const PERSONAL_CACHE_MAX_PROMOTION: usize = 3;
+const PERSONAL_PAIR_RESERVED_WORD_PROMOTION: usize = PERSONAL_CACHE_MAX_PROMOTION - 1;
+const PERSONAL_PAIR_ONCE_MIN_COUNT: u64 = 1;
+const PERSONAL_PAIR_REPEATED_MIN_COUNT: u64 = 2;
 // A candidate below this frozen prefix cannot enter the visible Top-K:
 // even after the maximum promotion, its adjusted rank is at least K, while
 // the original first K candidates always have adjusted ranks below K.
@@ -1077,6 +1080,14 @@ pub struct CapsuleReplayReport {
     pub personal_pair_history_target_word_cap_saturated_windows: u64,
     pub personal_pair_history_competing_evidence_windows: u64,
     pub personal_pair_history_evidence_candidates: u64,
+    pub personal_pair_reserved_once_window_canonical_full: ReplayStrategyStats,
+    pub personal_pair_reserved_repeated_window_canonical_full: ReplayStrategyStats,
+    pub personal_pair_reserved_once_vs_frozen_word: RankingReplayComparisonStats,
+    pub personal_pair_reserved_repeated_vs_frozen_word: RankingReplayComparisonStats,
+    pub personal_pair_reserved_once_active_windows: u64,
+    pub personal_pair_reserved_once_target_evidence_windows: u64,
+    pub personal_pair_reserved_repeated_active_windows: u64,
+    pub personal_pair_reserved_repeated_target_evidence_windows: u64,
 }
 
 impl CapsuleReplayReport {
@@ -1888,6 +1899,30 @@ impl CapsuleReplayReport {
         let pool = decoder.decode_sentence(&canonical, PERSONAL_CACHE_POOL_DEPTH)?;
 
         let target_index = pool.iter().position(|candidate| candidate.text == target);
+        let reserved_once_active = pool.iter().any(|candidate| {
+            candidate_has_pair_with_minimum_count(
+                candidate,
+                frozen_state,
+                PERSONAL_PAIR_ONCE_MIN_COUNT,
+            )
+        });
+        let reserved_repeated_active = pool.iter().any(|candidate| {
+            candidate_has_pair_with_minimum_count(
+                candidate,
+                frozen_state,
+                PERSONAL_PAIR_REPEATED_MIN_COUNT,
+            )
+        });
+        if reserved_once_active {
+            self.personal_pair_reserved_once_active_windows = self
+                .personal_pair_reserved_once_active_windows
+                .saturating_add(1);
+        }
+        if reserved_repeated_active {
+            self.personal_pair_reserved_repeated_active_windows = self
+                .personal_pair_reserved_repeated_active_windows
+                .saturating_add(1);
+        }
         let mut any_pair_evidence = false;
         let mut competing_pair_evidence = false;
         for (candidate_index, candidate) in pool.iter().enumerate() {
@@ -1923,6 +1958,24 @@ impl CapsuleReplayReport {
                 .personal_pair_history_target_in_pool_windows
                 .saturating_add(1);
             let target_candidate = &pool[target_index];
+            if candidate_has_pair_with_minimum_count(
+                target_candidate,
+                frozen_state,
+                PERSONAL_PAIR_ONCE_MIN_COUNT,
+            ) {
+                self.personal_pair_reserved_once_target_evidence_windows = self
+                    .personal_pair_reserved_once_target_evidence_windows
+                    .saturating_add(1);
+            }
+            if candidate_has_pair_with_minimum_count(
+                target_candidate,
+                frozen_state,
+                PERSONAL_PAIR_REPEATED_MIN_COUNT,
+            ) {
+                self.personal_pair_reserved_repeated_target_evidence_windows = self
+                    .personal_pair_reserved_repeated_target_evidence_windows
+                    .saturating_add(1);
+            }
             let word_evidence = personal_cache_evidence(
                 target_candidate,
                 frozen_state,
@@ -1983,15 +2036,51 @@ impl CapsuleReplayReport {
             &target,
             &mut self.personal_pair_causal_window_canonical_full,
         );
+        let reserved_once = observe_personal_strategy_from_pool_with_evidence(
+            &pool,
+            &canonical,
+            &target,
+            &mut self.personal_pair_reserved_once_window_canonical_full,
+            |candidate| {
+                personal_reserved_pair_evidence(
+                    candidate,
+                    frozen_state,
+                    &canonical,
+                    PERSONAL_PAIR_ONCE_MIN_COUNT,
+                    reserved_once_active,
+                )
+            },
+        );
+        let reserved_repeated = observe_personal_strategy_from_pool_with_evidence(
+            &pool,
+            &canonical,
+            &target,
+            &mut self.personal_pair_reserved_repeated_window_canonical_full,
+            |candidate| {
+                personal_reserved_pair_evidence(
+                    candidate,
+                    frozen_state,
+                    &canonical,
+                    PERSONAL_PAIR_REPEATED_MIN_COUNT,
+                    reserved_repeated_active,
+                )
+            },
+        );
         debug_assert_eq!(public_rank, frozen_word.unigram);
         debug_assert_eq!(frozen_word.unigram, frozen_pair.unigram);
         debug_assert_eq!(frozen_word.unigram, causal_pair.unigram);
+        debug_assert_eq!(frozen_word.unigram, reserved_once.unigram);
+        debug_assert_eq!(frozen_word.unigram, reserved_repeated.unigram);
         self.personal_pair_frozen_vs_frozen_word
             .observe(frozen_word.personal, frozen_pair.personal);
         self.personal_pair_causal_vs_frozen_word
             .observe(frozen_word.personal, causal_pair.personal);
         self.personal_pair_causal_vs_frozen_pair
             .observe(frozen_pair.personal, causal_pair.personal);
+        self.personal_pair_reserved_once_vs_frozen_word
+            .observe(frozen_word.personal, reserved_once.personal);
+        self.personal_pair_reserved_repeated_vs_frozen_word
+            .observe(frozen_word.personal, reserved_repeated.personal);
         Ok(())
     }
 
@@ -2928,11 +3017,11 @@ impl CapsuleReplayReport {
     pub fn personal_pair_comparison_terminal_report(&self) -> String {
         [
             format!(
-                "PERSONAL_PAIR_COMPARISON schema=ziranma-personal-pair-comparison-v1 \
+                "PERSONAL_PAIR_COMPARISON schema=ziranma-personal-pair-comparison-v2 \
                  contains_text=false contains_behavioral_metadata=true writes=false network=false \
                  frozen_evaluation_updates=0 causal_evaluation_learning=after_scoring \
                  pair_identity=adjacent_lexicon_words decay=none candidate_pool_depth={} \
-                 max_promotion={}",
+                 max_promotion={} reserved_pair_slot=one_of_three",
                 PERSONAL_CACHE_POOL_DEPTH, PERSONAL_CACHE_MAX_PROMOTION
             ),
             format!(
@@ -2993,6 +3082,18 @@ impl CapsuleReplayReport {
                 self.personal_pair_history_competing_evidence_windows,
                 self.personal_pair_history_evidence_candidates
             ),
+            format!(
+                "PAIR_RESERVED once_min_same_pair_count={} once_active_windows={} \
+                 once_target_evidence_windows={} repeated_min_same_pair_count={} \
+                 repeated_active_windows={} repeated_target_evidence_windows={} \
+                 activation_scope=shared_candidate_pool",
+                PERSONAL_PAIR_ONCE_MIN_COUNT,
+                self.personal_pair_reserved_once_active_windows,
+                self.personal_pair_reserved_once_target_evidence_windows,
+                PERSONAL_PAIR_REPEATED_MIN_COUNT,
+                self.personal_pair_reserved_repeated_active_windows,
+                self.personal_pair_reserved_repeated_target_evidence_windows
+            ),
             compact_strategy_line(
                 "window_unigram",
                 "canonical_full",
@@ -3013,6 +3114,16 @@ impl CapsuleReplayReport {
                 "canonical_full",
                 &self.personal_pair_causal_window_canonical_full,
             ),
+            compact_strategy_line(
+                "window_personal_pair_reserved_once_frozen",
+                "canonical_full",
+                &self.personal_pair_reserved_once_window_canonical_full,
+            ),
+            compact_strategy_line(
+                "window_personal_pair_reserved_repeated_frozen",
+                "canonical_full",
+                &self.personal_pair_reserved_repeated_window_canonical_full,
+            ),
             compact_ranking_comparison_line(
                 "personal_pair_frozen_vs_frozen_word",
                 &self.personal_pair_frozen_vs_frozen_word,
@@ -3024,6 +3135,14 @@ impl CapsuleReplayReport {
             compact_ranking_comparison_line(
                 "personal_pair_causal_vs_frozen_pair",
                 &self.personal_pair_causal_vs_frozen_pair,
+            ),
+            compact_ranking_comparison_line(
+                "personal_pair_reserved_once_vs_frozen_word",
+                &self.personal_pair_reserved_once_vs_frozen_word,
+            ),
+            compact_ranking_comparison_line(
+                "personal_pair_reserved_repeated_vs_frozen_word",
+                &self.personal_pair_reserved_repeated_vs_frozen_word,
             ),
         ]
         .join("\n")
@@ -3633,6 +3752,61 @@ fn personal_hybrid_evidence(
     }
 }
 
+fn personal_reserved_pair_evidence(
+    candidate: &SentenceCandidate,
+    state: &PersonalCacheReplayState,
+    code: &str,
+    minimum_pair_count: u64,
+    reserve_active: bool,
+) -> PersonalCacheEvidence {
+    let word = personal_cache_evidence(candidate, state, PersonalCacheKind::WordFrequency, code);
+    if !reserve_active {
+        return word;
+    }
+    let pair = personal_cache_evidence(candidate, state, PersonalCacheKind::OrderedWordPairs, code);
+    let qualifies = candidate_has_pair_with_minimum_count(candidate, state, minimum_pair_count);
+    PersonalCacheEvidence {
+        promotion: word
+            .promotion
+            .min(PERSONAL_PAIR_RESERVED_WORD_PROMOTION)
+            .saturating_add(usize::from(qualifies)),
+        observed_word_tokens: word.observed_word_tokens,
+        prior_occurrences: word.prior_occurrences,
+        observed_word_pairs: if qualifies {
+            pair.observed_word_pairs
+        } else {
+            0
+        },
+        prior_pair_occurrences: if qualifies {
+            pair.prior_pair_occurrences
+        } else {
+            0
+        },
+    }
+}
+
+fn candidate_has_pair_with_minimum_count(
+    candidate: &SentenceCandidate,
+    state: &PersonalCacheReplayState,
+    minimum_pair_count: u64,
+) -> bool {
+    debug_assert!(minimum_pair_count > 0);
+    let mut previous_word = None::<&str>;
+    for segment in &candidate.segments {
+        if segment.candidate.source != CandidateSource::Lexicon {
+            previous_word = None;
+            continue;
+        }
+        if previous_word.is_some_and(|previous| {
+            state.pair_count(previous, &segment.candidate.text) >= minimum_pair_count
+        }) {
+            return true;
+        }
+        previous_word = Some(&segment.candidate.text);
+    }
+    false
+}
+
 fn personal_cache_evidence(
     candidate: &SentenceCandidate,
     state: &PersonalCacheReplayState,
@@ -4171,10 +4345,11 @@ mod tests {
     use super::{
         CapsuleReplayReport, ContextReplayComparisonStats, PairedReplayStrategyStats,
         PersonalCacheKind, PersonalCacheReplayError, PersonalCacheReplayState,
-        RankingReplayComparisonStats, ReplayStrategyStats, decode_personal_pool_memoized,
-        effective_letter_code, observe_personal_hybrid_strategy_from_pool,
-        observe_personal_strategy_from_pool, observe_strategy_with_personal_cache,
-        personal_cache_evidence, personal_hybrid_evidence,
+        RankingReplayComparisonStats, ReplayStrategyStats, candidate_has_pair_with_minimum_count,
+        decode_personal_pool_memoized, effective_letter_code,
+        observe_personal_hybrid_strategy_from_pool, observe_personal_strategy_from_pool,
+        observe_strategy_with_personal_cache, personal_cache_evidence, personal_hybrid_evidence,
+        personal_reserved_pair_evidence,
     };
     use crate::{
         CommitRecord, DeltaPositionEvidence, EventCapsuleV1, RawKey, TextDelta, TimedTrackerOutput,
@@ -4974,6 +5149,18 @@ text\tpinyin\tfrequency
             report.personal_pair_causal_window_canonical_full.attempts,
             1
         );
+        assert_eq!(
+            report
+                .personal_pair_reserved_once_window_canonical_full
+                .attempts,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_pair_reserved_repeated_window_canonical_full
+                .attempts,
+            1
+        );
         assert_eq!(report.personal_pair_frozen_vs_frozen_word.comparisons, 1);
         assert_eq!(report.personal_pair_frozen_vs_frozen_word.rank_improved, 1);
         assert_eq!(report.personal_pair_causal_vs_frozen_word.rank_improved, 1);
@@ -4988,19 +5175,44 @@ text\tpinyin\tfrequency
             report.personal_pair_history_target_word_cap_saturated_windows,
             0
         );
+        assert_eq!(report.personal_pair_reserved_once_active_windows, 1);
+        assert_eq!(
+            report.personal_pair_reserved_once_target_evidence_windows,
+            1
+        );
+        assert_eq!(report.personal_pair_reserved_repeated_active_windows, 0);
+        assert_eq!(
+            report.personal_pair_reserved_repeated_target_evidence_windows,
+            0
+        );
+        assert_eq!(
+            report
+                .personal_pair_reserved_once_vs_frozen_word
+                .rank_improved,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_pair_reserved_repeated_vs_frozen_word
+                .rank_same,
+            1
+        );
         assert_eq!(report.personal_cache_learning_word_pairs, 1);
         assert_eq!(report.personal_cache_reversed_word_pairs, 1);
         assert_eq!(causal_state.learned_word_pairs(), 1);
         assert_eq!(format!("{frozen_state:?}"), frozen_before);
 
         let compact = report.personal_pair_comparison_terminal_report();
-        assert!(compact.contains("schema=ziranma-personal-pair-comparison-v1"));
+        assert!(compact.contains("schema=ziranma-personal-pair-comparison-v2"));
         assert!(compact.contains("causal_evaluation_learning=after_scoring"));
         assert!(compact.contains("scope=window_personal_word_cache_frozen"));
         assert!(compact.contains("scope=window_personal_pair_cache_frozen"));
         assert!(compact.contains("scope=window_personal_pair_cache_causal"));
         assert!(compact.contains("context=personal_pair_frozen_vs_frozen_word"));
         assert!(compact.contains("PAIR_EVIDENCE source=frozen_history"));
+        assert!(compact.contains("PAIR_RESERVED once_min_same_pair_count=1"));
+        assert!(compact.contains("scope=window_personal_pair_reserved_once_frozen"));
+        assert!(compact.contains("scope=window_personal_pair_reserved_repeated_frozen"));
         assert!(!compact.contains("在"));
         assert!(!compact.contains("猫"));
         assert!(!compact.contains("zai"));
@@ -5326,6 +5538,32 @@ text\tpinyin\tfrequency
         assert_eq!(pair_rank.personal, Some(2));
         assert!(pair_rank.personal < word_rank.personal);
         assert_eq!(pair_stats.hits_at_5, 1);
+    }
+
+    #[test]
+    fn reserved_pair_slot_distinguishes_one_observation_from_same_pair_repetition() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("zlmkmk", super::PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        let candidate = pool
+            .iter()
+            .find(|candidate| candidate.text == "在猫猫")
+            .unwrap();
+        let words = ["在".to_owned(), "猫猫".to_owned()];
+        let mut state = PersonalCacheReplayState::new();
+        state.learn_commit(0, 1, &["在".to_owned()]);
+        state.learn_commit(1, 2, &["猫猫".to_owned()]);
+        assert_eq!(state.learn_pair_sequence(0, 3, &words), 1);
+
+        assert!(candidate_has_pair_with_minimum_count(candidate, &state, 1));
+        assert!(!candidate_has_pair_with_minimum_count(candidate, &state, 2));
+
+        assert_eq!(state.learn_pair_sequence(3, 6, &words), 1);
+        assert!(candidate_has_pair_with_minimum_count(candidate, &state, 2));
+        let evidence = personal_reserved_pair_evidence(candidate, &state, "zlmkmk", 2, true);
+        assert_eq!(evidence.prior_pair_occurrences, 2);
+        assert!(evidence.promotion <= super::PERSONAL_CACHE_MAX_PROMOTION);
     }
 
     #[test]
