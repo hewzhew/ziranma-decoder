@@ -217,6 +217,37 @@ target\release\candidatectl.exe phrase-coverage-audit `
 来源材料哈希，因此这条路线在双文件认证和运行时负对照完成前保持为只读实验，
 不得把审计交集伪装成单来源发布包。
 
+随后新增的 `phrase-layer-audit` 会在内存中建立基础、5,000 条和 10,000 条三个
+真实 `CandidateSnapshot`，让新增目标走现有交互候选合并路径。它把新增目标与
+基础稳定性对照分开，完整检查所有 10,000 条配额命中的 UD 四字目标；基础对照
+则在训练和留出侧各使用最多 128 个、按稳定词面哈希固定选择的公开样本，避免
+审计工具无界重复完整解码。计时另取最多 48 个公开完整码并先预热：
+
+```powershell
+target\release\candidatectl.exe phrase-layer-audit `
+  --source .local\public-audit\wanxiang-fdda7afb\jichu.dict.yaml `
+  --allowlist .local\public-audit\wanxiang-fdda7afb\chengyu.txt `
+  --base-payload .local\public-audit\wanxiang-fdda7afb\package-top76300-plus-bigram-cover-v2\lexicon.tsv `
+  --fit-corpus data\public\ud-chinese-gsdsimp\zh_gsdsimp-ud-train.conllu `
+  --held-out-corpus data\public\ud-chinese-gsdsimp\zh_gsdsimp-ud-test.conllu `
+  --small-limit 5000 `
+  --large-limit 10000 `
+  --repetitions 5
+```
+
+同机 release 结果中，5,000 条层让训练侧 71 个目标中的 57 个进入 Top-10，
+10,000 条层为 71/71；独立 UD test 分别为 5/7 和 7/7，而且七个 10,000 条目标
+都成为首选。训练侧 96 个、留出侧 17 个基础包四字对照没有候选顺序变化、首选
+变化、目标降名次或掉出 Top-10。
+
+5,000/10,000 条短语层载荷分别为 165,602/331,550 字节，紧凑索引节点为
+14,083/26,948，隐式拼写为 80,000/160,000；本机构建约 17.5/40.8 ms。
+48 个预热公开码各重复五次时，基础、5,000 和 10,000 条路径的 median 分别约
+34.17/33.88/33.68 ms，P95 约 42.84/44.07/42.58 ms，分布没有显示稳定的层间
+延迟差异。这些结构计数不是实际堆内存，候选查询也不是 TSF 窗口首帧；宿主加载
+后的进程增量、首次绘制和双文件来源认证仍是发布前门槛。因此本轮只能说明
+10,000 条在该公开留出上有额外召回且未触发固定负对照，不能据此直接换代。
+
 ```powershell
 cargo run --release --bin candidatectl -- compare `
   --base-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `

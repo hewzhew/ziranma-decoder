@@ -1,6 +1,6 @@
 //! Explicit construction, inspection, and local slotting of candidate packages.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
@@ -27,18 +27,19 @@ use ziranma_core::{
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
     CandidateSupplementalState, CharacterBigramLanguageModel, ContinuousCompositionProbe,
-    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason,
-    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
+    DecoderIndexStats, FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason,
+    LexiconEntry, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
     MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
-    PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
-    PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
-    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SupplementalCandidateLayerConfig,
-    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
-    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_supplemental_layer,
+    PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
+    PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
+    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
+    SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
+    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
+    audit_public_lexicon_token_coverage, audit_public_supplemental_layer,
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
@@ -47,8 +48,8 @@ use ziranma_core::{
     parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_rime_lexicon,
     parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    select_public_lexicon_rank_probes, select_public_supplemental_composition_cases,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 
@@ -100,6 +101,16 @@ enum Options {
         fit_corpus: PathBuf,
         held_out_corpus: PathBuf,
         entry_limit: usize,
+    },
+    PhraseLayerAudit {
+        source: PathBuf,
+        allowlist: PathBuf,
+        base_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        small_limit: usize,
+        large_limit: usize,
+        repetitions: usize,
     },
     LayerAudit {
         core_payload: PathBuf,
@@ -269,6 +280,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &held_out_corpus,
             entry_limit,
         )?,
+        Options::PhraseLayerAudit {
+            source,
+            allowlist,
+            base_payload,
+            fit_corpus,
+            held_out_corpus,
+            small_limit,
+            large_limit,
+            repetitions,
+        } => audit_phrase_layers(PhraseLayerAuditRequest {
+            source: &source,
+            allowlist: &allowlist,
+            base_payload: &base_payload,
+            fit_corpus: &fit_corpus,
+            held_out_corpus: &held_out_corpus,
+            small_limit,
+            large_limit,
+            repetitions,
+        })?,
         Options::LayerAudit {
             core_payload,
             supplemental_payload,
@@ -379,6 +409,7 @@ fn parse_options(
         "compare" => parse_compare(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
+        "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
@@ -744,6 +775,56 @@ fn parse_phrase_coverage_audit(
         held_out_corpus: held_out_corpus
             .ok_or("phrase-coverage-audit requires --held-out-corpus")?,
         entry_limit,
+    })
+}
+
+fn parse_phrase_layer_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut allowlist = None;
+    let mut base_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    let mut small_limit = None;
+    let mut large_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--allowlist" => set_path(&mut allowlist, &mut arguments, "--allowlist")?,
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--small-limit" => set_usize(&mut small_limit, &mut arguments, "--small-limit")?,
+            "--large-limit" => set_usize(&mut large_limit, &mut arguments, "--large-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => return Err("unknown phrase-layer-audit argument; value was suppressed".into()),
+        }
+    }
+    let small_limit = small_limit.ok_or("phrase-layer-audit requires --small-limit")?;
+    let large_limit = large_limit.ok_or("phrase-layer-audit requires --large-limit")?;
+    if small_limit == 0
+        || small_limit >= large_limit
+        || large_limit > MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES
+    {
+        return Err("phrase-layer-audit limits must satisfy 1 <= small < large <= 50000".into());
+    }
+    let repetitions = repetitions.ok_or("phrase-layer-audit requires --repetitions")?;
+    if !(1..=100).contains(&repetitions) {
+        return Err("phrase-layer-audit --repetitions is outside the fixed bound".into());
+    }
+    Ok(Options::PhraseLayerAudit {
+        source: source.ok_or("phrase-layer-audit requires --source")?,
+        allowlist: allowlist.ok_or("phrase-layer-audit requires --allowlist")?,
+        base_payload: base_payload.ok_or("phrase-layer-audit requires --base-payload")?,
+        fit_corpus: fit_corpus.ok_or("phrase-layer-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus.ok_or("phrase-layer-audit requires --held-out-corpus")?,
+        small_limit,
+        large_limit,
+        repetitions,
     })
 }
 
@@ -1190,6 +1271,9 @@ fn print_usage() {
         "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
     );
     eprintln!(
+        "  phrase-layer-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --small-limit <N> --large-limit <N> --repetitions <1..100>"
+    );
+    eprintln!(
         "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
     );
     eprintln!(
@@ -1606,6 +1690,550 @@ fn write_phrase_coverage_section(
         four.challenger_gained_token_instances,
         four.challenger_lost_unique_tokens,
         four.challenger_lost_token_instances,
+    )
+    .unwrap();
+}
+
+const PHRASE_LAYER_RANK_DEPTH: usize = 10;
+const PHRASE_LAYER_BENCHMARK_CODE_LIMIT: usize = 48;
+const PHRASE_LAYER_CONTROL_LIMIT: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WeightedRankCounts {
+    at_one: usize,
+    at_one_instances: usize,
+    at_five: usize,
+    at_five_instances: usize,
+    at_ten: usize,
+    at_ten_instances: usize,
+}
+
+impl WeightedRankCounts {
+    fn observe(&mut self, rank: Option<usize>, instances: usize) {
+        let Some(rank) = rank else {
+            return;
+        };
+        if rank <= 10 {
+            self.at_ten += 1;
+            self.at_ten_instances += instances;
+        }
+        if rank <= 5 {
+            self.at_five += 1;
+            self.at_five_instances += instances;
+        }
+        if rank == 1 {
+            self.at_one += 1;
+            self.at_one_instances += instances;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WeightedRankMovement {
+    improved: usize,
+    improved_instances: usize,
+    unchanged: usize,
+    unchanged_instances: usize,
+    worsened: usize,
+    worsened_instances: usize,
+    newly_visible: usize,
+    newly_visible_instances: usize,
+    lost_visible: usize,
+    lost_visible_instances: usize,
+}
+
+impl WeightedRankMovement {
+    fn observe(&mut self, before: Option<usize>, after: Option<usize>, instances: usize) {
+        match (before, after) {
+            (None, Some(_)) => {
+                self.improved += 1;
+                self.improved_instances += instances;
+                self.newly_visible += 1;
+                self.newly_visible_instances += instances;
+            }
+            (Some(_), None) => {
+                self.worsened += 1;
+                self.worsened_instances += instances;
+                self.lost_visible += 1;
+                self.lost_visible_instances += instances;
+            }
+            (Some(before), Some(after)) if after < before => {
+                self.improved += 1;
+                self.improved_instances += instances;
+            }
+            (Some(before), Some(after)) if after > before => {
+                self.worsened += 1;
+                self.worsened_instances += instances;
+            }
+            _ => {
+                self.unchanged += 1;
+                self.unchanged_instances += instances;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PhraseRankComparison {
+    probes: usize,
+    instances: usize,
+    core: WeightedRankCounts,
+    small: WeightedRankCounts,
+    large: WeightedRankCounts,
+    small_vs_core: WeightedRankMovement,
+    large_vs_core: WeightedRankMovement,
+    small_order_changes: usize,
+    large_order_changes: usize,
+    small_top_changes: usize,
+    large_top_changes: usize,
+}
+
+struct PhraseLayerAuditRequest<'a> {
+    source: &'a Path,
+    allowlist: &'a Path,
+    base_payload: &'a Path,
+    fit_corpus: &'a Path,
+    held_out_corpus: &'a Path,
+    small_limit: usize,
+    large_limit: usize,
+    repetitions: usize,
+}
+
+fn audit_phrase_layers(
+    request: PhraseLayerAuditRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let PhraseLayerAuditRequest {
+        source,
+        allowlist,
+        base_payload,
+        fit_corpus,
+        held_out_corpus,
+        small_limit,
+        large_limit,
+        repetitions,
+    } = request;
+    if cfg!(debug_assertions) {
+        return Err("phrase-layer-audit must run from a release build".into());
+    }
+    let source_text = read_explicit_text(
+        source,
+        "public toned Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let allowlist_text = read_explicit_text(
+        allowlist,
+        "public fixed-phrase allowlist",
+        MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
+    )?;
+    let base_text = read_explicit_text(
+        base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        fit_corpus,
+        "public fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let fit_sha256 = candidate_sha256_hex(fit_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if fit_sha256 == held_out_sha256 {
+        return Err("phrase-layer-audit requires a distinct held-out corpus".into());
+    }
+
+    let base_entries = parse_lexicon_tsv(&base_text)?;
+    let imported = parse_public_rime_phrase_allowlist(
+        &source_text,
+        &allowlist_text,
+        MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
+    )?;
+    let base_surfaces = base_entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let available = imported
+        .entries
+        .into_iter()
+        .filter(|entry| !base_surfaces.contains(entry.text.as_str()))
+        .collect::<Vec<_>>();
+    if available.len() < large_limit {
+        return Err("phrase-layer-audit large limit exceeds available new public entries".into());
+    }
+    let small_entries = available[..small_limit].to_vec();
+    let large_entries = available[..large_limit].to_vec();
+    let small_payload = serialize_lexicon_payload(&small_entries);
+    let large_payload = serialize_lexicon_payload(&large_entries);
+
+    let core_started = Instant::now();
+    let core = snapshot_from_payload("phrase-layer-core-v1", &base_text)?;
+    let core_build = core_started.elapsed();
+    let small_started = Instant::now();
+    let small = snapshot_from_payload("phrase-layer-small-v1", &small_payload)?;
+    let small_build = small_started.elapsed();
+    let large_started = Instant::now();
+    let large = snapshot_from_payload("phrase-layer-large-v1", &large_payload)?;
+    let large_build = large_started.elapsed();
+
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let fit_targets = select_public_lexicon_rank_probes(&fit, &large_entries, 4);
+    let held_out_targets = select_public_lexicon_rank_probes(&held_out, &large_entries, 4);
+    let fit_controls = select_public_lexicon_rank_probes(&fit, &base_entries, 4);
+    let held_out_controls = select_public_lexicon_rank_probes(&held_out, &base_entries, 4);
+    let fit_control_unique = fit_controls.probes.len();
+    let fit_control_instances = fit_controls.matched_token_instances;
+    let held_out_control_unique = held_out_controls.probes.len();
+    let held_out_control_instances = held_out_controls.matched_token_instances;
+    let fit_control_probes = bounded_public_rank_probes(fit_controls.probes);
+    let held_out_control_probes = bounded_public_rank_probes(held_out_controls.probes);
+    let fit_target_report = compare_phrase_layer_ranks(&core, &small, &large, &fit_targets.probes)?;
+    let held_out_target_report =
+        compare_phrase_layer_ranks(&core, &small, &large, &held_out_targets.probes)?;
+    let fit_control_report =
+        compare_phrase_layer_ranks(&core, &small, &large, &fit_control_probes)?;
+    let held_out_control_report =
+        compare_phrase_layer_ranks(&core, &small, &large, &held_out_control_probes)?;
+    if fit_control_report.small_top_changes != 0
+        || fit_control_report.large_top_changes != 0
+        || held_out_control_report.small_top_changes != 0
+        || held_out_control_report.large_top_changes != 0
+    {
+        return Err("phrase layer changed a public base-control Top-1".into());
+    }
+
+    let mut benchmark_codes = BTreeSet::new();
+    for probe in fit_targets
+        .probes
+        .iter()
+        .chain(&held_out_targets.probes)
+        .chain(&fit_control_probes)
+        .chain(&held_out_control_probes)
+    {
+        benchmark_codes.insert(probe.observed.as_str().to_owned());
+    }
+    let benchmark_codes = benchmark_codes
+        .into_iter()
+        .take(PHRASE_LAYER_BENCHMARK_CODE_LIMIT)
+        .collect::<Vec<_>>();
+    if benchmark_codes.is_empty() {
+        return Err("phrase-layer-audit produced no public benchmark codes".into());
+    }
+    let config = SupplementalCandidateLayerConfig {
+        exact_promotions: 1,
+    };
+    for code in &benchmark_codes {
+        black_box(core.candidate_texts(black_box(code), PHRASE_LAYER_RANK_DEPTH)?);
+        black_box(layered_candidate_texts(
+            &core,
+            &small,
+            black_box(code),
+            PHRASE_LAYER_RANK_DEPTH,
+            config,
+        )?);
+        black_box(layered_candidate_texts(
+            &core,
+            &large,
+            black_box(code),
+            PHRASE_LAYER_RANK_DEPTH,
+            config,
+        )?);
+    }
+    let mut core_durations = Vec::with_capacity(repetitions * benchmark_codes.len());
+    let mut small_durations = Vec::with_capacity(repetitions * benchmark_codes.len());
+    let mut large_durations = Vec::with_capacity(repetitions * benchmark_codes.len());
+    let mut checksum = 0usize;
+    for _ in 0..repetitions {
+        for code in &benchmark_codes {
+            let started = Instant::now();
+            let candidates = core.candidate_texts(black_box(code), PHRASE_LAYER_RANK_DEPTH)?;
+            core_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+
+            let started = Instant::now();
+            let candidates = layered_candidate_texts(
+                &core,
+                &small,
+                black_box(code),
+                PHRASE_LAYER_RANK_DEPTH,
+                config,
+            )?;
+            small_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+
+            let started = Instant::now();
+            let candidates = layered_candidate_texts(
+                &core,
+                &large,
+                black_box(code),
+                PHRASE_LAYER_RANK_DEPTH,
+                config,
+            )?;
+            large_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+        }
+    }
+    let core_latency = summarize_durations(&mut core_durations)
+        .ok_or("phrase-layer-audit produced no core timings")?;
+    let small_latency = summarize_durations(&mut small_durations)
+        .ok_or("phrase-layer-audit produced no small-layer timings")?;
+    let large_latency = summarize_durations(&mut large_durations)
+        .ok_or("phrase-layer-audit produced no large-layer timings")?;
+
+    let mut output = format!(
+        "公开固定短语层排序与成本审计\n基础载荷：{} 条 · SHA-256 {}\n来源词典：SHA-256 {}\n固定短语表：SHA-256 {}\n配额：小层 {small_limit}；大层 {large_limit}；每码最多补 1 个完整词；候选深度 {PHRASE_LAYER_RANK_DEPTH}\n",
+        base_entries.len(),
+        candidate_sha256_hex(base_text.as_bytes()),
+        candidate_sha256_hex(source_text.as_bytes()),
+        candidate_sha256_hex(allowlist_text.as_bytes()),
+    );
+    write_phrase_rank_report(
+        &mut output,
+        "训练侧新增目标",
+        &fit_sha256,
+        fit_target_report,
+    );
+    write_phrase_rank_report(
+        &mut output,
+        "留出新增目标",
+        &held_out_sha256,
+        held_out_target_report,
+    );
+    write_phrase_control_report(
+        &mut output,
+        "训练侧基础对照",
+        fit_control_unique,
+        fit_control_instances,
+        fit_control_report,
+    );
+    write_phrase_control_report(
+        &mut output,
+        "留出基础对照",
+        held_out_control_unique,
+        held_out_control_instances,
+        held_out_control_report,
+    );
+    write_phrase_index_report(&mut output, "基础", &core, core.index_stats(), core_build);
+    write_phrase_index_report(
+        &mut output,
+        "小层",
+        &small,
+        small.index_stats(),
+        small_build,
+    );
+    write_phrase_index_report(
+        &mut output,
+        "大层",
+        &large,
+        large.index_stats(),
+        large_build,
+    );
+    writeln!(
+        output,
+        "预热查询：{} 个公开完整码 × {repetitions} 次；样本 {}",
+        benchmark_codes.len(),
+        core_latency.samples,
+    )?;
+    write_phrase_latency_report(&mut output, "基础", core_latency);
+    write_phrase_latency_report(&mut output, "小层", small_latency);
+    write_phrase_latency_report(&mut output, "大层", large_latency);
+    writeln!(output, "结果校验和：{checksum}")?;
+    output.push_str(
+        "口径：新增目标与基础稳定性对照分开统计；短语层通过真实 CandidateSnapshot 和交互合并路径查询。索引结构不是堆内存估算，预热查询也不是 TSF 绘制首帧；耗时只作本机同次诊断。命令不显示词面、不构建候选包、不写槽位。双文件来源认证与宿主首帧仍是发布前独立门槛。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn compare_phrase_layer_ranks(
+    core: &CandidateSnapshot,
+    small: &CandidateSnapshot,
+    large: &CandidateSnapshot,
+    probes: &[PublicLexiconRankProbe],
+) -> Result<PhraseRankComparison, Box<dyn std::error::Error>> {
+    let config = SupplementalCandidateLayerConfig {
+        exact_promotions: 1,
+    };
+    let mut report = PhraseRankComparison::default();
+    for probe in probes {
+        report.probes += 1;
+        report.instances += probe.instances;
+        let code = probe.observed.as_str();
+        let core_candidates = core.candidate_texts(code, PHRASE_LAYER_RANK_DEPTH)?;
+        let small_candidates =
+            layered_candidate_texts(core, small, code, PHRASE_LAYER_RANK_DEPTH, config)?;
+        let large_candidates =
+            layered_candidate_texts(core, large, code, PHRASE_LAYER_RANK_DEPTH, config)?;
+        let core_rank = candidate_rank(&core_candidates, &probe.expected_text);
+        let small_rank = candidate_rank(&small_candidates, &probe.expected_text);
+        let large_rank = candidate_rank(&large_candidates, &probe.expected_text);
+        report.core.observe(core_rank, probe.instances);
+        report.small.observe(small_rank, probe.instances);
+        report.large.observe(large_rank, probe.instances);
+        report
+            .small_vs_core
+            .observe(core_rank, small_rank, probe.instances);
+        report
+            .large_vs_core
+            .observe(core_rank, large_rank, probe.instances);
+        report.small_order_changes += usize::from(core_candidates != small_candidates);
+        report.large_order_changes += usize::from(core_candidates != large_candidates);
+        report.small_top_changes +=
+            usize::from(core_candidates.first() != small_candidates.first());
+        report.large_top_changes +=
+            usize::from(core_candidates.first() != large_candidates.first());
+    }
+    Ok(report)
+}
+
+fn bounded_public_rank_probes(
+    mut probes: Vec<PublicLexiconRankProbe>,
+) -> Vec<PublicLexiconRankProbe> {
+    probes.sort_by(|left, right| {
+        candidate_payload_fingerprint(left.expected_text.as_bytes())
+            .cmp(&candidate_payload_fingerprint(
+                right.expected_text.as_bytes(),
+            ))
+            .then_with(|| left.expected_text.cmp(&right.expected_text))
+    });
+    probes.truncate(PHRASE_LAYER_CONTROL_LIMIT);
+    probes
+}
+
+fn serialize_lexicon_payload(entries: &[LexiconEntry]) -> String {
+    let mut payload = String::from("text\tpinyin\tfrequency\n");
+    for entry in entries {
+        writeln!(
+            payload,
+            "{}\t{}\t{}",
+            entry.text, entry.pinyin, entry.frequency
+        )
+        .expect("writing to a String cannot fail");
+    }
+    payload
+}
+
+fn write_phrase_rank_report(
+    output: &mut String,
+    label: &str,
+    corpus_sha256: &str,
+    report: PhraseRankComparison,
+) {
+    writeln!(
+        output,
+        "{label}：{} 个词面（实例 {}）· SHA-256 {corpus_sha256}",
+        report.probes, report.instances,
+    )
+    .unwrap();
+    write_weighted_rank_counts(output, "  基础", report.core);
+    write_weighted_rank_counts(output, "  小层", report.small);
+    write_weighted_rank_counts(output, "  大层", report.large);
+    write_weighted_rank_movement(output, "  小层相对基础", report.small_vs_core);
+    write_weighted_rank_movement(output, "  大层相对基础", report.large_vs_core);
+}
+
+fn write_phrase_control_report(
+    output: &mut String,
+    label: &str,
+    matched_unique: usize,
+    matched_instances: usize,
+    report: PhraseRankComparison,
+) {
+    writeln!(
+        output,
+        "{label}：语料匹配 {} 个词面（实例 {}）；固定抽样 {}（实例 {}，上限 {PHRASE_LAYER_CONTROL_LIMIT}）",
+        matched_unique, matched_instances, report.probes, report.instances,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  小层：顺序变化 {}，首选变化 {}，目标变差 {}（实例 {}），掉出 Top-10 {}（实例 {}）",
+        report.small_order_changes,
+        report.small_top_changes,
+        report.small_vs_core.worsened,
+        report.small_vs_core.worsened_instances,
+        report.small_vs_core.lost_visible,
+        report.small_vs_core.lost_visible_instances,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  大层：顺序变化 {}，首选变化 {}，目标变差 {}（实例 {}），掉出 Top-10 {}（实例 {}）",
+        report.large_order_changes,
+        report.large_top_changes,
+        report.large_vs_core.worsened,
+        report.large_vs_core.worsened_instances,
+        report.large_vs_core.lost_visible,
+        report.large_vs_core.lost_visible_instances,
+    )
+    .unwrap();
+}
+
+fn write_weighted_rank_counts(output: &mut String, label: &str, counts: WeightedRankCounts) {
+    writeln!(
+        output,
+        "{label}：Top-1 {}/{}，Top-5 {}/{}，Top-10 {}/{}（词面/实例）",
+        counts.at_one,
+        counts.at_one_instances,
+        counts.at_five,
+        counts.at_five_instances,
+        counts.at_ten,
+        counts.at_ten_instances,
+    )
+    .unwrap();
+}
+
+fn write_weighted_rank_movement(output: &mut String, label: &str, movement: WeightedRankMovement) {
+    writeln!(
+        output,
+        "{label}：改善 {}（实例 {}），不变 {}（实例 {}），变差 {}（实例 {}）；新进 Top-10 {}，掉出 {}",
+        movement.improved,
+        movement.improved_instances,
+        movement.unchanged,
+        movement.unchanged_instances,
+        movement.worsened,
+        movement.worsened_instances,
+        movement.newly_visible,
+        movement.lost_visible,
+    )
+    .unwrap();
+}
+
+fn write_phrase_index_report(
+    output: &mut String,
+    label: &str,
+    snapshot: &CandidateSnapshot,
+    stats: DecoderIndexStats,
+    build: Duration,
+) {
+    writeln!(
+        output,
+        "索引 {label}：词条 {}，载荷 {} 字节，节点 {}，边 {}，终端 {}，最大同码扇出 {}，隐式拼写 {}；构建 {:.3} ms",
+        snapshot.entry_count(),
+        snapshot.payload_bytes(),
+        stats.node_count,
+        stats.edge_count,
+        stats.terminal_count,
+        stats.maximum_terminal_fanout,
+        stats.represented_spelling_count,
+        duration_ms(build),
+    )
+    .unwrap();
+}
+
+fn write_phrase_latency_report(output: &mut String, label: &str, summary: DurationSummary) {
+    writeln!(
+        output,
+        "查询 {label}：median {:.3} ms；p95 {:.3} ms；max {:.3} ms",
+        duration_ms(summary.median),
+        duration_ms(summary.p95),
+        duration_ms(summary.maximum),
     )
     .unwrap();
 }
@@ -4754,6 +5382,56 @@ mod tests {
     }
 
     #[test]
+    fn phrase_layer_parser_requires_ordered_quotas_and_release_repetitions() {
+        assert_eq!(
+            parse_options([
+                "phrase-layer-audit".to_owned(),
+                "--source".to_owned(),
+                "jichu.dict.yaml".to_owned(),
+                "--allowlist".to_owned(),
+                "chengyu.txt".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--small-limit".to_owned(),
+                "5000".to_owned(),
+                "--large-limit".to_owned(),
+                "10000".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::PhraseLayerAudit {
+                source: PathBuf::from("jichu.dict.yaml"),
+                allowlist: PathBuf::from("chengyu.txt"),
+                base_payload: PathBuf::from("base.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                small_limit: 5000,
+                large_limit: 10000,
+                repetitions: 5,
+            }
+        );
+        for (small, large) in [(0, 10), (10, 10), (11, 10), (1, 50_001)] {
+            assert!(
+                parse_options([
+                    "phrase-layer-audit".to_owned(),
+                    "--small-limit".to_owned(),
+                    small.to_string(),
+                    "--large-limit".to_owned(),
+                    large.to_string(),
+                    "--repetitions".to_owned(),
+                    "1".to_owned(),
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn length_coverage_report_is_aggregate_only_and_requires_holdout() {
         const BASE: &str = "text\tpinyin\tfrequency\n双字\tshuang zi\t10\n三字词\tsan zi ci\t9\n";
         const CHALLENGER: &str =
@@ -4811,6 +5489,66 @@ mod tests {
         assert!(audit_phrase_coverage(&source, &allowlist, &base, &fit, &fit, 1).is_err());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_layer_rank_comparison_separates_new_targets_from_base_controls() {
+        const CORE: &str = "text\tpinyin\tfrequency\n基础短语\tji chu duan yu\t100\n";
+        const SMALL: &str = "text\tpinyin\tfrequency\n公开短语\tgong kai duan yu\t100\n";
+        const LARGE: &str = "text\tpinyin\tfrequency\n\
+公开短语\tgong kai duan yu\t100\n\
+更多短语\tgeng duo duan yu\t90\n";
+        let core = snapshot_from_payload("phrase-test-core-v1", CORE).unwrap();
+        let small = snapshot_from_payload("phrase-test-small-v1", SMALL).unwrap();
+        let large = snapshot_from_payload("phrase-test-large-v1", LARGE).unwrap();
+        let targets = [
+            PublicLexiconRankProbe {
+                observed: encode_pinyin_phrase("gong kai duan yu").unwrap().full_code,
+                expected_text: "公开短语".to_owned(),
+                instances: 2,
+            },
+            PublicLexiconRankProbe {
+                observed: encode_pinyin_phrase("geng duo duan yu").unwrap().full_code,
+                expected_text: "更多短语".to_owned(),
+                instances: 1,
+            },
+        ];
+        let target_report = compare_phrase_layer_ranks(&core, &small, &large, &targets).unwrap();
+        assert_eq!(target_report.probes, 2);
+        assert_eq!(target_report.instances, 3);
+        assert_eq!(target_report.core.at_ten, 0);
+        assert_eq!(target_report.small.at_ten, 1);
+        assert_eq!(target_report.large.at_ten, 2);
+        assert_eq!(target_report.small_vs_core.newly_visible, 1);
+        assert_eq!(target_report.large_vs_core.newly_visible, 2);
+
+        let controls = [PublicLexiconRankProbe {
+            observed: encode_pinyin_phrase("ji chu duan yu").unwrap().full_code,
+            expected_text: "基础短语".to_owned(),
+            instances: 3,
+        }];
+        let control_report = compare_phrase_layer_ranks(&core, &small, &large, &controls).unwrap();
+        assert_eq!(control_report.small_top_changes, 0);
+        assert_eq!(control_report.large_top_changes, 0);
+        assert_eq!(control_report.small_vs_core.worsened, 0);
+        assert_eq!(control_report.large_vs_core.worsened, 0);
+    }
+
+    #[test]
+    fn phrase_layer_control_sampling_is_bounded_and_input_order_independent() {
+        let probes = (0..PHRASE_LAYER_CONTROL_LIMIT + 7)
+            .map(|index| PublicLexiconRankProbe {
+                observed: ziranma_core::KeySequence::new("aa").unwrap(),
+                expected_text: format!("公开对照{index:03}"),
+                instances: index + 1,
+            })
+            .collect::<Vec<_>>();
+        let expected = bounded_public_rank_probes(probes.clone());
+        let mut reversed = probes;
+        reversed.reverse();
+
+        assert_eq!(expected.len(), PHRASE_LAYER_CONTROL_LIMIT);
+        assert_eq!(bounded_public_rank_probes(reversed), expected);
     }
 
     #[test]

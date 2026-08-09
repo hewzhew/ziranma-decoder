@@ -8,8 +8,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Correction, Decoder, KeySequence, KeySequenceError, MAX_LEXICON_SYLLABLES, ScoreBreakdown,
-    parse_lexicon_tsv, spelling_is_complete_or_anchored_suffix,
+    Correction, Decoder, DecoderIndexStats, KeySequence, KeySequenceError, MAX_LEXICON_SYLLABLES,
+    ScoreBreakdown, parse_lexicon_tsv, spelling_is_complete_or_anchored_suffix,
 };
 
 /// First read-only candidate snapshot schema.
@@ -285,6 +285,14 @@ impl CandidateSnapshot {
     /// Returns the exact validated lexicon entry count.
     pub fn entry_count(&self) -> usize {
         self.entry_count
+    }
+
+    /// Returns structural counts for the validated in-memory decoder index.
+    ///
+    /// These deterministic counts support package comparisons; they are not
+    /// an estimate of allocator overhead or whole-process resident memory.
+    pub fn index_stats(&self) -> DecoderIndexStats {
+        self.decoder.index_stats()
     }
 
     /// Returns one one-based candidate for an interactive host.
@@ -1829,6 +1837,10 @@ mod tests {
         assert_eq!(snapshot.payload_bytes(), 1_132);
         assert_eq!(snapshot.payload_fingerprint(), 0x592a_4dbb_4b33_efa6);
         assert_eq!(snapshot.entry_count(), 50);
+        let index = snapshot.index_stats();
+        assert_eq!(index.terminal_count, snapshot.entry_count());
+        assert!(index.node_count > index.terminal_node_count);
+        assert!(index.represented_spelling_count >= snapshot.entry_count());
         assert_eq!(
             snapshot.candidate_text("nihk", 1).unwrap().as_deref(),
             Some("你好")

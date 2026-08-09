@@ -351,6 +351,34 @@ pub struct PublicLexiconTokenCoverageByLength {
     pub challenger_lost_token_instances: usize,
 }
 
+/// One exact public token surface paired with a source-selected full code.
+///
+/// The probe text remains in memory for rank comparison; aggregate audit
+/// callers should avoid printing it when individual public examples are not
+/// part of the report contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicLexiconRankProbe {
+    /// Complete code from the highest-ranked matching public lexicon entry.
+    pub observed: KeySequence,
+    /// Exact public UD token surface expected from the code.
+    pub expected_text: String,
+    /// Number of occurrences of this surface in the selected public corpus.
+    pub instances: usize,
+}
+
+/// Deterministic exact-token probes and their source accounting.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PublicLexiconRankSelection {
+    /// Unique matched surfaces, ordered by surface text.
+    pub probes: Vec<PublicLexiconRankProbe>,
+    /// Unique eligible source surfaces before lexicon matching.
+    pub source_unique_tokens: usize,
+    /// Eligible source token occurrences before lexicon matching.
+    pub source_token_instances: usize,
+    /// Matched public token occurrences represented by `probes`.
+    pub matched_token_instances: usize,
+}
+
 /// Filtering and size counts for public character-model training text.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PublicCharacterTrainingStats {
@@ -499,6 +527,56 @@ pub fn audit_public_lexicon_token_coverage(
         audit
     });
     PublicLexiconTokenCoverageAudit { lengths }
+}
+
+/// Selects exact public token probes for one fixed Han-character length.
+///
+/// Punctuation and non-Han tokens are excluded. Repeated source surfaces are
+/// coalesced with an occurrence count, and pronunciation/code always comes
+/// from the highest-ranked matching lexicon entry rather than being inferred
+/// from the UD text.
+pub fn select_public_lexicon_rank_probes(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+    characters: usize,
+) -> PublicLexiconRankSelection {
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut instances_by_text = BTreeMap::<String, usize>::new();
+    for token in corpus
+        .sentences
+        .iter()
+        .flat_map(|sentence| &sentence.tokens)
+    {
+        if token.upos == "PUNCT"
+            || token.form.chars().count() != characters
+            || !token.form.chars().all(is_han_character)
+        {
+            continue;
+        }
+        *instances_by_text.entry(token.form.clone()).or_default() += 1;
+    }
+
+    let source_unique_tokens = instances_by_text.len();
+    let source_token_instances = instances_by_text.values().sum();
+    let mut matched_token_instances = 0;
+    let probes = instances_by_text
+        .into_iter()
+        .filter_map(|(text, instances)| {
+            let entry = entries_by_text.get(text.as_str())?;
+            matched_token_instances += instances;
+            Some(PublicLexiconRankProbe {
+                observed: entry.code.clone(),
+                expected_text: text,
+                instances,
+            })
+        })
+        .collect();
+    PublicLexiconRankSelection {
+        probes,
+        source_unique_tokens,
+        source_token_instances,
+        matched_token_instances,
+    }
 }
 
 fn finish_sentence(
@@ -1509,7 +1587,8 @@ mod tests {
         parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_character_training_texts, select_public_continuous_composition_cases,
-        select_public_protocol_audit_cases, select_public_supplemental_composition_cases,
+        select_public_lexicon_rank_probes, select_public_protocol_audit_cases,
+        select_public_supplemental_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -1554,6 +1633,35 @@ mod tests {
         assert_eq!(audit.lengths[2].challenger_gained_token_instances, 1);
         assert!(!format!("{audit:?}").contains("三字词"));
         assert!(!format!("{audit:?}").contains("四字词语"));
+    }
+
+    #[test]
+    fn rank_probe_selection_coalesces_public_tokens_and_uses_lexicon_codes() {
+        const CORPUS: &str = "# sent_id = public-one\n\
+1\t固定短语\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t固定短语\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+3\t另个短语\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+4\t，\t_\tPUNCT\t_\t_\t1\tpunct\t_\t_\n\n";
+        let corpus = parse_ud_conllu(CORPUS).unwrap();
+        let lexicon = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+固定短语\tgu ding duan yu\t10\n\
+固定短语\tgu ding duan ju\t20\n\
+三个字\tsan ge zi\t30\n",
+        )
+        .unwrap();
+
+        let selection = select_public_lexicon_rank_probes(&corpus, &lexicon, 4);
+        assert_eq!(selection.source_unique_tokens, 2);
+        assert_eq!(selection.source_token_instances, 3);
+        assert_eq!(selection.matched_token_instances, 2);
+        assert_eq!(selection.probes.len(), 1);
+        assert_eq!(selection.probes[0].expected_text, "固定短语");
+        assert_eq!(selection.probes[0].instances, 2);
+        assert_eq!(
+            selection.probes[0].observed.as_str(),
+            lexicon[1].code.as_str()
+        );
     }
 
     #[test]
