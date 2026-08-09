@@ -46,17 +46,17 @@ mod windows_app {
         BS_DEFPUSHBUTTON, BS_OWNERDRAW, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT,
         CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
         DrawIconEx, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE, ES_READONLY, ES_WANTRETURN, FindWindowW,
-        GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU,
-        IDC_ARROW, IDI_APPLICATION, IDYES, IMAGE_ICON, IsDialogMessageW, LB_ADDSTRING,
-        LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS,
-        LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LR_DEFAULTCOLOR, LoadCursorW,
-        LoadIconW, LoadImageW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-        MB_YESNO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
-        SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORLISTBOX,
-        WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSW,
-        WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU,
-        WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        GWL_STYLE, GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
+        GetWindowTextW, HMENU, IDC_ARROW, IDI_APPLICATION, IDYES, IMAGE_ICON, IsDialogMessageW,
+        LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
+        LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LR_DEFAULTCOLOR,
+        LoadCursorW, LoadIconW, LoadImageW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION,
+        MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
+        RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW,
+        ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
+        WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT,
+        WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_COMPOSITED,
+        WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
     use ziranma_core::{
@@ -93,6 +93,8 @@ mod windows_app {
     const MANAGER_TRASH_VIEW_ID: i32 = 117;
     const MANAGER_RESTORE_ID: i32 = 118;
     const MANAGER_MOVE_TO_TRASH_ID: i32 = 119;
+    const MANAGER_ACTIVE_VIEW_ID: i32 = 120;
+    const MANAGER_SEARCH_LABEL_ID: i32 = 121;
     const NOTE_CATEGORY_ID: i32 = 201;
     const NOTE_EDIT_ID: i32 = 202;
     const NOTE_SAVE_ID: i32 = 203;
@@ -117,16 +119,27 @@ mod windows_app {
     static MANAGER_STATE: Mutex<Option<ManagerState>> = Mutex::new(None);
     static NOTE_TARGET: Mutex<Option<NoteTarget>> = Mutex::new(None);
 
+    #[derive(Clone)]
     struct ManagerRecord {
         info: WishPackageInfo,
         note: Option<WishNote>,
         note_unavailable: bool,
     }
 
+    #[derive(Clone)]
+    struct CachedManagerView {
+        view: ManagerView,
+        records: Vec<ManagerRecord>,
+        selected_id: Option<String>,
+    }
+
     struct ManagerState {
         root: PathBuf,
         view: ManagerView,
+        active_count: Option<usize>,
+        trash_count: Option<usize>,
         records: Vec<ManagerRecord>,
+        cached_view: Option<CachedManagerView>,
         visible_indices: Vec<usize>,
         selected: Option<usize>,
         show_context: bool,
@@ -149,22 +162,15 @@ mod windows_app {
 
         fn description(self) -> &'static str {
             match self {
-                Self::Active => "在输入法里输入 xuy 后按 Tab 留下现场；这里负责查看和整理。",
-                Self::Trash => "这里保留已移走的加密记录；恢复前不会重新进入许愿列表。",
-            }
-        }
-
-        fn switch_label(self) -> &'static str {
-            match self {
-                Self::Active => "回收站",
-                Self::Trash => "返回记录",
+                Self::Active => "输入 xuy 后按 Tab 留下刚才的情况；在这里查看、整理或暂存记录。",
+                Self::Trash => "已移走的记录暂存在这里；恢复后会回到许愿记录。",
             }
         }
 
         fn empty_title(self) -> &'static str {
             match self {
                 Self::Active => "猫猫正在听",
-                Self::Trash => "回收站是空的",
+                Self::Trash => "回收站里还没有记录",
             }
         }
 
@@ -173,7 +179,7 @@ mod windows_app {
                 Self::Active => {
                     "遇到不舒服的地方时，在输入法里输入 xuy，再按 Tab，\r\n就能把现场留在这里。"
                 }
-                Self::Trash => "移走的记录会留在这里，需要时可以再恢复。",
+                Self::Trash => "从许愿记录移走的内容会暂存在这里，需要时可以恢复。",
             }
         }
 
@@ -253,19 +259,28 @@ mod windows_app {
     enum ManagerButtonTone {
         Primary,
         Secondary,
+        Navigation,
     }
 
     fn manager_button_tone(id: i32) -> Option<ManagerButtonTone> {
         match id {
             MANAGER_EDIT_ID | MANAGER_RESTORE_ID | NOTE_SAVE_ID => Some(ManagerButtonTone::Primary),
+            MANAGER_ACTIVE_VIEW_ID | MANAGER_TRASH_VIEW_ID => Some(ManagerButtonTone::Navigation),
             MANAGER_REFRESH_ID
             | MANAGER_CONTEXT_ID
             | MANAGER_CLEAR_FILTER_ID
-            | MANAGER_TRASH_VIEW_ID
             | MANAGER_MOVE_TO_TRASH_ID
             | NOTE_CANCEL_ID => Some(ManagerButtonTone::Secondary),
             _ => None,
         }
+    }
+
+    fn manager_navigation_button_is_active(id: i32, view: ManagerView) -> bool {
+        matches!(
+            (id, view),
+            (MANAGER_ACTIVE_VIEW_ID, ManagerView::Active)
+                | (MANAGER_TRASH_VIEW_ID, ManagerView::Trash)
+        )
     }
 
     pub fn run() -> Result<(), Box<dyn Error>> {
@@ -306,7 +321,7 @@ mod windows_app {
                 return Err("无法注册许愿整理窗口".into());
             }
             let window = CreateWindowExW(
-                WS_EX_CONTROLPARENT,
+                WS_EX_CONTROLPARENT | WS_EX_COMPOSITED,
                 class_name,
                 w!("猫猫应愿"),
                 WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
@@ -354,7 +369,7 @@ mod windows_app {
         match message {
             OPEN_MANAGER_MESSAGE => {
                 unsafe { show_manager(window) };
-                refresh_records(window, selected_wish_id());
+                force_refresh_records(window, selected_wish_id());
                 LRESULT(0)
             }
             RECORDS_CHANGED_MESSAGE => {
@@ -390,13 +405,14 @@ mod windows_app {
                 match (wparam.0 & 0xffff) as i32 {
                     MANAGER_LIST_ID => select_from_list(window),
                     MANAGER_EDIT_ID => open_note_window(window),
-                    MANAGER_REFRESH_ID => refresh_records(window, selected_wish_id()),
+                    MANAGER_REFRESH_ID => force_refresh_records(window, selected_wish_id()),
                     MANAGER_CONTEXT_ID => toggle_context(window),
                     MANAGER_SEARCH_ID | MANAGER_STATUS_FILTER_ID | MANAGER_IMPORTANCE_FILTER_ID => {
                         apply_manager_filter(window, selected_wish_id().as_deref())
                     }
                     MANAGER_CLEAR_FILTER_ID => clear_manager_filter(window),
-                    MANAGER_TRASH_VIEW_ID => switch_manager_view(window),
+                    MANAGER_ACTIVE_VIEW_ID => navigate_manager_view(window, ManagerView::Active),
+                    MANAGER_TRASH_VIEW_ID => navigate_manager_view(window, ManagerView::Trash),
                     MANAGER_RESTORE_ID => restore_selected_record(window),
                     MANAGER_MOVE_TO_TRASH_ID => move_selected_record_to_trash(window),
                     _ => {}
@@ -455,37 +471,37 @@ mod windows_app {
             .ok()
             .and_then(|state| state.as_ref().map(|state| !state.records.is_empty()))
             .unwrap_or(false);
-        if has_records {
-            unsafe {
-                draw_manager_card(
-                    hdc,
-                    RECT {
-                        left: 24,
-                        top: 140,
-                        right: 278,
-                        bottom: 494,
-                    },
-                );
-                draw_manager_card(
-                    hdc,
-                    RECT {
-                        left: 294,
-                        top: 140,
-                        right: 780,
-                        bottom: 442,
-                    },
-                );
-            }
-        } else if let Ok(module) = unsafe { GetModuleHandleW(None) }
+        unsafe {
+            draw_manager_card(
+                hdc,
+                RECT {
+                    left: 24,
+                    top: 140,
+                    right: 278,
+                    bottom: 494,
+                },
+            );
+            draw_manager_card(
+                hdc,
+                RECT {
+                    left: 294,
+                    top: 140,
+                    right: 780,
+                    bottom: 442,
+                },
+            );
+        }
+        if !has_records
+            && let Ok(module) = unsafe { GetModuleHandleW(None) }
             && let Ok(icon) = unsafe {
                 load_wishpad_illustration(
                     HINSTANCE(module.0),
                     WISHPAD_LISTENING_ICON_RESOURCE_ID,
-                    88,
+                    72,
                 )
             }
         {
-            let _ = unsafe { DrawIconEx(hdc, 358, 172, icon, 88, 88, 0, None, DI_NORMAL) };
+            let _ = unsafe { DrawIconEx(hdc, 501, 214, icon, 72, 72, 0, None, DI_NORMAL) };
             let _ = unsafe { DestroyIcon(icon) };
         }
         unsafe {
@@ -560,14 +576,19 @@ mod windows_app {
         let control = HWND(lparam.0 as *mut c_void);
         let id = unsafe { GetDlgCtrlID(control) };
         let color = COLORREF(match id {
-            MANAGER_STATUS_ID | MANAGER_DESCRIPTION_ID | MANAGER_EMPTY_BODY_ID => unsafe {
-                GetSysColor(COLOR_GRAYTEXT)
-            },
+            MANAGER_STATUS_ID
+            | MANAGER_DESCRIPTION_ID
+            | MANAGER_EMPTY_BODY_ID
+            | MANAGER_SEARCH_LABEL_ID => unsafe { GetSysColor(COLOR_GRAYTEXT) },
             _ => unsafe { GetSysColor(COLOR_WINDOWTEXT) },
         });
         let on_card = matches!(
             id,
-            MANAGER_LIST_TITLE_ID | MANAGER_DETAIL_TITLE_ID | MANAGER_DETAIL_ID
+            MANAGER_LIST_TITLE_ID
+                | MANAGER_DETAIL_TITLE_ID
+                | MANAGER_DETAIL_ID
+                | MANAGER_EMPTY_TITLE_ID
+                | MANAGER_EMPTY_BODY_ID
         );
         let background = if on_card { COLOR_WINDOW } else { COLOR_3DFACE };
         unsafe {
@@ -708,6 +729,9 @@ mod windows_app {
         };
 
         let primary = tone == ManagerButtonTone::Primary;
+        let navigation = tone == ManagerButtonTone::Navigation;
+        let navigation_active =
+            navigation && manager_navigation_button_is_active(id, current_manager_view());
         let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
         let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0;
         let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
@@ -715,6 +739,8 @@ mod windows_app {
             unsafe { GetSysColor(COLOR_HIGHLIGHT) }
         } else if disabled {
             unsafe { GetSysColor(COLOR_3DFACE) }
+        } else if navigation_active {
+            unsafe { GetSysColor(COLOR_WINDOW) }
         } else if pressed {
             0x00e8_e8e8
         } else if hot {
@@ -722,7 +748,7 @@ mod windows_app {
         } else {
             unsafe { GetSysColor(COLOR_WINDOW) }
         });
-        let border_color = COLORREF(if primary && !disabled {
+        let border_color = COLORREF(if (primary || navigation_active) && !disabled {
             unsafe { GetSysColor(COLOR_HIGHLIGHT) }
         } else {
             0x00d1_d1d1
@@ -731,6 +757,8 @@ mod windows_app {
             unsafe { GetSysColor(COLOR_GRAYTEXT) }
         } else if primary {
             unsafe { GetSysColor(COLOR_HIGHLIGHTTEXT) }
+        } else if navigation_active {
+            unsafe { GetSysColor(COLOR_HIGHLIGHT) }
         } else {
             unsafe { GetSysColor(COLOR_WINDOWTEXT) }
         });
@@ -750,6 +778,18 @@ mod windows_app {
                 8,
                 8,
             );
+        }
+        if navigation_active && !disabled {
+            let accent = unsafe { GetSysColorBrush(COLOR_HIGHLIGHT) };
+            let accent_rect = RECT {
+                left: rect.left.saturating_add(10),
+                top: rect.bottom.saturating_sub(4),
+                right: rect.right.saturating_sub(10),
+                bottom: rect.bottom.saturating_sub(1),
+            };
+            unsafe {
+                let _ = FillRect(item.hDC, &accent_rect, accent);
+            }
         }
 
         let font = load_manager_font(&MANAGER_BUTTON_FONT);
@@ -850,7 +890,7 @@ mod windows_app {
                     control_style(0),
                     24,
                     18,
-                    540,
+                    420,
                     30,
                     Some(window),
                     Some(control_menu(MANAGER_TITLE_ID)),
@@ -878,11 +918,27 @@ mod windows_app {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("BUTTON"),
+                    w!("许愿记录"),
+                    control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
+                    478,
+                    21,
+                    104,
+                    32,
+                    Some(window),
+                    Some(control_menu(MANAGER_ACTIVE_VIEW_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
                     w!("回收站"),
                     control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
-                    594,
+                    590,
                     21,
-                    92,
+                    96,
                     32,
                     Some(window),
                     Some(control_menu(MANAGER_TRASH_VIEW_ID)),
@@ -912,9 +968,9 @@ mod windows_app {
                     w!("EDIT"),
                     PCWSTR::null(),
                     control_style(ES_LEFT | WS_TABSTOP.0 as i32),
-                    24,
+                    70,
                     90,
-                    250,
+                    204,
                     30,
                     Some(window),
                     Some(control_menu(MANAGER_SEARCH_ID)),
@@ -1142,9 +1198,9 @@ mod windows_app {
                     w!("STATIC"),
                     w!("猫猫正在听"),
                     control_style(SS_CENTER.0 as i32),
-                    100,
-                    274,
-                    604,
+                    330,
+                    296,
+                    414,
                     32,
                     Some(window),
                     Some(control_menu(MANAGER_EMPTY_TITLE_ID)),
@@ -1160,12 +1216,28 @@ mod windows_app {
                         "遇到不舒服的地方时，在输入法里输入 xuy，再按 Tab，\r\n就能把现场留在这里。"
                     ),
                     control_style(SS_CENTER.0 as i32),
-                    120,
-                    314,
-                    564,
+                    330,
+                    334,
+                    414,
                     58,
                     Some(window),
                     Some(control_menu(MANAGER_EMPTY_BODY_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("搜索"),
+                    control_style(0),
+                    24,
+                    94,
+                    42,
+                    24,
+                    Some(window),
+                    Some(control_menu(MANAGER_SEARCH_LABEL_ID)),
                     instance,
                     None,
                 )
@@ -1181,6 +1253,7 @@ mod windows_app {
             body_font,
             button_font,
             button_font,
+            button_font,
             body_font,
             body_font,
             body_font,
@@ -1196,6 +1269,7 @@ mod windows_app {
             body_font,
             heading_font,
             body_font,
+            body_font,
         ]) {
             let _ = unsafe {
                 SendMessageW(
@@ -1208,7 +1282,7 @@ mod windows_app {
         }
         let _ = unsafe {
             SendMessageW(
-                controls[9],
+                controls[10],
                 LB_SETITEMHEIGHT,
                 Some(WPARAM(0)),
                 Some(LPARAM(58)),
@@ -1216,34 +1290,22 @@ mod windows_app {
         };
         let _ = unsafe {
             SendMessageW(
-                controls[4],
+                controls[5],
                 EDIT_SET_LIMIT_TEXT,
                 Some(WPARAM(MANAGER_SEARCH_CHARACTER_LIMIT)),
                 None,
             )
         };
-        let cue = wide("搜索说明或整理标签");
+        let cue = wide("说明或整理标签");
         let _ = unsafe {
             SendMessageW(
-                controls[4],
+                controls[5],
                 EDIT_SET_CUE_BANNER,
                 Some(WPARAM(1)),
                 Some(LPARAM(cue.as_ptr() as isize)),
             )
         };
         for label in ["全部状态", "待整理", "处理中", "已完成"] {
-            let text = wide(label);
-            let _ = unsafe {
-                SendMessageW(
-                    controls[5],
-                    CB_ADDSTRING,
-                    None,
-                    Some(LPARAM(text.as_ptr() as isize)),
-                )
-            };
-        }
-        let _ = unsafe { SendMessageW(controls[5], CB_SETCURSEL, Some(WPARAM(0)), None) };
-        for label in ["全部记录", "只看普通", "只看重要"] {
             let text = wide(label);
             let _ = unsafe {
                 SendMessageW(
@@ -1255,6 +1317,18 @@ mod windows_app {
             };
         }
         let _ = unsafe { SendMessageW(controls[6], CB_SETCURSEL, Some(WPARAM(0)), None) };
+        for label in ["全部记录", "只看普通", "只看重要"] {
+            let text = wide(label);
+            let _ = unsafe {
+                SendMessageW(
+                    controls[7],
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                )
+            };
+        }
+        let _ = unsafe { SendMessageW(controls[7], CB_SETCURSEL, Some(WPARAM(0)), None) };
         if let Ok(restore) = unsafe { GetDlgItem(Some(window), MANAGER_RESTORE_ID) } {
             let _ = unsafe { ShowWindow(restore, SW_HIDE) };
         }
@@ -1318,6 +1392,11 @@ mod windows_app {
         refresh_records_for_view(window, current_manager_view(), preserve_id);
     }
 
+    fn force_refresh_records(window: HWND, preserve_id: Option<String>) {
+        clear_cached_manager_view();
+        refresh_records(window, preserve_id);
+    }
+
     fn refresh_records_for_view(window: HWND, view: ManagerView, preserve_id: Option<String>) {
         apply_manager_view_chrome(window, view);
         let Some(root) = std::env::current_exe()
@@ -1336,6 +1415,7 @@ mod windows_app {
             set_empty_state(window, true);
             apply_manager_view_chrome(window, view);
             set_manager_status(window, "无法定位本项目的许愿目录");
+            invalidate_manager_window(window);
             return;
         };
         let packages = match match view {
@@ -1357,8 +1437,23 @@ mod windows_app {
                 set_empty_state(window, true);
                 apply_manager_view_chrome(window, view);
                 set_manager_status(window, "暂时无法读取许愿记录");
+                invalidate_manager_window(window);
                 return;
             }
+        };
+        let (active_count, trash_count) = match view {
+            ManagerView::Active => (
+                Some(packages.len()),
+                list_trashed_wish_packages(&root)
+                    .ok()
+                    .map(|packages| packages.len()),
+            ),
+            ManagerView::Trash => (
+                list_wish_packages(&root)
+                    .ok()
+                    .map(|packages| packages.len()),
+                Some(packages.len()),
+            ),
         };
         let records = packages
             .into_iter()
@@ -1391,11 +1486,15 @@ mod windows_app {
             })
             .collect::<Vec<_>>();
         let empty = records.is_empty();
+        let cached_view = cached_manager_view_for_reload(&root, view);
         if let Ok(mut state) = MANAGER_STATE.lock() {
             *state = Some(ManagerState {
                 root,
                 view,
+                active_count,
+                trash_count,
                 records,
+                cached_view,
                 visible_indices: Vec::new(),
                 selected: None,
                 show_context: false,
@@ -1408,12 +1507,90 @@ mod windows_app {
         set_empty_state(window, empty);
         apply_manager_view_chrome(window, view);
         apply_manager_filter(window, preserve_id.as_deref());
+        invalidate_manager_window(window);
+    }
+
+    fn cached_manager_view_for_reload(
+        root: &Path,
+        reloaded_view: ManagerView,
+    ) -> Option<CachedManagerView> {
+        MANAGER_STATE.lock().ok().and_then(|state| {
+            let state = state.as_ref()?;
+            if state.root != root {
+                return None;
+            }
+            if state.view == reloaded_view {
+                return state.cached_view.clone();
+            }
+            Some(CachedManagerView {
+                view: state.view,
+                records: state.records.clone(),
+                selected_id: selected_wish_id_from_state(state),
+            })
+        })
+    }
+
+    fn selected_wish_id_from_state(state: &ManagerState) -> Option<String> {
+        state
+            .selected
+            .and_then(|index| state.records.get(index))
+            .map(|record| record.info.id().to_owned())
+    }
+
+    fn activate_cached_manager_view(window: HWND, view: ManagerView) -> bool {
+        let switched = MANAGER_STATE.lock().ok().and_then(|mut state| {
+            let state = state.as_mut()?;
+            let cached = state.cached_view.take()?;
+            if cached.view != view {
+                state.cached_view = Some(cached);
+                return None;
+            }
+            let prior_view = state.view;
+            let prior_selected_id = selected_wish_id_from_state(state);
+            let prior_records = std::mem::replace(&mut state.records, cached.records);
+            let prior = CachedManagerView {
+                view: prior_view,
+                records: prior_records,
+                selected_id: prior_selected_id,
+            };
+            state.view = view;
+            state.cached_view = Some(prior);
+            state.visible_indices.clear();
+            state.selected = None;
+            state.show_context = false;
+            Some((state.records.is_empty(), cached.selected_id))
+        });
+        let Some((empty, preserve_id)) = switched else {
+            return false;
+        };
+        if empty {
+            set_control_text(window, MANAGER_EMPTY_TITLE_ID, view.empty_title());
+            set_control_text(window, MANAGER_EMPTY_BODY_ID, view.empty_body());
+        }
+        set_empty_state(window, empty);
+        apply_manager_view_chrome(window, view);
+        apply_manager_filter(window, preserve_id.as_deref());
+        invalidate_manager_window(window);
+        true
+    }
+
+    fn invalidate_manager_window(window: HWND) {
+        unsafe {
+            let _ = InvalidateRect(Some(window), None, false);
+        }
+    }
+
+    fn clear_cached_manager_view() {
+        if let Ok(mut state) = MANAGER_STATE.lock()
+            && let Some(state) = state.as_mut()
+        {
+            state.cached_view = None;
+        }
     }
 
     fn apply_manager_view_chrome(window: HWND, view: ManagerView) {
         set_control_text(window, MANAGER_TITLE_ID, view.title());
         set_control_text(window, MANAGER_DESCRIPTION_ID, view.description());
-        set_control_text(window, MANAGER_TRASH_VIEW_ID, view.switch_label());
         set_control_text(
             window,
             MANAGER_DETAIL_TITLE_ID,
@@ -1422,11 +1599,29 @@ mod windows_app {
                 ManagerView::Trash => "回收站详情",
             },
         );
-        let has_records = MANAGER_STATE
+        let (has_records, active_count, trash_count) = MANAGER_STATE
             .lock()
             .ok()
-            .and_then(|state| state.as_ref().map(|state| !state.records.is_empty()))
-            .unwrap_or(false);
+            .and_then(|state| {
+                state.as_ref().map(|state| {
+                    (
+                        !state.records.is_empty(),
+                        state.active_count,
+                        state.trash_count,
+                    )
+                })
+            })
+            .unwrap_or((false, None, None));
+        set_control_text(
+            window,
+            MANAGER_ACTIVE_VIEW_ID,
+            &manager_navigation_label(ManagerView::Active, active_count),
+        );
+        set_control_text(
+            window,
+            MANAGER_TRASH_VIEW_ID,
+            &manager_navigation_label(ManagerView::Trash, trash_count),
+        );
         for (id, visible) in [
             (MANAGER_EDIT_ID, view == ManagerView::Active && has_records),
             (
@@ -1438,21 +1633,25 @@ mod windows_app {
                 view == ManagerView::Trash && has_records,
             ),
         ] {
-            if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
-                let _ = unsafe { ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE }) };
-            }
-        }
-        unsafe {
-            let _ = InvalidateRect(Some(window), None, true);
+            set_control_visible(window, id, visible);
         }
     }
 
-    fn switch_manager_view(window: HWND) {
-        let view = match current_manager_view() {
-            ManagerView::Active => ManagerView::Trash,
-            ManagerView::Trash => ManagerView::Active,
+    fn manager_navigation_label(view: ManagerView, count: Option<usize>) -> String {
+        let label = match view {
+            ManagerView::Active => "许愿记录",
+            ManagerView::Trash => "回收站",
         };
-        refresh_records_for_view(window, view, None);
+        count.map_or_else(|| label.to_owned(), |count| format!("{label} {count}"))
+    }
+
+    fn navigate_manager_view(window: HWND, view: ManagerView) {
+        if current_manager_view() == view {
+            return;
+        }
+        if !activate_cached_manager_view(window, view) {
+            refresh_records_for_view(window, view, None);
+        }
     }
 
     fn move_selected_record_to_trash(window: HWND) {
@@ -1487,6 +1686,7 @@ mod windows_app {
         }
         match move_wish_to_trash(&root, &wish_id) {
             Ok(()) => {
+                clear_cached_manager_view();
                 refresh_records_for_view(window, ManagerView::Active, preserve_id);
                 if manager_total_record_count() == 0 {
                     set_control_text(window, MANAGER_EMPTY_TITLE_ID, "已放进回收站");
@@ -1554,6 +1754,7 @@ mod windows_app {
         };
         match restore_wish_from_trash(&root, &wish_id, &WindowsUserDataProtector) {
             Ok(()) => {
+                clear_cached_manager_view();
                 refresh_records_for_view(window, ManagerView::Active, Some(wish_id));
                 set_manager_status(window, "记录已恢复到许愿列表");
             }
@@ -1914,28 +2115,39 @@ mod windows_app {
             MANAGER_LIST_TITLE_ID,
             MANAGER_LIST_ID,
             MANAGER_DETAIL_TITLE_ID,
-            MANAGER_DETAIL_ID,
-            MANAGER_CONTEXT_ID,
-            MANAGER_EDIT_ID,
-            MANAGER_MOVE_TO_TRASH_ID,
-            MANAGER_RESTORE_ID,
             MANAGER_STATUS_ID,
+            MANAGER_SEARCH_LABEL_ID,
             MANAGER_SEARCH_ID,
             MANAGER_STATUS_FILTER_ID,
             MANAGER_IMPORTANCE_FILTER_ID,
             MANAGER_CLEAR_FILTER_ID,
         ] {
-            if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
-                let _ = unsafe { ShowWindow(control, if empty { SW_HIDE } else { SW_SHOW }) };
+            set_control_visible(window, id, true);
+        }
+        set_control_visible(window, MANAGER_DETAIL_ID, !empty);
+        set_control_visible(window, MANAGER_CONTEXT_ID, !empty);
+        if empty {
+            for id in [
+                MANAGER_EDIT_ID,
+                MANAGER_MOVE_TO_TRASH_ID,
+                MANAGER_RESTORE_ID,
+            ] {
+                set_control_visible(window, id, false);
             }
         }
         for id in [MANAGER_EMPTY_TITLE_ID, MANAGER_EMPTY_BODY_ID] {
-            if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
-                let _ = unsafe { ShowWindow(control, if empty { SW_SHOW } else { SW_HIDE }) };
-            }
+            set_control_visible(window, id, empty);
         }
-        unsafe {
-            let _ = InvalidateRect(Some(window), None, true);
+    }
+
+    fn set_control_visible(window: HWND, id: i32, visible: bool) {
+        let Ok(control) = (unsafe { GetDlgItem(Some(window), id) }) else {
+            return;
+        };
+        let has_visible_style =
+            unsafe { GetWindowLongPtrW(control, GWL_STYLE) } & WS_VISIBLE.0 as isize != 0;
+        if has_visible_style != visible {
+            let _ = unsafe { ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE }) };
         }
     }
 
@@ -1963,7 +2175,7 @@ mod windows_app {
             ),
         ] {
             if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
-                let _ = unsafe { ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE }) };
+                set_control_visible(window, id, visible);
                 let _ = unsafe { EnableWindow(control, can_act) };
             }
         }
@@ -2976,13 +3188,21 @@ mod windows_app {
         #[test]
         fn manager_views_keep_active_and_trash_language_distinct() {
             assert_eq!(ManagerView::Active.title(), "许愿记录");
-            assert_eq!(ManagerView::Active.switch_label(), "回收站");
+            assert_eq!(
+                manager_navigation_label(ManagerView::Active, Some(9)),
+                "许愿记录 9"
+            );
             assert_eq!(ManagerView::Active.list_title(3, 3, false), "所有记录　3");
             assert_eq!(ManagerView::Trash.title(), "回收站");
-            assert_eq!(ManagerView::Trash.switch_label(), "返回记录");
+            assert_eq!(
+                manager_navigation_label(ManagerView::Trash, Some(1)),
+                "回收站 1"
+            );
+            assert_eq!(manager_navigation_label(ManagerView::Trash, None), "回收站");
             assert_eq!(ManagerView::Trash.list_title(3, 2, false), "已移走记录　3");
             assert_eq!(ManagerView::Trash.list_title(3, 2, true), "筛选结果　2 / 3");
-            assert!(ManagerView::Trash.description().contains("加密记录"));
+            assert!(ManagerView::Trash.description().contains("暂存"));
+            assert!(ManagerView::Trash.description().contains("恢复"));
         }
 
         #[test]
@@ -3028,7 +3248,11 @@ mod windows_app {
             );
             assert_eq!(
                 manager_button_tone(MANAGER_TRASH_VIEW_ID),
-                Some(ManagerButtonTone::Secondary)
+                Some(ManagerButtonTone::Navigation)
+            );
+            assert_eq!(
+                manager_button_tone(MANAGER_ACTIVE_VIEW_ID),
+                Some(ManagerButtonTone::Navigation)
             );
             assert_eq!(
                 manager_button_tone(MANAGER_MOVE_TO_TRASH_ID),
@@ -3043,6 +3267,14 @@ mod windows_app {
                 Some(ManagerButtonTone::Secondary)
             );
             assert_eq!(manager_button_tone(MANAGER_STATUS_ID), None);
+            assert!(manager_navigation_button_is_active(
+                MANAGER_ACTIVE_VIEW_ID,
+                ManagerView::Active
+            ));
+            assert!(!manager_navigation_button_is_active(
+                MANAGER_TRASH_VIEW_ID,
+                ManagerView::Active
+            ));
         }
 
         #[test]
