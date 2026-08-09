@@ -83,6 +83,10 @@ mod windows_app {
     const MANAGER_LIST_TITLE_ID: i32 = 110;
     const MANAGER_EMPTY_TITLE_ID: i32 = 111;
     const MANAGER_EMPTY_BODY_ID: i32 = 112;
+    const MANAGER_SEARCH_ID: i32 = 113;
+    const MANAGER_STATUS_FILTER_ID: i32 = 114;
+    const MANAGER_IMPORTANCE_FILTER_ID: i32 = 115;
+    const MANAGER_CLEAR_FILTER_ID: i32 = 116;
     const NOTE_CATEGORY_ID: i32 = 201;
     const NOTE_EDIT_ID: i32 = 202;
     const NOTE_SAVE_ID: i32 = 203;
@@ -97,7 +101,9 @@ mod windows_app {
     const NOTE_IMPORTANCE_ID: i32 = 212;
     const NOTE_IMPORTANCE_LABEL_ID: i32 = 213;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
+    const EDIT_SET_CUE_BANNER: u32 = 0x1501;
     const NOTE_TEXT_CHARACTER_LIMIT: usize = 2_048;
+    const MANAGER_SEARCH_CHARACTER_LIMIT: usize = 128;
     static MANAGER_HEADING_FONT: AtomicIsize = AtomicIsize::new(0);
     static MANAGER_BODY_FONT: AtomicIsize = AtomicIsize::new(0);
     static MANAGER_SECTION_FONT: AtomicIsize = AtomicIsize::new(0);
@@ -114,8 +120,60 @@ mod windows_app {
     struct ManagerState {
         root: PathBuf,
         records: Vec<ManagerRecord>,
+        visible_indices: Vec<usize>,
         selected: Option<usize>,
         show_context: bool,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    struct ManagerFilter {
+        query: String,
+        review_status: Option<WishReviewStatus>,
+        importance: Option<WishImportance>,
+    }
+
+    impl ManagerFilter {
+        fn is_active(&self) -> bool {
+            !self.query.is_empty() || self.review_status.is_some() || self.importance.is_some()
+        }
+
+        fn matches(&self, note: Option<&WishNote>, note_unavailable: bool) -> bool {
+            let (review_status, importance) = match note {
+                Some(note) => (Some(note.review_status()), Some(note.importance())),
+                None if !note_unavailable => {
+                    (Some(WishReviewStatus::Inbox), Some(WishImportance::Normal))
+                }
+                None => (None, None),
+            };
+            if self
+                .review_status
+                .is_some_and(|expected| review_status != Some(expected))
+                || self
+                    .importance
+                    .is_some_and(|expected| importance != Some(expected))
+            {
+                return false;
+            }
+            if self.query.is_empty() {
+                return true;
+            }
+            let mut fields = Vec::new();
+            if note_unavailable {
+                fields.push("说明暂时不可用".to_owned());
+            } else if let Some(note) = note {
+                fields.push(category_label(note.category()).to_owned());
+                fields.push(review_status_label(note.review_status()).to_owned());
+                fields.push(importance_label(note.importance()).to_owned());
+                fields.push(note.text().to_owned());
+            } else {
+                fields.push("待整理".to_owned());
+                fields.push("普通".to_owned());
+                fields.push("待补充说明".to_owned());
+            }
+            fields
+                .into_iter()
+                .any(|field| field.to_lowercase().contains(&self.query))
+        }
     }
 
     #[derive(Clone)]
@@ -135,7 +193,7 @@ mod windows_app {
     fn manager_button_tone(id: i32) -> Option<ManagerButtonTone> {
         match id {
             MANAGER_EDIT_ID | NOTE_SAVE_ID => Some(ManagerButtonTone::Primary),
-            MANAGER_REFRESH_ID | MANAGER_CONTEXT_ID | NOTE_CANCEL_ID => {
+            MANAGER_REFRESH_ID | MANAGER_CONTEXT_ID | MANAGER_CLEAR_FILTER_ID | NOTE_CANCEL_ID => {
                 Some(ManagerButtonTone::Secondary)
             }
             _ => None,
@@ -187,7 +245,7 @@ mod windows_app {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 820,
-                560,
+                610,
                 None,
                 None,
                 Some(instance),
@@ -266,6 +324,10 @@ mod windows_app {
                     MANAGER_EDIT_ID => open_note_window(window),
                     MANAGER_REFRESH_ID => refresh_records(window, selected_wish_id()),
                     MANAGER_CONTEXT_ID => toggle_context(window),
+                    MANAGER_SEARCH_ID | MANAGER_STATUS_FILTER_ID | MANAGER_IMPORTANCE_FILTER_ID => {
+                        apply_manager_filter(window, selected_wish_id().as_deref())
+                    }
+                    MANAGER_CLEAR_FILTER_ID => clear_manager_filter(window),
                     _ => {}
                 }
                 LRESULT(0)
@@ -328,18 +390,18 @@ mod windows_app {
                     hdc,
                     RECT {
                         left: 24,
-                        top: 98,
+                        top: 140,
                         right: 278,
-                        bottom: 452,
+                        bottom: 494,
                     },
                 );
                 draw_manager_card(
                     hdc,
                     RECT {
                         left: 294,
-                        top: 98,
+                        top: 140,
                         right: 780,
-                        bottom: 400,
+                        bottom: 442,
                     },
                 );
             }
@@ -352,7 +414,7 @@ mod windows_app {
                 )
             }
         {
-            let _ = unsafe { DrawIconEx(hdc, 358, 130, icon, 88, 88, 0, None, DI_NORMAL) };
+            let _ = unsafe { DrawIconEx(hdc, 358, 172, icon, 88, 88, 0, None, DI_NORMAL) };
             let _ = unsafe { DestroyIcon(icon) };
         }
         unsafe {
@@ -483,7 +545,11 @@ mod windows_app {
             return true;
         };
         let lines = MANAGER_STATE.lock().ok().and_then(|state| {
-            let record = state.as_ref()?.records.get(index)?;
+            let state = state.as_ref()?;
+            let record = state
+                .visible_indices
+                .get(index)
+                .and_then(|index| state.records.get(*index))?;
             Some(manager_record_lines(record, SystemTime::now()))
         });
         let Some((primary, secondary)) = lines else {
@@ -755,12 +821,84 @@ mod windows_app {
             },
             unsafe {
                 CreateWindowExW(
+                    WS_EX_CLIENTEDGE,
+                    w!("EDIT"),
+                    PCWSTR::null(),
+                    control_style(ES_LEFT | WS_TABSTOP.0 as i32),
+                    24,
+                    90,
+                    250,
+                    30,
+                    Some(window),
+                    Some(control_menu(MANAGER_SEARCH_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("COMBOBOX"),
+                    PCWSTR::null(),
+                    control_style(
+                        windows::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST
+                            | windows::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS
+                            | WS_TABSTOP.0 as i32,
+                    ),
+                    286,
+                    88,
+                    148,
+                    180,
+                    Some(window),
+                    Some(control_menu(MANAGER_STATUS_FILTER_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("COMBOBOX"),
+                    PCWSTR::null(),
+                    control_style(
+                        windows::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST
+                            | windows::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS
+                            | WS_TABSTOP.0 as i32,
+                    ),
+                    446,
+                    88,
+                    136,
+                    160,
+                    Some(window),
+                    Some(control_menu(MANAGER_IMPORTANCE_FILTER_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
+                    w!("清除筛选"),
+                    control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
+                    594,
+                    88,
+                    92,
+                    32,
+                    Some(window),
+                    Some(control_menu(MANAGER_CLEAR_FILTER_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("STATIC"),
                     w!("所有记录"),
                     control_style(0),
                     40,
-                    114,
+                    156,
                     222,
                     24,
                     Some(window),
@@ -783,7 +921,7 @@ mod windows_app {
                             | WS_VSCROLL.0 as i32,
                     ),
                     32,
-                    144,
+                    186,
                     238,
                     296,
                     Some(window),
@@ -799,7 +937,7 @@ mod windows_app {
                     w!("记录详情"),
                     control_style(0),
                     310,
-                    114,
+                    156,
                     454,
                     24,
                     Some(window),
@@ -822,7 +960,7 @@ mod windows_app {
                             | WS_VSCROLL.0 as i32,
                     ),
                     306,
-                    144,
+                    186,
                     462,
                     240,
                     Some(window),
@@ -838,7 +976,7 @@ mod windows_app {
                     w!("展开前后记录"),
                     control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
                     294,
-                    417,
+                    459,
                     150,
                     32,
                     Some(window),
@@ -854,7 +992,7 @@ mod windows_app {
                     w!("整理这条记录…"),
                     control_style(BS_OWNERDRAW | BS_DEFPUSHBUTTON | WS_TABSTOP.0 as i32),
                     630,
-                    417,
+                    459,
                     150,
                     32,
                     Some(window),
@@ -870,7 +1008,7 @@ mod windows_app {
                     w!("正在读取本机许愿记录…"),
                     control_style(0),
                     24,
-                    478,
+                    520,
                     756,
                     24,
                     Some(window),
@@ -886,7 +1024,7 @@ mod windows_app {
                     w!("猫猫正在听"),
                     control_style(SS_CENTER.0 as i32),
                     100,
-                    232,
+                    274,
                     604,
                     32,
                     Some(window),
@@ -904,7 +1042,7 @@ mod windows_app {
                     ),
                     control_style(SS_CENTER.0 as i32),
                     120,
-                    272,
+                    314,
                     564,
                     58,
                     Some(window),
@@ -921,6 +1059,10 @@ mod windows_app {
         let controls = controls.into_iter().map(Result::unwrap).collect::<Vec<_>>();
         for (control, font) in controls.iter().zip([
             heading_font,
+            body_font,
+            button_font,
+            body_font,
+            body_font,
             body_font,
             button_font,
             section_font,
@@ -944,12 +1086,53 @@ mod windows_app {
         }
         let _ = unsafe {
             SendMessageW(
-                controls[4],
+                controls[8],
                 LB_SETITEMHEIGHT,
                 Some(WPARAM(0)),
                 Some(LPARAM(58)),
             )
         };
+        let _ = unsafe {
+            SendMessageW(
+                controls[3],
+                EDIT_SET_LIMIT_TEXT,
+                Some(WPARAM(MANAGER_SEARCH_CHARACTER_LIMIT)),
+                None,
+            )
+        };
+        let cue = wide("搜索说明或整理标签");
+        let _ = unsafe {
+            SendMessageW(
+                controls[3],
+                EDIT_SET_CUE_BANNER,
+                Some(WPARAM(1)),
+                Some(LPARAM(cue.as_ptr() as isize)),
+            )
+        };
+        for label in ["全部状态", "待整理", "处理中", "已完成"] {
+            let text = wide(label);
+            let _ = unsafe {
+                SendMessageW(
+                    controls[4],
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                )
+            };
+        }
+        let _ = unsafe { SendMessageW(controls[4], CB_SETCURSEL, Some(WPARAM(0)), None) };
+        for label in ["全部记录", "只看普通", "只看重要"] {
+            let text = wide(label);
+            let _ = unsafe {
+                SendMessageW(
+                    controls[5],
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                )
+            };
+        }
+        let _ = unsafe { SendMessageW(controls[5], CB_SETCURSEL, Some(WPARAM(0)), None) };
         true
     }
 
@@ -969,7 +1152,11 @@ mod windows_app {
         MANAGER_STATE
             .lock()
             .ok()
-            .and_then(|state| state.as_ref().map(|state| !state.records.is_empty()))
+            .and_then(|state| {
+                state
+                    .as_ref()
+                    .map(|state| !state.visible_indices.is_empty())
+            })
             .unwrap_or(false)
     }
 
@@ -1052,24 +1239,16 @@ mod windows_app {
                 },
             )
             .collect::<Vec<_>>();
-        let selected = preserve_id
-            .as_deref()
-            .and_then(|id| records.iter().position(|record| record.info.id() == id))
-            .or_else(|| (!records.is_empty()).then_some(0));
-        let labels = records
-            .iter()
-            .map(|record| manager_record_label(record, SystemTime::now()))
-            .collect::<Vec<_>>();
-
+        let empty = records.is_empty();
         if let Ok(mut state) = MANAGER_STATE.lock() {
             *state = Some(ManagerState {
                 root,
                 records,
-                selected,
+                visible_indices: Vec::new(),
+                selected: None,
                 show_context: false,
             });
         }
-        let empty = labels.is_empty();
         if empty {
             set_control_text(window, MANAGER_EMPTY_TITLE_ID, "猫猫正在听");
             set_control_text(
@@ -1079,6 +1258,100 @@ mod windows_app {
             );
         }
         set_empty_state(window, empty);
+        apply_manager_filter(window, preserve_id.as_deref());
+    }
+
+    fn manager_filter_from_controls(window: HWND) -> ManagerFilter {
+        let query = manager_control_text(window, MANAGER_SEARCH_ID)
+            .trim()
+            .to_lowercase();
+        let review_status = match manager_combo_index(window, MANAGER_STATUS_FILTER_ID) {
+            Some(1) => Some(WishReviewStatus::Inbox),
+            Some(2) => Some(WishReviewStatus::InProgress),
+            Some(3) => Some(WishReviewStatus::Resolved),
+            _ => None,
+        };
+        let importance = match manager_combo_index(window, MANAGER_IMPORTANCE_FILTER_ID) {
+            Some(1) => Some(WishImportance::Normal),
+            Some(2) => Some(WishImportance::Important),
+            _ => None,
+        };
+        ManagerFilter {
+            query,
+            review_status,
+            importance,
+        }
+    }
+
+    fn manager_control_text(window: HWND, id: i32) -> String {
+        let Ok(control) = (unsafe { GetDlgItem(Some(window), id) }) else {
+            return String::new();
+        };
+        let length = unsafe { GetWindowTextLengthW(control) };
+        let Ok(length) = usize::try_from(length) else {
+            return String::new();
+        };
+        let mut buffer = vec![0_u16; length.min(MANAGER_SEARCH_CHARACTER_LIMIT).saturating_add(1)];
+        let copied = unsafe { GetWindowTextW(control, &mut buffer) };
+        usize::try_from(copied)
+            .ok()
+            .and_then(|copied| String::from_utf16(&buffer[..copied]).ok())
+            .unwrap_or_default()
+    }
+
+    fn manager_combo_index(window: HWND, id: i32) -> Option<usize> {
+        let control = unsafe { GetDlgItem(Some(window), id) }.ok()?;
+        usize::try_from(unsafe { SendMessageW(control, CB_GETCURSEL, None, None) }.0).ok()
+    }
+
+    fn apply_manager_filter(window: HWND, preserve_id: Option<&str>) {
+        let filter = manager_filter_from_controls(window);
+        let now = SystemTime::now();
+        let Some((labels, selected_list_index, total, visible)) =
+            MANAGER_STATE.lock().ok().and_then(|mut state| {
+                let state = state.as_mut()?;
+                state.visible_indices = state
+                    .records
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, record)| {
+                        filter
+                            .matches(record.note.as_ref(), record.note_unavailable)
+                            .then_some(index)
+                    })
+                    .collect();
+                let selected = preserve_id
+                    .and_then(|id| {
+                        state
+                            .visible_indices
+                            .iter()
+                            .copied()
+                            .find(|index| state.records[*index].info.id() == id)
+                    })
+                    .or_else(|| state.visible_indices.first().copied());
+                state.selected = selected;
+                state.show_context = false;
+                let labels = state
+                    .visible_indices
+                    .iter()
+                    .map(|index| manager_record_label(&state.records[*index], now))
+                    .collect::<Vec<_>>();
+                let selected_list_index = selected.and_then(|selected| {
+                    state
+                        .visible_indices
+                        .iter()
+                        .position(|index| *index == selected)
+                });
+                Some((
+                    labels,
+                    selected_list_index,
+                    state.records.len(),
+                    state.visible_indices.len(),
+                ))
+            })
+        else {
+            return;
+        };
         if let Ok(list) = unsafe { GetDlgItem(Some(window), MANAGER_LIST_ID) } {
             let _ = unsafe { SendMessageW(list, LB_RESETCONTENT, None, None) };
             for label in &labels {
@@ -1092,19 +1365,42 @@ mod windows_app {
                     )
                 };
             }
-            if let Some(index) = selected {
+            if let Some(index) = selected_list_index {
                 let _ = unsafe { SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None) };
             }
         }
+        set_control_text(
+            window,
+            MANAGER_LIST_TITLE_ID,
+            &if filter.is_active() {
+                format!("筛选结果　{visible} / {total}")
+            } else {
+                format!("所有记录　{total}")
+            },
+        );
         set_manager_status(
             window,
-            if labels.is_empty() {
+            if total == 0 {
                 "还没有许愿记录"
+            } else if visible == 0 {
+                "没有符合筛选条件的记录"
+            } else if filter.is_active() {
+                "筛选仅在当前窗口内存中进行"
             } else {
                 "选择一条记录查看重点现场"
             },
         );
         render_selected_record(window);
+    }
+
+    fn clear_manager_filter(window: HWND) {
+        set_control_text(window, MANAGER_SEARCH_ID, "");
+        for id in [MANAGER_STATUS_FILTER_ID, MANAGER_IMPORTANCE_FILTER_ID] {
+            if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
+                let _ = unsafe { SendMessageW(control, CB_SETCURSEL, Some(WPARAM(0)), None) };
+            }
+        }
+        apply_manager_filter(window, selected_wish_id().as_deref());
     }
 
     fn manager_record_label(record: &ManagerRecord, now: SystemTime) -> String {
@@ -1154,11 +1450,13 @@ mod windows_app {
             return;
         };
         let value = unsafe { SendMessageW(list, LB_GETCURSEL, None, None) }.0;
-        let selected = usize::try_from(value).ok();
+        let selected_list_index = usize::try_from(value).ok();
         if let Ok(mut state) = MANAGER_STATE.lock()
             && let Some(state) = state.as_mut()
         {
-            state.selected = selected.filter(|index| *index < state.records.len());
+            state.selected = selected_list_index
+                .and_then(|index| state.visible_indices.get(index))
+                .copied();
             state.show_context = false;
         }
         render_selected_record(window);
@@ -1175,23 +1473,33 @@ mod windows_app {
     }
 
     fn render_selected_record(window: HWND) {
-        let selected = MANAGER_STATE.lock().ok().and_then(|state| {
-            let state = state.as_ref()?;
-            let index = state.selected?;
-            let record = state.records.get(index)?;
-            Some((
-                state.root.clone(),
-                record.info.id().to_owned(),
-                record.info.modified(),
-                record.note.clone(),
-                record.note_unavailable,
-                state.show_context,
-            ))
-        });
+        let (selected, has_records) = MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| {
+                let state = state.as_ref()?;
+                let selected = state.selected.and_then(|index| {
+                    let record = state.records.get(index)?;
+                    Some((
+                        state.root.clone(),
+                        record.info.id().to_owned(),
+                        record.info.modified(),
+                        record.note.clone(),
+                        record.note_unavailable,
+                        state.show_context,
+                    ))
+                });
+                Some((selected, !state.records.is_empty()))
+            })
+            .unwrap_or((None, false));
         let Some((root, wish_id, modified, note, note_unavailable, show_context)) = selected else {
             show_empty_details(
                 window,
-                "还没有许愿记录。\r\n\r\n遇到不舒服时，在输入法里输入 xuy，再按 Tab。",
+                if has_records {
+                    "没有符合当前筛选条件的记录。\r\n\r\n可以修改搜索内容，或者清除筛选。"
+                } else {
+                    "还没有许愿记录。\r\n\r\n遇到不舒服时，在输入法里输入 xuy，再按 Tab。"
+                },
             );
             set_manager_actions(window, false, false, false);
             return;
@@ -1283,6 +1591,10 @@ mod windows_app {
             MANAGER_CONTEXT_ID,
             MANAGER_EDIT_ID,
             MANAGER_STATUS_ID,
+            MANAGER_SEARCH_ID,
+            MANAGER_STATUS_FILTER_ID,
+            MANAGER_IMPORTANCE_FILTER_ID,
+            MANAGER_CLEAR_FILTER_ID,
         ] {
             if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
                 let _ = unsafe { ShowWindow(control, if empty { SW_HIDE } else { SW_SHOW }) };
@@ -1331,6 +1643,13 @@ mod windows_app {
             WishReviewStatus::Inbox => "待整理",
             WishReviewStatus::InProgress => "处理中",
             WishReviewStatus::Resolved => "已完成",
+        }
+    }
+
+    fn importance_label(importance: WishImportance) -> &'static str {
+        match importance {
+            WishImportance::Normal => "普通",
+            WishImportance::Important => "重要",
         }
     }
 
@@ -2242,6 +2561,63 @@ mod windows_app {
         }
 
         #[test]
+        fn manager_filter_combines_private_text_status_and_importance_in_memory() {
+            let wish_id = format!("wish-{}", "ab".repeat(32));
+            let note = WishNote::with_organization(
+                &wish_id,
+                WishCategory::Display,
+                WishReviewStatus::InProgress,
+                WishImportance::Important,
+                "候选窗偶尔闪烁",
+            )
+            .unwrap();
+            let filter = ManagerFilter {
+                query: "闪烁".to_owned(),
+                review_status: Some(WishReviewStatus::InProgress),
+                importance: Some(WishImportance::Important),
+            };
+            assert!(filter.is_active());
+            assert!(filter.matches(Some(&note), false));
+            assert!(
+                ManagerFilter {
+                    query: "显示".to_owned(),
+                    ..ManagerFilter::default()
+                }
+                .matches(Some(&note), false)
+            );
+            assert!(
+                !ManagerFilter {
+                    review_status: Some(WishReviewStatus::Resolved),
+                    ..ManagerFilter::default()
+                }
+                .matches(Some(&note), false)
+            );
+
+            assert!(
+                ManagerFilter {
+                    query: "待补充".to_owned(),
+                    review_status: Some(WishReviewStatus::Inbox),
+                    importance: Some(WishImportance::Normal),
+                }
+                .matches(None, false)
+            );
+            assert!(
+                ManagerFilter {
+                    query: "暂时不可用".to_owned(),
+                    ..ManagerFilter::default()
+                }
+                .matches(None, true)
+            );
+            assert!(
+                !ManagerFilter {
+                    importance: Some(WishImportance::Important),
+                    ..ManagerFilter::default()
+                }
+                .matches(None, true)
+            );
+        }
+
+        #[test]
         fn manager_and_note_dialog_keep_primary_and_secondary_actions_distinct() {
             assert_eq!(
                 manager_button_tone(MANAGER_EDIT_ID),
@@ -2249,6 +2625,10 @@ mod windows_app {
             );
             assert_eq!(
                 manager_button_tone(MANAGER_CONTEXT_ID),
+                Some(ManagerButtonTone::Secondary)
+            );
+            assert_eq!(
+                manager_button_tone(MANAGER_CLEAR_FILTER_ID),
                 Some(ManagerButtonTone::Secondary)
             );
             assert_eq!(
