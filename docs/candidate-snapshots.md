@@ -237,11 +237,44 @@ target\release\candidatectl.exe phrase-coverage-audit `
 | 10,000 | 71 / 90 | 7 / 7 |
 
 三档的公开 token 审计均未丢失原覆盖，但这还没有测量完整候选排序、内存、索引
-建立和首帧成本；5,000 到 10,000 条的留出增益也已经变缓。更重要的是，实际
-候选包将同时依赖基础词典与固定短语表两个文件。v2 provenance 已能同时绑定
-这两份材料，旧 v1 包也保持兼容；但固定短语实验还没有提供会逐字节验证两份
-本地来源并生成 v2 包的构建命令。因此这条路线继续保持为只读实验，不得把审计
-交集伪装成单来源发布包。
+建立和首帧成本；5,000 到 10,000 条的留出增益也已经变缓。实际短语层不仅依赖
+基础词典与固定短语表，还依赖用于排除既有词面的基础 `lexicon.tsv`；即使最终
+新增载荷恰好相同，换一份基础载荷也必须改变包的认证身份。
+
+`build-phrase-layer` 因此要求三份普通 UTF-8 材料及三组独立声明。命令先完整
+读取并逐字节核对三个 SHA-256，随后才解析基础载荷、按词面去重，并沿用来源
+权重顺序精确选取 `--entry-limit` 条；可用新增词不足时失败。三份材料共同写入
+v2 provenance，输出仍只包含新增短语层，不复制基础载荷，也不安装或切换槽位：
+
+```powershell
+target\release\candidatectl.exe build-phrase-layer `
+  --source .local\public-audit\wanxiang-fdda7afb\jichu.dict.yaml `
+  --allowlist .local\public-audit\wanxiang-fdda7afb\chengyu.txt `
+  --base-payload .local\public-audit\wanxiang-fdda7afb\package-top76300-plus-bigram-cover-v2\lexicon.tsv `
+  --output .local\public-audit\wanxiang-fdda7afb\package-phrase-layer-top10k-v1 `
+  --revision wanxiang-fdda7afb-phrase-layer-top10k-v1 `
+  --entry-limit 10000 `
+  --source-id wanxiang-jichu-fdda7afb `
+  --source-license CC-BY-4.0 `
+  --source-url https://github.com/amzxyz/rime_wanxiang `
+  --source-sha256 9d14c0c49588d63b16c554df4711bed5da822c63de9d50f4759c53542138ac00 `
+  --allowlist-id wanxiang-chengyu-fdda7afb `
+  --allowlist-license CC-BY-4.0 `
+  --allowlist-url https://github.com/amzxyz/rime_wanxiang `
+  --allowlist-sha256 0cda817d29d312d46458f884bbb9f32b8048b92fe91e99288b4804df4629cc20 `
+  --base-id ziranma-wanxiang-base-top76300-bigram-v2 `
+  --base-license CC-BY-4.0 `
+  --base-url https://github.com/hewzhew/ziranma-decoder `
+  --base-sha256 d4090b731f0aee40a06f2bbc102a447b64273caef9d775529e9e721447aa843c `
+  --public
+```
+
+输出目录必须尚不存在。哈希漂移、重复来源 ID、格式错误、配额不足或回读失败都
+不会留下一个可被误认作完整包的新目录。旧单来源 v1 包仍保持逐字节兼容。
+固定材料的 10,000 条实包为 331,550 字节，发布 SHA-256 为
+`7a868ecc3004db512a1af94dc778657c3ab447986a798b37a2883eaa866d59c6`；现有
+`inspect`、独立摘要 `verify` 与 Windows TSF 合成 `preflight` 均已通过。该验证
+没有采用、暂存、启用或安装短语层。
 
 随后新增的 `phrase-layer-audit` 会在内存中建立基础、5,000 条和 10,000 条三个
 真实 `CandidateSnapshot`，让新增目标走现有交互候选合并路径。它把新增目标与
@@ -271,7 +304,7 @@ target\release\candidatectl.exe phrase-layer-audit `
 48 个预热公开码各重复五次时，基础、5,000 和 10,000 条路径的 median 分别约
 34.17/33.88/33.68 ms，P95 约 42.84/44.07/42.58 ms，分布没有显示稳定的层间
 延迟差异。这些结构计数不是实际堆内存，候选查询也不是 TSF 窗口首帧；宿主加载
-后的进程增量、首次绘制和具体实验包的双文件逐字节验证仍是发布前门槛。因此本轮只能说明
+后的进程增量、首次绘制和具体实验包的三材料逐字节验证仍是发布前门槛。因此本轮只能说明
 10,000 条在该公开留出上有额外召回且未触发固定负对照，不能据此直接换代。
 
 ```powershell

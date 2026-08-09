@@ -410,6 +410,11 @@ cargo run --release --bin candidatectl -- build `
   --public
 ```
 
+从公开词典与固定短语表生成补充短语层时，`build-phrase-layer` 还要求把用于
+词面去重的基础 `lexicon.tsv` 作为第三份材料逐字节认证；输出使用多来源 v2
+provenance，但只包含新增层，不复制基础载荷，也不自动安装。完整的三材料命令与
+固定万象示例见 [候选快照文档](docs/candidate-snapshots.md#同修订固定短语表审计)。
+
 `build` 会输出绑定三份包材料的“发布 SHA-256”。发布者应把它放在与候选包
 分开的可信渠道；使用者不能从同一个待验证目录读取摘要再称为可信。拿到独立
 摘要后，可以先只读验证。这个值是 `candidatectl` 对三份规范文件计算的域分隔

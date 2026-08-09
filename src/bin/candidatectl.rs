@@ -26,11 +26,12 @@ use ziranma_core::{
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CANDIDATE_SNAPSHOT_SCHEMA_V1,
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
-    CandidateSupplementalState, CharacterBigramLanguageModel, ContinuousCompositionProbe,
-    DecoderIndexStats, FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason,
-    LexiconEntry, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
-    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
-    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    CandidateSourceMaterial, CandidateSupplementalState, CharacterBigramLanguageModel,
+    ContinuousCompositionProbe, DecoderIndexStats, FourCharacterCorrectionDecision,
+    FourCharacterCorrectionKeepReason, LexiconEntry, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
+    MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
     MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
@@ -84,6 +85,7 @@ enum Options {
         declaration: PublicSourceDeclaration,
         config: PublicRimeSliceConfig,
     },
+    BuildPhraseLayer(Box<PhraseLayerBuildOptions>),
     Compare {
         base_payload: PathBuf,
         challenger_payload: PathBuf,
@@ -214,6 +216,19 @@ struct PublicSourceDeclaration {
     sha256: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PhraseLayerBuildOptions {
+    source: PathBuf,
+    allowlist: PathBuf,
+    base_payload: PathBuf,
+    output: PathBuf,
+    revision: String,
+    entry_limit: usize,
+    source_declaration: PublicSourceDeclaration,
+    allowlist_declaration: PublicSourceDeclaration,
+    base_declaration: PublicSourceDeclaration,
+}
+
 struct PreflightSummary {
     revision: String,
     input_keys: usize,
@@ -250,6 +265,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             declaration,
             config,
         } => build_rime_slice_public_package(&source, &output, &revision, &declaration, config)?,
+        Options::BuildPhraseLayer(options) => {
+            let PhraseLayerBuildOptions {
+                source,
+                allowlist,
+                base_payload,
+                output,
+                revision,
+                entry_limit,
+                source_declaration,
+                allowlist_declaration,
+                base_declaration,
+            } = *options;
+            build_phrase_layer_public_package(PhraseLayerBuildRequest {
+                source: &source,
+                allowlist: &allowlist,
+                base_payload: &base_payload,
+                output: &output,
+                revision: &revision,
+                entry_limit,
+                source_declaration: &source_declaration,
+                allowlist_declaration: &allowlist_declaration,
+                base_declaration: &base_declaration,
+            })?
+        }
         Options::Compare {
             base_payload,
             challenger_payload,
@@ -406,6 +445,7 @@ fn parse_options(
         "build" => parse_build(arguments, false),
         "build-rime" => parse_build(arguments, true),
         "build-rime-slice" => parse_build_rime_slice(arguments),
+        "build-phrase-layer" => parse_build_phrase_layer(arguments),
         "compare" => parse_compare(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
@@ -683,6 +723,105 @@ fn parse_build_rime_slice(
         },
         config,
     })
+}
+
+fn parse_build_phrase_layer(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut allowlist = None;
+    let mut base_payload = None;
+    let mut output = None;
+    let mut revision = None;
+    let mut entry_limit = None;
+    let mut source_id = None;
+    let mut source_license = None;
+    let mut source_url = None;
+    let mut source_sha256 = None;
+    let mut allowlist_id = None;
+    let mut allowlist_license = None;
+    let mut allowlist_url = None;
+    let mut allowlist_sha256 = None;
+    let mut base_id = None;
+    let mut base_license = None;
+    let mut base_url = None;
+    let mut base_sha256 = None;
+    let mut public = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--allowlist" => set_path(&mut allowlist, &mut arguments, "--allowlist")?,
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--output" => set_path(&mut output, &mut arguments, "--output")?,
+            "--revision" => set_value(&mut revision, &mut arguments, "--revision")?,
+            "--entry-limit" => set_usize(&mut entry_limit, &mut arguments, "--entry-limit")?,
+            "--source-id" => set_value(&mut source_id, &mut arguments, "--source-id")?,
+            "--source-license" => {
+                set_value(&mut source_license, &mut arguments, "--source-license")?
+            }
+            "--source-url" => set_value(&mut source_url, &mut arguments, "--source-url")?,
+            "--source-sha256" => set_value(&mut source_sha256, &mut arguments, "--source-sha256")?,
+            "--allowlist-id" => set_value(&mut allowlist_id, &mut arguments, "--allowlist-id")?,
+            "--allowlist-license" => set_value(
+                &mut allowlist_license,
+                &mut arguments,
+                "--allowlist-license",
+            )?,
+            "--allowlist-url" => set_value(&mut allowlist_url, &mut arguments, "--allowlist-url")?,
+            "--allowlist-sha256" => {
+                set_value(&mut allowlist_sha256, &mut arguments, "--allowlist-sha256")?
+            }
+            "--base-id" => set_value(&mut base_id, &mut arguments, "--base-id")?,
+            "--base-license" => set_value(&mut base_license, &mut arguments, "--base-license")?,
+            "--base-url" => set_value(&mut base_url, &mut arguments, "--base-url")?,
+            "--base-sha256" => set_value(&mut base_sha256, &mut arguments, "--base-sha256")?,
+            "--public" => {
+                if public {
+                    return Err("--public can be given only once".into());
+                }
+                public = true;
+            }
+            _ => {
+                return Err("unknown build-phrase-layer argument; value was suppressed".into());
+            }
+        }
+    }
+    if !public {
+        return Err("build-phrase-layer requires explicit --public".into());
+    }
+    let entry_limit = entry_limit.ok_or("build-phrase-layer requires --entry-limit")?;
+    if !(1..=MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES).contains(&entry_limit) {
+        return Err("build-phrase-layer --entry-limit is outside the fixed bound".into());
+    }
+    Ok(Options::BuildPhraseLayer(Box::new(
+        PhraseLayerBuildOptions {
+            source: source.ok_or("build-phrase-layer requires --source")?,
+            allowlist: allowlist.ok_or("build-phrase-layer requires --allowlist")?,
+            base_payload: base_payload.ok_or("build-phrase-layer requires --base-payload")?,
+            output: output.ok_or("build-phrase-layer requires --output")?,
+            revision: revision.ok_or("build-phrase-layer requires --revision")?,
+            entry_limit,
+            source_declaration: PublicSourceDeclaration {
+                id: source_id.ok_or("build-phrase-layer requires --source-id")?,
+                license: source_license.ok_or("build-phrase-layer requires --source-license")?,
+                url: source_url.ok_or("build-phrase-layer requires --source-url")?,
+                sha256: source_sha256.ok_or("build-phrase-layer requires --source-sha256")?,
+            },
+            allowlist_declaration: PublicSourceDeclaration {
+                id: allowlist_id.ok_or("build-phrase-layer requires --allowlist-id")?,
+                license: allowlist_license
+                    .ok_or("build-phrase-layer requires --allowlist-license")?,
+                url: allowlist_url.ok_or("build-phrase-layer requires --allowlist-url")?,
+                sha256: allowlist_sha256.ok_or("build-phrase-layer requires --allowlist-sha256")?,
+            },
+            base_declaration: PublicSourceDeclaration {
+                id: base_id.ok_or("build-phrase-layer requires --base-id")?,
+                license: base_license.ok_or("build-phrase-layer requires --base-license")?,
+                url: base_url.ok_or("build-phrase-layer requires --base-url")?,
+                sha256: base_sha256.ok_or("build-phrase-layer requires --base-sha256")?,
+            },
+        },
+    )))
 }
 
 fn parse_compare(
@@ -1263,6 +1402,9 @@ fn print_usage() {
     eprintln!(
         "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] [--three-character-coverage-entries <N>] [--four-character-coverage-entries <N>] --max-text-characters <1..12> --public"
     );
+    eprintln!(
+        "  build-phrase-layer --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --allowlist-id <ID> --allowlist-license <SPDX> --allowlist-url <HTTPS_URL> --allowlist-sha256 <SHA256> --base-id <ID> --base-license <SPDX> --base-url <HTTPS_URL> --base-sha256 <SHA256> --public"
+    );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
@@ -1416,6 +1558,118 @@ fn build_rime_slice_public_package(
     let mut report = write_public_package(output, revision, declaration, &payload)?;
     write_slice_stats(&mut report, imported.stats);
     Ok(report)
+}
+
+struct PhraseLayerBuildRequest<'a> {
+    source: &'a Path,
+    allowlist: &'a Path,
+    base_payload: &'a Path,
+    output: &'a Path,
+    revision: &'a str,
+    entry_limit: usize,
+    source_declaration: &'a PublicSourceDeclaration,
+    allowlist_declaration: &'a PublicSourceDeclaration,
+    base_declaration: &'a PublicSourceDeclaration,
+}
+
+fn build_phrase_layer_public_package(
+    request: PhraseLayerBuildRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let PhraseLayerBuildRequest {
+        source,
+        allowlist,
+        base_payload,
+        output,
+        revision,
+        entry_limit,
+        source_declaration,
+        allowlist_declaration,
+        base_declaration,
+    } = request;
+    let source_text = read_explicit_text(
+        source,
+        "public toned Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let allowlist_text = read_explicit_text(
+        allowlist,
+        "public fixed-phrase allowlist",
+        MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
+    )?;
+    let base_text = read_explicit_text(
+        base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+
+    // All three exact inputs are authenticated before an output directory can
+    // be created. The base payload affects de-duplication even though it is not
+    // copied into the supplemental phrase-layer payload.
+    let materials = vec![
+        verified_source_material(
+            source_declaration,
+            source_text.as_bytes(),
+            "public Rime source",
+        )?,
+        verified_source_material(
+            allowlist_declaration,
+            allowlist_text.as_bytes(),
+            "public fixed-phrase allowlist",
+        )?,
+        verified_source_material(
+            base_declaration,
+            base_text.as_bytes(),
+            "base public candidate payload",
+        )?,
+    ];
+
+    let base_entries = parse_lexicon_tsv(&base_text)?;
+    let imported = parse_public_rime_phrase_allowlist(
+        &source_text,
+        &allowlist_text,
+        MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
+    )?;
+    let base_surfaces = base_entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let mut available = imported
+        .entries
+        .into_iter()
+        .filter(|entry| !base_surfaces.contains(entry.text.as_str()))
+        .collect::<Vec<_>>();
+    let available_entries = available.len();
+    if available_entries < entry_limit {
+        return Err("build-phrase-layer entry limit exceeds available new public entries".into());
+    }
+    available.truncate(entry_limit);
+    let payload = serialize_lexicon_payload(&available);
+    let mut report = write_multi_source_public_package(output, revision, materials, &payload)?;
+    writeln!(
+        report,
+        "固定短语层：基础 {} 条；可用新增 {} 条；确定性选取 {} 条",
+        base_entries.len(),
+        available_entries,
+        entry_limit,
+    )?;
+    Ok(report)
+}
+
+fn verified_source_material(
+    declaration: &PublicSourceDeclaration,
+    bytes: &[u8],
+    label: &str,
+) -> Result<CandidateSourceMaterial, Box<dyn std::error::Error>> {
+    let material = CandidateSourceMaterial::new(
+        &declaration.id,
+        &declaration.license,
+        &declaration.url,
+        &declaration.sha256,
+    )?;
+    material
+        .validate_bytes(bytes)
+        .map_err(|_| format!("{label} SHA-256 does not match the explicit pin"))?;
+    Ok(material)
 }
 
 fn compare_payloads(
@@ -4329,7 +4583,6 @@ fn write_public_package(
     declaration: &PublicSourceDeclaration,
     payload: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    ensure_path_absent(output, "package output")?;
     let manifest = CandidatePackageManifest::from_payload(revision, false, payload)?;
     let manifest_text = manifest.render();
     let provenance_text = CandidatePackageProvenance::from_materials(
@@ -4341,6 +4594,32 @@ fn write_public_package(
         payload,
     )?
     .render();
+
+    write_public_package_files(output, &manifest_text, &provenance_text, payload)
+}
+
+fn write_multi_source_public_package(
+    output: &Path,
+    revision: &str,
+    materials: Vec<CandidateSourceMaterial>,
+    payload: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let manifest = CandidatePackageManifest::from_payload(revision, false, payload)?;
+    let manifest_text = manifest.render();
+    let provenance_text =
+        CandidatePackageProvenance::from_source_materials(materials, &manifest_text, payload)?
+            .render();
+
+    write_public_package_files(output, &manifest_text, &provenance_text, payload)
+}
+
+fn write_public_package_files(
+    output: &Path,
+    manifest_text: &str,
+    provenance_text: &str,
+    payload: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    ensure_path_absent(output, "package output")?;
 
     fs::create_dir(output).map_err(|_| "cannot create explicitly named package output")?;
     let build_result = (|| -> Result<LoadedPackage, Box<dyn std::error::Error>> {
@@ -5236,6 +5515,13 @@ mod tests {
     const MANIFEST: &str = include_str!("../../tests/fixtures/public/demo_candidate_manifest.zcm");
     const LEXICON: &str = include_str!("../../tests/fixtures/public/demo_lexicon.tsv");
     const RIME_LEXICON: &str = "---\nname: test\n...\n亲\tqin\t6778\n清\tqing\t6000\n請\tqing\t0\n";
+    const PHRASE_SOURCE: &str = "---\nname: public-phrases\n...\n\
+公开短语\tgōng kāi duǎn yǔ\t30\n\
+更多短语\tgèng duō duǎn yǔ\t20\n\
+已有短语\tyǐ yǒu duǎn yǔ\t10\n";
+    const PHRASE_ALLOWLIST: &str = "gkdy\t公开短语\ngddy\t更多短语\nyydy\t已有短语\n";
+    const PHRASE_BASE: &str =
+        "text\tpinyin\tfrequency\n已有短语\tyi you duan yu\t10\n基础词\tji chu ci\t9\n";
     const PROVENANCE: &str =
         include_str!("../../tests/fixtures/public/demo_candidate_provenance.zcp");
 
@@ -5245,6 +5531,15 @@ mod tests {
             license: "MPL-2.0".to_owned(),
             url: "https://github.com/hewzhew/ziranma-decoder".to_owned(),
             sha256: candidate_sha256_hex(payload.as_bytes()),
+        }
+    }
+
+    fn phrase_material_declaration(id: &str, contents: &str) -> PublicSourceDeclaration {
+        PublicSourceDeclaration {
+            id: id.to_owned(),
+            license: "CC-BY-4.0".to_owned(),
+            url: format!("https://example.com/{id}"),
+            sha256: candidate_sha256_hex(contents.as_bytes()),
         }
     }
 
@@ -5448,6 +5743,67 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn phrase_layer_build_parser_requires_all_three_public_materials() {
+        let arguments = vec![
+            "build-phrase-layer",
+            "--source",
+            "jichu.dict.yaml",
+            "--allowlist",
+            "chengyu.txt",
+            "--base-payload",
+            "base.tsv",
+            "--output",
+            "package",
+            "--revision",
+            "phrase-layer-v1",
+            "--entry-limit",
+            "10000",
+            "--source-id",
+            "wanxiang-jichu",
+            "--source-license",
+            "CC-BY-4.0",
+            "--source-url",
+            "https://example.com/jichu",
+            "--source-sha256",
+            &"1".repeat(64),
+            "--allowlist-id",
+            "wanxiang-chengyu",
+            "--allowlist-license",
+            "CC-BY-4.0",
+            "--allowlist-url",
+            "https://example.com/chengyu",
+            "--allowlist-sha256",
+            &"2".repeat(64),
+            "--base-id",
+            "ziranma-base",
+            "--base-license",
+            "CC-BY-4.0",
+            "--base-url",
+            "https://example.com/base",
+            "--base-sha256",
+            &"3".repeat(64),
+            "--public",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let Options::BuildPhraseLayer(parsed) = parse_options(arguments.clone()).unwrap() else {
+            panic!("expected build-phrase-layer options");
+        };
+        assert_eq!(parsed.entry_limit, 10000);
+
+        let without_public = arguments[..arguments.len() - 1].to_vec();
+        assert!(parse_options(without_public).is_err());
+        let without_base_hash = arguments
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ![arguments.len() - 3, arguments.len() - 2].contains(index))
+            .map(|(_, argument)| argument.clone())
+            .collect::<Vec<_>>();
+        assert!(parse_options(without_base_hash).is_err());
     }
 
     #[test]
@@ -6109,6 +6465,183 @@ mod tests {
         assert!(report.contains("源数据：4 行"));
         assert!(report.contains("字段 1"));
         assert!(report.contains("上限外 1"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_layer_build_is_deterministic_v2_and_usable_by_existing_checks() {
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let allowlist = root.join("phrases.txt");
+        let base = root.join("base.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, PHRASE_SOURCE).unwrap();
+        fs::write(&allowlist, PHRASE_ALLOWLIST).unwrap();
+        fs::write(&base, PHRASE_BASE).unwrap();
+        let source_declaration = phrase_material_declaration("dictionary", PHRASE_SOURCE);
+        let allowlist_declaration =
+            phrase_material_declaration("fixed-phrase-list", PHRASE_ALLOWLIST);
+        let base_declaration = phrase_material_declaration("base-payload", PHRASE_BASE);
+
+        let build = |output: &Path| {
+            build_phrase_layer_public_package(PhraseLayerBuildRequest {
+                source: &source,
+                allowlist: &allowlist,
+                base_payload: &base,
+                output,
+                revision: "phrase-layer-v1",
+                entry_limit: 2,
+                source_declaration: &source_declaration,
+                allowlist_declaration: &allowlist_declaration,
+                base_declaration: &base_declaration,
+            })
+        };
+        let report = build(&package_a).unwrap();
+        build(&package_b).unwrap();
+
+        let loaded = load_public_package_directory(&package_a).unwrap();
+        assert_eq!(loaded.provenance.source_count(), 3);
+        assert_eq!(loaded.snapshot.entry_count(), 2);
+        assert!(report.contains("确定性选取 2 条"));
+        for text in ["公开短语", "更多短语", "已有短语"] {
+            assert!(!report.contains(text));
+        }
+        assert_eq!(
+            inspect(
+                &package_a.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
+                &package_a.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+                &package_a.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            )
+            .unwrap(),
+            render_inspect_report(&loaded.snapshot, &loaded.provenance),
+        );
+        assert!(preflight(&package_a).unwrap().contains("结果：通过"));
+        for filename in [
+            CANDIDATE_PACKAGE_MANIFEST_FILE,
+            CANDIDATE_PACKAGE_PAYLOAD_FILE,
+            CANDIDATE_PACKAGE_PROVENANCE_FILE,
+        ] {
+            assert_eq!(
+                fs::read(package_a.join(filename)).unwrap(),
+                fs::read(package_b.join(filename)).unwrap(),
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_layer_build_checks_every_pin_before_creating_output() {
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let allowlist = root.join("phrases.txt");
+        let base = root.join("base.tsv");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, PHRASE_SOURCE).unwrap();
+        fs::write(&allowlist, PHRASE_ALLOWLIST).unwrap();
+        fs::write(&base, PHRASE_BASE).unwrap();
+
+        for changed in 0..3 {
+            let mut declarations = [
+                phrase_material_declaration("dictionary", PHRASE_SOURCE),
+                phrase_material_declaration("fixed-phrase-list", PHRASE_ALLOWLIST),
+                phrase_material_declaration("base-payload", PHRASE_BASE),
+            ];
+            declarations[changed].sha256 = "0".repeat(64);
+            let output = root.join(format!("package-{changed}"));
+            assert!(
+                build_phrase_layer_public_package(PhraseLayerBuildRequest {
+                    source: &source,
+                    allowlist: &allowlist,
+                    base_payload: &base,
+                    output: &output,
+                    revision: "phrase-layer-v1",
+                    entry_limit: 2,
+                    source_declaration: &declarations[0],
+                    allowlist_declaration: &declarations[1],
+                    base_declaration: &declarations[2],
+                })
+                .is_err()
+            );
+            assert!(!output.exists());
+        }
+
+        let declarations = [
+            phrase_material_declaration("dictionary", PHRASE_SOURCE),
+            phrase_material_declaration("fixed-phrase-list", PHRASE_ALLOWLIST),
+            phrase_material_declaration("base-payload", PHRASE_BASE),
+        ];
+        let insufficient_output = root.join("package-insufficient");
+        assert!(
+            build_phrase_layer_public_package(PhraseLayerBuildRequest {
+                source: &source,
+                allowlist: &allowlist,
+                base_payload: &base,
+                output: &insufficient_output,
+                revision: "phrase-layer-v1",
+                entry_limit: 3,
+                source_declaration: &declarations[0],
+                allowlist_declaration: &declarations[1],
+                base_declaration: &declarations[2],
+            })
+            .is_err()
+        );
+        assert!(!insufficient_output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_layer_identity_binds_base_payload_even_when_selected_text_is_unchanged() {
+        const OTHER_BASE: &str = "text\tpinyin\tfrequency\n另一个词\tling yi ge ci\t8\n";
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let allowlist = root.join("phrases.txt");
+        let base_a = root.join("base-a.tsv");
+        let base_b = root.join("base-b.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, PHRASE_SOURCE).unwrap();
+        fs::write(&allowlist, PHRASE_ALLOWLIST).unwrap();
+        fs::write(&base_a, "text\tpinyin\tfrequency\n基础词\tji chu ci\t9\n").unwrap();
+        fs::write(&base_b, OTHER_BASE).unwrap();
+        let source_declaration = phrase_material_declaration("dictionary", PHRASE_SOURCE);
+        let allowlist_declaration =
+            phrase_material_declaration("fixed-phrase-list", PHRASE_ALLOWLIST);
+        let base_a_text = fs::read_to_string(&base_a).unwrap();
+        let base_a_declaration = phrase_material_declaration("base-payload", &base_a_text);
+        let base_b_declaration = phrase_material_declaration("base-payload", OTHER_BASE);
+
+        for (base_payload, output, base_declaration) in [
+            (&base_a, &package_a, &base_a_declaration),
+            (&base_b, &package_b, &base_b_declaration),
+        ] {
+            build_phrase_layer_public_package(PhraseLayerBuildRequest {
+                source: &source,
+                allowlist: &allowlist,
+                base_payload,
+                output,
+                revision: "phrase-layer-v1",
+                entry_limit: 2,
+                source_declaration: &source_declaration,
+                allowlist_declaration: &allowlist_declaration,
+                base_declaration,
+            })
+            .unwrap();
+        }
+
+        let loaded_a = load_public_package_directory(&package_a).unwrap();
+        let loaded_b = load_public_package_directory(&package_b).unwrap();
+        assert_eq!(loaded_a.payload_text, loaded_b.payload_text);
+        assert_ne!(loaded_a.provenance_text, loaded_b.provenance_text);
+        assert_ne!(
+            loaded_a.authentication_sha256,
+            loaded_b.authentication_sha256
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
