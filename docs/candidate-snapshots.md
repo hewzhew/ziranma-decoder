@@ -315,6 +315,36 @@ allowlist，因而也不在 10,000 条短语层；`wutijc` 的“误提交”同
 包直接作逐项因果比较；它们足以否定“合并无代价即可换代”，后续需先补来源覆盖
 审计和负对照门槛。
 
+### 公开漏词分诊
+
+`diagnose-public-miss` 把一个明确声明为公开的完整双拼目标同时放到四个可核验
+层次中：固定 Rime 来源是否含相同文字与规范码、日用核心是否有完整词、补充包
+是否有完整词、两层合在一起最少需要几个完整分段，以及目标在与 TSF 相同的公开
+分层候选前 50 中实际位于哪里。它要求明确的 `--public`，拒绝私人候选包，只
+输出调用者显式给出的目标，不读取许愿、会话、个人排序或上下文：
+
+```powershell
+target\release\candidatectl.exe diagnose-public-miss `
+  --source .local\public-audit\wanxiang-fdda7afb\jichu.dict.yaml `
+  --core-package .local\candidate-rime-pinyin-simp-0c6861ef-v1 `
+  --supplemental-package .local\public-audit\wanxiang-fdda7afb\package-bigram-cover-plus-phrase-top10k-v1 `
+  --code wutijc `
+  --text 误提交 `
+  --public
+```
+
+固定来源 SHA-256 为
+`9d14c0c49588d63b16c554df4711bed5da822c63de9d50f4759c53542138ac00`。
+三条公开案例给出三个不同原因：
+
+- `bgdr → 绷断`：来源与补充包都有完整同码词，公开分层候选第 1；
+- `blklrbsv → 掰开揉碎`：来源有完整词，两层包都没有；现有三段组合仅第 22；
+- `wutijc → 误提交`：来源和两层包都没有完整词，但可由两段完整词组成，仅第 14。
+
+因此前者已经解决，第二条是构建选择缺口，第三条是组合召回/排序问题。分诊只
+陈述固定材料下的证据，不把“来源出现”当成收录建议，也不把 Top-50 外误报成
+“无法生成”。
+
 随后新增的 `phrase-layer-audit` 会在内存中建立基础、5,000 条和 10,000 条三个
 真实 `CandidateSnapshot`，让新增目标走现有交互候选合并路径。它把新增目标与
 基础稳定性对照分开，完整检查所有 10,000 条配额命中的 UD 四字目标；基础对照

@@ -108,6 +108,25 @@ pub struct PublicRimePhraseAllowlistImportStats {
     pub imported_entries: usize,
 }
 
+/// Aggregate evidence for one explicitly supplied public target identity.
+///
+/// This lookup scans one exact public source without retaining unrelated rows.
+/// It is intended to distinguish source absence from later package selection;
+/// it does not claim that source inclusion makes a target linguistically good.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicRimeTargetAudit {
+    /// Non-comment data rows observed after the Rime YAML marker.
+    pub source_rows: usize,
+    /// Rows whose text exactly matches the requested public target.
+    pub surface_rows: usize,
+    /// Matching surfaces with a positive weight and a usable full reading.
+    pub valid_surface_rows: usize,
+    /// Valid matching surfaces whose canonical full code is the requested code.
+    pub exact_code_rows: usize,
+    /// Highest public weight among exact-code rows.
+    pub highest_exact_frequency: Option<u64>,
+}
+
 /// Auditable row accounting for a large public Rime slice.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PublicRimeSliceImportStats {
@@ -720,6 +739,85 @@ pub fn parse_public_rime_phrase_allowlist(
     Ok(PublicRimePhraseAllowlistImport { entries, stats })
 }
 
+/// Finds aggregate evidence for one public text/code identity in a toned Rime source.
+///
+/// The target must contain one to twelve Han characters and the code must be one
+/// complete two-key syllable per character. Unrelated malformed source rows are
+/// ignored just as in the bounded public-slice importer.
+pub fn audit_public_rime_target(
+    contents: &str,
+    target_text: &str,
+    target_code: &str,
+) -> Result<PublicRimeTargetAudit, PublicRimeSliceError> {
+    let target_characters = target_text.chars().count();
+    if target_characters == 0
+        || target_characters > MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS
+        || !target_text.chars().all(is_han_character)
+        || target_code.len() != target_characters * 2
+        || !target_code.as_bytes().iter().all(u8::is_ascii_lowercase)
+    {
+        return Err(PublicRimeSliceError::InvalidTarget);
+    }
+
+    let mut saw_document_start = false;
+    let mut saw_data_marker = false;
+    let mut audit = PublicRimeTargetAudit::default();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if !saw_data_marker {
+            match line {
+                "---" => saw_document_start = true,
+                "..." if saw_document_start => saw_data_marker = true,
+                _ => {}
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        audit.source_rows += 1;
+        let mut fields = line.split('\t');
+        let (Some(text), Some(toned_pinyin), Some(weight), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if text != target_text {
+            continue;
+        }
+        audit.surface_rows += 1;
+        let Some(weight) = weight.parse::<u64>().ok().filter(|weight| *weight != 0) else {
+            continue;
+        };
+        let Some(encoded) = normalize_pinyin_tone_marks(toned_pinyin)
+            .ok()
+            .and_then(|pinyin| encode_pinyin_phrase(&pinyin).ok())
+            .filter(|encoded| encoded.syllable_codes.len() == target_characters)
+        else {
+            continue;
+        };
+        audit.valid_surface_rows += 1;
+        if encoded.full_code.as_str() == target_code {
+            audit.exact_code_rows += 1;
+            audit.highest_exact_frequency = Some(
+                audit
+                    .highest_exact_frequency
+                    .map_or(weight, |current| current.max(weight)),
+            );
+        }
+    }
+    if !saw_document_start {
+        return Err(PublicRimeSliceError::MissingDocumentStart);
+    }
+    if !saw_data_marker {
+        return Err(PublicRimeSliceError::MissingDataMarker);
+    }
+    if audit.source_rows == 0 {
+        return Err(PublicRimeSliceError::Empty);
+    }
+    Ok(audit)
+}
+
 /// Selects a deterministic, Han-only, exact-syllable slice from a large
 /// public Rime dictionary with Unicode tone marks.
 pub fn parse_public_rime_slice(
@@ -1077,6 +1175,8 @@ pub enum PublicRimeSliceError {
     InvalidLongWordCoverageLimit,
     /// The text-length cap is zero or above the decoder's fixed bound.
     InvalidTextLimit,
+    /// A targeted audit received non-Han text or a non-complete canonical code.
+    InvalidTarget,
     /// No YAML document start marker was found.
     MissingDocumentStart,
     /// No data marker followed the YAML document start.
@@ -1101,6 +1201,7 @@ impl fmt::Display for PublicRimeSliceError {
                 write!(formatter, "公开词表裁剪的三字、四字覆盖配额超出剩余容量")
             }
             Self::InvalidTextLimit => write!(formatter, "公开词表裁剪的文字长度上限无效"),
+            Self::InvalidTarget => write!(formatter, "公开词表目标或完整双拼码无效"),
             Self::MissingDocumentStart => write!(formatter, "公开 Rime 词表缺少 YAML 起始标记 ---"),
             Self::MissingDataMarker => write!(formatter, "公开 Rime 词表缺少数据起始标记 ..."),
             Self::Empty => write!(formatter, "公开 Rime 词表没有可裁剪的数据行"),
@@ -1370,6 +1471,54 @@ A词\ta cí\t100\n\
             )
             .unwrap_err(),
             PublicRimeSliceError::InvalidPhraseAllowlistEntryLimit
+        );
+    }
+
+    #[test]
+    fn targeted_public_lookup_separates_surface_code_and_absence() {
+        const SOURCE: &str = "---\n...\n\
+绷断\tbēng duàn\t20\n\
+绷断\tbāng duàn\t30\n\
+误提交\tunsupported!\t40\n\
+其他\tqí tā\t10\n";
+        let exact = audit_public_rime_target(SOURCE, "绷断", "bgdr").unwrap();
+        assert_eq!(exact.source_rows, 4);
+        assert_eq!(exact.surface_rows, 2);
+        assert_eq!(exact.valid_surface_rows, 2);
+        assert_eq!(exact.exact_code_rows, 1);
+        assert_eq!(exact.highest_exact_frequency, Some(20));
+
+        let missing_code = audit_public_rime_target(SOURCE, "绷断", "zzzz").unwrap();
+        assert_eq!(missing_code.surface_rows, 2);
+        assert_eq!(missing_code.exact_code_rows, 0);
+        assert_eq!(missing_code.highest_exact_frequency, None);
+
+        let invalid_reading = audit_public_rime_target(SOURCE, "误提交", "wutijc").unwrap();
+        assert_eq!(invalid_reading.surface_rows, 1);
+        assert_eq!(invalid_reading.valid_surface_rows, 0);
+        assert_eq!(invalid_reading.exact_code_rows, 0);
+
+        let absent = audit_public_rime_target(SOURCE, "掰开揉碎", "blklrbsv").unwrap();
+        assert_eq!(absent.surface_rows, 0);
+        assert_eq!(absent.exact_code_rows, 0);
+    }
+
+    #[test]
+    fn targeted_public_lookup_requires_a_complete_han_identity_and_rime_markers() {
+        const SOURCE: &str = "---\n...\n绷断\tbēng duàn\t20\n";
+        for (text, code) in [("", ""), ("A词", "ac"), ("绷断", "bgd"), ("绷断", "BGDR")] {
+            assert_eq!(
+                audit_public_rime_target(SOURCE, text, code).unwrap_err(),
+                PublicRimeSliceError::InvalidTarget
+            );
+        }
+        assert_eq!(
+            audit_public_rime_target("...\n绷断\tbēng duàn\t20\n", "绷断", "bgdr").unwrap_err(),
+            PublicRimeSliceError::MissingDocumentStart
+        );
+        assert_eq!(
+            audit_public_rime_target("---\n绷断\tbēng duàn\t20\n", "绷断", "bgdr").unwrap_err(),
+            PublicRimeSliceError::MissingDataMarker
         );
     }
 

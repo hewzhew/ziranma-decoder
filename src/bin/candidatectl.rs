@@ -40,7 +40,7 @@ use ziranma_core::{
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
     SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
     SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
-    audit_public_lexicon_token_coverage, audit_public_supplemental_layer,
+    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
@@ -91,6 +91,13 @@ enum Options {
         overlay: PathBuf,
         output: PathBuf,
         revision: String,
+    },
+    DiagnosePublicMiss {
+        source: PathBuf,
+        core_package: PathBuf,
+        supplemental_package: PathBuf,
+        code: String,
+        text: String,
     },
     Compare {
         base_payload: PathBuf,
@@ -306,6 +313,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             revision,
         } => merge_public_packages(&base, &overlay, &output, &revision)?,
+        Options::DiagnosePublicMiss {
+            source,
+            core_package,
+            supplemental_package,
+            code,
+            text,
+        } => diagnose_public_miss(&source, &core_package, &supplemental_package, &code, &text)?,
         Options::Compare {
             base_payload,
             challenger_payload,
@@ -469,6 +483,7 @@ fn parse_options(
         "build-rime-slice" => parse_build_rime_slice(arguments),
         "build-phrase-layer" => parse_build_phrase_layer(arguments),
         "merge-public-packages" => parse_merge_public_packages(arguments),
+        "diagnose-public-miss" => parse_diagnose_public_miss(arguments),
         "compare" => parse_compare(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
@@ -881,6 +896,56 @@ fn parse_merge_public_packages(
         overlay: overlay.ok_or("merge-public-packages requires --overlay")?,
         output: output.ok_or("merge-public-packages requires --output")?,
         revision: revision.ok_or("merge-public-packages requires --revision")?,
+    })
+}
+
+fn parse_diagnose_public_miss(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut core_package = None;
+    let mut supplemental_package = None;
+    let mut code = None;
+    let mut text = None;
+    let mut public = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--core-package" => set_path(&mut core_package, &mut arguments, "--core-package")?,
+            "--supplemental-package" => set_path(
+                &mut supplemental_package,
+                &mut arguments,
+                "--supplemental-package",
+            )?,
+            "--code" => set_value(&mut code, &mut arguments, "--code")?,
+            "--text" => set_value(&mut text, &mut arguments, "--text")?,
+            "--public" => {
+                if public {
+                    return Err("--public can be given only once".into());
+                }
+                public = true;
+            }
+            _ => return Err("unknown diagnose-public-miss argument; value was suppressed".into()),
+        }
+    }
+    if !public {
+        return Err("diagnose-public-miss requires explicit --public".into());
+    }
+    let code = code.ok_or("diagnose-public-miss requires --code")?;
+    if code.is_empty() || code.len() > 24 || !code.as_bytes().iter().all(u8::is_ascii_lowercase) {
+        return Err("diagnose-public-miss --code must be 1..24 lowercase ASCII letters".into());
+    }
+    let text = text.ok_or("diagnose-public-miss requires --text")?;
+    if text.is_empty() || text.len() > 48 {
+        return Err("diagnose-public-miss --text is outside the fixed UTF-8 byte bound".into());
+    }
+    Ok(Options::DiagnosePublicMiss {
+        source: source.ok_or("diagnose-public-miss requires --source")?,
+        core_package: core_package.ok_or("diagnose-public-miss requires --core-package")?,
+        supplemental_package: supplemental_package
+            .ok_or("diagnose-public-miss requires --supplemental-package")?,
+        code,
+        text,
     })
 }
 
@@ -1497,6 +1562,9 @@ fn print_usage() {
     eprintln!(
         "  merge-public-packages --base <PACKAGE_DIR> --overlay <PACKAGE_DIR> --output <NEW_PACKAGE_DIR> --revision <REV> --public"
     );
+    eprintln!(
+        "  diagnose-public-miss --source <TONED_RIME.dict.yaml> --core-package <PUBLIC_PACKAGE_DIR> --supplemental-package <PUBLIC_PACKAGE_DIR> --code <FULL_KEYS> --text <PUBLIC_TARGET> --public"
+    );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
@@ -1781,6 +1849,231 @@ struct MergedPublicLexicon {
     overlay_entries: usize,
     appended_entries: usize,
     duplicate_entries: usize,
+}
+
+const PUBLIC_MISS_VISIBLE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicMissDiagnosis {
+    WholeWordVisible {
+        rank: usize,
+    },
+    WholeWordOutsideVisible,
+    SourceWholeWordExcluded {
+        minimum_segments: Option<usize>,
+        visible_rank: Option<usize>,
+    },
+    CompositionVisible {
+        segments: usize,
+        rank: usize,
+    },
+    CompositionCrowded {
+        segments: usize,
+    },
+    Unexplained,
+}
+
+fn diagnose_public_miss(
+    source: &Path,
+    core_package: &Path,
+    supplemental_package: &Path,
+    code: &str,
+    target_text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        source,
+        "public Rime target-audit source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let source_sha256 = candidate_sha256_hex(source_text.as_bytes());
+    let source_audit = audit_public_rime_target(&source_text, target_text, code)?;
+    let core = load_public_package_directory(core_package)?;
+    let supplemental = load_public_package_directory(supplemental_package)?;
+    let mut entries = parse_lexicon_tsv(&core.payload_text)?;
+    let supplemental_entries = parse_lexicon_tsv(&supplemental.payload_text)?;
+    let core_whole_word = entries
+        .iter()
+        .any(|entry| entry.text == target_text && entry.code.as_str() == code);
+    let supplemental_whole_word = supplemental_entries
+        .iter()
+        .any(|entry| entry.text == target_text && entry.code.as_str() == code);
+    entries.extend(supplemental_entries);
+    let package_whole_word = core_whole_word || supplemental_whole_word;
+    let minimum_segments = minimum_exact_public_segments(&entries, target_text, code);
+    let candidates = layered_candidate_texts_with_consensus(
+        &core.snapshot,
+        &supplemental.snapshot,
+        code,
+        PUBLIC_MISS_VISIBLE_LIMIT,
+        SupplementalCandidateLayerConfig {
+            exact_promotions: 1,
+        },
+    )?;
+    let visible_rank = candidates
+        .iter()
+        .position(|candidate| candidate == target_text)
+        .map(|index| index + 1);
+    let diagnosis = classify_public_miss(
+        source_audit.exact_code_rows != 0,
+        package_whole_word,
+        minimum_segments,
+        visible_rank,
+    );
+
+    let mut output = String::new();
+    writeln!(output, "公开漏词分诊")?;
+    writeln!(output, "输入：{code} → {target_text}")?;
+    writeln!(output, "来源 SHA-256：{source_sha256}")?;
+    writeln!(output, "核心版本：{}", core.snapshot.revision())?;
+    writeln!(output, "补充版本：{}", supplemental.snapshot.revision())?;
+    match source_audit.highest_exact_frequency {
+        Some(frequency) => writeln!(
+            output,
+            "公开来源完整同码词：有（{} 行；最高权重 {}）",
+            source_audit.exact_code_rows, frequency
+        )?,
+        None if source_audit.surface_rows != 0 => writeln!(
+            output,
+            "公开来源完整同码词：无（同文字 {} 行，但读音或规范码不符）",
+            source_audit.surface_rows
+        )?,
+        None => writeln!(output, "公开来源完整同码词：无")?,
+    }
+    writeln!(
+        output,
+        "核心完整同码词：{}",
+        if core_whole_word { "有" } else { "无" }
+    )?;
+    writeln!(
+        output,
+        "补充完整同码词：{}",
+        if supplemental_whole_word {
+            "有"
+        } else {
+            "无"
+        }
+    )?;
+    match minimum_segments {
+        Some(segments) => writeln!(output, "包内最少完整分段：{segments}")?,
+        None => writeln!(output, "包内最少完整分段：无")?,
+    }
+    match visible_rank {
+        Some(rank) => writeln!(output, "前 {PUBLIC_MISS_VISIBLE_LIMIT}：第 {rank} 名")?,
+        None => writeln!(output, "前 {PUBLIC_MISS_VISIBLE_LIMIT}：未出现")?,
+    }
+    writeln!(output, "判断：{}", public_miss_diagnosis_text(diagnosis))?;
+    writeln!(
+        output,
+        "边界：只核对显式公开目标、一个固定来源与两个公开候选层；不读取个人数据，不推断用户意图。"
+    )?;
+    writeln!(output, "本次操作：只读")?;
+    Ok(output)
+}
+
+fn classify_public_miss(
+    source_whole_word: bool,
+    package_whole_word: bool,
+    minimum_segments: Option<usize>,
+    visible_rank: Option<usize>,
+) -> PublicMissDiagnosis {
+    if package_whole_word {
+        return visible_rank.map_or(PublicMissDiagnosis::WholeWordOutsideVisible, |rank| {
+            PublicMissDiagnosis::WholeWordVisible { rank }
+        });
+    }
+    if source_whole_word {
+        return PublicMissDiagnosis::SourceWholeWordExcluded {
+            minimum_segments,
+            visible_rank,
+        };
+    }
+    match (minimum_segments, visible_rank) {
+        (Some(segments), Some(rank)) => PublicMissDiagnosis::CompositionVisible { segments, rank },
+        (Some(segments), None) => PublicMissDiagnosis::CompositionCrowded { segments },
+        (None, _) => PublicMissDiagnosis::Unexplained,
+    }
+}
+
+fn public_miss_diagnosis_text(diagnosis: PublicMissDiagnosis) -> String {
+    match diagnosis {
+        PublicMissDiagnosis::WholeWordVisible { rank } => {
+            format!("完整词已经收录，并在可见范围第 {rank} 名")
+        }
+        PublicMissDiagnosis::WholeWordOutsideVisible => {
+            "完整词已经收录，但没有进入前 50；属于候选生成或排序问题".to_owned()
+        }
+        PublicMissDiagnosis::SourceWholeWordExcluded {
+            minimum_segments: Some(segments),
+            visible_rank: Some(rank),
+        } => format!(
+            "公开来源存在完整同码词，但候选层没有收录；当前 {segments} 段组合位于第 {rank} 名，属于构建选择缺口"
+        ),
+        PublicMissDiagnosis::SourceWholeWordExcluded {
+            minimum_segments: Some(segments),
+            visible_rank: None,
+        } => format!(
+            "公开来源存在完整同码词，但候选层没有收录；当前 {segments} 段组合未进入前 50，属于构建选择缺口"
+        ),
+        PublicMissDiagnosis::SourceWholeWordExcluded {
+            minimum_segments: None,
+            visible_rank: Some(rank),
+        } => format!(
+            "公开来源存在完整同码词，但候选层没有收录；目标通过非完整分段路径位于第 {rank} 名，属于构建选择缺口"
+        ),
+        PublicMissDiagnosis::SourceWholeWordExcluded {
+            minimum_segments: None,
+            visible_rank: None,
+        } => "公开来源存在完整同码词，但候选层没有收录，也没有完整分段路径；属于构建选择缺口"
+            .to_owned(),
+        PublicMissDiagnosis::CompositionVisible { segments, rank } => {
+            format!("没有完整词条，但可由 {segments} 个包内完整段组成，并在可见范围第 {rank} 名")
+        }
+        PublicMissDiagnosis::CompositionCrowded { segments } => format!(
+            "没有完整词条；可由 {segments} 个包内完整段组成，但没有进入前 50，属于组合召回或排序拥挤"
+        ),
+        PublicMissDiagnosis::Unexplained => {
+            "当前来源无完整同码词，候选包也无法按完整段解释；需要补充来源或检查编码".to_owned()
+        }
+    }
+}
+
+fn minimum_exact_public_segments(
+    entries: &[LexiconEntry],
+    target_text: &str,
+    code: &str,
+) -> Option<usize> {
+    let mut text_boundaries = target_text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    text_boundaries.push(target_text.len());
+    let character_count = text_boundaries.len().checked_sub(1)?;
+    if character_count == 0 || code.len() != character_count * 2 {
+        return None;
+    }
+    let identities = entries
+        .iter()
+        .map(|entry| (entry.text.as_str(), entry.code.as_str()))
+        .collect::<HashSet<_>>();
+    let mut best = vec![None::<usize>; character_count + 1];
+    best[0] = Some(0);
+    for start in 0..character_count {
+        let Some(prefix_segments) = best[start] else {
+            continue;
+        };
+        for end in start + 1..=character_count {
+            let text = &target_text[text_boundaries[start]..text_boundaries[end]];
+            let code = &code[start * 2..end * 2];
+            if !identities.contains(&(text, code)) {
+                continue;
+            }
+            let segments = prefix_segments + 1;
+            if best[end].is_none_or(|current| segments < current) {
+                best[end] = Some(segments);
+            }
+        }
+    }
+    best[character_count]
 }
 
 fn merge_public_packages(
@@ -6060,6 +6353,36 @@ mod tests {
     }
 
     #[test]
+    fn public_miss_diagnosis_parser_requires_explicit_public_target() {
+        let arguments = [
+            "diagnose-public-miss",
+            "--source",
+            "jichu.dict.yaml",
+            "--core-package",
+            "core-package",
+            "--supplemental-package",
+            "supplemental-package",
+            "--code",
+            "bgdr",
+            "--text",
+            "绷断",
+            "--public",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            parse_options(arguments.clone()).unwrap(),
+            Options::DiagnosePublicMiss {
+                source: PathBuf::from("jichu.dict.yaml"),
+                core_package: PathBuf::from("core-package"),
+                supplemental_package: PathBuf::from("supplemental-package"),
+                code: "bgdr".to_owned(),
+                text: "绷断".to_owned(),
+            }
+        );
+        assert!(parse_options(arguments[..arguments.len() - 1].to_vec()).is_err());
+    }
+
+    #[test]
     fn public_package_query_parser_is_bounded() {
         assert_eq!(
             parse_options([
@@ -7070,6 +7393,101 @@ mod tests {
             merge_public_lexicon_payloads(BASE, OVERLAY, usize::MAX, merged.payload.len() - 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn public_miss_diagnosis_distinguishes_selection_and_composition() {
+        assert_eq!(
+            classify_public_miss(true, true, Some(1), Some(1)),
+            PublicMissDiagnosis::WholeWordVisible { rank: 1 }
+        );
+        assert_eq!(
+            classify_public_miss(true, true, Some(1), None),
+            PublicMissDiagnosis::WholeWordOutsideVisible
+        );
+        assert_eq!(
+            classify_public_miss(true, false, Some(3), None),
+            PublicMissDiagnosis::SourceWholeWordExcluded {
+                minimum_segments: Some(3),
+                visible_rank: None,
+            }
+        );
+        assert_eq!(
+            classify_public_miss(false, false, Some(2), Some(7)),
+            PublicMissDiagnosis::CompositionVisible {
+                segments: 2,
+                rank: 7
+            }
+        );
+        assert_eq!(
+            classify_public_miss(false, false, Some(2), None),
+            PublicMissDiagnosis::CompositionCrowded { segments: 2 }
+        );
+        assert_eq!(
+            classify_public_miss(false, false, None, None),
+            PublicMissDiagnosis::Unexplained
+        );
+    }
+
+    #[test]
+    fn exact_public_segmentation_finds_the_fewest_complete_package_words() {
+        const PAYLOAD: &str = "text\tpinyin\tfrequency\n\
+误\twu\t50\n\
+提交\tti jiao\t40\n\
+掰开\tbai kai\t30\n\
+揉\trou\t20\n\
+碎\tsui\t10\n";
+        let entries = parse_lexicon_tsv(PAYLOAD).unwrap();
+        assert_eq!(
+            minimum_exact_public_segments(&entries, "误提交", "wutijc"),
+            Some(2)
+        );
+        assert_eq!(
+            minimum_exact_public_segments(&entries, "掰开揉碎", "blklrbsv"),
+            Some(3)
+        );
+        assert_eq!(
+            minimum_exact_public_segments(&entries, "未知", "wwvi"),
+            None
+        );
+    }
+
+    #[test]
+    fn public_miss_diagnosis_uses_verified_source_package_and_visible_rank() {
+        const SOURCE: &str = "---\n...\n绷断\tbēng duàn\t20\n";
+        const CORE: &str = "text\tpinyin\tfrequency\n甲\tjia\t30\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n绷断\tbeng duan\t20\n";
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let core = root.join("core");
+        let supplemental = root.join("supplemental");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, SOURCE).unwrap();
+        write_public_package(
+            &core,
+            "diagnosis-core-v1",
+            &phrase_material_declaration("diagnosis-core", CORE),
+            CORE,
+        )
+        .unwrap();
+        write_public_package(
+            &supplemental,
+            "diagnosis-v1",
+            &phrase_material_declaration("diagnosis-source", SOURCE),
+            SUPPLEMENTAL,
+        )
+        .unwrap();
+
+        let report = diagnose_public_miss(&source, &core, &supplemental, "bgdr", "绷断").unwrap();
+        assert!(report.contains("公开来源完整同码词：有"));
+        assert!(report.contains("核心完整同码词：无"));
+        assert!(report.contains("补充完整同码词：有"));
+        assert!(report.contains("包内最少完整分段：1"));
+        assert!(report.contains("前 50：第 1 名"));
+        assert!(report.contains("判断：完整词已经收录"));
+        assert!(report.contains("本次操作：只读"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

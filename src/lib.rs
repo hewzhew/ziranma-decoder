@@ -320,8 +320,8 @@ pub use public_lexicon_slice::{
     MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
     MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, PublicLexiconComparison,
     PublicRimePhraseAllowlistImport, PublicRimePhraseAllowlistImportStats, PublicRimeSliceConfig,
-    PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats,
-    PublicSupplementalLayerAudit, PublicSupplementalLayerAuditError,
+    PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats, PublicRimeTargetAudit,
+    PublicSupplementalLayerAudit, PublicSupplementalLayerAuditError, audit_public_rime_target,
     audit_public_supplemental_layer, compare_public_lexicons, parse_public_rime_phrase_allowlist,
     parse_public_rime_slice,
 };
