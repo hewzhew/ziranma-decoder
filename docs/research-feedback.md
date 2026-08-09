@@ -70,11 +70,12 @@ cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchct
 .\update-ime.cmd
 ```
 
-根目录脚本把明确授权缩成三个动作：
+根目录脚本把持续授权与本地回顾缩成四个动作：
 
 ```powershell
 .\research-ime.cmd status
 .\research-ime.cmd on
+.\research-ime.cmd review
 .\research-ime.cmd off
 ```
 
@@ -83,11 +84,18 @@ cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchct
 再次核验。`off` 立即撤销后续落盘授权，运行中的宿主不会再发布新批次；已有密文
 保留，不会被关闭动作顺带删除。
 
+`review` 是显式的本地只读回顾。它逐批使用当前用户 DPAPI 解密，聚合首选率、
+非首选/翻页提交、候选加载深度、候选窗耗时、自动换序标签，以及同一编码和文字
+是否出现“第一次靠选择、后来升为首选”。它会在当前终端显示真实编码和提交文字，
+因此底层命令要求 `--confirm-show-private-text`；结果不写文件、不写模型、不联网。
+非首选、取消和原码上屏只作为待复查线索，不能自动解释为错误。
+
 底层等价命令为：
 
 ```powershell
 .\target\release\researchctl.exe enable --confirm-continuous-private-feedback
 .\target\release\researchctl.exe status
+.\target\release\researchctl.exe review --confirm-show-private-text
 .\target\release\researchctl.exe disable
 ```
 

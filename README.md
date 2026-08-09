@@ -206,11 +206,14 @@ cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchct
 .\update-ime.cmd
 .\research-ime.cmd on
 .\research-ime.cmd status
+.\research-ime.cmd review
 .\research-ime.cmd off
 ```
 
 不带参数的 `research-ime.cmd` 等同于 `status`。开启或关闭后，已加载宿主会在后续
-输入中自动发现；关闭不会删除已有加密批次。
+输入中自动发现；关闭不会删除已有加密批次。`review` 会在当前终端解密并汇总
+真实编码和提交文字，列出非首选提交、翻页、先选后升为首选、取消、原码上屏和
+候选窗耗时；它不写模型、不联网，也不修改排序。
 
 本地许愿放在 Git 忽略的 `.local/tsf-alpha/user-data/wishes`。默认管理命令只显示
 数量和随机内容 ID；查看输入原文必须显式确认，说明另存为绑定同一 ID 的加密
