@@ -26,6 +26,11 @@ pub const MAX_CANDIDATE_SNAPSHOT_RANK: usize = 50;
 const MAX_CANDIDATE_SNAPSHOT_REVISION_BYTES: usize = 64;
 const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
 const AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH: usize = 6;
+/// Maximum exact-prefix/final-initial candidates promoted ahead of the
+/// ordinary mixed-abbreviation lane on an odd-key frame. Three protects the
+/// leading half of the six-item TSF page while keeping ordinary abbreviations
+/// reachable without paging.
+const MAX_FINAL_INITIAL_PROMOTIONS: usize = 3;
 const FULL_CODE_CHARACTER_PAIR_DEPTH: usize = 24;
 const MAX_FULL_CODE_CHARACTER_PAIRS: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 /// Per-span core exact candidates retained by the mixed-layer path search.
@@ -46,6 +51,7 @@ pub(crate) enum InteractiveCandidateSource {
     SupplementalExact,
     CharacterPair,
     CompleteSentence,
+    FinalInitialSentence,
     Decoder,
     FourCharacterCorrection,
 }
@@ -750,6 +756,7 @@ pub(crate) fn layered_candidate_query_with_sources(
                 candidate.source,
                 InteractiveCandidateSource::CharacterPair
                     | InteractiveCandidateSource::CompleteSentence
+                    | InteractiveCandidateSource::FinalInitialSentence
             )
         })
         .map(|candidate| &candidate.text)
@@ -1408,6 +1415,8 @@ impl Decoder {
         let original_first_candidate_is_complete =
             candidates.first().is_some_and(sentence_is_complete);
         let complete_candidates = self.decode_complete_sentence(code, sentence_limit)?;
+        let final_initial_candidates =
+            self.decode_complete_sentence_with_final_initial(code, sentence_limit)?;
         let mut visible = Vec::with_capacity(limit);
         let mut seen = HashSet::new();
         for candidate in exact {
@@ -1446,6 +1455,26 @@ impl Decoder {
                 visible.push(InteractiveCandidateText {
                     text: candidate.text.clone(),
                     source: InteractiveCandidateSource::CompleteSentence,
+                });
+            }
+        }
+
+        // Between the two keys of the last double-pinyin pair, prefer paths
+        // that keep every completed pair exact and abbreviate only that final
+        // unfinished syllable. This preserves immediate feedback without
+        // letting free abbreviations from earlier syllables dominate the
+        // transient odd-key frame.
+        for candidate in final_initial_candidates
+            .iter()
+            .take(MAX_FINAL_INITIAL_PROMOTIONS)
+        {
+            if visible.len() == limit {
+                break;
+            }
+            if seen.insert(candidate.text.clone()) {
+                visible.push(InteractiveCandidateText {
+                    text: candidate.text.clone(),
+                    source: InteractiveCandidateSource::FinalInitialSentence,
                 });
             }
         }
@@ -1984,6 +2013,100 @@ mod tests {
         assert!(
             visible.iter().any(|candidate| candidate == "只动"),
             "zero-error full-code character composition should stay visible without becoming a lexicon word: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn odd_interactive_frame_prefers_exact_pairs_plus_one_final_initial() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+误\twu\t900\n\
+提交\tti jiao\t800\n\
+误提交\twu ti jiao\t1000\n\
+误提及\twu ti ji\t700\n";
+        let decoder = Decoder::new(parse_lexicon_tsv(LEXICON).unwrap());
+
+        let anchored = decoder
+            .decode_complete_sentence_with_final_initial("wutij", 6)
+            .unwrap();
+        assert_eq!(
+            anchored.first().map(|candidate| candidate.text.as_str()),
+            Some("误提交")
+        );
+        let first = &anchored[0];
+        assert_eq!(first.unresolved_key_count, 0);
+        assert!(!first.used_error);
+        assert!(
+            first.segments[..first.segments.len() - 1]
+                .iter()
+                .all(|segment| segment.candidate.spelling.abbreviated_syllables.is_empty())
+        );
+        let final_segment = first.segments.last().unwrap();
+        assert_eq!(
+            final_segment.candidate.spelling.abbreviated_syllables,
+            [final_segment.candidate.code.as_str().len() / 2 - 1]
+        );
+
+        let query = decoder.interactive_candidate_query("wutij", 6).unwrap();
+        assert_eq!(query.candidates[0].text, "误提交");
+        assert_eq!(
+            query.candidates[0].source,
+            InteractiveCandidateSource::FinalInitialSentence
+        );
+        assert!(
+            decoder
+                .decode_complete_sentence_with_final_initial("wutijc", 6)
+                .unwrap()
+                .is_empty(),
+            "the lane must disappear as soon as the final pair is complete"
+        );
+    }
+
+    #[test]
+    fn public_odd_prefix_keeps_a_familiar_completion_in_the_narrow_lane() {
+        const PUBLIC_RIME: &str =
+            include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
+        let imported = crate::parse_simplified_rime_lexicon(PUBLIC_RIME).unwrap();
+        let decoder = Decoder::new(imported.entries);
+
+        let query = decoder.interactive_candidate_query("nih", 6).unwrap();
+        let greeting = query
+            .candidates
+            .iter()
+            .find(|candidate| candidate.text == "你好")
+            .expect("the exact `ni` prefix plus final `h` initial should expose 你好");
+        assert_eq!(
+            greeting.source,
+            InteractiveCandidateSource::FinalInitialSentence
+        );
+        assert!(
+            query
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.source == InteractiveCandidateSource::FinalInitialSentence
+                })
+                .count()
+                <= MAX_FINAL_INITIAL_PROMOTIONS
+        );
+
+        let long_query = decoder.interactive_candidate_query("wutij", 10).unwrap();
+        assert_eq!(
+            long_query
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.source == InteractiveCandidateSource::FinalInitialSentence
+                })
+                .count(),
+            MAX_FINAL_INITIAL_PROMOTIONS
+        );
+        assert!(
+            long_query
+                .candidates
+                .iter()
+                .skip(MAX_FINAL_INITIAL_PROMOTIONS)
+                .any(|candidate| candidate.source == InteractiveCandidateSource::Decoder),
+            "the narrow lane must not erase the ordinary abbreviation fallback"
         );
     }
 

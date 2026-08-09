@@ -847,7 +847,8 @@ fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidat
         InteractiveCandidateSource::CoreExact => NativeCandidateSource::CoreExact,
         InteractiveCandidateSource::SupplementalExact => NativeCandidateSource::SupplementalExact,
         InteractiveCandidateSource::CharacterPair => NativeCandidateSource::CharacterPair,
-        InteractiveCandidateSource::CompleteSentence => NativeCandidateSource::Decoder,
+        InteractiveCandidateSource::CompleteSentence
+        | InteractiveCandidateSource::FinalInitialSentence => NativeCandidateSource::Decoder,
         InteractiveCandidateSource::Decoder => NativeCandidateSource::Decoder,
         InteractiveCandidateSource::FourCharacterCorrection => {
             NativeCandidateSource::FourCharacterCorrection

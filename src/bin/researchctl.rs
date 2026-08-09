@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use ziranma_core::{
     NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
-    NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchSceneAnalysis,
-    TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
-    analyze_linked_research, list_wish_packages, repository_root_for_user_tool_executable,
+    NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind,
+    ResearchHalfPairAnalysis, ResearchSceneAnalysis, TranspositionCalibrationLabel,
+    WishCaptureScope, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
+    analyze_runtime_half_pairs, list_wish_packages, repository_root_for_user_tool_executable,
     research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
@@ -109,10 +110,13 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
     let latest_runtime = latest_runtime_review(&snapshots)?;
     let wishes = load_linkable_wishes(root)?;
     let scenes = analyze_linked_research(&snapshots, &wishes)?;
-    let latest_runtime = latest_runtime.map_or_else(
-        || "最新运行身份：尚无带版本标识的批次。".to_owned(),
-        |(identity, review)| review.render_runtime_summary(&identity),
-    );
+    let latest_runtime = match latest_runtime {
+        Some((identity, review)) => {
+            let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
+            review.render_runtime_summary(&identity, &half_pairs)
+        }
+        None => "最新运行身份：尚无带版本标识的批次。".to_owned(),
+    };
     println!(
         "{}\n\n{}\n\n{}",
         latest_runtime,
@@ -565,7 +569,11 @@ impl ResearchReview {
         output
     }
 
-    fn render_runtime_summary(&self, identity: &WishRuntimeIdentity) -> String {
+    fn render_runtime_summary(
+        &self,
+        identity: &WishRuntimeIdentity,
+        half_pairs: &ResearchHalfPairAnalysis,
+    ) -> String {
         let mut output = String::new();
         writeln!(output, "最新运行身份（与旧批次分开）").unwrap();
         writeln!(
@@ -601,6 +609,32 @@ impl ResearchReview {
             self.candidate_frames, self.odd_code_frames, self.long_decoder_primary_frames,
         )
         .unwrap();
+        writeln!(
+            output,
+            "双拼暂态配对：{}；间隔 {}。",
+            half_pairs.paired_frames(),
+            render_half_pair_histogram(half_pairs.gap_histogram()),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "暂态变化：首选改变 {} / {}（{:.1}%）；原可见项保留 {} / {}（{:.1}%）；完成帧首选仍来自普通组合 {} / {}。",
+            half_pairs.top_candidate_changes(),
+            half_pairs.top_candidate_comparisons(),
+            percent(
+                half_pairs.top_candidate_changes(),
+                half_pairs.top_candidate_comparisons(),
+            ),
+            half_pairs.retained_candidates(),
+            half_pairs.candidate_slots_before(),
+            percent(
+                half_pairs.retained_candidates(),
+                half_pairs.candidate_slots_before(),
+            ),
+            half_pairs.decoder_top_after_completion(),
+            half_pairs.provenance_comparisons(),
+        )
+        .unwrap();
         render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
         render_latency(&mut output, "首次出现", &self.initial_popup_ms);
         render_latency(
@@ -617,6 +651,18 @@ impl ResearchReview {
         output.push_str("口径：这里只汇总时间上最新的已标识 DLL；首选提交不自动等于文字正确。");
         output
     }
+}
+
+fn render_half_pair_histogram(histogram: &[usize; 9]) -> String {
+    let labels = [
+        "<8", "8–15", "16–23", "24–31", "32–47", "48–63", "64–95", "96–159", "≥160",
+    ];
+    labels
+        .into_iter()
+        .zip(histogram)
+        .map(|(label, count)| format!("{label} ms {count}"))
+        .collect::<Vec<_>>()
+        .join("；")
 }
 
 fn latest_runtime_review(
@@ -1059,13 +1105,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let (latest_identity, latest_review) =
-            latest_runtime_review(&[snapshot, newer]).unwrap().unwrap();
+        let snapshots = [snapshot, newer];
+        let (latest_identity, latest_review) = latest_runtime_review(&snapshots).unwrap().unwrap();
+        let half_pairs = analyze_runtime_half_pairs(&snapshots, &latest_identity).unwrap();
         assert_eq!(latest_identity.module_sha256(), "cd".repeat(32));
         assert_eq!(latest_review.batches, 1);
         assert!(
             latest_review
-                .render_runtime_summary(&latest_identity)
+                .render_runtime_summary(&latest_identity, &half_pairs)
                 .contains("最新运行身份（与旧批次分开）")
         );
     }

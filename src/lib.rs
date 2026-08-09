@@ -326,8 +326,8 @@ pub use public_lexicon_slice::{
     parse_public_rime_slice,
 };
 pub use research_analysis::{
-    ResearchHabitClue, ResearchHabitKind, ResearchSceneAnalysis, ResearchSceneError,
-    analyze_linked_research,
+    ResearchHabitClue, ResearchHabitKind, ResearchHalfPairAnalysis, ResearchSceneAnalysis,
+    ResearchSceneError, analyze_linked_research, analyze_runtime_half_pairs,
 };
 pub use research_feedback::{
     RESEARCH_FEEDBACK_CONSENT_FILE, RESEARCH_FEEDBACK_CONSENT_SCHEMA_V1,
@@ -958,7 +958,7 @@ impl Decoder {
             let umlaut_alias = (chunk[1] == b'u' && matches!(chunk[0], b'j' | b'q' | b'x' | b'y'))
                 .then_some([chunk[0], b'v']);
             let mut next = Vec::new();
-            for node in nodes {
+            for &node in &nodes {
                 if let Some(edge) = self.trie.nodes[node]
                     .children
                     .iter()
@@ -1031,6 +1031,62 @@ impl Decoder {
         };
         let mut search_stats = SentenceSearchStats::default();
         let lattice = self.build_complete_sentence_lattice(observed.as_str(), &mut search_stats);
+        let initial_state = SentenceRankingState {
+            position: 0,
+            used_error: false,
+            previous_word: None,
+        };
+        let ranking_config = SentenceRankingConfig {
+            top_k,
+            segmentations_per_text: 1,
+            log_frequency_total,
+        };
+        let mut memo = HashMap::new();
+        let mut candidates = self.k_best_from_state(
+            &lattice,
+            initial_state,
+            ranking_config,
+            &mut memo,
+            &mut search_stats,
+        );
+        candidates.sort_by(sentence_order);
+        candidates.truncate(top_k);
+        Ok(candidates)
+    }
+
+    /// Decodes an odd-length interactive prefix whose completed syllables use
+    /// exact double-pinyin pairs and whose final syllable has only its initial
+    /// key so far.
+    ///
+    /// This is deliberately narrower than ordinary mixed abbreviation: the
+    /// unfinished final syllable is the only allowed abbreviation, and no key
+    /// correction or unresolved edge is admitted. It gives the host a useful
+    /// low-volatility lane while the user is between the two keys of a pair.
+    pub(crate) fn decode_complete_sentence_with_final_initial(
+        &self,
+        observed: &str,
+        top_k: usize,
+    ) -> Result<Vec<SentenceCandidate>, KeySequenceError> {
+        let observed = KeySequence::new(observed)?;
+        if top_k == 0 || observed.as_str().len().is_multiple_of(2) {
+            return Ok(Vec::new());
+        }
+
+        let frequency_total = self
+            .lexicon
+            .iter()
+            .map(|entry| entry.frequency as f64)
+            .sum::<f64>();
+        let log_frequency_total = if frequency_total > 0.0 {
+            frequency_total.ln()
+        } else {
+            0.0
+        };
+        let mut search_stats = SentenceSearchStats::default();
+        let lattice = self.build_complete_sentence_lattice_with_final_initial(
+            observed.as_str(),
+            &mut search_stats,
+        );
         let initial_state = SentenceRankingState {
             position: 0,
             used_error: false,
@@ -1223,7 +1279,35 @@ impl Decoder {
             if !reachable[start] {
                 continue;
             }
-            let transitions = self.complete_segment_transitions(observed, start, search_stats);
+            let transitions =
+                self.complete_segment_transitions(observed, start, false, search_stats);
+            for transition in &transitions {
+                reachable[transition.end] = true;
+            }
+            search_stats.lattice_transitions_retained += transitions.len();
+            outgoing[start] = transitions;
+        }
+
+        SentenceLattice { outgoing, length }
+    }
+
+    fn build_complete_sentence_lattice_with_final_initial(
+        &self,
+        observed: &str,
+        search_stats: &mut SentenceSearchStats,
+    ) -> SentenceLattice {
+        debug_assert!(!observed.len().is_multiple_of(2));
+        let length = observed.len();
+        let mut outgoing = vec![Vec::new(); length + 1];
+        let mut reachable = vec![false; length + 1];
+        reachable[0] = true;
+
+        for start in (0..length).step_by(2) {
+            if !reachable[start] {
+                continue;
+            }
+            let transitions =
+                self.complete_segment_transitions(observed, start, true, search_stats);
             for transition in &transitions {
                 reachable[transition.end] = true;
             }
@@ -1238,18 +1322,22 @@ impl Decoder {
         &self,
         observed: &str,
         start: usize,
+        allow_final_initial: bool,
         search_stats: &mut SentenceSearchStats,
     ) -> Vec<SegmentTransition> {
         search_stats.segment_trie_scans += 1;
         let mut nodes = vec![0_usize];
         let mut transitions = SegmentTransitionAccumulator::default();
+        let remaining = &observed.as_bytes()[start..];
+        let paired_length = remaining.len() / 2 * 2;
+        let mut exact_prefix_complete = true;
 
-        for (syllable_offset, chunk) in observed.as_bytes()[start..].chunks_exact(2).enumerate() {
+        for (syllable_offset, chunk) in remaining[..paired_length].chunks_exact(2).enumerate() {
             let exact = [chunk[0], chunk[1]];
             let umlaut_alias = (chunk[1] == b'u' && matches!(chunk[0], b'j' | b'q' | b'x' | b'y'))
                 .then_some([chunk[0], b'v']);
             let mut next = Vec::new();
-            for node in nodes {
+            for &node in &nodes {
                 search_stats.trie_path_visits += 1;
                 if let Some(edge) = self.trie.nodes[node]
                     .children
@@ -1270,6 +1358,7 @@ impl Decoder {
             next.sort_unstable();
             next.dedup();
             if next.is_empty() {
+                exact_prefix_complete = false;
                 break;
             }
             nodes = next;
@@ -1295,6 +1384,44 @@ impl Decoder {
                         observed: spelling.code.clone(),
                         candidate,
                     });
+                }
+            }
+        }
+
+        if allow_final_initial
+            && paired_length < remaining.len()
+            && exact_prefix_complete
+            && !nodes.is_empty()
+        {
+            let initial = remaining[paired_length];
+            let end = observed.len();
+            let observed_segment = &observed[start..end];
+            let spelling = Spelling {
+                code: KeySequence::new(observed_segment)
+                    .expect("a sentence slice is lowercase ASCII"),
+                abbreviated_syllables: vec![paired_length / 2],
+            };
+            for &node in &nodes {
+                search_stats.trie_path_visits += 1;
+                for edge in self.trie.nodes[node]
+                    .children
+                    .iter()
+                    .filter(|edge| edge.code[0] == initial)
+                {
+                    for &entry_index in &self.trie.nodes[edge.child].terminals {
+                        search_stats.terminal_spelling_matches += 1;
+                        let candidate = self.make_candidate(
+                            &self.lexicon[entry_index],
+                            spelling.clone(),
+                            Correction::Exact,
+                        );
+                        transitions.upsert(SegmentTransition {
+                            end,
+                            uses_error: false,
+                            observed: spelling.code.clone(),
+                            candidate,
+                        });
+                    }
                 }
             }
         }
