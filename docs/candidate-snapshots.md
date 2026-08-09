@@ -178,6 +178,45 @@ cargo run --release --bin candidatectl -- length-coverage-audit `
 输出包就依赖第二个公开来源；在多来源哈希、许可和选择参数能够一起被认证以前，
 切片器不会提供这种构建模式。留出审计可以评价假设，但不能绕过来源绑定生成包。
 
+### 同修订固定短语表审计
+
+万象固定修订 `fdda7afb` 还包含一份独立的
+[`lua/data/chengyu.txt`](https://github.com/amzxyz/rime_wanxiang/blob/fdda7afb/lua/data/chengyu.txt)，
+SHA-256 为
+`0cda817d29d312d46458f884bbb9f32b8048b92fe91e99288b4804df4629cc20`。
+它不是拼音词典，而是小写索引到一个或多个四字固定短语的辅助表；内容也不全是
+成语，包含普通短语和专名。因此实验只把它当作允许研究的词面集合，拼音、规范码
+和来源权重仍必须由同一修订的 `jichu.dict.yaml` 独立确认。
+
+`phrase-coverage-audit` 只做这两个公开文件的交集与公开 UD 训练/留出词面审计，
+不输出短语文字，不运行候选排序，也不构建候选包：
+
+```powershell
+target\release\candidatectl.exe phrase-coverage-audit `
+  --source .local\public-audit\wanxiang-fdda7afb\jichu.dict.yaml `
+  --allowlist .local\public-audit\wanxiang-fdda7afb\chengyu.txt `
+  --base-payload .local\public-audit\wanxiang-fdda7afb\package-top76300-plus-bigram-cover-v2\lexicon.tsv `
+  --fit-corpus data\public\ud-chinese-gsdsimp\zh_gsdsimp-ud-train.conllu `
+  --held-out-corpus data\public\ud-chinese-gsdsimp\zh_gsdsimp-ud-test.conllu `
+  --entry-limit 5000
+```
+
+固定材料解析出 26,040 个唯一四字词面，其中 21,651 个能从基础词典取得合格的
+四音节读音，2,483 个已在完整双字覆盖包内；剩余 19,168 个按同一来源权重排序。
+在不删除基础载荷条目的纯加法口径下：
+
+| 新增长词配额 | UD train 新增词面 / 实例 | UD test 新增词面 / 实例 |
+| ---: | ---: | ---: |
+| 2,000 | 19 / 29 | 2 / 2 |
+| 5,000 | 54 / 72 | 5 / 5 |
+| 10,000 | 71 / 90 | 7 / 7 |
+
+三档的公开 token 审计均未丢失原覆盖，但这还没有测量完整候选排序、内存、索引
+建立和首帧成本；5,000 到 10,000 条的留出增益也已经变缓。更重要的是，实际
+候选包将同时依赖基础词典与固定短语表两个文件。当前 v1 provenance 只有一个
+来源材料哈希，因此这条路线在双文件认证和运行时负对照完成前保持为只读实验，
+不得把审计交集伪装成单来源发布包。
+
 ```powershell
 cargo run --release --bin candidatectl -- compare `
   --base-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `

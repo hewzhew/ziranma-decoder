@@ -313,11 +313,14 @@ pub use public_corpus::{
     select_public_protocol_audit_cases, select_public_supplemental_composition_cases,
 };
 pub use public_lexicon_slice::{
+    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
-    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, PublicLexiconComparison, PublicRimeSliceConfig,
+    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, PublicLexiconComparison,
+    PublicRimePhraseAllowlistImport, PublicRimePhraseAllowlistImportStats, PublicRimeSliceConfig,
     PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats,
     PublicSupplementalLayerAudit, PublicSupplementalLayerAuditError,
-    audit_public_supplemental_layer, compare_public_lexicons, parse_public_rime_slice,
+    audit_public_supplemental_layer, compare_public_lexicons, parse_public_rime_phrase_allowlist,
+    parse_public_rime_slice,
 };
 pub use research_analysis::{
     ResearchHabitClue, ResearchHabitKind, ResearchSceneAnalysis, ResearchSceneError,

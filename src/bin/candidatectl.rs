@@ -31,7 +31,8 @@ use ziranma_core::{
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
-    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
+    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
+    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
     PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
     PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
@@ -43,10 +44,11 @@ use ziranma_core::{
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
     load_candidate_runtime_snapshots, load_current_candidate_snapshot, parse_lexicon_tsv,
-    parse_public_rime_slice, parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
-    select_public_bigram_training_sequences, select_public_character_training_texts,
-    select_public_continuous_composition_cases, select_public_supplemental_composition_cases,
-    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_rime_lexicon,
+    parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_character_training_texts, select_public_continuous_composition_cases,
+    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 
@@ -90,6 +92,14 @@ enum Options {
         challenger_payload: PathBuf,
         fit_corpus: PathBuf,
         held_out_corpus: PathBuf,
+    },
+    PhraseCoverageAudit {
+        source: PathBuf,
+        allowlist: PathBuf,
+        base_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        entry_limit: usize,
     },
     LayerAudit {
         core_payload: PathBuf,
@@ -244,6 +254,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &fit_corpus,
             &held_out_corpus,
         )?,
+        Options::PhraseCoverageAudit {
+            source,
+            allowlist,
+            base_payload,
+            fit_corpus,
+            held_out_corpus,
+            entry_limit,
+        } => audit_phrase_coverage(
+            &source,
+            &allowlist,
+            &base_payload,
+            &fit_corpus,
+            &held_out_corpus,
+            entry_limit,
+        )?,
         Options::LayerAudit {
             core_payload,
             supplemental_payload,
@@ -353,6 +378,7 @@ fn parse_options(
         "build-rime-slice" => parse_build_rime_slice(arguments),
         "compare" => parse_compare(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
+        "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
@@ -681,6 +707,43 @@ fn parse_length_coverage_audit(
         fit_corpus: fit_corpus.ok_or("length-coverage-audit requires --fit-corpus")?,
         held_out_corpus: held_out_corpus
             .ok_or("length-coverage-audit requires --held-out-corpus")?,
+    })
+}
+
+fn parse_phrase_coverage_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut allowlist = None;
+    let mut base_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    let mut entry_limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--allowlist" => set_path(&mut allowlist, &mut arguments, "--allowlist")?,
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--entry-limit" => set_usize(&mut entry_limit, &mut arguments, "--entry-limit")?,
+            _ => return Err("unknown phrase-coverage-audit argument; value was suppressed".into()),
+        }
+    }
+    let entry_limit = entry_limit.ok_or("phrase-coverage-audit requires --entry-limit")?;
+    if !(1..=MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES).contains(&entry_limit) {
+        return Err("phrase-coverage-audit --entry-limit is outside the fixed bound".into());
+    }
+    Ok(Options::PhraseCoverageAudit {
+        source: source.ok_or("phrase-coverage-audit requires --source")?,
+        allowlist: allowlist.ok_or("phrase-coverage-audit requires --allowlist")?,
+        base_payload: base_payload.ok_or("phrase-coverage-audit requires --base-payload")?,
+        fit_corpus: fit_corpus.ok_or("phrase-coverage-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("phrase-coverage-audit requires --held-out-corpus")?,
+        entry_limit,
     })
 }
 
@@ -1124,6 +1187,9 @@ fn print_usage() {
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
     );
     eprintln!(
+        "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
+    );
+    eprintln!(
         "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
     );
     eprintln!(
@@ -1394,6 +1460,154 @@ fn write_length_coverage_section(
         )
         .unwrap();
     }
+}
+
+fn audit_phrase_coverage(
+    source: &Path,
+    allowlist: &Path,
+    base_payload: &Path,
+    fit_corpus: &Path,
+    held_out_corpus: &Path,
+    entry_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        source,
+        "public toned Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let allowlist_text = read_explicit_text(
+        allowlist,
+        "public fixed-phrase allowlist",
+        MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
+    )?;
+    let base_text = read_explicit_text(
+        base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        fit_corpus,
+        "public fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let source_sha256 = candidate_sha256_hex(source_text.as_bytes());
+    let allowlist_sha256 = candidate_sha256_hex(allowlist_text.as_bytes());
+    let base_sha256 = candidate_sha256_hex(base_text.as_bytes());
+    let fit_sha256 = candidate_sha256_hex(fit_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if fit_sha256 == held_out_sha256 {
+        return Err("phrase-coverage-audit requires a distinct held-out corpus".into());
+    }
+
+    let base = parse_lexicon_tsv(&base_text)?;
+    let imported = parse_public_rime_phrase_allowlist(
+        &source_text,
+        &allowlist_text,
+        MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
+    )?;
+    let base_surfaces = base
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let mut available = imported
+        .entries
+        .iter()
+        .filter(|entry| !base_surfaces.contains(entry.text.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let available_new_entries = available.len();
+    available.truncate(entry_limit);
+    let selected_entries = available.len();
+    let minimum_selected_frequency = available.last().map_or(0, |entry| entry.frequency);
+    let mut challenger = base.clone();
+    challenger.extend(available);
+
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let fit_audit = audit_public_lexicon_token_coverage(&fit, &base, &challenger);
+    let held_out_audit = audit_public_lexicon_token_coverage(&held_out, &base, &challenger);
+    let stats = imported.stats;
+    let mut output = format!(
+        "公开固定短语覆盖留出审计\n基础载荷：{} 条 · SHA-256 {base_sha256}\n来源词典：SHA-256 {source_sha256}\n固定短语表：SHA-256 {allowlist_sha256}\n",
+        base.len(),
+    );
+    writeln!(
+        output,
+        "短语表：{} 行；合格四字词面 {}，重复 {}，非四字 {}，格式异常 {}",
+        stats.allowlist_rows,
+        stats.eligible_terms,
+        stats.duplicate_terms,
+        stats.non_four_character_terms,
+        stats.malformed_allowlist_rows,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "来源交集：可用词面 {}，相关源行 {}，无效相关源行 {}；基础已覆盖 {}，新增候选 {}",
+        stats.matched_terms,
+        stats.allowlisted_source_rows,
+        stats.invalid_allowlisted_source_rows,
+        stats.matched_terms.saturating_sub(available_new_entries),
+        available_new_entries,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "实验配额：{}；实际加入 {}；配额外 {}；最低入选来源权重 {}",
+        entry_limit,
+        selected_entries,
+        available_new_entries.saturating_sub(selected_entries),
+        minimum_selected_frequency,
+    )
+    .unwrap();
+    write_phrase_coverage_section(&mut output, "训练侧参考", &fit_sha256, fit.stats, fit_audit);
+    write_phrase_coverage_section(
+        &mut output,
+        "留出评测",
+        &held_out_sha256,
+        held_out.stats,
+        held_out_audit,
+    );
+    output.push_str(
+        "口径：短语表只决定允许研究哪些四字词面；拼音、规范码和权重仍来自同修订 Rime 词典。结果只比较公开 UD token 词面覆盖，不运行候选排序，不构建或安装候选包。真正发布前仍须让两个输入文件同时进入可认证来源声明。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn write_phrase_coverage_section(
+    output: &mut String,
+    label: &str,
+    corpus_sha256: &str,
+    corpus_stats: UdCorpusImportStats,
+    audit: PublicLexiconTokenCoverageAudit,
+) {
+    let four = audit.lengths[2];
+    writeln!(
+        output,
+        "{label}：{} 句，{} 个句法 token · SHA-256 {corpus_sha256}",
+        corpus_stats.sentences, corpus_stats.syntactic_tokens,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  四字词面 {}（实例 {}）；基础覆盖 {}（实例 {}），实验覆盖 {}（实例 {}）；新增 {}（实例 {}），丢失 {}（实例 {}）",
+        four.source_unique_tokens,
+        four.source_token_instances,
+        four.base_covered_unique_tokens,
+        four.base_covered_token_instances,
+        four.challenger_covered_unique_tokens,
+        four.challenger_covered_token_instances,
+        four.challenger_gained_unique_tokens,
+        four.challenger_gained_token_instances,
+        four.challenger_lost_unique_tokens,
+        four.challenger_lost_token_instances,
+    )
+    .unwrap();
 }
 
 fn audit_candidate_layers(
@@ -4502,6 +4716,44 @@ mod tests {
     }
 
     #[test]
+    fn phrase_coverage_parser_binds_both_public_materials_and_holdout() {
+        assert_eq!(
+            parse_options([
+                "phrase-coverage-audit".to_owned(),
+                "--source".to_owned(),
+                "jichu.dict.yaml".to_owned(),
+                "--allowlist".to_owned(),
+                "chengyu.txt".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--entry-limit".to_owned(),
+                "5000".to_owned(),
+            ])
+            .unwrap(),
+            Options::PhraseCoverageAudit {
+                source: PathBuf::from("jichu.dict.yaml"),
+                allowlist: PathBuf::from("chengyu.txt"),
+                base_payload: PathBuf::from("base.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                entry_limit: 5000,
+            }
+        );
+        assert!(
+            parse_options([
+                "phrase-coverage-audit".to_owned(),
+                "--entry-limit".to_owned(),
+                "50001".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn length_coverage_report_is_aggregate_only_and_requires_holdout() {
         const BASE: &str = "text\tpinyin\tfrequency\n双字\tshuang zi\t10\n三字词\tsan zi ci\t9\n";
         const CHALLENGER: &str =
@@ -4527,6 +4779,36 @@ mod tests {
         assert!(!report.contains("三字词"));
         assert!(!report.contains("四字词语"));
         assert!(audit_length_coverage(&base, &challenger, &fit, &fit).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_coverage_report_is_aggregate_only_and_does_not_build_a_package() {
+        const SOURCE: &str = "---\n...\n公开短语\tgōng kāi duǎn yǔ\t20\n";
+        const ALLOWLIST: &str = "gkdy\t公开短语\n";
+        const BASE: &str = "text\tpinyin\tfrequency\n基础词\tji chu ci\t10\n";
+        const FIT: &str = "# sent_id = fit\n1\t公开短语\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\n";
+        const HELD_OUT: &str =
+            "# sent_id = held-out\n1\t公开短语\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\n";
+        let root = temporary_test_root();
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.yaml");
+        let allowlist = root.join("phrases.txt");
+        let base = root.join("base.tsv");
+        let fit = root.join("fit.conllu");
+        let held_out = root.join("held-out.conllu");
+        fs::write(&source, SOURCE).unwrap();
+        fs::write(&allowlist, ALLOWLIST).unwrap();
+        fs::write(&base, BASE).unwrap();
+        fs::write(&fit, FIT).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+
+        let report = audit_phrase_coverage(&source, &allowlist, &base, &fit, &held_out, 1).unwrap();
+        assert!(report.contains("合格四字词面 1"));
+        assert!(report.contains("新增 1（实例 1），丢失 0（实例 0）"));
+        assert!(!report.contains("公开短语"));
+        assert!(audit_phrase_coverage(&source, &allowlist, &base, &fit, &fit, 1).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }

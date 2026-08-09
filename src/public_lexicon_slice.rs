@@ -17,6 +17,11 @@ use crate::{
 
 /// Largest source file accepted by the explicit large-public-dictionary CLI.
 pub const MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+/// Largest explicitly supplied public fixed-phrase allowlist accepted by an
+/// offline audit.
+pub const MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES: usize = 1024 * 1024;
+/// Maximum valid fixed phrases retained by one offline allowlist import.
+pub const MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES: usize = 50_000;
 /// Conservative entry cap for one experimental public slice.
 ///
 /// This remains below the validated snapshot ceiling while allowing a narrow
@@ -61,6 +66,46 @@ pub struct PublicRimeSliceImport {
     pub entries: Vec<LexiconEntry>,
     /// Deterministic accounting for every accepted or skipped source row.
     pub stats: PublicRimeSliceImportStats,
+}
+
+/// Exact four-character entries selected by one public fixed-phrase list.
+///
+/// This is an audit input, not an installable candidate package. The caller
+/// must still authenticate every source material before constructing a
+/// package from more than one upstream file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicRimePhraseAllowlistImport {
+    /// Matched source entries ordered by descending source weight, then line.
+    pub entries: Vec<LexiconEntry>,
+    /// Deterministic accounting for the allowlist/source intersection.
+    pub stats: PublicRimePhraseAllowlistImportStats,
+}
+
+/// Aggregate accounting for a public fixed-phrase allowlist import.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicRimePhraseAllowlistImportStats {
+    /// Non-empty, non-comment rows in the allowlist.
+    pub allowlist_rows: usize,
+    /// Allowlist rows without one lowercase ASCII key and phrase field.
+    pub malformed_allowlist_rows: usize,
+    /// Phrase fields rejected because they are not exactly four Han characters.
+    pub non_four_character_terms: usize,
+    /// Repeated valid phrase surfaces ignored after their first occurrence.
+    pub duplicate_terms: usize,
+    /// Unique valid four-character phrase surfaces.
+    pub eligible_terms: usize,
+    /// Non-comment rows after the Rime YAML data marker.
+    pub source_rows: usize,
+    /// Source rows whose surface was requested by the allowlist.
+    pub allowlisted_source_rows: usize,
+    /// Requested source rows that could not be normalized into four syllables.
+    pub invalid_allowlisted_source_rows: usize,
+    /// Unique requested surfaces with at least one usable source entry.
+    pub matched_terms: usize,
+    /// Usable matched surfaces outside the explicit import bound.
+    pub dropped_by_entry_cap: usize,
+    /// Final number of entries returned by the audit import.
+    pub imported_entries: usize,
 }
 
 /// Auditable row accounting for a large public Rime slice.
@@ -534,6 +579,147 @@ fn materialize_ranked_entries(contents: &str, source_lines: &HashSet<usize>) -> 
     entries
 }
 
+/// Intersects one public fixed-phrase allowlist with a toned Rime dictionary.
+///
+/// The allowlist format is deliberately narrow: every data row is
+/// `lowercase-key<TAB>phrase`, and additional phrases on the same row are
+/// separated by the two literal characters `\t`. Only unique four-Han
+/// surfaces are retained. Pinyin and frequency always come from the Rime
+/// source, so this helper never invents a reading from the allowlist key.
+pub fn parse_public_rime_phrase_allowlist(
+    source_contents: &str,
+    allowlist_contents: &str,
+    max_entries: usize,
+) -> Result<PublicRimePhraseAllowlistImport, PublicRimeSliceError> {
+    if max_entries == 0 || max_entries > MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES {
+        return Err(PublicRimeSliceError::InvalidPhraseAllowlistEntryLimit);
+    }
+
+    let mut stats = PublicRimePhraseAllowlistImportStats::default();
+    let mut allowed = HashSet::<String>::new();
+    for raw_line in allowlist_contents.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        stats.allowlist_rows += 1;
+        let Some((key, phrases)) = line.split_once('\t') else {
+            stats.malformed_allowlist_rows += 1;
+            continue;
+        };
+        if key.is_empty()
+            || phrases.is_empty()
+            || !key.as_bytes().iter().all(u8::is_ascii_lowercase)
+        {
+            stats.malformed_allowlist_rows += 1;
+            continue;
+        }
+        for phrase in phrases.split("\\t") {
+            if phrase.chars().count() != 4 || !phrase.chars().all(is_han_character) {
+                stats.non_four_character_terms += 1;
+            } else if !allowed.insert(phrase.to_owned()) {
+                stats.duplicate_terms += 1;
+            }
+        }
+    }
+    stats.eligible_terms = allowed.len();
+    if allowed.is_empty() {
+        return Err(PublicRimeSliceError::EmptyPhraseAllowlist);
+    }
+
+    let mut saw_document_start = false;
+    let mut saw_data_marker = false;
+    let mut best_by_text = HashMap::<String, RankedEntry>::new();
+    for (zero_based_line, raw_line) in source_contents.lines().enumerate() {
+        let source_line = zero_based_line + 1;
+        let line = raw_line.trim_end_matches('\r');
+        if !saw_data_marker {
+            match line {
+                "---" => saw_document_start = true,
+                "..." if saw_document_start => saw_data_marker = true,
+                _ => {}
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        stats.source_rows += 1;
+        let mut fields = line.split('\t');
+        let (Some(text), Some(toned_pinyin), Some(weight), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !allowed.contains(text) {
+            continue;
+        }
+        stats.allowlisted_source_rows += 1;
+        let Some(weight) = weight.parse::<u64>().ok().filter(|weight| *weight != 0) else {
+            stats.invalid_allowlisted_source_rows += 1;
+            continue;
+        };
+        let Some((normalized_pinyin, encoded)) = normalize_pinyin_tone_marks(toned_pinyin)
+            .ok()
+            .and_then(|pinyin| {
+                encode_pinyin_phrase(&pinyin)
+                    .ok()
+                    .map(|encoded| (pinyin, encoded))
+            })
+            .filter(|(_, encoded)| encoded.syllable_codes.len() == 4)
+        else {
+            stats.invalid_allowlisted_source_rows += 1;
+            continue;
+        };
+        let ranked = RankedEntry {
+            source_line,
+            entry: LexiconEntry {
+                text: text.to_owned(),
+                pinyin: normalized_pinyin,
+                code: encoded.full_code,
+                syllable_codes: encoded.syllable_codes,
+                frequency: weight,
+            },
+        };
+        match best_by_text.entry(text.to_owned()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(ranked);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if ranked.is_better_than(slot.get()) {
+                    slot.insert(ranked);
+                }
+            }
+        }
+    }
+    if !saw_document_start {
+        return Err(PublicRimeSliceError::MissingDocumentStart);
+    }
+    if !saw_data_marker {
+        return Err(PublicRimeSliceError::MissingDataMarker);
+    }
+    stats.matched_terms = best_by_text.len();
+    if best_by_text.is_empty() {
+        return Err(PublicRimeSliceError::Empty);
+    }
+    let mut ranked = best_by_text.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .entry
+            .frequency
+            .cmp(&left.entry.frequency)
+            .then_with(|| left.source_line.cmp(&right.source_line))
+    });
+    stats.dropped_by_entry_cap = ranked.len().saturating_sub(max_entries);
+    ranked.truncate(max_entries);
+    let entries = ranked
+        .into_iter()
+        .map(|ranked| ranked.entry)
+        .collect::<Vec<_>>();
+    stats.imported_entries = entries.len();
+    Ok(PublicRimePhraseAllowlistImport { entries, stats })
+}
+
 /// Selects a deterministic, Han-only, exact-syllable slice from a large
 /// public Rime dictionary with Unicode tone marks.
 pub fn parse_public_rime_slice(
@@ -883,6 +1069,8 @@ fn is_han_character(character: char) -> bool {
 pub enum PublicRimeSliceError {
     /// The configured entry cap is zero or above the fixed experiment bound.
     InvalidEntryLimit,
+    /// The fixed-phrase import bound is zero or above its audit ceiling.
+    InvalidPhraseAllowlistEntryLimit,
     /// The global frequency frontier is zero or exceeds the total entry cap.
     InvalidFrequencyFrontierLimit,
     /// Explicit three/four-character coverage exceeds post-frontier capacity.
@@ -895,12 +1083,17 @@ pub enum PublicRimeSliceError {
     MissingDataMarker,
     /// No compatible row survived the explicit filters.
     Empty,
+    /// The fixed-phrase allowlist contained no valid four-Han surface.
+    EmptyPhraseAllowlist,
 }
 
 impl fmt::Display for PublicRimeSliceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidEntryLimit => write!(formatter, "公开词表裁剪的词条上限无效"),
+            Self::InvalidPhraseAllowlistEntryLimit => {
+                write!(formatter, "公开固定短语审计的词条上限无效")
+            }
             Self::InvalidFrequencyFrontierLimit => {
                 write!(formatter, "公开词表裁剪的全局高频前沿上限无效")
             }
@@ -911,6 +1104,7 @@ impl fmt::Display for PublicRimeSliceError {
             Self::MissingDocumentStart => write!(formatter, "公开 Rime 词表缺少 YAML 起始标记 ---"),
             Self::MissingDataMarker => write!(formatter, "公开 Rime 词表缺少数据起始标记 ..."),
             Self::Empty => write!(formatter, "公开 Rime 词表没有可裁剪的数据行"),
+            Self::EmptyPhraseAllowlist => write!(formatter, "公开固定短语表没有合格的四字词面"),
         }
     }
 }
@@ -1132,6 +1326,51 @@ A词\ta cí\t100\n\
         assert_eq!(imported.stats.two_character_coverage_candidates, 2);
         assert_eq!(imported.stats.two_character_coverage_admitted, 1);
         assert_eq!(imported.stats.two_character_coverage_dropped, 1);
+    }
+
+    #[test]
+    fn phrase_allowlist_uses_source_readings_and_bounded_source_weight_order() {
+        const ALLOWLIST: &str = "wlrh\t无论如何\\t五颜六色\n\
+                                  repeat\t无论如何\n\
+                                  short\t三个字\n\
+                                  INVALID\t固定短语\n";
+        const SOURCE: &str = "---\n...\n\
+                              无论如何\twú lùn rú hé\t20\n\
+                              五颜六色\twǔ yán liù sè\t30\n\
+                              固定短语\tgù dìng duǎn yǔ\t40\n\
+                              无论如何\twú lùn rú hé\t10\n";
+        let imported = parse_public_rime_phrase_allowlist(SOURCE, ALLOWLIST, 1).unwrap();
+
+        assert_eq!(imported.entries.len(), 1);
+        assert_eq!(imported.entries[0].text, "五颜六色");
+        assert_eq!(imported.entries[0].pinyin, "wu yan liu se");
+        assert_eq!(imported.stats.allowlist_rows, 4);
+        assert_eq!(imported.stats.malformed_allowlist_rows, 1);
+        assert_eq!(imported.stats.non_four_character_terms, 1);
+        assert_eq!(imported.stats.duplicate_terms, 1);
+        assert_eq!(imported.stats.eligible_terms, 2);
+        assert_eq!(imported.stats.allowlisted_source_rows, 3);
+        assert_eq!(imported.stats.matched_terms, 2);
+        assert_eq!(imported.stats.dropped_by_entry_cap, 1);
+        assert_eq!(imported.stats.imported_entries, 1);
+    }
+
+    #[test]
+    fn phrase_allowlist_rejects_empty_terms_and_unbounded_imports() {
+        const SOURCE: &str = "---\n...\n无论如何\twú lùn rú hé\t20\n";
+        assert_eq!(
+            parse_public_rime_phrase_allowlist(SOURCE, "bad-row\n", 1).unwrap_err(),
+            PublicRimeSliceError::EmptyPhraseAllowlist
+        );
+        assert_eq!(
+            parse_public_rime_phrase_allowlist(
+                SOURCE,
+                "wlrh\t无论如何\n",
+                MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES + 1,
+            )
+            .unwrap_err(),
+            PublicRimeSliceError::InvalidPhraseAllowlistEntryLimit
+        );
     }
 
     #[test]
