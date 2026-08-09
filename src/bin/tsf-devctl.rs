@@ -3067,6 +3067,31 @@ mod tests {
     }
 
     #[test]
+    fn preparation_wrapper_is_offline_locked_and_never_installs() {
+        let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prepare-ime.cmd");
+        let contents = fs::read_to_string(wrapper).unwrap();
+
+        assert!(contents.contains("cargo.exe build --release --locked --offline"));
+        for target in [
+            "--lib",
+            "--bin tsf-devctl",
+            "--bin candidatectl",
+            "--bin aliasctl",
+            "--bin aliaspad",
+            "--bin personalctl",
+            "--bin researchctl",
+            "--bin wishctl",
+            "--bin wishpad",
+        ] {
+            assert!(contents.contains(target), "missing release target {target}");
+        }
+        assert!(contents.contains("update-ime.cmd\" status"));
+        assert!(!contents.contains("-EnableCurrentUserAfterReplace"));
+        assert!(!contents.contains("register-machine"));
+        assert!(contents.contains("Nothing was installed"));
+    }
+
+    #[test]
     fn parser_requires_one_explicit_dll() {
         assert_eq!(parse_options(Vec::<String>::new()).unwrap(), Options::Help);
         assert_eq!(

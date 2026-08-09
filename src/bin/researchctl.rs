@@ -921,14 +921,12 @@ mod tests {
     #[test]
     fn release_tool_derives_the_stable_installed_user_data_root() {
         assert_eq!(
-            research_root_for_executable(Path::new(
-                r"D:\IME\ziranma-decoder\target\release\researchctl.exe"
-            )),
+            research_root_for_executable(Path::new(r"X:\workspace\target\release\researchctl.exe")),
             Some(PathBuf::from(
-                r"D:\IME\ziranma-decoder\.local\tsf-alpha\user-data\research-inbox"
+                r"X:\workspace\.local\tsf-alpha\user-data\research-inbox"
             ))
         );
-        assert!(research_root_for_executable(Path::new(r"D:\tools\researchctl.exe")).is_none());
+        assert!(research_root_for_executable(Path::new(r"X:\tools\researchctl.exe")).is_none());
     }
 
     #[test]

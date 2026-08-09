@@ -499,9 +499,16 @@ stderr 的 `NativeCommandError` 包装由脚本先完整捕获，再按真实进
 在任意 PowerShell 当前目录中均可运行：
 
 ```powershell
+.\prepare-ime.cmd
 .\update-ime.cmd
 .\update-ime.cmd status
 ```
+
+`prepare-ime.cmd` 把构建和安装拆成两个明确授权：它使用 `Cargo.lock` 与 Cargo
+`--offline` 构建 release DLL、安装控制器以及日用别名、个人学习、持续研究和许愿
+工具，随后只调用 `update-ime.cmd status`。这个阶段不请求管理员权限，不操作 TSF
+注册或当前用户配置，也不会触碰系统已安装的内容寻址 DLL；因此可以在现有 Codex
+宿主继续使用旧版时先完成。若本地依赖缓存不完整，离线构建直接失败，不回退联网。
 
 `status` 是同一入口的只读分支：它验证 release 候选数据、安装凭据、当前用户状态
 和可见宿主缓存，然后分别显示 release/installed 摘要与是否待换代。它不禁用、

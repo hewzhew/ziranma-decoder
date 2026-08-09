@@ -257,9 +257,16 @@ cargo build --release --bin wishctl --bin wishpad
 猫猫完成 release 构建后，本地 Alpha 可从任意 PowerShell 目录一键换代：
 
 ```powershell
+.\prepare-ime.cmd
 .\update-ime.cmd
 .\update-ime.cmd status
 ```
+
+`prepare-ime.cmd` 是不需要管理员权限的离线准备步骤：它使用锁定依赖构建 TSF DLL
+及日用候选、别名、个人学习、持续研究和许愿工具，然后自动执行只读 `status`。
+它只更新仓库的 `target/release`，不禁用、注册、启用或安装输入法；构建失败和候选
+数据验证失败都保持现有系统版本不变。开发可以先完成这一步，真正换代仍由宝宝以后
+方便时单独运行不带参数的 `update-ime.cmd`。
 
 不带参数才执行换代；`status` 只读比较 release 与已安装 DLL、验证候选槽和当前用户
 状态，并报告相对 release 的新旧宿主数量，不弹 UAC、不打开管理器、不写文件。

@@ -310,6 +310,7 @@ $requiredFiles = @(
     'Cargo.toml',
     'CONTRIBUTING.md',
     'LICENSE',
+    'prepare-ime.cmd',
     'PRIVACY.md',
     'README.md',
     'THIRD_PARTY_NOTICES.md',
@@ -365,7 +366,7 @@ $expectedHashes = @{
     'data/public/rime-pinyin-simp/LICENSE' =
         'CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30'
     'data/public/rime-pinyin-simp/SOURCE.md' =
-        'DC3CFD72CBDD7403357094A411BA2EF1DBDCF3595034726289234B11995C13BC'
+        '76085D2ABA760C9C520001CFB8B1A39E3CE07BFB8A170B7448DCF20E920E642B'
     'data/public/rime-pinyin-simp/pinyin_simp.dict.yaml' =
         'E341598343A0F0F2035BB1AAFC34A7F3BB7887DEEECB3F60796262AAA2983E6B'
     'data/public/ud-chinese-gsdsimp/CC-BY-SA-4.0.txt' =
