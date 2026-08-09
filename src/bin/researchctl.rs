@@ -526,6 +526,7 @@ impl ResearchReview {
             "慢按键编辑会话阶段",
             &self.slow_key_edit_session_ms,
         );
+        render_slow_key_coverage(&mut output, &self.slow_key_total_ms);
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -603,6 +604,7 @@ impl ResearchReview {
             "慢按键编辑会话阶段",
             &self.slow_key_edit_session_ms,
         );
+        render_slow_key_coverage(&mut output, &self.slow_key_total_ms);
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -759,6 +761,7 @@ impl ResearchReview {
             "慢按键总耗时（仅 ≥16 ms）",
             &self.slow_key_total_ms,
         );
+        render_slow_key_coverage(&mut output, &self.slow_key_total_ms);
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -835,6 +838,16 @@ fn render_latency(output: &mut String, label: &str, values: &[u32]) {
         .unwrap();
     } else {
         writeln!(output, "{label}：暂无样本。").unwrap();
+    }
+}
+
+fn render_slow_key_coverage(output: &mut String, values: &[u32]) {
+    if values.is_empty() {
+        output.push_str(
+            "慢按键分段覆盖：未确认；0 条既可能表示没有 ≥16 ms 按键，也可能表示运行 DLL 尚未采集该字段。\n",
+        );
+    } else {
+        output.push_str("慢按键分段覆盖：已确认；记录中存在分阶段耗时。\n");
     }
 }
 
@@ -1242,6 +1255,7 @@ mod tests {
         assert!(!aggregate.contains("大国"));
         assert!(!aggregate.contains("打过"));
         assert!(!aggregate.contains("需要复查"));
+        assert!(aggregate.contains("慢按键分段覆盖：未确认"));
         assert!(
             review
                 .render()
