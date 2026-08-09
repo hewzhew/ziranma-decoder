@@ -3101,12 +3101,16 @@ mod tests {
         let script =
             fs::read_to_string(repository.join("scripts").join("refresh-user-tools.ps1")).unwrap();
 
-        assert!(wrapper.contains("Usage: refresh-ime.cmd [refresh^|status^|space^|rollback]"));
+        assert!(
+            wrapper.contains("Usage: refresh-ime.cmd [refresh^|status^|space^|cleanup^|rollback]")
+        );
         assert!(wrapper.contains("-StatusOnly"));
         assert!(wrapper.contains("-SpaceOnly"));
+        assert!(wrapper.contains("-Cleanup -ConfirmCleanupUnreferencedBundles"));
         assert!(wrapper.contains("-Rollback"));
         assert!(wrapper.contains("if /i \"%action%\"==\"status\" goto status"));
         assert!(wrapper.contains("if /i \"%action%\"==\"space\" goto space"));
+        assert!(wrapper.contains("if /i \"%action%\"==\"cleanup\" goto cleanup"));
         assert!(wrapper.contains("if /i \"%action%\"==\"rollback\" goto rollback"));
         for tool in [
             "aliasctl",
@@ -3131,6 +3135,9 @@ mod tests {
         assert!(script.contains("Publish-DesktopLauncher -BundleId $bundleId"));
         assert!(script.contains("Potential reclaim:"));
         assert!(script.contains("No files were deleted"));
+        assert!(script.contains("Get-RunningToolBundleIds"));
+        assert!(script.contains("Remove-UnreferencedBundles"));
+        assert!(script.contains("Cargo cache and other root entries: unchanged"));
         assert!(script.contains("[IO.File]::Replace"));
         assert!(script.contains("TSF DLL: unchanged"));
         assert!(!script.contains("'--lib'"));
@@ -3306,7 +3313,7 @@ mod tests {
             "schema=ziranma-user-tools-slots-v1\r\ncurrent={second}\r\nprevious={first}\r\n"
         );
         fs::write(root.0.join("slots.zut"), &original).unwrap();
-        let _unreferenced = write_bundle(&root.0, "unreferenced");
+        let unreferenced = write_bundle(&root.0, "unreferenced");
         fs::create_dir(root.0.join("cargo-target")).unwrap();
         fs::write(root.0.join("cargo-target").join("cache.bin"), [0_u8; 1024]).unwrap();
         fs::create_dir(root.0.join("probe-target")).unwrap();
@@ -3354,6 +3361,96 @@ mod tests {
         assert_eq!(
             fs::read_dir(root.0.join("builds")).unwrap().count(),
             builds_before_space
+        );
+        let malformed = "0".repeat(64);
+        fs::create_dir(root.0.join("builds").join(&malformed)).unwrap();
+        fs::write(
+            root.0.join("builds").join(&malformed).join("payload.bin"),
+            b"not a bundle",
+        )
+        .unwrap();
+        let rejected_malformed_cleanup = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-Cleanup")
+            .arg("-ConfirmCleanupUnreferencedBundles")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(!rejected_malformed_cleanup.status.success());
+        assert!(root.0.join("builds").join(&unreferenced).is_dir());
+        assert!(root.0.join("builds").join(&malformed).is_dir());
+        assert_eq!(
+            fs::read(root.0.join("slots.zut")).unwrap(),
+            original.as_bytes()
+        );
+        fs::remove_dir_all(root.0.join("builds").join(&malformed)).unwrap();
+        fs::write(root.0.join("builds").join("unknown.entry"), b"retain me").unwrap();
+        let cleanup_without_confirmation = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-Cleanup")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(!cleanup_without_confirmation.status.success());
+        assert!(root.0.join("builds").join(&unreferenced).is_dir());
+        let cleanup = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-Cleanup")
+            .arg("-ConfirmCleanupUnreferencedBundles")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(
+            cleanup.status.success(),
+            "confirmed cleanup failed: {}",
+            String::from_utf8_lossy(&cleanup.stderr)
+        );
+        let cleanup_stdout = String::from_utf8_lossy(&cleanup.stdout);
+        for expected in [
+            "IME user tool cleanup completed",
+            "Removed bundles: 1,",
+            "Running bundles retained: 0, 0 B",
+            "Unrecognized build entries retained: 1",
+            "Cargo cache and other root entries: unchanged",
+        ] {
+            assert!(
+                cleanup_stdout.contains(expected),
+                "cleanup report omitted {expected:?}: {cleanup_stdout}"
+            );
+        }
+        assert!(!root.0.join("builds").join(&unreferenced).exists());
+        assert!(root.0.join("builds").join(&first).is_dir());
+        assert!(root.0.join("builds").join(&second).is_dir());
+        assert!(root.0.join("cargo-target").join("cache.bin").is_file());
+        assert!(root.0.join("probe-target").join("probe.bin").is_file());
+        assert!(root.0.join("builds").join("unknown.entry").is_file());
+        assert_eq!(
+            fs::read(root.0.join("slots.zut")).unwrap(),
+            original.as_bytes()
         );
         let rollback = std::process::Command::new(&powershell)
             .args([

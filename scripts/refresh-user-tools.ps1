@@ -2,6 +2,8 @@
 param(
     [switch]$StatusOnly,
     [switch]$SpaceOnly,
+    [switch]$Cleanup,
+    [switch]$ConfirmCleanupUnreferencedBundles,
     [switch]$Rollback,
     [string]$UserToolsRoot
 )
@@ -9,9 +11,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$operationCount = [int][bool]$StatusOnly + [int][bool]$SpaceOnly + [int][bool]$Rollback
+$operationCount = [int][bool]$StatusOnly + [int][bool]$SpaceOnly + [int][bool]$Cleanup +
+    [int][bool]$Rollback
 if ($operationCount -gt 1) {
-    throw 'StatusOnly, SpaceOnly, and Rollback cannot be combined.'
+    throw 'StatusOnly, SpaceOnly, Cleanup, and Rollback cannot be combined.'
+}
+if ($ConfirmCleanupUnreferencedBundles -and -not $Cleanup) {
+    throw 'ConfirmCleanupUnreferencedBundles requires Cleanup.'
+}
+if ($Cleanup -and -not $ConfirmCleanupUnreferencedBundles) {
+    throw 'Cleanup requires ConfirmCleanupUnreferencedBundles.'
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -280,7 +289,8 @@ function Read-SlotState {
     $current = $currentLine.Substring('current='.Length)
     $previous = $previousLine.Substring('previous='.Length)
     if (-not (Test-BundleId -Value $current) -or
-        ($previous -ne '-' -and -not (Test-BundleId -Value $previous))) {
+        ($previous -ne '-' -and
+            (-not (Test-BundleId -Value $previous) -or $previous -eq $current))) {
         throw 'The user tool slot ids are invalid.'
     }
     $previousValue = if ($previous -eq '-') { $null } else { $previous }
@@ -300,7 +310,8 @@ function Write-SlotState {
     )
 
     if (-not (Test-BundleId -Value $Current) -or
-        (-not [string]::IsNullOrEmpty($Previous) -and -not (Test-BundleId -Value $Previous))) {
+        (-not [string]::IsNullOrEmpty($Previous) -and
+            (-not (Test-BundleId -Value $Previous) -or $Previous -eq $Current))) {
         throw 'Refusing to write invalid user tool slot ids.'
     }
     $previousValue = if ([string]::IsNullOrEmpty($Previous)) { '-' } else { $Previous }
@@ -504,6 +515,144 @@ function Show-SpaceUsage {
     Write-Host 'This action: read only'
 }
 
+function Get-RunningToolBundleIds {
+    $bundleIds = New-Object 'Collections.Generic.HashSet[string]' (
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $canonicalBuildsRoot = [IO.Path]::GetFullPath($buildsRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    foreach ($tool in $toolNames) {
+        foreach ($process in @(Get-Process -Name $tool -ErrorAction SilentlyContinue)) {
+            try {
+                $executablePath = $process.Path
+            } catch {
+                throw "A running $tool process could not be inspected; cleanup was not started."
+            }
+            if ([string]::IsNullOrWhiteSpace($executablePath)) {
+                throw "A running $tool process has no inspectable path; cleanup was not started."
+            }
+            $executable = [IO.Path]::GetFullPath($executablePath)
+            $bundle = [IO.Directory]::GetParent($executable)
+            if ($null -eq $bundle -or -not (Test-BundleId -Value $bundle.Name)) {
+                continue
+            }
+            $parent = $bundle.Parent
+            if ($null -ne $parent -and
+                [string]::Equals(
+                    $parent.FullName.TrimEnd(
+                        [IO.Path]::DirectorySeparatorChar,
+                        [IO.Path]::AltDirectorySeparatorChar
+                    ),
+                    $canonicalBuildsRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                [void]$bundleIds.Add($bundle.Name)
+            }
+        }
+    }
+    return ,$bundleIds
+}
+
+function Remove-UnreferencedBundles {
+    Assert-NormalDirectory -Path $UserToolsRoot -Label 'User tool root'
+    Assert-NormalDirectory -Path $buildsRoot -Label 'User tool builds root'
+    $lock = $null
+    try {
+        $lock = Open-RefreshLock
+        $state = Read-SlotState
+        if ($null -eq $state) {
+            throw 'There is no current user tool bundle to protect; cleanup was not started.'
+        }
+        Assert-Bundle -BundleId $state.Current
+        if ($null -ne $state.Previous) {
+            Assert-Bundle -BundleId $state.Previous
+        }
+
+        $candidates = @()
+        [long]$unrecognizedCount = 0
+        foreach ($item in @(Get-ChildItem -LiteralPath $buildsRoot -Force | Sort-Object Name)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'User tool builds root contains a reparse point; cleanup was not started.'
+            }
+            if (-not $item.PSIsContainer -or -not (Test-BundleId -Value $item.Name)) {
+                $unrecognizedCount++
+                continue
+            }
+            if ($item.Name -eq $state.Current -or
+                ($null -ne $state.Previous -and $item.Name -eq $state.Previous)) {
+                continue
+            }
+            Assert-Bundle -BundleId $item.Name
+            $usage = Get-DirectoryUsage -Path $item.FullName -Label 'Unreferenced user tool bundle'
+            $candidates += [PSCustomObject]@{
+                Id = $item.Name
+                Path = $item.FullName
+                Bytes = [long]$usage.Bytes
+            }
+        }
+
+        $running = Get-RunningToolBundleIds
+        [long]$removedCount = 0
+        [long]$removedBytes = 0
+        [long]$inUseCount = 0
+        [long]$inUseBytes = 0
+        foreach ($candidate in $candidates) {
+            if ($running.Contains($candidate.Id)) {
+                $inUseCount++
+                $inUseBytes += $candidate.Bytes
+                continue
+            }
+            $running = Get-RunningToolBundleIds
+            if ($running.Contains($candidate.Id)) {
+                $inUseCount++
+                $inUseBytes += $candidate.Bytes
+                continue
+            }
+            $expected = Join-Path $buildsRoot $candidate.Id
+            if (-not [string]::Equals(
+                [IO.Path]::GetFullPath($candidate.Path),
+                [IO.Path]::GetFullPath($expected),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw 'An unreferenced bundle path changed during cleanup.'
+            }
+            Assert-Bundle -BundleId $candidate.Id
+            Remove-Item -LiteralPath $candidate.Path -Recurse -Force
+            if (Test-Path -LiteralPath $candidate.Path) {
+                throw 'An unreferenced bundle could not be removed completely.'
+            }
+            $removedCount++
+            $removedBytes += $candidate.Bytes
+        }
+
+        $stateAfter = Read-SlotState
+        if ($null -eq $stateAfter -or
+            $stateAfter.Current -ne $state.Current -or
+            $stateAfter.Previous -ne $state.Previous) {
+            throw 'The protected user tool slots changed during cleanup.'
+        }
+        Assert-Bundle -BundleId $stateAfter.Current
+        if ($null -ne $stateAfter.Previous) {
+            Assert-Bundle -BundleId $stateAfter.Previous
+        }
+        Write-Host 'IME user tool cleanup completed'
+        Write-Host "Removed bundles: $removedCount, $(Format-ByteSize -Bytes $removedBytes)"
+        Write-Host "Running bundles retained: $inUseCount, $(Format-ByteSize -Bytes $inUseBytes)"
+        Write-Host "Unrecognized build entries retained: $unrecognizedCount"
+        Write-Host "Current protected: $(Short-Id -Value $stateAfter.Current)"
+        Write-Host "Previous protected: $(Short-Id -Value $stateAfter.Previous)"
+        Write-Host 'Cargo cache and other root entries: unchanged'
+        Write-Host 'TSF DLL: unchanged'
+        Write-Host 'Administrator: not required'
+    } finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+    }
+}
+
 function Show-Status {
     $state = Read-SlotState
     Write-Host 'IME user tool status'
@@ -566,6 +715,11 @@ if ($StatusOnly) {
 
 if ($SpaceOnly) {
     Show-SpaceUsage
+    exit 0
+}
+
+if ($Cleanup) {
+    Remove-UnreferencedBundles
     exit 0
 }
 

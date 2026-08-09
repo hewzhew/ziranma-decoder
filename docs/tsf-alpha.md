@@ -508,6 +508,7 @@ stderr 的 `NativeCommandError` 包装由脚本先完整捕获，再按真实进
 .\refresh-ime.cmd
 .\refresh-ime.cmd status
 .\refresh-ime.cmd space
+.\refresh-ime.cmd cleanup
 .\refresh-ime.cmd rollback
 .\prepare-ime.cmd
 .\update-ime.cmd

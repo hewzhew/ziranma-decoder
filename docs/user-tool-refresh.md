@@ -11,6 +11,7 @@ TSF 状态，也不要求关闭正在输入的宿主。
 .\refresh-ime.cmd
 .\refresh-ime.cmd status
 .\refresh-ime.cmd space
+.\refresh-ime.cmd cleanup
 .\refresh-ime.cmd rollback
 ```
 
@@ -47,8 +48,15 @@ builds 条目的逻辑大小。“潜在可回收”只统计未引用包，但�
 都不算进去。它遇到重解析点会拒绝给出含糊结果，也不会删除任何文件。
 
 旧包仍不自动删除，避免刷新动作误伤仍在运行的管理器。需要回收磁盘时先运行
-`space` 留下可核对的基线；实际清理要使用后续单独设计的显式命令，不能成为
-正常刷新过程的隐含副作用。
+`space` 留下可核对的基线。`cleanup` 是独立的显式删除操作，只处理规范摘要目录
+中既非 current 也非 previous 的完整工具包。它先完整验证受保护槽和所有待删除
+包，再检查八种受管工具的运行路径；仍被进程使用的包跳过，无法检查进程路径、
+重解析点、损坏包或执行中状态漂移都会关闭失败。每个包在删除前再次核对身份和
+进程，删除后再次验证 current/previous 未变。
+
+`cleanup` 不处理 Cargo 缓存、来源不明的 builds 条目或其他根目录，也不关闭任
+何程序。删除的旧包不再能直接恢复，但 current/previous 回滚能力保持不变，且
+后续仍可从对应源码重新构建。正常 `refresh` 永远不会隐式调用清理。
 
 `alias-ime.cmd`、`candidate-data.cmd`、`personal-ime.cmd`、`research-ime.cmd`
 和 `wish-ime.cmd` 通过固定白名单解析 current。还没有工具槽时，它们兼容回退
