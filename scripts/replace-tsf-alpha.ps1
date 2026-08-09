@@ -177,7 +177,12 @@ function Write-ReplacementSummary {
         [Parameter(Mandatory = $true)]
         [string]$Result,
         [Parameter(Mandatory = $true)]
-        [object]$HostCacheState
+        [object]$HostCacheState,
+        [Parameter(Mandatory = $true)]
+        [Diagnostics.Stopwatch]$TotalStopwatch,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$TimingParts
     )
 
     Write-Host ''
@@ -216,6 +221,11 @@ function Write-ReplacementSummary {
     } else {
         Write-Host 'No further host action is needed.'
     }
+    Write-Host (
+        'Timing: {0} ms total ({1})' -f
+            $TotalStopwatch.ElapsedMilliseconds,
+            ($TimingParts -join '; ')
+    )
     Write-Host 'Microsoft Pinyin and the default input method were unchanged'
 }
 
@@ -366,6 +376,8 @@ if ($AdminPhase) {
     }
 }
 
+$totalStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$preflightStopwatch = [Diagnostics.Stopwatch]::StartNew()
 $sourceDigest = Get-Sha256Hex -Path $sourceDll
 $installedBuildRoot = Join-Path $repositoryRoot ".local\tsf-alpha\builds\$sourceDigest"
 $installedCandidateRoot = Join-Path $installedBuildRoot 'candidate-data'
@@ -446,29 +458,42 @@ if (-not $ForceReregister -and
                 '--confirm-enable-current-user-development-alpha'
             ) -Quiet
         }
+        $preflightStopwatch.Stop()
+        $verificationStopwatch = [Diagnostics.Stopwatch]::StartNew()
         Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
-        Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
-        Invoke-DevCtl -Arguments @('inspect', '--dll', $sourceDll) -Quiet
+        $verificationStopwatch.Stop()
+        $hostCacheStopwatch = [Diagnostics.Stopwatch]::StartNew()
         $hostCacheState = Get-HostCacheState
+        $hostCacheStopwatch.Stop()
         Write-ReplacementSummary `
             -Digest $sourceDigest `
             -Result 'TSF Alpha is already current' `
-            -HostCacheState $hostCacheState
+            -HostCacheState $hostCacheState `
+            -TotalStopwatch $totalStopwatch `
+            -TimingParts @(
+                "preflight $($preflightStopwatch.ElapsedMilliseconds) ms",
+                "enable verification $($verificationStopwatch.ElapsedMilliseconds) ms",
+                "host scan $($hostCacheStopwatch.ElapsedMilliseconds) ms"
+            )
         exit 0
     } catch {
         Write-Host 'The existing TSF Alpha registration needs one compatibility refresh.'
     }
 }
 
+$preflightStopwatch.Stop()
+$disableStopwatch = [Diagnostics.Stopwatch]::StartNew()
 if (Test-Path -LiteralPath $receipt -PathType Leaf) {
     Invoke-DevCtl -Arguments @(
         'disable-current-user',
         '--confirm-disable-current-user-development-alpha'
     )
 }
+$disableStopwatch.Stop()
 
 $adminArguments = @(
     '-NoProfile',
+    '-NonInteractive',
     '-ExecutionPolicy',
     'Bypass',
     '-File',
@@ -476,6 +501,7 @@ $adminArguments = @(
     '-AdminPhase'
 )
 $adminLaunchError = $null
+$administratorStopwatch = [Diagnostics.Stopwatch]::StartNew()
 if (Test-Administrator) {
     try {
         & $windowsPowerShell @adminArguments
@@ -499,6 +525,7 @@ if (Test-Administrator) {
         $adminLaunchError = $_.Exception.Message
     }
 }
+$administratorStopwatch.Stop()
 if ($adminExitCode -ne 0) {
     if (Test-Path -LiteralPath $adminReport -PathType Leaf) {
         Get-Content -LiteralPath $adminReport -Encoding UTF8 |
@@ -514,6 +541,7 @@ if (Test-Path -LiteralPath $adminReport -PathType Leaf) {
     Remove-Item -LiteralPath $adminReport -Force
 }
 
+$postflightStopwatch = [Diagnostics.Stopwatch]::StartNew()
 Invoke-CandidateCtl -Arguments @('status', '--root', $installedCandidateRoot) -Quiet
 
 $receiptDigest = Get-InstalledReceiptDigest
@@ -527,12 +555,21 @@ if ($EnableCurrentUserAfterReplace) {
         '--confirm-enable-current-user-development-alpha'
     ) -Quiet
     Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
-    Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
 }
-Invoke-DevCtl -Arguments @('inspect', '--dll', $sourceDll) -Quiet
+$postflightStopwatch.Stop()
 
+$hostCacheStopwatch = [Diagnostics.Stopwatch]::StartNew()
 $hostCacheState = Get-HostCacheState
+$hostCacheStopwatch.Stop()
 Write-ReplacementSummary `
     -Digest $sourceDigest `
     -Result 'TSF Alpha replacement completed' `
-    -HostCacheState $hostCacheState
+    -HostCacheState $hostCacheState `
+    -TotalStopwatch $totalStopwatch `
+    -TimingParts @(
+        "preflight $($preflightStopwatch.ElapsedMilliseconds) ms",
+        "disable $($disableStopwatch.ElapsedMilliseconds) ms",
+        "administrator/UAC $($administratorStopwatch.ElapsedMilliseconds) ms",
+        "postflight $($postflightStopwatch.ElapsedMilliseconds) ms",
+        "host scan $($hostCacheStopwatch.ElapsedMilliseconds) ms"
+    )

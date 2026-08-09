@@ -18,7 +18,7 @@ if not exist "%windows_powershell%" (
     exit /b 1
 )
 
-"%windows_powershell%" -NoProfile -ExecutionPolicy Bypass -File "%update_script%" -EnableCurrentUserAfterReplace
+"%windows_powershell%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%update_script%" -EnableCurrentUserAfterReplace
 set "update_exit_code=%ERRORLEVEL%"
 if "%update_exit_code%"=="0" (
     if exist "%~dp0target\release\wishpad.exe" (

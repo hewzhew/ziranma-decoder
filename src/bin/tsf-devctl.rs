@@ -3026,6 +3026,27 @@ mod tests {
     }
 
     #[test]
+    fn replacement_script_uses_one_bounded_stability_gate_per_success_path() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("replace-tsf-alpha.ps1");
+        let contents = fs::read_to_string(script).unwrap();
+
+        assert_eq!(
+            contents
+                .matches("Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet")
+                .count(),
+            2,
+            "the already-current and replacement paths should each verify once"
+        );
+        assert!(
+            !contents.contains("Invoke-DevCtl -Arguments @('inspect'"),
+            "host-cache-state already validates the source DLL while enable verification validates the installed layout"
+        );
+        assert!(contents.contains("Timing: {0} ms total ({1})"));
+    }
+
+    #[test]
     fn parser_requires_one_explicit_dll() {
         assert_eq!(parse_options(Vec::<String>::new()).unwrap(), Options::Help);
         assert_eq!(
