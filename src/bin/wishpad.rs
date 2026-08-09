@@ -47,15 +47,16 @@ mod windows_app {
         CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
         DrawIconEx, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE, ES_READONLY, ES_WANTRETURN, FindWindowW,
         GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU,
-        IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, IsDialogMessageW, LB_ADDSTRING, LB_GETCURSEL,
-        LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-        LBS_NOTIFY, LBS_OWNERDRAWFIXED, LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, LoadImageW,
-        MB_ICONERROR, MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
-        RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW,
-        ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
-        WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT,
-        WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-        WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        IDC_ARROW, IDI_APPLICATION, IDYES, IMAGE_ICON, IsDialogMessageW, LB_ADDSTRING,
+        LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS,
+        LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LR_DEFAULTCOLOR, LoadCursorW,
+        LoadIconW, LoadImageW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+        MB_YESNO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
+        SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORLISTBOX,
+        WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSW,
+        WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU,
+        WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
     use ziranma_core::{
@@ -64,7 +65,7 @@ mod windows_app {
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
         WishPackageInfo, WishReviewStatus, list_trashed_wish_packages, list_wish_packages,
         load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot,
-        repository_root_for_user_tool_executable, restore_wish_from_trash,
+        move_wish_to_trash, repository_root_for_user_tool_executable, restore_wish_from_trash,
         save_or_replace_wish_note,
     };
 
@@ -91,6 +92,7 @@ mod windows_app {
     const MANAGER_CLEAR_FILTER_ID: i32 = 116;
     const MANAGER_TRASH_VIEW_ID: i32 = 117;
     const MANAGER_RESTORE_ID: i32 = 118;
+    const MANAGER_MOVE_TO_TRASH_ID: i32 = 119;
     const NOTE_CATEGORY_ID: i32 = 201;
     const NOTE_EDIT_ID: i32 = 202;
     const NOTE_SAVE_ID: i32 = 203;
@@ -260,6 +262,7 @@ mod windows_app {
             | MANAGER_CONTEXT_ID
             | MANAGER_CLEAR_FILTER_ID
             | MANAGER_TRASH_VIEW_ID
+            | MANAGER_MOVE_TO_TRASH_ID
             | NOTE_CANCEL_ID => Some(ManagerButtonTone::Secondary),
             _ => None,
         }
@@ -395,6 +398,7 @@ mod windows_app {
                     MANAGER_CLEAR_FILTER_ID => clear_manager_filter(window),
                     MANAGER_TRASH_VIEW_ID => switch_manager_view(window),
                     MANAGER_RESTORE_ID => restore_selected_record(window),
+                    MANAGER_MOVE_TO_TRASH_ID => move_selected_record_to_trash(window),
                     _ => {}
                 }
                 LRESULT(0)
@@ -1072,6 +1076,22 @@ mod windows_app {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("BUTTON"),
+                    w!("移入回收站"),
+                    control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
+                    460,
+                    459,
+                    150,
+                    32,
+                    Some(window),
+                    Some(control_menu(MANAGER_MOVE_TO_TRASH_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
                     w!("恢复这条记录"),
                     control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
                     630,
@@ -1172,6 +1192,7 @@ mod windows_app {
             button_font,
             button_font,
             button_font,
+            button_font,
             body_font,
             heading_font,
             body_font,
@@ -1234,7 +1255,9 @@ mod windows_app {
             };
         }
         let _ = unsafe { SendMessageW(controls[6], CB_SETCURSEL, Some(WPARAM(0)), None) };
-        let _ = unsafe { ShowWindow(controls[13], SW_HIDE) };
+        if let Ok(restore) = unsafe { GetDlgItem(Some(window), MANAGER_RESTORE_ID) } {
+            let _ = unsafe { ShowWindow(restore, SW_HIDE) };
+        }
         true
     }
 
@@ -1407,6 +1430,10 @@ mod windows_app {
         for (id, visible) in [
             (MANAGER_EDIT_ID, view == ManagerView::Active && has_records),
             (
+                MANAGER_MOVE_TO_TRASH_ID,
+                view == ManagerView::Active && has_records,
+            ),
+            (
                 MANAGER_RESTORE_ID,
                 view == ManagerView::Trash && has_records,
             ),
@@ -1426,6 +1453,90 @@ mod windows_app {
             ManagerView::Trash => ManagerView::Active,
         };
         refresh_records_for_view(window, view, None);
+    }
+
+    fn move_selected_record_to_trash(window: HWND) {
+        let selected = MANAGER_STATE.lock().ok().and_then(|state| {
+            let state = state.as_ref()?;
+            if state.view != ManagerView::Active {
+                return None;
+            }
+            let selected_index = state.selected?;
+            let record = state.records.get(selected_index)?;
+            let preserve_id = adjacent_visible_record_index(&state.visible_indices, selected_index)
+                .and_then(|index| state.records.get(*index))
+                .map(|record| record.info.id().to_owned());
+            Some((state.root.clone(), record.info.id().to_owned(), preserve_id))
+        });
+        let Some((root, wish_id, preserve_id)) = selected else {
+            show_note_message(window, "请先选择一条许愿记录。", false);
+            return;
+        };
+        let choice = unsafe {
+            MessageBoxW(
+                Some(window),
+                w!(
+                    "这条记录会离开当前列表并进入本地回收站，需要时可以再恢复。\r\n\r\n确定继续吗？"
+                ),
+                w!("移入回收站"),
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+            )
+        };
+        if choice != IDYES {
+            return;
+        }
+        match move_wish_to_trash(&root, &wish_id) {
+            Ok(()) => {
+                refresh_records_for_view(window, ManagerView::Active, preserve_id);
+                if manager_total_record_count() == 0 {
+                    set_control_text(window, MANAGER_EMPTY_TITLE_ID, "已放进回收站");
+                    set_control_text(
+                        window,
+                        MANAGER_EMPTY_BODY_ID,
+                        "需要时可以从右上角“回收站”恢复。\r\n新的许愿仍会继续出现在这里。",
+                    );
+                } else {
+                    set_manager_status(window, "记录已移入回收站，需要时可以恢复");
+                }
+            }
+            Err(error) => show_note_message(window, move_to_trash_error_message(error), true),
+        }
+    }
+
+    fn adjacent_visible_record_index(
+        visible_indices: &[usize],
+        selected_index: usize,
+    ) -> Option<&usize> {
+        let selected_position = visible_indices
+            .iter()
+            .position(|index| *index == selected_index)?;
+        visible_indices
+            .get(selected_position.saturating_add(1))
+            .or_else(|| {
+                selected_position
+                    .checked_sub(1)
+                    .and_then(|position| visible_indices.get(position))
+            })
+    }
+
+    fn manager_total_record_count() -> usize {
+        MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|state| state.records.len()))
+            .unwrap_or(0)
+    }
+
+    fn move_to_trash_error_message(error: WishFeedbackError) -> &'static str {
+        match error {
+            WishFeedbackError::WishAlreadyExists | WishFeedbackError::NoteAlreadyExists => {
+                "回收站中已有同名内容，猫猫没有覆盖。"
+            }
+            WishFeedbackError::WishUnavailable | WishFeedbackError::NoteUnavailable => {
+                "这条记录暂时不完整，猫猫没有移动任何内容。"
+            }
+            _ => "暂时无法把这条记录移入回收站；原有内容没有被修改。",
+        }
     }
 
     fn restore_selected_record(window: HWND) {
@@ -1806,6 +1917,7 @@ mod windows_app {
             MANAGER_DETAIL_ID,
             MANAGER_CONTEXT_ID,
             MANAGER_EDIT_ID,
+            MANAGER_MOVE_TO_TRASH_ID,
             MANAGER_RESTORE_ID,
             MANAGER_STATUS_ID,
             MANAGER_SEARCH_ID,
@@ -1841,6 +1953,10 @@ mod windows_app {
             .unwrap_or(false);
         for (id, visible) in [
             (MANAGER_EDIT_ID, view == ManagerView::Active && has_records),
+            (
+                MANAGER_MOVE_TO_TRASH_ID,
+                view == ManagerView::Active && has_records,
+            ),
             (
                 MANAGER_RESTORE_ID,
                 view == ManagerView::Trash && has_records,
@@ -2881,6 +2997,18 @@ mod windows_app {
         }
 
         #[test]
+        fn moving_a_record_preserves_the_nearest_visible_selection() {
+            assert_eq!(adjacent_visible_record_index(&[7, 3, 9], 3), Some(&9));
+            assert_eq!(adjacent_visible_record_index(&[7, 3, 9], 9), Some(&3));
+            assert_eq!(adjacent_visible_record_index(&[7], 7), None);
+            assert_eq!(adjacent_visible_record_index(&[7, 3], 4), None);
+            assert!(
+                move_to_trash_error_message(WishFeedbackError::WishAlreadyExists)
+                    .contains("没有覆盖")
+            );
+        }
+
+        #[test]
         fn manager_and_note_dialog_keep_primary_and_secondary_actions_distinct() {
             assert_eq!(
                 manager_button_tone(MANAGER_EDIT_ID),
@@ -2900,6 +3028,10 @@ mod windows_app {
             );
             assert_eq!(
                 manager_button_tone(MANAGER_TRASH_VIEW_ID),
+                Some(ManagerButtonTone::Secondary)
+            );
+            assert_eq!(
+                manager_button_tone(MANAGER_MOVE_TO_TRASH_ID),
                 Some(ManagerButtonTone::Secondary)
             );
             assert_eq!(
