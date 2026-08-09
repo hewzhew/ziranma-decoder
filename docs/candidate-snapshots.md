@@ -156,10 +156,27 @@ cargo run --release --bin candidatectl -- build-rime-slice `
 
 固定来源上的 2,000 + 2,000 配额实验仍保持 120,000 条和全部共有码首选，新增
 3,977 个长词规范码，同时放弃 3,977 个最低权重双字码。独立 UD train 词面
-负对照只新增 4 个三字、2 个四字 token，却丢失 34 个双字 token；UD test
-新增 0 个三字、1 个四字 token，丢失 7 个双字 token。该 token 口径不能代表
-连续短语或个人输入，但已经足以拒绝自动换代：配额功能只保留为离线实验工具，
-当前日用包继续使用三字、四字配额为 0 的完整双字覆盖方案。
+负对照只新增 4 个三字词面（4 次）、2 个四字词面（4 次），却丢失 34 个双字
+词面（44 次）；UD test 新增 0 个三字、1 个四字词面（1 次），丢失 7 个双字
+词面（8 次）。该 token 口径不能代表连续短语或个人输入，但已经足以拒绝自动
+换代：配额功能只保留为离线实验工具，当前日用包继续使用三字、四字配额为 0
+的完整双字覆盖方案。
+
+上述数字可用只读、聚合的留出审计复现。命令要求训练侧参考与留出语料具有不同
+SHA-256，同时报告独立词面数和实际出现次数，不显示文字、不推断 UD 中没有的
+读音，也不比较候选包之间的原始权重：
+
+```powershell
+cargo run --release --bin candidatectl -- length-coverage-audit `
+  --base-payload .local/public-audit/wanxiang-fdda7afb/package-top76300-plus-bigram-cover-v2/lexicon.tsv `
+  --challenger-payload .local/public-audit/wanxiang-fdda7afb/package-top76300-plus-length2k-v1/lexicon.tsv `
+  --fit-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu `
+  --held-out-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu
+```
+
+当前候选包 provenance 只绑定一个词典来源。若将 UD train 真正用于挑选长词，
+输出包就依赖第二个公开来源；在多来源哈希、许可和选择参数能够一起被认证以前，
+切片器不会提供这种构建模式。留出审计可以评价假设，但不能绕过来源绑定生成包。
 
 ```powershell
 cargo run --release --bin candidatectl -- compare `

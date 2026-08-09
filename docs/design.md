@@ -495,6 +495,9 @@ cargo test --release --lib pinned_public_transposition_probe_reuses_the_primary_
 配额占用既有 120k 上限而不扩展热索引。2k + 2k 公开实验在独立 UD token
 负对照上的长词增益不足以抵消双字损失，当前不进入日用包；后续若继续，应先用
 独立训练来源选择、保留评测来源验证，不能把同一语料既当选择器又当结论。
+`candidatectl length-coverage-audit` 强制训练侧参考与留出语料字节不同，并按词面
+与实例分别报告二至四字覆盖。真正让训练语料参与切片前，还必须先让候选包
+provenance 认证词典和选择语料两个来源；当前单来源声明不能隐去这一依赖。
 
 TSF 现可选择消费这条纯合并结果，但默认关闭。补充包位于跨 DLL 版本共享的
 独立公开槽根，启用状态严格绑定 current 包与每码补词上限；开关缺失即关闭，

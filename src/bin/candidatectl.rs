@@ -33,10 +33,11 @@ use ziranma_core::{
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
-    PublicRimeSliceConfig, PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
-    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
-    SupplementalCompositionOrder, are_qwerty_neighbors, audit_public_supplemental_layer,
+    PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
+    PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
+    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SupplementalCandidateLayerConfig,
+    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
+    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_supplemental_layer,
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
@@ -83,6 +84,12 @@ enum Options {
     Compare {
         base_payload: PathBuf,
         challenger_payload: PathBuf,
+    },
+    LengthCoverageAudit {
+        base_payload: PathBuf,
+        challenger_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
     },
     LayerAudit {
         core_payload: PathBuf,
@@ -226,6 +233,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_payload,
             challenger_payload,
         } => compare_payloads(&base_payload, &challenger_payload)?,
+        Options::LengthCoverageAudit {
+            base_payload,
+            challenger_payload,
+            fit_corpus,
+            held_out_corpus,
+        } => audit_length_coverage(
+            &base_payload,
+            &challenger_payload,
+            &fit_corpus,
+            &held_out_corpus,
+        )?,
         Options::LayerAudit {
             core_payload,
             supplemental_payload,
@@ -334,6 +352,7 @@ fn parse_options(
         "build-rime" => parse_build(arguments, true),
         "build-rime-slice" => parse_build_rime_slice(arguments),
         "compare" => parse_compare(arguments),
+        "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
@@ -628,6 +647,40 @@ fn parse_compare(
     Ok(Options::Compare {
         base_payload: base_payload.ok_or("compare requires --base-payload")?,
         challenger_payload: challenger_payload.ok_or("compare requires --challenger-payload")?,
+    })
+}
+
+fn parse_length_coverage_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut base_payload = None;
+    let mut challenger_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--challenger-payload" => set_path(
+                &mut challenger_payload,
+                &mut arguments,
+                "--challenger-payload",
+            )?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            _ => {
+                return Err("unknown length-coverage-audit argument; value was suppressed".into());
+            }
+        }
+    }
+    Ok(Options::LengthCoverageAudit {
+        base_payload: base_payload.ok_or("length-coverage-audit requires --base-payload")?,
+        challenger_payload: challenger_payload
+            .ok_or("length-coverage-audit requires --challenger-payload")?,
+        fit_corpus: fit_corpus.ok_or("length-coverage-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("length-coverage-audit requires --held-out-corpus")?,
     })
 }
 
@@ -1068,6 +1121,9 @@ fn print_usage() {
     );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
+        "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
+    );
+    eprintln!(
         "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
     );
     eprintln!(
@@ -1242,6 +1298,102 @@ fn compare_payloads(
         report.changed_top_text_codes,
         report.consensus_top_reorder_eligible_codes,
     ))
+}
+
+fn audit_length_coverage(
+    base_payload: &Path,
+    challenger_payload: &Path,
+    fit_corpus: &Path,
+    held_out_corpus: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base_text = read_explicit_text(
+        base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let challenger_text = read_explicit_text(
+        challenger_payload,
+        "challenger public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        fit_corpus,
+        "public fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let base_sha256 = candidate_sha256_hex(base_text.as_bytes());
+    let challenger_sha256 = candidate_sha256_hex(challenger_text.as_bytes());
+    let fit_sha256 = candidate_sha256_hex(fit_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if base_sha256 == challenger_sha256 {
+        return Err("length-coverage-audit requires two distinct candidate payloads".into());
+    }
+    if fit_sha256 == held_out_sha256 {
+        return Err("length-coverage-audit requires a distinct held-out corpus".into());
+    }
+
+    let base = parse_lexicon_tsv(&base_text)?;
+    let challenger = parse_lexicon_tsv(&challenger_text)?;
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let fit_audit = audit_public_lexicon_token_coverage(&fit, &base, &challenger);
+    let held_out_audit = audit_public_lexicon_token_coverage(&held_out, &base, &challenger);
+
+    let mut output = format!(
+        "公开词面长度覆盖留出审计\n候选载荷：基线 {} 条 · SHA-256 {base_sha256}；对照 {} 条 · SHA-256 {challenger_sha256}\n",
+        base.len(),
+        challenger.len(),
+    );
+    write_length_coverage_section(&mut output, "训练侧参考", &fit_sha256, fit.stats, fit_audit);
+    write_length_coverage_section(
+        &mut output,
+        "留出评测",
+        &held_out_sha256,
+        held_out.stats,
+        held_out_audit,
+    );
+    output.push_str(
+        "口径：只比较二至四字 Han token 的公开词面覆盖；不推断读音，不比较跨来源权重，不显示词条文字。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn write_length_coverage_section(
+    output: &mut String,
+    label: &str,
+    corpus_sha256: &str,
+    corpus_stats: UdCorpusImportStats,
+    audit: PublicLexiconTokenCoverageAudit,
+) {
+    writeln!(
+        output,
+        "{label}：{} 句，{} 个句法 token · SHA-256 {corpus_sha256}",
+        corpus_stats.sentences, corpus_stats.syntactic_tokens,
+    )
+    .unwrap();
+    for length in audit.lengths {
+        writeln!(
+            output,
+            "  {}字：词面 {}（实例 {}）；基线覆盖 {}（实例 {}），对照覆盖 {}（实例 {}）；新增 {}（实例 {}），丢失 {}（实例 {}）",
+            length.characters,
+            length.source_unique_tokens,
+            length.source_token_instances,
+            length.base_covered_unique_tokens,
+            length.base_covered_token_instances,
+            length.challenger_covered_unique_tokens,
+            length.challenger_covered_token_instances,
+            length.challenger_gained_unique_tokens,
+            length.challenger_gained_token_instances,
+            length.challenger_lost_unique_tokens,
+            length.challenger_lost_token_instances,
+        )
+        .unwrap();
+    }
 }
 
 fn audit_candidate_layers(
@@ -4315,6 +4467,68 @@ mod tests {
             synthesize_four_character_edit(intended, SyntheticFourCharacterEdit::ExtraKey, 4)
                 .unwrap();
         assert_eq!(extra, "abcdeefgh");
+    }
+
+    #[test]
+    fn length_coverage_parser_requires_both_public_corpus_roles() {
+        assert_eq!(
+            parse_options([
+                "length-coverage-audit".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+                "--challenger-payload".to_owned(),
+                "challenger.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+            ])
+            .unwrap(),
+            Options::LengthCoverageAudit {
+                base_payload: PathBuf::from("base.tsv"),
+                challenger_payload: PathBuf::from("challenger.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+            }
+        );
+        assert!(
+            parse_options([
+                "length-coverage-audit".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn length_coverage_report_is_aggregate_only_and_requires_holdout() {
+        const BASE: &str = "text\tpinyin\tfrequency\n双字\tshuang zi\t10\n三字词\tsan zi ci\t9\n";
+        const CHALLENGER: &str =
+            "text\tpinyin\tfrequency\n双字\tshuang zi\t10\n四字词语\tsi zi ci yu\t9\n";
+        const FIT: &str = "# sent_id = fit\n1\t双字\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\n";
+        const HELD_OUT: &str = "# sent_id = held-out\n1\t三字词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n2\t四字词语\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        let root = temporary_test_root();
+        fs::create_dir(&root).unwrap();
+        let base = root.join("base.tsv");
+        let challenger = root.join("challenger.tsv");
+        let fit = root.join("fit.conllu");
+        let held_out = root.join("held-out.conllu");
+        fs::write(&base, BASE).unwrap();
+        fs::write(&challenger, CHALLENGER).unwrap();
+        fs::write(&fit, FIT).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+
+        let report = audit_length_coverage(&base, &challenger, &fit, &held_out).unwrap();
+        assert!(report.contains("训练侧参考：1 句"));
+        assert!(report.contains("留出评测：1 句"));
+        assert!(report.contains("新增 1（实例 1），丢失 0（实例 0）"));
+        assert!(report.contains("新增 0（实例 0），丢失 1（实例 1）"));
+        assert!(!report.contains("三字词"));
+        assert!(!report.contains("四字词语"));
+        assert!(audit_length_coverage(&base, &challenger, &fit, &fit).is_err());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

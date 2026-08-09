@@ -317,6 +317,40 @@ pub struct PublicCharacterTrainingCorpus {
     pub stats: PublicCharacterTrainingStats,
 }
 
+/// Aggregate-only surface coverage of one public UD corpus by two lexicons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicLexiconTokenCoverageAudit {
+    /// Fixed two-, three-, and four-character rows, in that order.
+    pub lengths: [PublicLexiconTokenCoverageByLength; 3],
+}
+
+/// Public UD token coverage for one fixed Han-character length.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicLexiconTokenCoverageByLength {
+    /// Number of Han characters in every token represented by this row.
+    pub characters: usize,
+    /// Distinct public UD token surfaces of this length.
+    pub source_unique_tokens: usize,
+    /// Public UD token occurrences of this length.
+    pub source_token_instances: usize,
+    /// Distinct source token surfaces present in the baseline lexicon.
+    pub base_covered_unique_tokens: usize,
+    /// Distinct source token surfaces present in the challenger lexicon.
+    pub challenger_covered_unique_tokens: usize,
+    /// Distinct source surfaces gained only by the challenger.
+    pub challenger_gained_unique_tokens: usize,
+    /// Distinct source surfaces lost from the baseline.
+    pub challenger_lost_unique_tokens: usize,
+    /// Source token occurrences covered by the baseline lexicon.
+    pub base_covered_token_instances: usize,
+    /// Source token occurrences covered by the challenger lexicon.
+    pub challenger_covered_token_instances: usize,
+    /// Source occurrences whose surface is gained only by the challenger.
+    pub challenger_gained_token_instances: usize,
+    /// Source occurrences whose surface is lost from the baseline.
+    pub challenger_lost_token_instances: usize,
+}
+
 /// Filtering and size counts for public character-model training text.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PublicCharacterTrainingStats {
@@ -399,6 +433,72 @@ pub fn parse_ud_conllu(contents: &str) -> Result<UdCorpus, UdCorpusParseError> {
     }
     stats.sentences = sentences.len();
     Ok(UdCorpus { sentences, stats })
+}
+
+/// Compares two public lexicons against public UD token surfaces.
+///
+/// Punctuation, non-Han tokens, and lengths outside two through four are
+/// excluded. The result contains only aggregate counts; pronunciation is not
+/// inferred from UD, and raw frequency values are never compared across the
+/// two lexicons.
+pub fn audit_public_lexicon_token_coverage(
+    corpus: &UdCorpus,
+    base: &[LexiconEntry],
+    challenger: &[LexiconEntry],
+) -> PublicLexiconTokenCoverageAudit {
+    let base_surfaces = base
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let challenger_surfaces = challenger
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let mut tokens_by_length =
+        std::array::from_fn::<HashMap<&str, usize>, 3, _>(|_| HashMap::new());
+
+    for token in corpus
+        .sentences
+        .iter()
+        .flat_map(|sentence| &sentence.tokens)
+    {
+        if token.upos == "PUNCT" || !token.form.chars().all(is_han_character) {
+            continue;
+        }
+        let characters = token.form.chars().count();
+        let Some(length_index) = characters.checked_sub(2).filter(|&index| index < 3) else {
+            continue;
+        };
+        *tokens_by_length[length_index]
+            .entry(token.form.as_str())
+            .or_default() += 1;
+    }
+
+    let lengths = std::array::from_fn(|index| {
+        let tokens = std::mem::take(&mut tokens_by_length[index]);
+        let mut audit = PublicLexiconTokenCoverageByLength {
+            characters: index + 2,
+            source_unique_tokens: tokens.len(),
+            source_token_instances: tokens.values().sum(),
+            ..PublicLexiconTokenCoverageByLength::default()
+        };
+        for (token, instances) in tokens {
+            let in_base = base_surfaces.contains(token);
+            let in_challenger = challenger_surfaces.contains(token);
+            audit.base_covered_unique_tokens += usize::from(in_base);
+            audit.challenger_covered_unique_tokens += usize::from(in_challenger);
+            audit.challenger_gained_unique_tokens += usize::from(!in_base && in_challenger);
+            audit.challenger_lost_unique_tokens += usize::from(in_base && !in_challenger);
+            audit.base_covered_token_instances += instances * usize::from(in_base);
+            audit.challenger_covered_token_instances += instances * usize::from(in_challenger);
+            audit.challenger_gained_token_instances +=
+                instances * usize::from(!in_base && in_challenger);
+            audit.challenger_lost_token_instances +=
+                instances * usize::from(in_base && !in_challenger);
+        }
+        audit
+    });
+    PublicLexiconTokenCoverageAudit { lengths }
 }
 
 fn finish_sentence(
@@ -1404,7 +1504,8 @@ mod tests {
 
     use crate::{
         BigramLanguageModel, CharacterBigramLanguageModel, MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES,
-        audit_anchored_tail_failures, audit_public_protocol_context, audit_public_protocols,
+        audit_anchored_tail_failures, audit_public_lexicon_token_coverage,
+        audit_public_protocol_context, audit_public_protocols,
         parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_character_training_texts, select_public_continuous_composition_cases,
@@ -1416,6 +1517,44 @@ mod tests {
         include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu");
     const UD_TEST: &str =
         include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu");
+
+    #[test]
+    fn token_coverage_audit_reports_unique_and_repeated_held_out_changes() {
+        const CORPUS: &str = "# sent_id = public-one\n\
+1\t双字\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t三字词\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+3\t三字词\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+4\t四字词语\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        let corpus = parse_ud_conllu(CORPUS).unwrap();
+        let base = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+双字\tshuang zi\t100\n\
+三字词\tsan zi ci\t90\n",
+        )
+        .unwrap();
+        let challenger = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+双字\tshuang zi\t100\n\
+四字词语\tsi zi ci yu\t90\n",
+        )
+        .unwrap();
+
+        let audit = audit_public_lexicon_token_coverage(&corpus, &base, &challenger);
+        assert_eq!(audit.lengths[0].characters, 2);
+        assert_eq!(audit.lengths[0].source_unique_tokens, 1);
+        assert_eq!(audit.lengths[0].base_covered_unique_tokens, 1);
+        assert_eq!(audit.lengths[0].challenger_covered_unique_tokens, 1);
+        assert_eq!(audit.lengths[1].characters, 3);
+        assert_eq!(audit.lengths[1].source_unique_tokens, 1);
+        assert_eq!(audit.lengths[1].source_token_instances, 2);
+        assert_eq!(audit.lengths[1].challenger_lost_unique_tokens, 1);
+        assert_eq!(audit.lengths[1].challenger_lost_token_instances, 2);
+        assert_eq!(audit.lengths[2].characters, 4);
+        assert_eq!(audit.lengths[2].challenger_gained_unique_tokens, 1);
+        assert_eq!(audit.lengths[2].challenger_gained_token_instances, 1);
+        assert!(!format!("{audit:?}").contains("三字词"));
+        assert!(!format!("{audit:?}").contains("四字词语"));
+    }
 
     #[test]
     fn pinned_ud_train_snapshot_has_stable_bigram_mapping() {
