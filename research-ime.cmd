@@ -37,10 +37,15 @@ if /i "%action%"=="off" (
     exit /b %ERRORLEVEL%
 )
 
+if /i "%action%"=="summary" (
+    "%researchctl%" summary --confirm-read-private-feedback --root "%research_root%"
+    exit /b %ERRORLEVEL%
+)
+
 if /i "%action%"=="review" (
     "%researchctl%" review --confirm-show-private-text --root "%research_root%"
     exit /b %ERRORLEVEL%
 )
 
-echo Usage: research-ime.cmd [status^|on^|off^|review]
+echo Usage: research-ime.cmd [status^|on^|off^|summary^|review]
 exit /b 2

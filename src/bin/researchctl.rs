@@ -23,6 +23,7 @@ enum Command {
     Status,
     Enable,
     Disable,
+    Summary,
     Review,
 }
 
@@ -31,6 +32,7 @@ struct Options {
     command: Command,
     root: Option<PathBuf>,
     confirmed: bool,
+    read_private_feedback: bool,
     show_private_text: bool,
 }
 
@@ -77,6 +79,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
             Ok(())
         }
+        Command::Summary => {
+            if !options.read_private_feedback {
+                return Err("摘要会在本机解密私人反馈并只显示聚合数字；请加入 \
+                     --confirm-read-private-feedback"
+                    .into());
+            }
+            print_summary(&root)
+        }
         Command::Review => {
             if !options.show_private_text {
                 return Err("回顾会解密并在当前终端显示真实编码和提交文字；请加入 \
@@ -86,6 +96,36 @@ fn run() -> Result<(), Box<dyn Error>> {
             print_review(&root)
         }
     }
+}
+
+#[cfg(not(windows))]
+fn print_summary(_root: &Path) -> Result<(), Box<dyn Error>> {
+    Err("持续研究摘要的当前用户解密目前只支持 Windows".into())
+}
+
+#[cfg(windows)]
+fn print_summary(root: &Path) -> Result<(), Box<dyn Error>> {
+    let mut packages = list_wish_packages(root)?;
+    let available_batches = packages.len();
+    packages.truncate(MAX_REVIEW_BATCHES);
+    packages.reverse();
+    let mut review = ResearchReview::default();
+    let mut snapshots = Vec::with_capacity(packages.len());
+    for package in packages {
+        let snapshot = load_wish_snapshot(root, package.id(), &WindowsUserDataProtector)?;
+        review.observe(&snapshot)?;
+        snapshots.push(snapshot);
+    }
+    review.available_batches = available_batches;
+    let latest_runtime = match latest_runtime_review(&snapshots)? {
+        Some((identity, review)) => {
+            let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
+            review.render_runtime_summary(&identity, &half_pairs)
+        }
+        None => "最新运行身份：尚无带版本标识的批次。".to_owned(),
+    };
+    println!("{}\n\n{}", latest_runtime, review.render_aggregate());
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -419,6 +459,83 @@ impl ResearchReview {
                 && first_candidate
                     .is_some_and(|candidate| candidate.source() == NativeCandidateSource::Decoder),
         );
+    }
+
+    fn render_aggregate(&self) -> String {
+        let mut output = String::new();
+        writeln!(output, "持续研究摘要（不显示输入原文）").unwrap();
+        writeln!(
+            output,
+            "批次：读取 {} / 可用 {}；完整 {}；事件 {} / 来源 {}，省略 {}。",
+            self.batches,
+            self.available_batches,
+            self.complete_batches,
+            self.events,
+            self.source_events,
+            self.omitted_events,
+        )
+        .unwrap();
+        render_runtime_identities(
+            &mut output,
+            &self.runtime_batches,
+            self.unidentified_runtime_batches,
+        );
+        writeln!(
+            output,
+            "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；显式选择 {}；无法配对现场 {}。",
+            self.candidate_commits,
+            self.top_one_commits,
+            percent(self.top_one_commits, self.candidate_commits),
+            self.non_top_commits,
+            self.paged_commits,
+            self.manual_commits,
+            self.unpaired_commits,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "候选：{} 帧；最大已加载深度 {}；仍可继续加载 {} 帧；Tab 找字 {} 帧（逐字组词 {} 帧）。",
+            self.candidate_frames,
+            self.maximum_loaded_candidates,
+            self.frames_allowing_more_load,
+            self.shape_frames,
+            self.tab_assembly_frames,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "其他结束：原码上屏 {}；取消 {}；提交后紧接退格 {}（已交给宿主，结果未观测）。",
+            self.raw_commits, self.cancellations, self.post_commit_backspaces_routed,
+        )
+        .unwrap();
+        render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
+        render_latency(&mut output, "首次出现", &self.initial_popup_ms);
+        render_latency(
+            &mut output,
+            "慢按键总耗时（仅 ≥16 ms）",
+            &self.slow_key_total_ms,
+        );
+        render_latency(&mut output, "慢按键刷新阶段", &self.slow_key_refresh_ms);
+        render_latency(
+            &mut output,
+            "慢按键候选规划阶段",
+            &self.slow_key_planning_ms,
+        );
+        render_latency(
+            &mut output,
+            "慢按键编辑会话阶段",
+            &self.slow_key_edit_session_ms,
+        );
+        writeln!(
+            output,
+            "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
+            self.transposition_accepted, self.transposition_rejected, self.transposition_unknown,
+        )
+        .unwrap();
+        output.push_str(
+            "口径：只读解密本地持续批次；只显示聚合数字，不显示原码、候选或提交文字；没有写模型、修改排序、联网或导出文件。",
+        );
+        output
     }
 
     fn render(&self) -> String {
@@ -902,11 +1019,13 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
         Some("status") => Command::Status,
         Some("enable") => Command::Enable,
         Some("disable") => Command::Disable,
+        Some("summary") => Command::Summary,
         Some("review") => Command::Review,
         _ => return Err(usage().into()),
     };
     let mut root = None;
     let mut confirmed = false;
+    let mut read_private_feedback = false;
     let mut show_private_text = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -914,11 +1033,17 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
                 root = Some(PathBuf::from(arguments.next().ok_or("--root 后缺少目录")?));
             }
             "--confirm-continuous-private-feedback" if !confirmed => confirmed = true,
+            "--confirm-read-private-feedback" if !read_private_feedback => {
+                read_private_feedback = true
+            }
             "--confirm-show-private-text" if !show_private_text => show_private_text = true,
             _ => return Err(usage().into()),
         }
     }
     if command != Command::Enable && confirmed {
+        return Err(usage().into());
+    }
+    if command != Command::Summary && read_private_feedback {
         return Err(usage().into());
     }
     if command != Command::Review && show_private_text {
@@ -928,6 +1053,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
         command,
         root,
         confirmed,
+        read_private_feedback,
         show_private_text,
     })
 }
@@ -944,7 +1070,8 @@ fn research_root_for_executable(executable: &Path) -> Option<PathBuf> {
 }
 
 fn usage() -> String {
-    "用法：\n  researchctl status [--root <目录>]\n  researchctl review \
+    "用法：\n  researchctl status [--root <目录>]\n  researchctl summary \
+     --confirm-read-private-feedback [--root <目录>]\n  researchctl review \
      --confirm-show-private-text [--root <目录>]\n  researchctl enable \
      --confirm-continuous-private-feedback [--root <目录>]\n  researchctl disable [--root <目录>]"
         .to_owned()
@@ -962,6 +1089,7 @@ mod tests {
                 command: Command::Status,
                 root: None,
                 confirmed: false,
+                read_private_feedback: false,
                 show_private_text: false,
             }
         );
@@ -978,6 +1106,25 @@ mod tests {
             parse_options([
                 "disable".to_owned(),
                 "--confirm-continuous-private-feedback".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            !parse_options(["summary".to_owned()])
+                .unwrap()
+                .read_private_feedback
+        );
+        let summary = parse_options([
+            "summary".to_owned(),
+            "--confirm-read-private-feedback".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(summary.command, Command::Summary);
+        assert!(summary.read_private_feedback);
+        assert!(
+            parse_options([
+                "review".to_owned(),
+                "--confirm-read-private-feedback".to_owned(),
             ])
             .is_err()
         );
@@ -1089,6 +1236,12 @@ mod tests {
         assert_eq!(pattern.last_rank, Some(1));
         assert_eq!(pattern.session_promoted_frames, 1);
         assert!(review.render().contains("首次第 2，最近第 1"));
+        let aggregate = review.render_aggregate();
+        assert!(aggregate.contains("持续研究摘要（不显示输入原文）"));
+        assert!(!aggregate.contains("dago"));
+        assert!(!aggregate.contains("大国"));
+        assert!(!aggregate.contains("打过"));
+        assert!(!aggregate.contains("需要复查"));
         assert!(
             review
                 .render()
@@ -1110,11 +1263,11 @@ mod tests {
         let half_pairs = analyze_runtime_half_pairs(&snapshots, &latest_identity).unwrap();
         assert_eq!(latest_identity.module_sha256(), "cd".repeat(32));
         assert_eq!(latest_review.batches, 1);
-        assert!(
-            latest_review
-                .render_runtime_summary(&latest_identity, &half_pairs)
-                .contains("最新运行身份（与旧批次分开）")
-        );
+        let latest_summary = latest_review.render_runtime_summary(&latest_identity, &half_pairs);
+        assert!(latest_summary.contains("最新运行身份（与旧批次分开）"));
+        assert!(!latest_summary.contains("dago"));
+        assert!(!latest_summary.contains("大国"));
+        assert!(!latest_summary.contains("打过"));
     }
 
     #[test]

@@ -83,11 +83,12 @@ cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchct
 .\update-ime.cmd
 ```
 
-根目录脚本把持续授权与本地回顾缩成四个动作：
+根目录脚本把持续授权与本地分析缩成五个动作：
 
 ```powershell
 .\research-ime.cmd status
 .\research-ime.cmd on
+.\research-ime.cmd summary
 .\research-ime.cmd review
 .\research-ime.cmd off
 ```
@@ -112,11 +113,18 @@ V8 及之后批次会先按连续链接回，再以失焦/宿主结束为硬边�
 文件边界或文件时间伪装成自然片段。非首选、取消和原码上屏只作为待复查线索，
 不能自动解释为错误；单次改码也不会形成手癖结论。
 
+`summary` 使用同一套只读解密和聚合逻辑，但只显示运行版本、批次/事件计数、
+候选与提交计数、候选窗耗时、慢按键分段耗时和自动换序标签。它不列出原码、
+候选、提交文字、取消组合、个人学习身份或许愿场景，适合先判断某次卡顿是否留下
+可用样本。底层仍要求显式的 `--confirm-read-private-feedback`，因为即使不回显
+文字，计算聚合值也确实在当前进程内解密并读取了私人批次。
+
 底层等价命令为：
 
 ```powershell
 .\target\release\researchctl.exe enable --confirm-continuous-private-feedback
 .\target\release\researchctl.exe status
+.\target\release\researchctl.exe summary --confirm-read-private-feedback
 .\target\release\researchctl.exe review --confirm-show-private-text
 .\target\release\researchctl.exe disable
 ```
