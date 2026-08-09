@@ -16,8 +16,10 @@ $devctl = Join-Path $repositoryRoot 'target\release\tsf-devctl.exe'
 $candidatectl = Join-Path $repositoryRoot 'target\release\candidatectl.exe'
 $sourceDll = Join-Path $repositoryRoot 'target\release\ziranma_core.dll'
 $sourceCandidateRoot = Join-Path $repositoryRoot 'target\release\candidate-data'
-$receipt = Join-Path $repositoryRoot '.local\tsf-alpha\install-v1.txt'
-$adminReport = Join-Path $repositoryRoot '.local\tsf-alpha\admin-phase-last.txt'
+$stateRoot = Join-Path $repositoryRoot '.local\tsf-alpha'
+$receipt = Join-Path $stateRoot 'install-v1.txt'
+$adminReport = Join-Path $stateRoot 'admin-phase-last.txt'
+$replacementLockPath = Join-Path $stateRoot 'replacement.lock'
 $windowsPowerShell = Join-Path `
     $env:SystemRoot `
     'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -28,6 +30,47 @@ function Test-Administrator {
     return $principal.IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator
     )
+}
+
+function Open-ReplacementLock {
+    if (Test-Path -LiteralPath $script:stateRoot) {
+        $stateRootItem = Get-Item -LiteralPath $script:stateRoot -Force
+        if (-not $stateRootItem.PSIsContainer -or
+            ($stateRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The TSF Alpha state root is invalid.'
+        }
+    } else {
+        New-Item -ItemType Directory -Path $script:stateRoot | Out-Null
+    }
+    if (Test-Path -LiteralPath $script:replacementLockPath) {
+        $lockItem = Get-Item -LiteralPath $script:replacementLockPath -Force
+        if ($lockItem.PSIsContainer -or
+            ($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The TSF Alpha replacement lock is invalid.'
+        }
+    }
+    try {
+        return [IO.File]::Open(
+            $script:replacementLockPath,
+            [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+    } catch {
+        throw 'Another TSF Alpha replacement is running, or its lock is unavailable.'
+    }
+}
+
+function Remove-StaleAdministratorReport {
+    if (-not (Test-Path -LiteralPath $script:adminReport)) {
+        return
+    }
+    $item = Get-Item -LiteralPath $script:adminReport -Force
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The administrator replacement report is invalid.'
+    }
+    Remove-Item -LiteralPath $script:adminReport -Force
 }
 
 function Invoke-DevCtl {
@@ -508,6 +551,8 @@ if ($AdminPhase) {
     }
 }
 
+$replacementLock = Open-ReplacementLock
+try {
 $totalStopwatch = [Diagnostics.Stopwatch]::StartNew()
 $preflightStopwatch = [Diagnostics.Stopwatch]::StartNew()
 $sourceDigest = Get-Sha256Hex -Path $sourceDll
@@ -592,6 +637,7 @@ if (-not $ForceReregister -and
 }
 
 $preflightStopwatch.Stop()
+Remove-StaleAdministratorReport
 $disableStopwatch = [Diagnostics.Stopwatch]::StartNew()
 if (Test-Path -LiteralPath $receipt -PathType Leaf) {
     Invoke-DevCtl -Arguments @(
@@ -652,19 +698,25 @@ if (Test-Path -LiteralPath $adminReport -PathType Leaf) {
 }
 
 $postflightStopwatch = [Diagnostics.Stopwatch]::StartNew()
-Invoke-CandidateCtl -Arguments @('status', '--root', $installedCandidateRoot) -Quiet
+try {
+    Invoke-CandidateCtl -Arguments @('status', '--root', $installedCandidateRoot) -Quiet
 
-$receiptDigest = Get-InstalledReceiptDigest
-if ($receiptDigest -ne $sourceDigest) {
-    throw 'The installed TSF receipt does not match the release DLL.'
-}
+    $receiptDigest = Get-InstalledReceiptDigest
+    if ($receiptDigest -ne $sourceDigest) {
+        throw 'The installed TSF receipt does not match the release DLL.'
+    }
 
-if ($EnableCurrentUserAfterReplace) {
-    Invoke-DevCtl -Arguments @(
-        'enable-current-user',
-        '--confirm-enable-current-user-development-alpha'
-    ) -Quiet
-    Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
+    if ($EnableCurrentUserAfterReplace) {
+        Invoke-DevCtl -Arguments @(
+            'enable-current-user',
+            '--confirm-enable-current-user-development-alpha'
+        ) -Quiet
+        Invoke-DevCtl -Arguments $currentUserVerificationArguments -Quiet
+    }
+} catch {
+    Write-Warning 'Machine replacement completed, but postflight verification failed; restoring the requested current-user enablement.'
+    Restore-RequestedCurrentUserEnablement
+    throw
 }
 $postflightStopwatch.Stop()
 
@@ -683,3 +735,8 @@ Write-ReplacementSummary `
         "postflight $($postflightStopwatch.ElapsedMilliseconds) ms",
         "host scan $($hostCacheStopwatch.ElapsedMilliseconds) ms"
     )
+} finally {
+    if ($null -ne $replacementLock) {
+        $replacementLock.Dispose()
+    }
+}

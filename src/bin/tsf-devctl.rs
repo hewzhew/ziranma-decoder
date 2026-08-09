@@ -3047,6 +3047,48 @@ mod tests {
     }
 
     #[test]
+    fn replacement_script_serializes_mutation_and_recovers_postflight() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("replace-tsf-alpha.ps1");
+        let contents = fs::read_to_string(script).unwrap();
+
+        let status_branch = contents.find("if ($StatusOnly)").unwrap();
+        let replacement_lock = contents
+            .find("$replacementLock = Open-ReplacementLock")
+            .unwrap();
+        assert!(
+            status_branch < replacement_lock,
+            "read-only status must finish before a replacement lock can be created"
+        );
+        assert!(contents.contains("[IO.FileShare]::None"));
+        assert!(contents.contains("$replacementLock.Dispose()"));
+
+        let stale_report = contents.rfind("Remove-StaleAdministratorReport").unwrap();
+        let disable = contents
+            .find("'disable-current-user',")
+            .expect("replacement must still disable only after preflight");
+        assert!(
+            stale_report < disable,
+            "a stale administrator report must be cleared before current-user state changes"
+        );
+        let postflight_warning = contents
+            .find(
+                "Machine replacement completed, but postflight verification failed; restoring the requested current-user enablement.",
+            )
+            .unwrap();
+        let postflight_tail = &contents[postflight_warning..];
+        let restore = postflight_tail
+            .find("    Restore-RequestedCurrentUserEnablement")
+            .unwrap();
+        let rethrow = postflight_tail.find("    throw").unwrap();
+        assert!(
+            restore < rethrow,
+            "postflight recovery must precede rethrow"
+        );
+    }
+
+    #[test]
     fn update_wrapper_keeps_status_read_only_and_replacement_explicit() {
         let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("update-ime.cmd");
         let contents = fs::read_to_string(wrapper).unwrap();
