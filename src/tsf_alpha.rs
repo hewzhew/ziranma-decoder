@@ -26,8 +26,9 @@ use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabA
 use crate::personal_ranking::CandidateTextPromotion;
 use crate::{
     CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
-    CandidateRuntimeError, CandidateSnapshot, CharacterShapeIndex, CompositionEffect,
-    CompositionInput, CompositionPunctuation, CompositionSession,
+    CandidateRuntimeError, CandidateRuntimeSupplemental, CandidateRuntimeSupplementalSelection,
+    CandidateSnapshot, CharacterShapeIndex, CompositionEffect, CompositionInput,
+    CompositionPunctuation, CompositionSession,
     DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
     DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder,
     ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot, LoadedPersonalRanking,
@@ -47,7 +48,8 @@ use crate::{
     WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
     WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
     WishJournalAnchor, WishJournalContext, WishJournalSpan, WishRuntimeIdentity, WishSnapshot,
-    candidate_sha256_hex, load_candidate_runtime_snapshots, load_current_explicit_alias_snapshot,
+    candidate_sha256_hex, load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
+    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
     load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
     parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
     refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
@@ -234,7 +236,7 @@ enum AutomaticTranspositionOutcome {
     RecoveryAvailable(AutomaticTranspositionTier),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CandidateDataIdentity {
     core_revision: String,
     supplemental_revision: Option<String>,
@@ -625,14 +627,12 @@ enum CandidateProviderLoadError {
 
 struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
-    supplemental: Option<(
-        Arc<CandidateSnapshot>,
-        crate::SupplementalCandidateLayerConfig,
-    )>,
+    supplemental: PublicSupplementRuntime,
     aliases: Option<ExplicitAliasRuntime>,
 }
 
 impl SnapshotCandidateProvider {
+    #[cfg(test)]
     fn new(
         snapshot: Arc<CandidateSnapshot>,
         supplemental: Option<(
@@ -643,7 +643,20 @@ impl SnapshotCandidateProvider {
     ) -> Self {
         Self {
             snapshot,
-            supplemental,
+            supplemental: PublicSupplementRuntime::static_layer(supplemental),
+            aliases: alias_root.map(ExplicitAliasRuntime::new),
+        }
+    }
+
+    fn new_with_runtime(
+        snapshot: Arc<CandidateSnapshot>,
+        supplemental: Option<CandidateRuntimeSupplemental>,
+        supplemental_root: Option<PathBuf>,
+        alias_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            snapshot,
+            supplemental: PublicSupplementRuntime::managed(supplemental_root, supplemental),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
         }
     }
@@ -684,8 +697,8 @@ impl SnapshotCandidateProvider {
                         ));
                     }
                 }
-                let snapshot_query = self
-                    .supplemental
+                let supplemental = self.supplemental.current();
+                let snapshot_query = supplemental
                     .as_ref()
                     .and_then(|(supplemental, config)| {
                         layered_candidate_query_with_consensus_sources(
@@ -764,20 +777,156 @@ fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidat
 #[derive(Clone)]
 struct CandidateProviderBlueprint {
     snapshot: Arc<CandidateSnapshot>,
-    supplemental: Option<(
-        Arc<CandidateSnapshot>,
-        crate::SupplementalCandidateLayerConfig,
-    )>,
+    supplemental: Option<CandidateRuntimeSupplemental>,
+    supplemental_root: Option<PathBuf>,
     alias_root: Option<PathBuf>,
 }
 
 impl CandidateProviderBlueprint {
     fn build(&self) -> Arc<dyn CandidateProvider> {
-        Arc::new(SnapshotCandidateProvider::new(
+        Arc::new(SnapshotCandidateProvider::new_with_runtime(
             Arc::clone(&self.snapshot),
             self.supplemental.clone(),
+            self.supplemental_root.clone(),
             self.alias_root.clone(),
         ))
+    }
+}
+
+struct PublicSupplementRuntime {
+    root: Option<PathBuf>,
+    state: Mutex<PublicSupplementRuntimeState>,
+}
+
+struct PublicSupplementRuntimeState {
+    package_id: Option<String>,
+    snapshot: Option<Arc<CandidateSnapshot>>,
+    config: Option<crate::SupplementalCandidateLayerConfig>,
+}
+
+impl PublicSupplementRuntime {
+    #[cfg(test)]
+    fn static_layer(
+        supplemental: Option<(
+            Arc<CandidateSnapshot>,
+            crate::SupplementalCandidateLayerConfig,
+        )>,
+    ) -> Self {
+        let (snapshot, config) = supplemental
+            .map(|(snapshot, config)| (Some(snapshot), Some(config)))
+            .unwrap_or_default();
+        Self {
+            root: None,
+            state: Mutex::new(PublicSupplementRuntimeState {
+                package_id: None,
+                snapshot,
+                config,
+            }),
+        }
+    }
+
+    fn managed(root: Option<PathBuf>, supplemental: Option<CandidateRuntimeSupplemental>) -> Self {
+        let state = match supplemental {
+            Some(supplemental) => PublicSupplementRuntimeState {
+                package_id: Some(supplemental.package_id().to_owned()),
+                snapshot: Some(Arc::clone(supplemental.snapshot())),
+                config: Some(supplemental.config()),
+            },
+            None => PublicSupplementRuntimeState {
+                package_id: None,
+                snapshot: None,
+                config: None,
+            },
+        };
+        let runtime = Self {
+            root,
+            state: Mutex::new(state),
+        };
+        let _ = runtime.refresh();
+        runtime
+    }
+
+    fn current(
+        &self,
+    ) -> Option<(
+        Arc<CandidateSnapshot>,
+        crate::SupplementalCandidateLayerConfig,
+    )> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| Some((Arc::clone(state.snapshot.as_ref()?), state.config?)))
+    }
+
+    fn revision(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|state| {
+            state
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revision().to_owned())
+        })
+    }
+
+    fn refresh(&self) -> bool {
+        let Some(root) = self.root.as_deref() else {
+            return false;
+        };
+        let next = match load_candidate_runtime_supplemental_selection(root) {
+            Ok(next) => next,
+            Err(_) => return false,
+        };
+        let current = match self.state.lock() {
+            Ok(state) => (
+                state.package_id.clone(),
+                state.snapshot.clone(),
+                state.config,
+            ),
+            Err(_) => return false,
+        };
+        let next_state = match &next {
+            CandidateRuntimeSupplementalSelection::Disabled => {
+                if current.0.is_none() && current.1.is_none() {
+                    return false;
+                }
+                PublicSupplementRuntimeState {
+                    package_id: None,
+                    snapshot: None,
+                    config: None,
+                }
+            }
+            CandidateRuntimeSupplementalSelection::Enabled { package_id, config } => {
+                if current.0.as_deref() == Some(package_id)
+                    && current.1.is_some()
+                    && current.2 == Some(*config)
+                {
+                    return false;
+                }
+                if current.0.as_deref() == Some(package_id) {
+                    PublicSupplementRuntimeState {
+                        package_id: Some(package_id.clone()),
+                        snapshot: current.1,
+                        config: Some(*config),
+                    }
+                } else {
+                    let loaded = match load_candidate_runtime_supplemental(root, &next) {
+                        Ok(Some(loaded)) => loaded,
+                        _ => return false,
+                    };
+                    PublicSupplementRuntimeState {
+                        package_id: Some(loaded.package_id().to_owned()),
+                        snapshot: Some(Arc::clone(loaded.snapshot())),
+                        config: Some(loaded.config()),
+                    }
+                }
+            }
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        state.package_id = next_state.package_id;
+        state.snapshot = next_state.snapshot;
+        state.config = next_state.config;
+        true
     }
 }
 
@@ -856,10 +1005,7 @@ impl CandidateProvider for SnapshotCandidateProvider {
     fn candidate_data_identity(&self) -> Option<CandidateDataIdentity> {
         Some(CandidateDataIdentity {
             core_revision: self.snapshot.revision().to_owned(),
-            supplemental_revision: self
-                .supplemental
-                .as_ref()
-                .map(|(snapshot, _)| snapshot.revision().to_owned()),
+            supplemental_revision: self.supplemental.revision(),
         })
     }
 
@@ -916,9 +1062,12 @@ impl CandidateProvider for SnapshotCandidateProvider {
     }
 
     fn refresh_at_safe_boundary(&self) -> bool {
-        self.aliases
+        let aliases_changed = self
+            .aliases
             .as_ref()
-            .is_some_and(ExplicitAliasRuntime::refresh)
+            .is_some_and(ExplicitAliasRuntime::refresh);
+        let supplemental_changed = self.supplemental.refresh();
+        aliases_changed || supplemental_changed
     }
 
     fn protected_candidate_prefix_len(&self, code: &str, view: InteractiveCandidateView) -> usize {
@@ -942,7 +1091,7 @@ impl CandidateProvider for SnapshotCandidateProvider {
                 .exact_full_code_texts(code, CANDIDATE_LIMIT)
                 .ok()
                 .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
-            || self.supplemental.as_ref().is_some_and(|(snapshot, _)| {
+            || self.supplemental.current().is_some_and(|(snapshot, _)| {
                 snapshot
                     .exact_full_code_texts(code, CANDIDATE_LIMIT)
                     .ok()
@@ -1434,6 +1583,7 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
             Ok(CandidateProviderBlueprint {
                 snapshot,
                 supplemental: None,
+                supplemental_root: None,
                 alias_root: None,
             })
         })
@@ -1464,12 +1614,12 @@ fn candidate_provider_for_roots(
     {
         Some(runtime) => Ok(CandidateProviderBlueprint {
             snapshot: Arc::clone(runtime.core()),
-            supplemental: runtime
-                .supplemental()
-                .map(|supplemental| (Arc::clone(supplemental.snapshot()), supplemental.config())),
+            supplemental: runtime.supplemental().cloned(),
+            supplemental_root: supplemental_root.map(Path::to_path_buf),
             alias_root,
         }),
         None => development_candidate_blueprint().map(|mut blueprint| {
+            blueprint.supplemental_root = supplemental_root.map(Path::to_path_buf);
             blueprint.alias_root = alias_root;
             blueprint
         }),
@@ -1878,6 +2028,7 @@ fn run_candidate_preflight(
         Ok(CandidateProviderBlueprint {
             snapshot,
             supplemental: None,
+            supplemental_root: None,
             alias_root: None,
         }),
         KeyAdviceMode::SyntheticHost,
@@ -7023,6 +7174,17 @@ impl ResearchFeedbackJournal {
         self.root.is_some()
     }
 
+    fn update_candidate_identity(&mut self, candidate_identity: Option<CandidateDataIdentity>) {
+        if self.candidate_identity == candidate_identity {
+            return;
+        }
+        // A continuous-journal batch has one runtime identity. Close any
+        // buffered batch before applying a newly loaded candidate revision so
+        // later events cannot be mislabeled with the prior supplement.
+        let _ = self.flush();
+        self.candidate_identity = candidate_identity;
+    }
+
     fn refresh_consent(&mut self, monotonic_ms: u64) -> bool {
         let due = self.last_consent_check_ms.is_none_or(|previous| {
             monotonic_ms < previous
@@ -7255,6 +7417,10 @@ impl NativeFeedbackRuntime {
 
     fn is_accepting(&self) -> bool {
         self.session.is_accepting() || self.research.can_refresh()
+    }
+
+    fn update_candidate_identity(&mut self, candidate_identity: Option<CandidateDataIdentity>) {
+        self.research.update_candidate_identity(candidate_identity);
     }
 
     fn record_at(
@@ -9178,15 +9344,16 @@ impl TsfTextService_Impl {
                 .ok()
                 .and_then(|vkey| decode_virtual_key(vkey, modifiers, self.input_mode.get()))
                 .is_some_and(|input| matches!(input, CompositionInput::Letters(_)))
-            && self
-                .candidate_provider
-                .as_ref()
-                .is_some_and(|provider| provider.refresh_at_safe_boundary())
+            && let Some(provider) = self.candidate_provider.as_ref()
+            && provider.refresh_at_safe_boundary()
         {
             *self
                 .candidate_cache
                 .try_borrow_mut()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))? = CandidateCache::default();
+            if let Ok(mut feedback) = self.native_feedback.lock() {
+                feedback.update_candidate_identity(provider.candidate_data_identity());
+            }
         }
         let (pair_gap_ms, next_letter_anchor) = self.delivered_letter_timing(wparam, modifiers);
         let previous_pair_timing = self.last_completed_pair_timing.get();
@@ -9721,6 +9888,83 @@ mod tests {
     };
     use windows::core::ComObject;
 
+    fn candidate_runtime_test_root(stem: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-{stem}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn install_candidate_runtime_test_package(
+        root: &Path,
+        revision: &str,
+        payload: &str,
+    ) -> String {
+        let manifest = CandidatePackageManifest::from_payload(revision, false, payload).unwrap();
+        let manifest_text = manifest.render();
+        let provenance_text = crate::CandidatePackageProvenance::from_materials(
+            "tsf-runtime-test-source",
+            "MPL-2.0",
+            "https://github.com/hewzhew/ziranma-decoder",
+            &candidate_sha256_hex(payload.as_bytes()),
+            &manifest_text,
+            payload,
+        )
+        .unwrap()
+        .render();
+        let package_id =
+            crate::candidate_package_storage_id(&provenance_text, &manifest_text, payload);
+        let package_sha256 = crate::candidate_package_authentication_sha256(
+            &provenance_text,
+            &manifest_text,
+            payload,
+        );
+        let package = root
+            .join(crate::CANDIDATE_PACKAGES_DIRECTORY)
+            .join(&package_id);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join(crate::CANDIDATE_PACKAGE_MANIFEST_FILE),
+            manifest_text,
+        )
+        .unwrap();
+        fs::write(
+            package.join(crate::CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            provenance_text,
+        )
+        .unwrap();
+        fs::write(package.join(crate::CANDIDATE_PACKAGE_PAYLOAD_FILE), payload).unwrap();
+        let preflights = root.join(crate::CANDIDATE_PREFLIGHTS_DIRECTORY);
+        fs::create_dir_all(&preflights).unwrap();
+        fs::write(
+            preflights.join(format!("{package_id}.zpf")),
+            crate::candidate_preflight_receipt_body(&package_id, &package_sha256),
+        )
+        .unwrap();
+        package_id
+    }
+
+    fn select_candidate_runtime_test_package(
+        root: &Path,
+        package_id: &str,
+        exact_promotions: usize,
+    ) {
+        let mut slots = crate::CandidateSlotState::default();
+        slots.adopt(package_id).unwrap();
+        fs::write(root.join(crate::CANDIDATE_SLOT_STATE_FILE), slots.render()).unwrap();
+        fs::write(
+            root.join(crate::CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            crate::CandidateSupplementalState::enabled(package_id, exact_promotions)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn candidate_promotion_mirrors_existing_personal_markers_by_position() {
         let mut batch = CandidateBatch {
@@ -10150,7 +10394,7 @@ mod tests {
         );
         let provider = SnapshotCandidateProvider {
             snapshot,
-            supplemental: None,
+            supplemental: PublicSupplementRuntime::static_layer(None),
             aliases: Some(runtime),
         };
         let mut candidates = provider.candidates("aa", 2, InteractiveCandidateView::Primary);
@@ -11533,6 +11777,136 @@ mod tests {
                 .candidates("uuyu", 0, InteractiveCandidateView::Primary)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn supplemental_runtime_refreshes_only_between_compositions_and_retains_last_good_data() {
+        const CORE: &str = "text\tpinyin\tfrequency\n什么\tshen me\t100\n";
+        const FIRST: &str = "text\tpinyin\tfrequency\n神马\tshen me\t100\n";
+        const SECOND: &str = "text\tpinyin\tfrequency\n甚么\tshen me\t100\n";
+        const BROKEN: &str = "text\tpinyin\tfrequency\n神么\tshen me\t100\n";
+        let load_core = || {
+            Arc::new(
+                CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                    schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                    revision: "tsf-hot-core-v1",
+                    contains_private_text: false,
+                    lexicon_tsv: CORE,
+                    expected_payload_bytes: CORE.len(),
+                    expected_payload_fingerprint: crate::candidate_payload_fingerprint(
+                        CORE.as_bytes(),
+                    ),
+                    expected_entry_count: 1,
+                })
+                .unwrap(),
+            )
+        };
+        let root = candidate_runtime_test_root("supplement-hot-refresh");
+        let first = install_candidate_runtime_test_package(&root, "tsf-hot-first-v1", FIRST);
+        let second = install_candidate_runtime_test_package(&root, "tsf-hot-second-v1", SECOND);
+        let broken = install_candidate_runtime_test_package(&root, "tsf-hot-broken-v1", BROKEN);
+        select_candidate_runtime_test_package(&root, &first, 1);
+        let selection = load_candidate_runtime_supplemental_selection(&root).unwrap();
+        let initial = load_candidate_runtime_supplemental(&root, &selection)
+            .unwrap()
+            .unwrap();
+        let provider = SnapshotCandidateProvider::new_with_runtime(
+            load_core(),
+            Some(initial),
+            Some(root.clone()),
+            None,
+        );
+
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "神马"]
+        );
+        assert_eq!(
+            provider
+                .candidate_data_identity()
+                .unwrap()
+                .supplemental_revision
+                .as_deref(),
+            Some("tsf-hot-first-v1")
+        );
+
+        let first_payload = root
+            .join(crate::CANDIDATE_PACKAGES_DIRECTORY)
+            .join(&first)
+            .join(crate::CANDIDATE_PACKAGE_PAYLOAD_FILE);
+        fs::write(&first_payload, "damaged\n").unwrap();
+        assert!(!provider.refresh_at_safe_boundary());
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "神马"],
+            "an unchanged small pointer must not reopen the large payload"
+        );
+        fs::write(&first_payload, FIRST).unwrap();
+
+        let first_snapshot = provider.supplemental.current().unwrap().0;
+        select_candidate_runtime_test_package(&root, &first, 2);
+        assert!(provider.refresh_at_safe_boundary());
+        let reconfigured_snapshot = provider.supplemental.current().unwrap().0;
+        assert!(Arc::ptr_eq(&first_snapshot, &reconfigured_snapshot));
+
+        select_candidate_runtime_test_package(&root, &second, 1);
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "神马"],
+            "an active composition keeps the already selected snapshot"
+        );
+        assert!(provider.refresh_at_safe_boundary());
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "甚么"]
+        );
+        assert_eq!(
+            provider
+                .candidate_data_identity()
+                .unwrap()
+                .supplemental_revision
+                .as_deref(),
+            Some("tsf-hot-second-v1")
+        );
+
+        fs::remove_file(
+            root.join(crate::CANDIDATE_PREFLIGHTS_DIRECTORY)
+                .join(format!("{broken}.zpf")),
+        )
+        .unwrap();
+        select_candidate_runtime_test_package(&root, &broken, 1);
+        assert!(!provider.refresh_at_safe_boundary());
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "甚么"],
+            "a damaged replacement must retain the last valid snapshot"
+        );
+
+        fs::write(
+            root.join(crate::CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            crate::CandidateSupplementalState::default().render(),
+        )
+        .unwrap();
+        assert!(provider.refresh_at_safe_boundary());
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么"]
+        );
+        assert_eq!(
+            provider
+                .candidate_data_identity()
+                .unwrap()
+                .supplemental_revision,
+            None
+        );
+
+        select_candidate_runtime_test_package(&root, &first, 1);
+        assert!(provider.refresh_at_safe_boundary());
+        assert_eq!(
+            provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
+            ["什么", "神马"]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -13261,6 +13635,65 @@ mod tests {
         assert_eq!(span.first_event_ordinal(), 8);
         assert_eq!(span.previous_event_gap_ms(), Some(893));
 
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_revision_refresh_closes_the_old_research_batch_before_relabeling() {
+        let _guard = test_lock();
+        let root = candidate_runtime_test_root("research-candidate-refresh");
+        crate::set_research_feedback_enabled(&root, true).unwrap();
+        let mut runtime = NativeFeedbackRuntime::with_research_root(root.clone());
+        runtime.research.module_sha256 = Some("ef".repeat(32));
+        runtime.update_candidate_identity(Some(CandidateDataIdentity {
+            core_revision: "research-core-v1".to_owned(),
+            supplemental_revision: Some("research-supplement-a".to_owned()),
+        }));
+        runtime.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "ab".to_owned(),
+            },
+            100,
+        );
+        runtime.update_candidate_identity(Some(CandidateDataIdentity {
+            core_revision: "research-core-v1".to_owned(),
+            supplemental_revision: Some("research-supplement-b".to_owned()),
+        }));
+        runtime.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "cd".to_owned(),
+            },
+            200,
+        );
+        assert!(runtime.flush_research());
+
+        let mut snapshots = crate::list_wish_packages(&root)
+            .unwrap()
+            .into_iter()
+            .map(|package| {
+                crate::load_wish_snapshot(&root, package.id(), &WindowsUserDataProtector).unwrap()
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| match snapshot.journal_context() {
+            Some(WishJournalContext::ContinuousSpan(span)) => span.batch_sequence(),
+            _ => u64::MAX,
+        });
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0]
+                .runtime_identity()
+                .and_then(WishRuntimeIdentity::supplemental_candidate_revision),
+            Some("research-supplement-a")
+        );
+        assert_eq!(
+            snapshots[1]
+                .runtime_identity()
+                .and_then(WishRuntimeIdentity::supplemental_candidate_revision),
+            Some("research-supplement-b")
+        );
         drop(runtime);
         fs::remove_dir_all(root).unwrap();
     }

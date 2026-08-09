@@ -138,9 +138,10 @@ pub use candidate_runtime::{
     CANDIDATE_PREFLIGHT_HOST_V1, CANDIDATE_PREFLIGHT_RECEIPT_SCHEMA_V2,
     CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_RUNTIME_DIRECTORY, CANDIDATE_SLOT_STATE_FILE,
     CandidateRuntimeError, CandidateRuntimeSnapshots, CandidateRuntimeSupplemental,
-    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, candidate_package_storage_id,
-    candidate_preflight_receipt_body, load_candidate_runtime_snapshots,
-    load_current_candidate_snapshot,
+    CandidateRuntimeSupplementalSelection, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
+    candidate_package_storage_id, candidate_preflight_receipt_body,
+    load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
+    load_candidate_runtime_supplemental_selection, load_current_candidate_snapshot,
 };
 pub use candidate_signature::{
     CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519, CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1,

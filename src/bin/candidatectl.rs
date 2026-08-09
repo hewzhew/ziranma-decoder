@@ -3146,7 +3146,7 @@ fn supplement_enable(
     let state = CandidateSupplementalState::enabled(package, exact_promotions)?;
     write_supplemental_state(root, &state)?;
     Ok(format!(
-        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n冷启动：新增词不越过核心首选；共有词可按补充首选校准\n生效：新打开的输入法宿主\n",
+        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n冷启动：新增词不越过核心首选；共有词可按补充首选校准\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
         loaded.snapshot.revision(),
     ))
 }
@@ -3157,7 +3157,7 @@ fn supplement_disable(root: &Path) -> Result<String, Box<dyn std::error::Error>>
         return Ok("公开补充词层已经关闭\n写入：0 个文件\n现有输入法宿主：未改动\n".to_owned());
     }
     write_supplemental_state(root, &CandidateSupplementalState::default())?;
-    Ok("公开补充词层已关闭\n候选包：保留，可再次启用\n生效：新打开的输入法宿主\n".to_owned())
+    Ok("公开补充词层已关闭\n候选包：保留，可再次启用\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n".to_owned())
 }
 
 fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {

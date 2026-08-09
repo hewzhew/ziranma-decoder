@@ -16,8 +16,9 @@ use crate::{
     CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_PACKAGE_PROVENANCE_FILE,
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageError, CandidatePackageManifest,
     CandidatePackageProvenance, CandidateProvenanceError, CandidateSlotError, CandidateSlotState,
-    CandidateSnapshot, CandidateSupplementalState, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
-    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    CandidateSnapshot, CandidateSupplementalState, CandidateSupplementalStateError,
+    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
+    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, SupplementalCandidateLayerConfig,
     candidate_package_authentication_sha256,
 };
@@ -70,11 +71,17 @@ impl CandidateRuntimeSnapshots {
 /// Validated supplemental snapshot and its fixed candidate influence cap.
 #[derive(Clone, Debug)]
 pub struct CandidateRuntimeSupplemental {
+    package_id: String,
     snapshot: Arc<CandidateSnapshot>,
     config: SupplementalCandidateLayerConfig,
 }
 
 impl CandidateRuntimeSupplemental {
+    /// Returns the immutable package selected by the supplemental state.
+    pub fn package_id(&self) -> &str {
+        &self.package_id
+    }
+
     /// Returns the immutable supplemental public snapshot.
     pub fn snapshot(&self) -> &Arc<CandidateSnapshot> {
         &self.snapshot
@@ -84,6 +91,21 @@ impl CandidateRuntimeSupplemental {
     pub fn config(&self) -> SupplementalCandidateLayerConfig {
         self.config
     }
+}
+
+/// Small, validated supplemental selection that can be polled without loading
+/// the lexicon payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateRuntimeSupplementalSelection {
+    /// The supplemental root or activation state is absent or explicitly off.
+    Disabled,
+    /// One immutable package is enabled with a bounded exact-word influence.
+    Enabled {
+        /// Package identifier bound by both the activation and slot states.
+        package_id: String,
+        /// Exact-word merge configuration bound by the activation state.
+        config: SupplementalCandidateLayerConfig,
+    },
 }
 
 struct LoadedRuntimeCandidate {
@@ -143,9 +165,11 @@ pub fn load_candidate_runtime_snapshots(
         return Ok(None);
     };
     let (supplemental, supplemental_fell_back) = match supplemental_root {
-        Some(root) => match load_supplemental_candidate(root) {
+        Some(root) => match load_candidate_runtime_supplemental_selection(root)
+            .and_then(|selection| load_candidate_runtime_supplemental(root, &selection))
+        {
             Ok(supplemental) => (supplemental, false),
-            Err(()) => (None, true),
+            Err(_) => (None, true),
         },
         None => (None, false),
     };
@@ -154,6 +178,89 @@ pub fn load_candidate_runtime_snapshots(
         supplemental,
         supplemental_fell_back,
     }))
+}
+
+/// Reads only the supplemental activation and slot pointers.
+///
+/// This intentionally does not open a manifest, provenance file, preflight
+/// receipt, or lexicon payload. Callers can compare the returned value with
+/// their last applied selection before deciding whether a full load is needed.
+pub fn load_candidate_runtime_supplemental_selection(
+    root: &Path,
+) -> Result<CandidateRuntimeSupplementalSelection, CandidateRuntimeError> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateRuntimeSupplementalSelection::Disabled);
+        }
+        Err(_) => return Err(CandidateRuntimeError::SupplementalRootUnavailable),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CandidateRuntimeError::InvalidSupplementalRoot);
+        }
+        Ok(_) => {}
+    }
+    let state_path = root.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE);
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateRuntimeSupplementalSelection::Disabled);
+        }
+        Err(_) => return Err(CandidateRuntimeError::SupplementalStateUnavailable),
+        Ok(_) => {}
+    }
+    let state_text = read_regular_utf8(
+        &state_path,
+        MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
+        CandidateRuntimeError::SupplementalStateUnavailable,
+    )?;
+    let state = CandidateSupplementalState::parse(&state_text)
+        .map_err(CandidateRuntimeError::SupplementalState)?;
+    let Some(expected_package) = state.package() else {
+        return Ok(CandidateRuntimeSupplementalSelection::Disabled);
+    };
+    let slot_text = read_regular_utf8(
+        &root.join(CANDIDATE_SLOT_STATE_FILE),
+        MAX_CANDIDATE_SLOT_STATE_BYTES,
+        CandidateRuntimeError::SlotStateUnavailable,
+    )?;
+    let slots = CandidateSlotState::parse(&slot_text).map_err(CandidateRuntimeError::SlotState)?;
+    if slots.current() != Some(expected_package) {
+        return Err(CandidateRuntimeError::SupplementalPackageMismatch);
+    }
+    Ok(CandidateRuntimeSupplementalSelection::Enabled {
+        package_id: expected_package.to_owned(),
+        config: SupplementalCandidateLayerConfig {
+            exact_promotions: state.exact_promotions(),
+        },
+    })
+}
+
+/// Loads one supplemental snapshot after its small selection changed.
+///
+/// The selection is checked again after the immutable package is loaded. If a
+/// concurrent slot update changed either pointer, the load fails closed and a
+/// caller can retain its last known-good in-memory snapshot.
+pub fn load_candidate_runtime_supplemental(
+    root: &Path,
+    expected: &CandidateRuntimeSupplementalSelection,
+) -> Result<Option<CandidateRuntimeSupplemental>, CandidateRuntimeError> {
+    let loaded = match expected {
+        CandidateRuntimeSupplementalSelection::Disabled => None,
+        CandidateRuntimeSupplementalSelection::Enabled { package_id, config } => {
+            let loaded = load_current_candidate_package(root)?
+                .ok_or(CandidateRuntimeError::SupplementalPackageMismatch)?;
+            if loaded.package_id != *package_id {
+                return Err(CandidateRuntimeError::SupplementalPackageMismatch);
+            }
+            Some(CandidateRuntimeSupplemental {
+                package_id: loaded.package_id,
+                snapshot: loaded.snapshot,
+                config: *config,
+            })
+        }
+    };
+    if load_candidate_runtime_supplemental_selection(root)? != *expected {
+        return Err(CandidateRuntimeError::SupplementalSelectionChanged);
+    }
+    Ok(loaded)
 }
 
 fn load_current_candidate_package(
@@ -231,43 +338,6 @@ fn load_current_candidate_package(
     Ok(Some(LoadedRuntimeCandidate {
         package_id: package_id.to_owned(),
         snapshot: Arc::new(snapshot),
-    }))
-}
-
-fn load_supplemental_candidate(root: &Path) -> Result<Option<CandidateRuntimeSupplemental>, ()> {
-    match fs::symlink_metadata(root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return Err(()),
-        Ok(_) => {}
-    }
-    let state_path = root.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE);
-    match fs::symlink_metadata(&state_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
-        Ok(_) => {}
-    }
-    let state_text = read_regular_utf8(
-        &state_path,
-        MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
-        CandidateRuntimeError::SupplementalStateUnavailable,
-    )
-    .map_err(|_| ())?;
-    let state = CandidateSupplementalState::parse(&state_text).map_err(|_| ())?;
-    let Some(expected_package) = state.package() else {
-        return Ok(None);
-    };
-    let loaded = load_current_candidate_package(root)
-        .map_err(|_| ())?
-        .ok_or(())?;
-    if loaded.package_id != expected_package {
-        return Err(());
-    }
-    Ok(Some(CandidateRuntimeSupplemental {
-        snapshot: loaded.snapshot,
-        config: SupplementalCandidateLayerConfig {
-            exact_promotions: state.exact_promotions(),
-        },
     }))
 }
 
@@ -352,6 +422,16 @@ pub enum CandidateRuntimeError {
     PreflightReceiptMismatch,
     /// The optional supplemental activation state could not be read safely.
     SupplementalStateUnavailable,
+    /// The supplemental root metadata could not be inspected.
+    SupplementalRootUnavailable,
+    /// The existing supplemental root is not a regular directory.
+    InvalidSupplementalRoot,
+    /// The supplemental activation state did not satisfy its strict schema.
+    SupplementalState(CandidateSupplementalStateError),
+    /// The activation state and current package slot do not select the same package.
+    SupplementalPackageMismatch,
+    /// The supplemental selection changed while its immutable package was loading.
+    SupplementalSelectionChanged,
 }
 
 impl fmt::Display for CandidateRuntimeError {
@@ -375,6 +455,11 @@ impl fmt::Display for CandidateRuntimeError {
             Self::PreflightReceiptUnavailable => "当前候选包缺少预检凭据",
             Self::PreflightReceiptMismatch => "当前候选包预检凭据不符",
             Self::SupplementalStateUnavailable => "补充词层状态不可用",
+            Self::SupplementalRootUnavailable => "无法检查补充词层目录",
+            Self::InvalidSupplementalRoot => "补充词层目录无效",
+            Self::SupplementalState(_) => "补充词层状态无效",
+            Self::SupplementalPackageMismatch => "补充词层状态与当前候选包不符",
+            Self::SupplementalSelectionChanged => "补充词层在载入期间发生变化",
         };
         formatter.write_str(message)
     }
@@ -386,6 +471,7 @@ impl Error for CandidateRuntimeError {
             Self::SlotState(error) => Some(error),
             Self::Package(error) => Some(error),
             Self::Provenance(error) => Some(error),
+            Self::SupplementalState(error) => Some(error),
             _ => None,
         }
     }
