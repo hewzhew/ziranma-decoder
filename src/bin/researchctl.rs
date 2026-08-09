@@ -251,6 +251,17 @@ impl SelectionPattern {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectionPressure {
+    observed_codes: usize,
+    multi_output_codes: usize,
+    competing_non_top_codes: usize,
+    single_output_non_top_codes: usize,
+    first_non_top_identities: usize,
+    later_top_identities: usize,
+    never_top_identities: usize,
+}
+
 #[derive(Default)]
 struct ResearchReview {
     available_batches: usize,
@@ -461,6 +472,69 @@ impl ResearchReview {
         );
     }
 
+    fn selection_pressure(&self) -> SelectionPressure {
+        let mut by_code: HashMap<&str, Vec<&SelectionPattern>> = HashMap::new();
+        for ((code, _), pattern) in &self.selections {
+            by_code.entry(code).or_default().push(pattern);
+        }
+        let mut pressure = SelectionPressure {
+            observed_codes: by_code.len(),
+            first_non_top_identities: self
+                .selections
+                .values()
+                .filter(|pattern| pattern.first_rank.is_some_and(|rank| rank > 1))
+                .count(),
+            later_top_identities: self
+                .selections
+                .values()
+                .filter(|pattern| {
+                    pattern.selections >= 2
+                        && pattern.first_rank.is_some_and(|rank| rank > 1)
+                        && pattern.last_rank == Some(1)
+                })
+                .count(),
+            never_top_identities: self
+                .selections
+                .values()
+                .filter(|pattern| pattern.non_top_selections != 0 && pattern.minimum_rank > 1)
+                .count(),
+            ..SelectionPressure::default()
+        };
+        for patterns in by_code.values() {
+            let outputs_with_non_top = patterns
+                .iter()
+                .filter(|pattern| pattern.non_top_selections != 0)
+                .count();
+            pressure.multi_output_codes += usize::from(patterns.len() >= 2);
+            pressure.competing_non_top_codes += usize::from(outputs_with_non_top >= 2);
+            pressure.single_output_non_top_codes +=
+                usize::from(patterns.len() == 1 && outputs_with_non_top == 1);
+        }
+        pressure
+    }
+
+    fn render_selection_pressure(&self, output: &mut String) {
+        let pressure = self.selection_pressure();
+        writeln!(
+            output,
+            "选择压力（不含文字）：观察码 {}；出现多种已提交文字 {}；至少两种文字都曾从非首选提交 {}；仅一种已见文字且曾从非首选提交 {}。",
+            pressure.observed_codes,
+            pressure.multi_output_codes,
+            pressure.competing_non_top_codes,
+            pressure.single_output_non_top_codes,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "学习轨迹（不含文字）：首次非首选身份 {}；后来成为首选 {}；观察期内从未到首选 {}；原码身份 {}。",
+            pressure.first_non_top_identities,
+            pressure.later_top_identities,
+            pressure.never_top_identities,
+            self.raw_codes.len(),
+        )
+        .unwrap();
+    }
+
     fn render_aggregate(&self) -> String {
         let mut output = String::new();
         writeln!(output, "持续研究摘要（不显示输入原文）").unwrap();
@@ -492,6 +566,7 @@ impl ResearchReview {
             self.unpaired_commits,
         )
         .unwrap();
+        self.render_selection_pressure(&mut output);
         writeln!(
             output,
             "候选：{} 帧；最大已加载深度 {}；仍可继续加载 {} 帧；Tab 找字 {} 帧（逐字组词 {} 帧）。",
@@ -722,6 +797,7 @@ impl ResearchReview {
             self.post_commit_backspaces_routed,
         )
         .unwrap();
+        self.render_selection_pressure(&mut output);
         writeln!(
             output,
             "候选：{} 帧；奇数键中间态 {} 帧；五码及以上且首选来自普通组合 {} 帧。",
@@ -1148,6 +1224,44 @@ mod tests {
         .unwrap();
         assert_eq!(review.command, Command::Review);
         assert!(review.show_private_text);
+    }
+
+    #[test]
+    fn aggregate_selection_pressure_distinguishes_competing_and_cold_identities() {
+        let mut review = ResearchReview::default();
+        for (code, text, ranks) in [
+            ("same", "alpha", vec![2, 1]),
+            ("same", "beta", vec![2]),
+            ("cold", "gamma", vec![3]),
+            ("easy", "delta", vec![1]),
+        ] {
+            let pattern = review
+                .selections
+                .entry((code.to_owned(), text.to_owned()))
+                .or_default();
+            for rank in ranks {
+                pattern.observe(rank, NativeSelectionSource::Numeric, None);
+            }
+        }
+
+        assert_eq!(
+            review.selection_pressure(),
+            SelectionPressure {
+                observed_codes: 3,
+                multi_output_codes: 1,
+                competing_non_top_codes: 1,
+                single_output_non_top_codes: 1,
+                first_non_top_identities: 3,
+                later_top_identities: 1,
+                never_top_identities: 2,
+            }
+        );
+        let mut rendered = String::new();
+        review.render_selection_pressure(&mut rendered);
+        assert!(rendered.contains("至少两种文字都曾从非首选提交 1"));
+        for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
+            assert!(!rendered.contains(private_value));
+        }
     }
 
     #[test]
