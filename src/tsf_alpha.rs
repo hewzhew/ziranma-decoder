@@ -14,9 +14,11 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, Weak as SyncWeak};
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::candidate_snapshot::{
     FourCharacterCorrectionDecision, InteractiveCandidateQuery, InteractiveCandidateSource,
@@ -159,6 +161,8 @@ const AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS: u64 = 48;
 const AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS: u64 = 64;
 const AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS: u64 = 96;
 const PERSONAL_RANKING_FLUSH_SELECTIONS: usize = 8;
+const BACKGROUND_PERSISTENCE_QUEUE_CAPACITY: usize = 16;
+const CANDIDATE_RUNTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INLINE_WISH_TRIGGER_CODE: &str = "xuy";
 const INLINE_WISH_NOTICE_TIMER_ID: usize = 1;
 const INLINE_WISH_NOTICE_DURATION_MS: u32 = 1_200;
@@ -625,10 +629,29 @@ enum CandidateProviderLoadError {
     ModuleLocation,
 }
 
+#[derive(Default)]
+struct RefreshThrottle {
+    last_check: Option<Instant>,
+}
+
+impl RefreshThrottle {
+    fn allow(&mut self, now: Instant) -> bool {
+        if self.last_check.is_some_and(|previous| {
+            now.checked_duration_since(previous)
+                .is_some_and(|elapsed| elapsed < CANDIDATE_RUNTIME_REFRESH_INTERVAL)
+        }) {
+            return false;
+        }
+        self.last_check = Some(now);
+        true
+    }
+}
+
 struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
     supplemental: PublicSupplementRuntime,
     aliases: Option<ExplicitAliasRuntime>,
+    refresh_throttle: Mutex<RefreshThrottle>,
 }
 
 impl SnapshotCandidateProvider {
@@ -645,6 +668,7 @@ impl SnapshotCandidateProvider {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(supplemental),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
+            refresh_throttle: Mutex::new(RefreshThrottle::default()),
         }
     }
 
@@ -658,7 +682,25 @@ impl SnapshotCandidateProvider {
             snapshot,
             supplemental: PublicSupplementRuntime::managed(supplemental_root, supplemental),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
+            refresh_throttle: Mutex::new(RefreshThrottle::default()),
         }
+    }
+
+    fn refresh_at_safe_boundary_at(&self, now: Instant) -> bool {
+        let due = self
+            .refresh_throttle
+            .lock()
+            .map(|mut throttle| throttle.allow(now))
+            .unwrap_or(false);
+        if !due {
+            return false;
+        }
+        let aliases_changed = self
+            .aliases
+            .as_ref()
+            .is_some_and(ExplicitAliasRuntime::refresh);
+        let supplemental_changed = self.supplemental.refresh();
+        aliases_changed || supplemental_changed
     }
 
     fn candidate_output(
@@ -1100,12 +1142,7 @@ impl CandidateProvider for SnapshotCandidateProvider {
     }
 
     fn refresh_at_safe_boundary(&self) -> bool {
-        let aliases_changed = self
-            .aliases
-            .as_ref()
-            .is_some_and(ExplicitAliasRuntime::refresh);
-        let supplemental_changed = self.supplemental.refresh();
-        aliases_changed || supplemental_changed
+        self.refresh_at_safe_boundary_at(Instant::now())
     }
 
     fn protected_candidate_prefix_len(&self, code: &str, view: InteractiveCandidateView) -> usize {
@@ -6774,6 +6811,184 @@ fn provider_verifies_personal_character_composition(
     characters.next().is_none()
 }
 
+enum BackgroundPersistenceCommand {
+    Research {
+        root: PathBuf,
+        snapshot: WishSnapshot,
+    },
+    PersonalRanking {
+        root: PathBuf,
+        batch: PersonalRankingBatch,
+    },
+    Barrier(mpsc::Sender<()>),
+    Shutdown,
+}
+
+#[derive(Default)]
+struct BackgroundPersistenceHealth {
+    research_failed: AtomicBool,
+    personal_ranking_failed: AtomicBool,
+    rejected_research_jobs: AtomicU64,
+    rejected_personal_ranking_jobs: AtomicU64,
+}
+
+#[derive(Clone)]
+struct BackgroundPersistenceHandle {
+    sender: SyncSender<BackgroundPersistenceCommand>,
+    health: Arc<BackgroundPersistenceHealth>,
+}
+
+impl BackgroundPersistenceHandle {
+    fn enqueue_research(&self, root: PathBuf, snapshot: WishSnapshot) -> bool {
+        if self.health.research_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        match self
+            .sender
+            .try_send(BackgroundPersistenceCommand::Research { root, snapshot })
+        {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.health
+                    .rejected_research_jobs
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.health.research_failed.store(true, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    fn enqueue_personal_ranking(&self, root: PathBuf, batch: PersonalRankingBatch) -> bool {
+        if self.health.personal_ranking_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        match self
+            .sender
+            .try_send(BackgroundPersistenceCommand::PersonalRanking { root, batch })
+        {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.health
+                    .rejected_personal_ranking_jobs
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.health
+                    .personal_ranking_failed
+                    .store(true, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    fn wait_for_personal_ranking_idle(&self) -> bool {
+        let (acknowledge, acknowledged) = mpsc::channel();
+        if self
+            .sender
+            .send(BackgroundPersistenceCommand::Barrier(acknowledge))
+            .is_err()
+            || acknowledged.recv().is_err()
+        {
+            return false;
+        }
+        !self.health.personal_ranking_failed.load(Ordering::Acquire)
+    }
+}
+
+struct BackgroundPersistence {
+    sender: Option<SyncSender<BackgroundPersistenceCommand>>,
+    worker: Option<JoinHandle<()>>,
+    health: Arc<BackgroundPersistenceHealth>,
+}
+
+impl BackgroundPersistence {
+    fn start() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(BACKGROUND_PERSISTENCE_QUEUE_CAPACITY);
+        let health = Arc::new(BackgroundPersistenceHealth::default());
+        let worker_health = Arc::clone(&health);
+        let worker = std::thread::Builder::new()
+            .name("ziranma-persistence".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        BackgroundPersistenceCommand::Research { root, snapshot } => {
+                            if worker_health.research_failed.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if research_feedback_enabled(&root) == Ok(true)
+                                && save_wish_snapshot(&root, &snapshot, &WindowsUserDataProtector)
+                                    .is_err()
+                            {
+                                worker_health.research_failed.store(true, Ordering::Release);
+                            }
+                        }
+                        BackgroundPersistenceCommand::PersonalRanking { root, batch } => {
+                            if worker_health
+                                .personal_ranking_failed
+                                .load(Ordering::Acquire)
+                            {
+                                continue;
+                            }
+                            if save_personal_ranking_batch(&root, &batch, &WindowsUserDataProtector)
+                                .is_err()
+                            {
+                                worker_health
+                                    .personal_ranking_failed
+                                    .store(true, Ordering::Release);
+                            }
+                        }
+                        BackgroundPersistenceCommand::Barrier(acknowledge) => {
+                            let _ = acknowledge.send(());
+                        }
+                        BackgroundPersistenceCommand::Shutdown => break,
+                    }
+                }
+            })
+            .ok();
+        if worker.is_none() {
+            health.research_failed.store(true, Ordering::Release);
+            health
+                .personal_ranking_failed
+                .store(true, Ordering::Release);
+        }
+        Self {
+            sender: Some(sender),
+            worker,
+            health,
+        }
+    }
+
+    fn handle(&self) -> BackgroundPersistenceHandle {
+        BackgroundPersistenceHandle {
+            sender: self
+                .sender
+                .as_ref()
+                .expect("active background-persistence sender")
+                .clone(),
+            health: Arc::clone(&self.health),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(BackgroundPersistenceCommand::Shutdown);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for BackgroundPersistence {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 struct PersonalRankingRuntime {
     root: Option<PathBuf>,
     suppression_root: Option<PathBuf>,
@@ -6784,6 +6999,7 @@ struct PersonalRankingRuntime {
     unflushed: Vec<PersonalRankingSelection>,
     next_sequence: u64,
     next_suppression_sequence: u64,
+    persistence: Option<BackgroundPersistenceHandle>,
 }
 
 impl PersonalRankingRuntime {
@@ -6796,7 +7012,16 @@ impl PersonalRankingRuntime {
         Self::new_with_roots(root, suppression_root)
     }
 
+    #[cfg(test)]
     fn new_with_roots(root: Option<PathBuf>, suppression_root: Option<PathBuf>) -> Self {
+        Self::new_with_roots_and_persistence(root, suppression_root, None)
+    }
+
+    fn new_with_roots_and_persistence(
+        root: Option<PathBuf>,
+        suppression_root: Option<PathBuf>,
+        persistence: Option<BackgroundPersistenceHandle>,
+    ) -> Self {
         let Some(root) = root else {
             return Self::memory_only();
         };
@@ -6832,6 +7057,7 @@ impl PersonalRankingRuntime {
                     suppressions,
                     unflushed: Vec::new(),
                     next_suppression_sequence,
+                    persistence,
                 }
             }
             _ => Self::memory_only(),
@@ -6849,10 +7075,18 @@ impl PersonalRankingRuntime {
             unflushed: Vec::new(),
             next_sequence: 0,
             next_suppression_sequence: 0,
+            persistence: None,
         }
     }
 
     fn refresh(&mut self) -> bool {
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| !persistence.wait_for_personal_ranking_idle())
+        {
+            return false;
+        }
         let Some(root) = self.root.as_ref() else {
             return false;
         };
@@ -7079,7 +7313,11 @@ impl PersonalRankingRuntime {
         ) else {
             return false;
         };
-        if save_personal_ranking_batch(root, &batch, &WindowsUserDataProtector).is_err() {
+        let saved = match self.persistence.as_ref() {
+            Some(persistence) => persistence.enqueue_personal_ranking(root.clone(), batch),
+            None => save_personal_ranking_batch(root, &batch, &WindowsUserDataProtector).is_ok(),
+        };
+        if !saved {
             return false;
         }
         self.unflushed.clear();
@@ -7091,6 +7329,7 @@ impl PersonalRankingRuntime {
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
 struct TsfTextService {
     activation: Mutex<ActivationState>,
+    background_persistence: Option<BackgroundPersistence>,
     composition: Rc<RefCell<CompositionSession>>,
     document_composition: Rc<RefCell<DocumentCompositionState>>,
     candidate_provider: Option<Arc<dyn CandidateProvider>>,
@@ -7132,6 +7371,7 @@ const RESEARCH_FEEDBACK_CONSENT_POLL_MS: u64 = 1_000;
 
 struct ResearchFeedbackJournal {
     root: Option<PathBuf>,
+    persistence: Option<BackgroundPersistenceHandle>,
     module_sha256: Option<String>,
     candidate_identity: Option<CandidateDataIdentity>,
     stream_id: String,
@@ -7150,6 +7390,7 @@ impl ResearchFeedbackJournal {
     fn for_mode(
         key_advice_mode: KeyAdviceMode,
         candidate_identity: Option<CandidateDataIdentity>,
+        persistence: Option<BackgroundPersistenceHandle>,
     ) -> Self {
         let root = matches!(key_advice_mode, KeyAdviceMode::Foreground)
             .then(|| {
@@ -7171,6 +7412,7 @@ impl ResearchFeedbackJournal {
             .flatten();
         Self {
             root,
+            persistence,
             module_sha256,
             candidate_identity,
             stream_id: new_research_stream_id(),
@@ -7193,6 +7435,7 @@ impl ResearchFeedbackJournal {
             .is_some_and(|root| research_feedback_enabled(root).unwrap_or(false));
         Self {
             root,
+            persistence: None,
             module_sha256: None,
             candidate_identity: None,
             stream_id: new_research_stream_id(),
@@ -7299,7 +7542,7 @@ impl ResearchFeedbackJournal {
             self.completed_episodes = 0;
             return false;
         };
-        if research_feedback_enabled(root) != Ok(true) {
+        if self.persistence.is_none() && research_feedback_enabled(root) != Ok(true) {
             self.enabled = false;
             self.events.clear();
             self.completed_episodes = 0;
@@ -7326,7 +7569,7 @@ impl ResearchFeedbackJournal {
         .ok()
         .map(WishJournalContext::ContinuousSpan);
         let runtime_identity = self.runtime_identity();
-        let saved = journal_context
+        let snapshot = journal_context
             .and_then(|journal_context| {
                 crate::FrozenNativeFeedbackSnapshot::from_journal_events(marker_ms, &self.events)
                     .ok()
@@ -7341,12 +7584,15 @@ impl ResearchFeedbackJournal {
                     Some(journal_context),
                 )
                 .ok()
-            })
-            .and_then(|snapshot| {
-                save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector).ok()
-            })
-            .is_some();
-        if saved {
+            });
+        let accepted = snapshot.is_some_and(|snapshot| match self.persistence.as_ref() {
+            Some(persistence) => persistence.enqueue_research(root.to_path_buf(), snapshot),
+            None => {
+                research_feedback_enabled(root) == Ok(true)
+                    && save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector).is_ok()
+            }
+        });
+        if accepted {
             self.events.clear();
             self.completed_episodes = 0;
             self.first_event_ordinal = None;
@@ -7354,15 +7600,16 @@ impl ResearchFeedbackJournal {
             self.previous_event_timestamp_ms = Some(marker_ms);
             self.batch_sequence = self.batch_sequence.saturating_add(1);
         } else {
-            // A malformed marker, unavailable DPAPI, or storage failure must
-            // never retain an unbounded private buffer inside the host.
+            // A malformed marker or saturated/unavailable writer must never
+            // retain an unbounded private buffer inside the host. The writer
+            // records aggregate route health without putting content in it.
             self.root = None;
             self.enabled = false;
             self.events.clear();
             self.completed_episodes = 0;
             self.reset_stream();
         }
-        saved
+        accepted
     }
 
     fn runtime_identity(&self) -> Option<WishRuntimeIdentity> {
@@ -7422,6 +7669,7 @@ impl NativeFeedbackRuntime {
     fn for_mode(
         key_advice_mode: KeyAdviceMode,
         candidate_identity: Option<CandidateDataIdentity>,
+        persistence: Option<BackgroundPersistenceHandle>,
     ) -> Self {
         let mut session = NativeFeedbackSession::default();
         if matches!(key_advice_mode, KeyAdviceMode::Foreground) {
@@ -7433,7 +7681,11 @@ impl NativeFeedbackRuntime {
         }
         Self {
             session,
-            research: ResearchFeedbackJournal::for_mode(key_advice_mode, candidate_identity),
+            research: ResearchFeedbackJournal::for_mode(
+                key_advice_mode,
+                candidate_identity,
+                persistence,
+            ),
         }
     }
 
@@ -7505,8 +7757,9 @@ impl Drop for NativeFeedbackRuntime {
 fn native_feedback_runtime_for_mode(
     key_advice_mode: KeyAdviceMode,
     candidate_identity: Option<CandidateDataIdentity>,
+    persistence: Option<BackgroundPersistenceHandle>,
 ) -> NativeFeedbackRuntime {
-    NativeFeedbackRuntime::for_mode(key_advice_mode, candidate_identity)
+    NativeFeedbackRuntime::for_mode(key_advice_mode, candidate_identity, persistence)
 }
 
 impl TsfTextService {
@@ -7518,9 +7771,15 @@ impl TsfTextService {
         let candidate_identity = candidate_provider
             .as_deref()
             .and_then(CandidateProvider::candidate_data_identity);
+        let background_persistence =
+            matches!(key_advice_mode, KeyAdviceMode::Foreground).then(BackgroundPersistence::start);
+        let persistence = background_persistence
+            .as_ref()
+            .map(BackgroundPersistence::handle);
         let native_feedback = Arc::new(Mutex::new(native_feedback_runtime_for_mode(
             key_advice_mode,
             candidate_identity,
+            persistence.clone(),
         )));
         let native_feedback_context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
         let input_mode = Rc::new(Cell::new(InputMode::Chinese));
@@ -7552,6 +7811,7 @@ impl TsfTextService {
             .unwrap_or_default();
         Self {
             activation: Mutex::new(ActivationState::default()),
+            background_persistence,
             composition: Rc::new(RefCell::new(CompositionSession::default())),
             document_composition: Rc::new(RefCell::new(DocumentCompositionState::default())),
             candidate_provider,
@@ -7561,9 +7821,10 @@ impl TsfTextService {
             personal_phrase_composer: RefCell::new(PersonalPhraseComposer::default()),
             personal_context_ranking: RefCell::new(PersonalContextRanking::default()),
             personal_left_context: RefCell::new(None),
-            personal_ranking: RefCell::new(PersonalRankingRuntime::new_with_roots(
+            personal_ranking: RefCell::new(PersonalRankingRuntime::new_with_roots_and_persistence(
                 personal_ranking_roots.0,
                 personal_ranking_roots.1,
+                persistence,
             )),
             candidate_forget_state: RefCell::new(CandidateForgetState::Inactive),
             candidate_ui: Rc::new(RefCell::new(candidate_ui)),
@@ -7622,6 +7883,12 @@ impl Drop for TsfTextService {
             }
         }
         let _ = self.personal_ranking.get_mut().flush();
+        if let Ok(mut feedback) = self.native_feedback.lock() {
+            let _ = feedback.flush_research();
+        }
+        if let Some(persistence) = self.background_persistence.as_mut() {
+            persistence.shutdown();
+        }
         object_dropped();
     }
 }
@@ -10111,6 +10378,63 @@ mod tests {
     }
 
     #[test]
+    fn background_persistence_drains_personal_ranking_before_shutdown() {
+        let parent = candidate_runtime_test_root("background-ranking");
+        let root = parent.join("ranking");
+        let mut persistence = BackgroundPersistence::start();
+        let handle = persistence.handle();
+        let mut runtime = PersonalRankingRuntime::new_with_roots_and_persistence(
+            Some(root.clone()),
+            None,
+            Some(handle.clone()),
+        );
+
+        assert!(runtime.record("ab", "乙"));
+        assert!(
+            runtime.flush(),
+            "the hot path should accept the bounded job"
+        );
+        assert!(
+            handle.wait_for_personal_ranking_idle(),
+            "the activation barrier should observe a durable background write"
+        );
+        let reloaded = PersonalRankingRuntime::new(Some(root));
+        assert_eq!(reloaded.snapshot.preferred_text("ab"), Some("乙"));
+
+        drop(runtime);
+        persistence.shutdown();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn full_background_queue_rejects_without_waiting_for_capacity() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let health = Arc::new(BackgroundPersistenceHealth::default());
+        let handle = BackgroundPersistenceHandle {
+            sender: sender.clone(),
+            health: Arc::clone(&health),
+        };
+        let (acknowledge, _acknowledged) = mpsc::channel();
+        sender
+            .try_send(BackgroundPersistenceCommand::Barrier(acknowledge))
+            .unwrap();
+        let batch = PersonalRankingBatch::now(
+            std::process::id(),
+            0,
+            vec![PersonalRankingSelection::new("ab", "乙").unwrap()],
+        )
+        .unwrap();
+
+        assert!(!handle.enqueue_personal_ranking(PathBuf::from("unused"), batch));
+        assert_eq!(
+            health
+                .rejected_personal_ranking_jobs
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn personal_ranking_runtime_applies_and_refreshes_explicit_suppressions() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = std::env::temp_dir().join(format!(
@@ -10434,6 +10758,7 @@ mod tests {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(None),
             aliases: Some(runtime),
+            refresh_throttle: Mutex::new(RefreshThrottle::default()),
         };
         let mut candidates = provider.candidates("aa", 2, InteractiveCandidateView::Primary);
         assert_eq!(candidates, ["乙", "啊"]);
@@ -11947,13 +12272,14 @@ mod tests {
                 .as_deref(),
             Some("tsf-hot-first-v1")
         );
+        let mut refresh_at = Instant::now();
 
         let first_payload = root
             .join(crate::CANDIDATE_PACKAGES_DIRECTORY)
             .join(&first)
             .join(crate::CANDIDATE_PACKAGE_PAYLOAD_FILE);
         fs::write(&first_payload, "damaged\n").unwrap();
-        assert!(!provider.refresh_at_safe_boundary());
+        assert!(!provider.refresh_at_safe_boundary_at(refresh_at));
         assert_eq!(
             provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
             ["什么", "神马"],
@@ -11963,7 +12289,12 @@ mod tests {
 
         let first_snapshot = provider.supplemental.current().unwrap().0;
         select_candidate_runtime_test_package(&root, &first, 2);
-        assert!(provider.refresh_at_safe_boundary());
+        assert!(
+            !provider.refresh_at_safe_boundary_at(refresh_at + Duration::from_millis(500)),
+            "a second composition inside the polling interval must not reopen state files"
+        );
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
         let reconfigured_snapshot = provider.supplemental.current().unwrap().0;
         assert!(Arc::ptr_eq(&first_snapshot, &reconfigured_snapshot));
 
@@ -11973,7 +12304,8 @@ mod tests {
             ["什么", "神马"],
             "an active composition keeps the already selected snapshot"
         );
-        assert!(provider.refresh_at_safe_boundary());
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
         assert_eq!(
             provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
             ["什么", "甚么"]
@@ -11993,7 +12325,8 @@ mod tests {
         )
         .unwrap();
         select_candidate_runtime_test_package(&root, &broken, 1);
-        assert!(!provider.refresh_at_safe_boundary());
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(!provider.refresh_at_safe_boundary_at(refresh_at));
         assert_eq!(
             provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
             ["什么", "甚么"],
@@ -12005,7 +12338,8 @@ mod tests {
             crate::CandidateSupplementalState::default().render(),
         )
         .unwrap();
-        assert!(provider.refresh_at_safe_boundary());
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
         assert_eq!(
             provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
             ["什么"]
@@ -12019,7 +12353,8 @@ mod tests {
         );
 
         select_candidate_runtime_test_package(&root, &first, 1);
-        assert!(provider.refresh_at_safe_boundary());
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
         assert_eq!(
             provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
             ["什么", "神马"]
@@ -13639,14 +13974,14 @@ mod tests {
 
     #[test]
     fn foreground_hosts_keep_a_bounded_memory_only_wish_buffer_ready() {
-        let foreground = native_feedback_runtime_for_mode(KeyAdviceMode::Foreground, None);
+        let foreground = native_feedback_runtime_for_mode(KeyAdviceMode::Foreground, None, None);
         assert_eq!(
             foreground.summary().lifecycle,
             NativeFeedbackLifecycle::Recording
         );
         assert_eq!(foreground.summary().events, 0);
 
-        let synthetic = native_feedback_runtime_for_mode(KeyAdviceMode::SyntheticHost, None);
+        let synthetic = native_feedback_runtime_for_mode(KeyAdviceMode::SyntheticHost, None, None);
         assert_eq!(
             synthetic.summary().lifecycle,
             NativeFeedbackLifecycle::Disabled
@@ -13752,6 +14087,37 @@ mod tests {
         };
         assert_eq!(span.first_event_ordinal(), 8);
         assert_eq!(span.previous_event_gap_ms(), Some(893));
+
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_persistence_drains_encrypted_research_before_shutdown() {
+        let _guard = test_lock();
+        let root = candidate_runtime_test_root("background-research");
+        crate::set_research_feedback_enabled(&root, true).unwrap();
+        let mut persistence = BackgroundPersistence::start();
+        let mut runtime = NativeFeedbackRuntime::with_research_root(root.clone());
+        runtime.research.persistence = Some(persistence.handle());
+
+        for index in 0..RESEARCH_FEEDBACK_BATCH_EPISODES {
+            runtime.record_at(
+                NativeFeedbackContext::Eligible,
+                NativeFeedbackEvent::RawCodeCommitted {
+                    code: "ab".to_owned(),
+                },
+                u64::try_from(index).unwrap(),
+            );
+        }
+        assert!(runtime.research.events.is_empty());
+        persistence.shutdown();
+
+        let packages = crate::list_wish_packages(&root).unwrap();
+        assert_eq!(packages.len(), 1);
+        let snapshot =
+            crate::load_wish_snapshot(&root, packages[0].id(), &WindowsUserDataProtector).unwrap();
+        assert_eq!(snapshot.events().len(), RESEARCH_FEEDBACK_BATCH_EPISODES);
 
         drop(runtime);
         fs::remove_dir_all(root).unwrap();
