@@ -500,7 +500,13 @@ stderr 的 `NativeCommandError` 包装由脚本先完整捕获，再按真实进
 
 ```powershell
 .\update-ime.cmd
+.\update-ime.cmd status
 ```
+
+`status` 是同一入口的只读分支：它验证 release 候选数据、安装凭据、当前用户状态
+和可见宿主缓存，然后分别显示 release/installed 摘要与是否待换代。它不禁用、
+注销、注册、启用或打开 `wishpad`，也不请求管理员权限；因此可在多个 Codex 任务
+仍运行时随时区分“新版尚未安装”和“新版已经安装、现有宿主仍缓存旧 DLL”。
 
 - 不直接写注册表设置默认键盘；注册使用 TSF 正式接口；
 - 安装、注销、升级和回退必须是不同的显式操作；

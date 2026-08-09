@@ -3047,6 +3047,26 @@ mod tests {
     }
 
     #[test]
+    fn update_wrapper_keeps_status_read_only_and_replacement_explicit() {
+        let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("update-ime.cmd");
+        let contents = fs::read_to_string(wrapper).unwrap();
+
+        assert!(contents.contains("Usage: update-ime.cmd [status]"));
+        assert!(contents.contains("-StatusOnly"));
+        assert!(contents.contains("-EnableCurrentUserAfterReplace"));
+        assert!(contents.contains("if /i \"%update_mode%\"==\"status\" goto status"));
+
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("replace-tsf-alpha.ps1");
+        let script_contents = fs::read_to_string(script).unwrap();
+        assert!(script_contents.contains("This action: read only"));
+        assert!(
+            script_contents.contains("StatusOnly cannot be combined with replacement switches.")
+        );
+    }
+
+    #[test]
     fn parser_requires_one_explicit_dll() {
         assert_eq!(parse_options(Vec::<String>::new()).unwrap(), Options::Help);
         assert_eq!(

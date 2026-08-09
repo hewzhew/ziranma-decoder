@@ -258,9 +258,12 @@ cargo build --release --bin wishctl --bin wishpad
 
 ```powershell
 .\update-ime.cmd
+.\update-ime.cmd status
 ```
 
-该入口只定位并调用仓库内既有的安全换代脚本；仍会显示 Windows 管理员确认，
+不带参数才执行换代；`status` 只读比较 release 与已安装 DLL、验证候选槽和当前用户
+状态，并报告相对 release 的新旧宿主数量，不弹 UAC、不打开管理器、不写文件。
+默认入口只定位并调用仓库内既有的安全换代脚本；真正换代仍会显示 Windows 管理员确认，
 不会自行编译、联网或更改默认输入法。已安装版本的 DLL 摘要与候选槽完全相同
 时走只读快路径，不再注销、注册或弹出管理员确认；真正的新版本仍保留完整的
 安全换代事务。`tsf-devctl inspect` 会额外汇总可见宿主正在加载的同版与旧版

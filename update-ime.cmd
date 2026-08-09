@@ -1,8 +1,14 @@
 @echo off
 setlocal
 
-if not "%~1"=="" (
-    echo Usage: update-ime.cmd
+if not "%~2"=="" (
+    echo Usage: update-ime.cmd [status]
+    exit /b 2
+)
+
+set "update_mode=%~1"
+if not "%update_mode%"=="" if /i not "%update_mode%"=="status" (
+    echo Usage: update-ime.cmd [status]
     exit /b 2
 )
 
@@ -18,6 +24,8 @@ if not exist "%windows_powershell%" (
     exit /b 1
 )
 
+if /i "%update_mode%"=="status" goto status
+
 "%windows_powershell%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%update_script%" -EnableCurrentUserAfterReplace
 set "update_exit_code=%ERRORLEVEL%"
 if "%update_exit_code%"=="0" (
@@ -26,3 +34,7 @@ if "%update_exit_code%"=="0" (
     )
 )
 exit /b %update_exit_code%
+
+:status
+"%windows_powershell%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%update_script%" -StatusOnly
+exit /b %ERRORLEVEL%

@@ -4,7 +4,8 @@
 param(
     [switch]$AdminPhase,
     [switch]$EnableCurrentUserAfterReplace,
-    [switch]$ForceReregister
+    [switch]$ForceReregister,
+    [switch]$StatusOnly
 )
 
 Set-StrictMode -Version Latest
@@ -270,6 +271,87 @@ function Get-HostCacheState {
     }
 }
 
+function Get-CurrentUserState {
+    $stateOutput = [Collections.Generic.List[string]]::new()
+    $stateExitCode = Invoke-DevCtlCapture `
+        -Arguments @('current-user-state') `
+        -Lines $stateOutput
+    if ($stateExitCode -ne 0) {
+        $stateOutput | ForEach-Object { Write-Host $_ }
+        throw "current-user-state stopped with exit code $stateExitCode"
+    }
+    $stateLines = @(
+        $stateOutput |
+            Where-Object { $_ -like 'TSF_CURRENT_USER_STATE *' }
+    )
+    if ($stateLines.Count -ne 1) {
+        throw 'current-user-state returned an unexpected report shape'
+    }
+    $stateMatch = [regex]::Match(
+        $stateLines[0],
+        '^TSF_CURRENT_USER_STATE schema=ziranma-tsf-current-user-state-v1 enabled=(true|false) active=(true|false) writes=false$'
+    )
+    if (-not $stateMatch.Success) {
+        throw 'current-user-state returned an invalid report'
+    }
+    return [PSCustomObject]@{
+        Enabled = $stateMatch.Groups[1].Value -eq 'true'
+        Active = $stateMatch.Groups[2].Value -eq 'true'
+    }
+}
+
+function Write-UpdateStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDigest,
+        [AllowNull()]
+        [string]$InstalledDigest,
+        [AllowNull()]
+        [object]$CurrentUserState,
+        [Parameter(Mandatory = $true)]
+        [object]$HostCacheState,
+        [Parameter(Mandatory = $true)]
+        [string]$UpdateState
+    )
+
+    Write-Host 'TSF Alpha update status'
+    Write-Host "Release DLL: $SourceDigest"
+    if ($null -eq $InstalledDigest) {
+        Write-Host 'Installed DLL: none'
+    } else {
+        Write-Host "Installed DLL: $InstalledDigest"
+    }
+    Write-Host "Update: $UpdateState"
+    if ($null -eq $CurrentUserState) {
+        Write-Host 'Current user: unavailable before first install'
+    } else {
+        Write-Host (
+            'Current user: enabled={0} active={1}' -f
+                $CurrentUserState.Enabled.ToString().ToLowerInvariant(),
+                $CurrentUserState.Active.ToString().ToLowerInvariant()
+        )
+    }
+    if (-not $HostCacheState.ScanAvailable) {
+        Write-Host 'Host cache: inspection unavailable'
+    } else {
+        Write-Host (
+            'Host cache: release build {0}; other builds {1}' -f
+                $HostCacheState.MatchingVersion,
+                $HostCacheState.OtherVersions
+        )
+    }
+    if ($UpdateState -eq 'already current' -and $HostCacheState.OtherVersions -gt 0) {
+        Write-Host 'Next: no installation needed; existing old hosts update when reopened.'
+    } elseif ($UpdateState -eq 'already current') {
+        Write-Host 'Next: no installation or host restart needed.'
+    } elseif ($null -eq $InstalledDigest) {
+        Write-Host 'Next: run update-ime.cmd when a machine-wide first install is wanted.'
+    } else {
+        Write-Host 'Next: run update-ime.cmd when convenient; existing hosts need not close first.'
+    }
+    Write-Host 'This action: read only'
+}
+
 function Restore-RequestedCurrentUserEnablement {
     if (-not $script:EnableCurrentUserAfterReplace -or
         -not (Test-Path -LiteralPath $script:receipt -PathType Leaf)) {
@@ -302,6 +384,56 @@ if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
 }
 
 Set-Location -LiteralPath $repositoryRoot
+
+if ($StatusOnly) {
+    if ($AdminPhase -or $EnableCurrentUserAfterReplace -or $ForceReregister) {
+        throw 'StatusOnly cannot be combined with replacement switches.'
+    }
+    $sourceDigest = Get-Sha256Hex -Path $sourceDll
+    if (-not (Test-Path -LiteralPath $sourceCandidateRoot -PathType Container)) {
+        throw 'Release candidate data is missing.'
+    }
+    Invoke-CandidateCtl -Arguments @('status', '--root', $sourceCandidateRoot) -Quiet
+    $receiptPresent = Test-Path -LiteralPath $receipt -PathType Leaf
+    $receiptDigest = Get-InstalledReceiptDigest
+    if ($receiptPresent -and $null -eq $receiptDigest) {
+        throw 'The installed TSF receipt is invalid.'
+    }
+    $currentUserState = if ($null -ne $receiptDigest) {
+        Get-CurrentUserState
+    } else {
+        $null
+    }
+    if ($receiptDigest -eq $sourceDigest) {
+        $installedCandidateRoot = Join-Path `
+            $repositoryRoot `
+            ".local\tsf-alpha\builds\$sourceDigest\candidate-data"
+        if (-not (Test-Path -LiteralPath $installedCandidateRoot -PathType Container)) {
+            throw 'The current immutable build has no installed candidate data.'
+        }
+        Invoke-CandidateCtl -Arguments @('status', '--root', $installedCandidateRoot) -Quiet
+        if (-not (Test-CandidateSlotStateMatch `
+            -SourceRoot $sourceCandidateRoot `
+            -InstalledRoot $installedCandidateRoot)) {
+            throw 'Release candidate slots differ from the immutable installed build.'
+        }
+    }
+    $hostCacheState = Get-HostCacheState
+    $updateState = if ($null -eq $receiptDigest) {
+        'not installed'
+    } elseif ($receiptDigest -eq $sourceDigest) {
+        'already current'
+    } else {
+        'ready to install'
+    }
+    Write-UpdateStatus `
+        -SourceDigest $sourceDigest `
+        -InstalledDigest $receiptDigest `
+        -CurrentUserState $currentUserState `
+        -HostCacheState $hostCacheState `
+        -UpdateState $updateState
+    exit 0
+}
 
 if ($AdminPhase) {
     if (-not (Test-Administrator)) {
@@ -420,29 +552,7 @@ if (-not $candidateSlotStateMatches) {
 $receiptDigest = Get-InstalledReceiptDigest
 $wasCurrentUserActive = $false
 if ($null -ne $receiptDigest) {
-    $currentUserStateOutput = [Collections.Generic.List[string]]::new()
-    $currentUserStateExitCode = Invoke-DevCtlCapture `
-        -Arguments @('current-user-state') `
-        -Lines $currentUserStateOutput
-    if ($currentUserStateExitCode -ne 0) {
-        $currentUserStateOutput | ForEach-Object { Write-Host $_ }
-        throw "current-user-state stopped with exit code $currentUserStateExitCode"
-    }
-    $currentUserStateLines = @(
-        $currentUserStateOutput |
-            Where-Object { $_ -like 'TSF_CURRENT_USER_STATE *' }
-    )
-    if ($currentUserStateLines.Count -ne 1) {
-        throw 'current-user-state returned an unexpected report shape'
-    }
-    $currentUserStateMatch = [regex]::Match(
-        $currentUserStateLines[0],
-        '^TSF_CURRENT_USER_STATE schema=ziranma-tsf-current-user-state-v1 enabled=(true|false) active=(true|false) writes=false$'
-    )
-    if (-not $currentUserStateMatch.Success) {
-        throw 'current-user-state returned an invalid report'
-    }
-    $wasCurrentUserActive = $currentUserStateMatch.Groups[2].Value -eq 'true'
+    $wasCurrentUserActive = (Get-CurrentUserState).Active
 }
 $currentUserVerificationArguments = @('verify-current-user-enabled')
 if ($wasCurrentUserActive) {
