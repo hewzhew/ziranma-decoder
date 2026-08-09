@@ -3192,6 +3192,7 @@ struct ParsedArpaNgram {
 struct SparseArpaLanguageModel {
     declared_order: usize,
     effective_order: usize,
+    sentence_boundaries: bool,
     bytes: u64,
     sha256: String,
     known_query_tokens: HashSet<String>,
@@ -3218,13 +3219,12 @@ impl SparseArpaLanguageModel {
             .iter()
             .map(|token| self.canonical_token(token))
             .collect::<Vec<_>>();
-        let mut history = vec!["<s>".to_owned()];
+        let mut history = Vec::new();
+        if self.sentence_boundaries {
+            history.push("<s>".to_owned());
+        }
         let mut total_log10 = 0.0;
-        for token in tokens
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once("</s>"))
-        {
+        for token in &tokens {
             total_log10 += self.score_word(&history, token)?;
             history.push(token.to_owned());
             let maximum_history = self.effective_order.saturating_sub(1);
@@ -3232,6 +3232,9 @@ impl SparseArpaLanguageModel {
                 let remove = history.len() - maximum_history;
                 history.drain(..remove);
             }
+        }
+        if self.sentence_boundaries {
+            total_log10 += self.score_word(&history, "</s>")?;
         }
         let characters = candidate.text.chars().count().max(1);
         Ok(total_log10 / characters as f64)
@@ -3361,6 +3364,15 @@ fn audit_static_context(
     )?;
     writeln!(
         output,
+        "句界：{}",
+        if language_model.sentence_boundaries {
+            "模型提供 <s>/</s>"
+        } else {
+            "模型未提供；按空上下文起始且不添加句末分"
+        }
+    )?;
+    writeln!(
+        output,
         "稀疏装载：需要 {} 条 N-gram，实际命中 {}；候选所需词型中 {} 个映射为 <unk>",
         language_model.required_ngrams,
         language_model.records.len(),
@@ -3487,19 +3499,23 @@ fn load_sparse_arpa_language_model<'a>(
     cases: impl Iterator<Item = &'a FrozenStaticContextCase> + Clone,
     requested_order: usize,
 ) -> Result<SparseArpaLanguageModel, Box<dyn std::error::Error>> {
-    let mut query_tokens = cases
+    let candidate_query_tokens = cases
         .clone()
         .flat_map(|case| &case.candidates)
         .flat_map(|candidate| &candidate.segments)
         .cloned()
         .collect::<HashSet<_>>();
+    let mut query_tokens = candidate_query_tokens.clone();
     query_tokens.insert("<s>".to_owned());
     query_tokens.insert("</s>".to_owned());
     let scan = scan_arpa_vocabulary(path, &query_tokens)?;
-    if !scan.known_query_tokens.contains("<s>") || !scan.known_query_tokens.contains("</s>") {
-        return Err("public ARPA model must contain <s> and </s>".into());
+    let has_start_boundary = scan.known_query_tokens.contains("<s>");
+    let has_end_boundary = scan.known_query_tokens.contains("</s>");
+    if has_start_boundary != has_end_boundary {
+        return Err("public ARPA model must contain both <s> and </s>, or neither".into());
     }
-    let missing_tokens = query_tokens
+    let sentence_boundaries = has_start_boundary;
+    let missing_tokens = candidate_query_tokens
         .iter()
         .filter(|token| !scan.known_query_tokens.contains(*token))
         .count();
@@ -3518,9 +3534,13 @@ fn load_sparse_arpa_language_model<'a>(
     for case in cases {
         for candidate in &case.candidates {
             let mut sequence = Vec::with_capacity(candidate.segments.len() + 2);
-            sequence.push("<s>".to_owned());
+            if sentence_boundaries {
+                sequence.push("<s>".to_owned());
+            }
             sequence.extend(candidate.segments.iter().map(|token| canonicalize(token)));
-            sequence.push("</s>".to_owned());
+            if sentence_boundaries {
+                sequence.push("</s>".to_owned());
+            }
             for start in 0..sequence.len() {
                 for order in 1..=effective_order.min(sequence.len() - start) {
                     required.insert(sequence[start..start + order].to_vec());
@@ -3528,8 +3548,10 @@ fn load_sparse_arpa_language_model<'a>(
             }
         }
     }
-    required.insert(vec!["<s>".to_owned()]);
-    required.insert(vec!["</s>".to_owned()]);
+    if sentence_boundaries {
+        required.insert(vec!["<s>".to_owned()]);
+        required.insert(vec!["</s>".to_owned()]);
+    }
     if missing_tokens != 0 {
         required.insert(vec!["<unk>".to_owned()]);
     }
@@ -3538,6 +3560,7 @@ fn load_sparse_arpa_language_model<'a>(
     Ok(SparseArpaLanguageModel {
         declared_order: scan.declared_order,
         effective_order,
+        sentence_boundaries,
         bytes: scan.bytes,
         sha256: scan.sha256,
         known_query_tokens: scan.known_query_tokens,
@@ -8689,6 +8712,7 @@ ngram 2=10\n\n\
 
         let report = audit_static_context(&model, &core, &fit, &held_out, 8, 8, 2).unwrap();
         assert!(report.contains("保留集净改善且未损失正确首选"));
+        assert!(report.contains("句界：模型提供 <s>/</s>"));
         assert!(report.contains("本次操作：只读"));
         for text in ["误提交", "无提交", "误检查", "正确检查"] {
             assert!(!report.contains(text));
@@ -8725,6 +8749,67 @@ ngram 2=0\n\n\
         let model = load_sparse_arpa_language_model(&model_path, cases.iter(), 2).unwrap();
         let score = model.score_candidate(&cases[0].candidates[0]).unwrap();
         assert!((score - -1.9).abs() < 1e-12);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sparse_arpa_accepts_fcitx_style_models_without_sentence_markers() {
+        const ARPA: &str = "\\data\\\n\
+ngram 1=3\n\
+ngram 2=1\n\n\
+\\1-grams:\n\
+-2.0 <unk> 0\n\
+-1.0 误 -0.3\n\
+-0.8 提交 0\n\n\
+\\2-grams:\n\
+-0.2 误 提交\n\n\
+\\end\\\n";
+        let root = temporary_test_root();
+        let model_path = root.join("boundaryless.arpa");
+        fs::create_dir(&root).unwrap();
+        fs::write(&model_path, ARPA).unwrap();
+        let cases = [FrozenStaticContextCase {
+            expected_text: "误提交".to_owned(),
+            candidates: vec![FrozenStaticContextCandidate {
+                text: "误提交".to_owned(),
+                segments: vec!["误".to_owned(), "提交".to_owned()],
+            }],
+        }];
+
+        let model = load_sparse_arpa_language_model(&model_path, cases.iter(), 2).unwrap();
+        assert!(!model.sentence_boundaries);
+        let score = model.score_candidate(&cases[0].candidates[0]).unwrap();
+        assert!((score - -0.4).abs() < 1e-12);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sparse_arpa_rejects_a_single_sentence_marker() {
+        const ARPA: &str = "\\data\\\n\
+ngram 1=3\n\n\
+\\1-grams:\n\
+-0.1 <s> 0\n\
+-2.0 <unk> 0\n\
+-1.0 误 0\n\n\
+\\end\\\n";
+        let root = temporary_test_root();
+        let model_path = root.join("partial-boundary.arpa");
+        fs::create_dir(&root).unwrap();
+        fs::write(&model_path, ARPA).unwrap();
+        let cases = [FrozenStaticContextCase {
+            expected_text: "误".to_owned(),
+            candidates: vec![FrozenStaticContextCandidate {
+                text: "误".to_owned(),
+                segments: vec!["误".to_owned()],
+            }],
+        }];
+
+        let error = load_sparse_arpa_language_model(&model_path, cases.iter(), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("both <s> and </s>, or neither"));
 
         fs::remove_dir_all(root).unwrap();
     }
