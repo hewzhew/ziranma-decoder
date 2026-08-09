@@ -10345,9 +10345,9 @@ mod tests {
         ));
         fs::create_dir_all(root.join(crate::EXPLICIT_ALIAS_PACKAGES_DIRECTORY)).unwrap();
 
-        let install = |text: &str| {
+        let install = |code: &str, text: &str| {
             let mut snapshot = ExplicitAliasSnapshot::default();
-            snapshot.set("aa", text).unwrap();
+            snapshot.set(code, text).unwrap();
             let package =
                 crate::protect_explicit_alias_snapshot(&snapshot, &WindowsUserDataProtector)
                     .unwrap();
@@ -10360,14 +10360,14 @@ mod tests {
             package_id
         };
 
-        let first = install("甲");
+        let first = install("aa", "甲");
         let mut slots = crate::ExplicitAliasSlotState::default();
         slots.adopt(&first).unwrap();
         fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), slots.render()).unwrap();
         let runtime = ExplicitAliasRuntime::new(root.clone());
         assert_eq!(runtime.text("aa").as_deref(), Some("甲"));
 
-        let second = install("乙");
+        let second = install("aa", "乙");
         slots.stage(&second).unwrap();
         slots.promote().unwrap();
         fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), slots.render()).unwrap();
@@ -10421,6 +10421,23 @@ mod tests {
         assert_eq!(protected, 1);
         assert!(memory.promote_texts_after("aa", &mut candidates, protected));
         assert_eq!(candidates, ["乙", "啊"]);
+
+        let mixed = install("vtrayn", "v2rayN");
+        slots.stage(&mixed).unwrap();
+        slots.promote().unwrap();
+        fs::write(root.join(crate::EXPLICIT_ALIAS_SLOT_FILE), slots.render()).unwrap();
+        assert!(provider.aliases.as_ref().unwrap().refresh());
+        let mixed_output =
+            provider.candidates_with_provenance("vtrayn", 2, InteractiveCandidateView::Primary);
+        assert_eq!(
+            mixed_output.candidates.first().map(String::as_str),
+            Some("v2rayN")
+        );
+        assert_eq!(mixed_output.protected_prefix_len, 1);
+        assert_eq!(
+            mixed_output.provenance[0].source(),
+            NativeCandidateSource::ExplicitAlias
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

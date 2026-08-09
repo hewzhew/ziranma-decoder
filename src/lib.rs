@@ -63,6 +63,7 @@ mod transposition_calibration;
 #[cfg(windows)]
 mod tsf_alpha;
 mod user_tool_layout;
+mod user_tool_runtime;
 mod wish_command;
 mod wish_feedback;
 
@@ -361,7 +362,12 @@ pub use transposition_calibration::{
     TranspositionCalibrationObservation, TranspositionCalibrationRecommendation,
     TranspositionCalibrationSummary, TranspositionCalibrator,
 };
-pub use user_tool_layout::repository_root_for_user_tool_executable;
+pub use user_tool_layout::{
+    repository_root_for_desktop_launcher_executable, repository_root_for_user_tool_executable,
+};
+pub use user_tool_runtime::{
+    LaunchableUserTool, MANAGED_USER_TOOL_NAMES, UserToolRuntimeError, resolve_current_user_tool,
+};
 #[cfg(windows)]
 pub use wish_command::{WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID};
 pub use wish_command::{

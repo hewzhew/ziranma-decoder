@@ -688,9 +688,11 @@ mod tests {
     #[test]
     fn snapshot_round_trips_in_code_order() {
         let mut snapshot = ExplicitAliasSnapshot::default();
+        snapshot.set("vtrayn", "v2rayN").unwrap();
         snapshot.set("wuu", "呜呜").unwrap();
         snapshot.set("wua", "呜哇").unwrap();
         let bytes = snapshot.render().unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("vtrayn\tv2rayN\n"));
         assert!(String::from_utf8_lossy(&bytes).contains("wua\t呜哇\nwuu\t呜呜\n"));
         assert_eq!(ExplicitAliasSnapshot::parse(&bytes).unwrap(), snapshot);
     }

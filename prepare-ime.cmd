@@ -28,7 +28,8 @@ cargo.exe build --release --locked --offline ^
     --bin personalctl ^
     --bin researchctl ^
     --bin wishctl ^
-    --bin wishpad
+    --bin wishpad ^
+    --bin ziranma-launcher
 set "build_exit_code=%ERRORLEVEL%"
 if not "%build_exit_code%"=="0" (
     popd

@@ -234,13 +234,20 @@ Typora 等进程使用的旧 DLL。
 .\refresh-ime.cmd rollback
 ```
 
-默认命令离线、锁定依赖地构建七个别名、候选、个人排序、研究和许愿管理 EXE，
+默认命令离线、锁定依赖地构建八个别名、候选、个人排序、研究、许愿和桌面启动 EXE，
 并发布到 Git 忽略的不可变 `current / previous` 用户工具槽。现有工具进程不被
 关闭，新打开的 `aliaspad` / `wishpad` 和下一次管理命令使用 current；状态只读，
 回退先复核完整摘要。这个入口不构建 `--lib`，不生成或替换 TSF DLL，也不读取
 私人数据根。`candidate-data.cmd` 可调用当前候选管理器，`personal-ime.cmd` 则把
 个人排序命令固定到既有当前用户数据根；具体生效边界见
 [用户态工具独立刷新](docs/user-tool-refresh.md)。
+
+刷新还会原子更新固定的原生启动器
+`.local/tsf-alpha/desktop-launcher/ziranma-launcher.exe`。桌面上的“向猫猫许愿”、
+“自定义短语”和“自然码换代”快捷方式可以分别传入 `wish`、`alias`、`update`；
+前两项直接启动摘要校验通过的 current GUI，不再经过 `.cmd` 或闪出命令窗口，
+换代仍保留可见控制台、诊断输出和既有确认边界。启动器只接受这三个固定动作，
+不会执行调用者提供的程序名或路径。
 
 本地许愿放在 Git 忽略的 `.local/tsf-alpha/user-data/wishes`。默认管理命令只显示
 数量和随机内容 ID；查看输入原文必须显式确认，说明另存为绑定同一 ID 的加密
@@ -474,8 +481,8 @@ PE/Authenticode 签名。
 用户主动指定的精确别名与公开候选包分开保存。`alias-ime.cmd` 把它们写入
 Git 忽略的 `.local/tsf-alpha/user-data/aliases`，正文始终先经过 Windows
 当前用户 DPAPI 加密，再进入不可变包和 current / candidate / previous 三槽。
-日常使用时，不带参数运行脚本会打开“固定候选”面板。填写输入码和首选文字后
-一次保存并切换，旧版本留作撤销；移除和回退也在同一面板完成。面板通过私密
+日常使用时，不带参数运行脚本会打开“自定义短语”面板。填写小写字母触发码和
+候选内容后一次保存并切换，旧版本留作撤销；移除和回退也在同一面板完成。面板通过私密
 标准输入把内容交给独立管理器，码和文字不出现在子进程命令行：
 
 ```powershell
@@ -489,9 +496,14 @@ cargo build --release --bin aliasctl --bin aliaspad
 ```powershell
 .\alias-ime.cmd set --code wua --text 呜哇
 .\alias-ime.cmd set --code wuu --text 呜呜
+.\alias-ime.cmd set --code vtrayn --text v2rayN
 .\alias-ime.cmd promote
 .\alias-ime.cmd status
 ```
+
+触发码保持为 1–64 个小写 ASCII 字母，避免占用候选数字键和宿主的 Shift 行为；
+候选内容则可以混合中文、英文、大小写和数字。因此软件名可显式设为
+`vtrayn → v2rayN`，但程序不会擅自替用户选择或写入这个私人映射。
 
 `remove --code <码>` 同样先暂存；`unstage` 放弃暂存，`rollback` 交换 current 与
 previous。只有显式加入 `--confirm-show-private-text` 的 `list` 才会在当前终端

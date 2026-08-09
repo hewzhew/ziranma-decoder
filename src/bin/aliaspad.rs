@@ -2,7 +2,7 @@
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("固定候选面板目前只支持 Windows");
+    eprintln!("自定义短语面板目前只支持 Windows");
     std::process::exit(1);
 }
 
@@ -109,13 +109,13 @@ mod windows_app {
                 ..Default::default()
             };
             if RegisterClassW(&class) == 0 {
-                return Err("无法注册固定候选面板窗口".into());
+                return Err("无法注册自定义短语面板窗口".into());
             }
             APP_STATE.with(|slot| slot.replace(Some(state)));
             let window = match CreateWindowExW(
                 WS_EX_CONTROLPARENT,
                 class_name,
-                w!("固定候选"),
+                w!("自定义短语"),
                 WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -141,7 +141,7 @@ mod windows_app {
             loop {
                 let result = GetMessageW(&mut message, None, 0, 0).0;
                 if result == -1 {
-                    return Err("固定候选面板消息循环失败".into());
+                    return Err("自定义短语面板消息循环失败".into());
                 }
                 if result == 0 {
                     break;
@@ -244,7 +244,7 @@ mod windows_app {
             create_control(
                 window,
                 w!("STATIC"),
-                w!("把喜欢的候选稳稳固定下来"),
+                w!("把常用词和专名固定为首选"),
                 24,
                 18,
                 480,
@@ -256,7 +256,9 @@ mod windows_app {
             create_control(
                 window,
                 w!("STATIC"),
-                w!("只保存你主动填写的映射。新的输入组合立即生效，换代后仍会保留。"),
+                w!(
+                    "用小写字母作为触发码；候选内容可包含中文、英文、大小写和数字，例如 vtrayn → v2rayN。"
+                ),
                 24,
                 54,
                 480,
@@ -268,7 +270,7 @@ mod windows_app {
             create_control(
                 window,
                 w!("STATIC"),
-                w!("输入码"),
+                w!("触发码"),
                 24,
                 104,
                 112,
@@ -292,7 +294,7 @@ mod windows_app {
             create_control(
                 window,
                 w!("STATIC"),
-                w!("首选文字"),
+                w!("候选内容"),
                 240,
                 104,
                 264,
@@ -316,7 +318,7 @@ mod windows_app {
             create_control(
                 window,
                 w!("BUTTON"),
-                w!("固定为首选"),
+                w!("保存为首选"),
                 24,
                 178,
                 232,
@@ -524,7 +526,7 @@ mod windows_app {
             Ok(_) => {
                 clear_control(window, CODE_EDIT_ID);
                 clear_control(window, TEXT_EDIT_ID);
-                refresh_status(window, Some("已固定。新的输入组合会使用它。"));
+                refresh_status(window, Some("已保存。新的输入组合会使用它。"));
                 focus_code(window);
             }
             Err(error) => notify_error(window, &error),
@@ -545,7 +547,7 @@ mod windows_app {
         private_input.fill(0);
         match result {
             Ok(output) if output.contains("没有变化") => {
-                refresh_status(window, Some("这个码原本没有固定首选。"));
+                refresh_status(window, Some("这个触发码原本没有自定义短语。"));
             }
             Ok(_) => {
                 clear_control(window, CODE_EDIT_ID);
@@ -614,7 +616,7 @@ mod windows_app {
                 .borrow()
                 .as_ref()
                 .cloned()
-                .ok_or_else(|| "固定候选面板尚未准备好".to_owned())?;
+                .ok_or_else(|| "自定义短语面板尚未准备好".to_owned())?;
             let mut command = Command::new(&state.aliasctl);
             command
                 .arg(action)
@@ -659,7 +661,7 @@ mod windows_app {
                     .ok()
                     .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
                     .filter(|text| !text.is_empty())
-                    .unwrap_or_else(|| "固定候选操作失败".to_owned());
+                    .unwrap_or_else(|| "自定义短语操作失败".to_owned());
                 Err(error)
             }
         })
@@ -686,7 +688,7 @@ mod windows_app {
             || code.len() > MAX_CODE_BYTES
             || !code.as_bytes().iter().all(u8::is_ascii_lowercase)
         {
-            return Err("输入码请使用 1–64 个小写字母。");
+            return Err("触发码请使用 1–64 个小写字母。");
         }
         Ok(())
     }
@@ -695,7 +697,7 @@ mod windows_app {
         let characters = text.chars().count();
         if characters == 0 || characters > MAX_TEXT_CHARACTERS || text.chars().any(char::is_control)
         {
-            return Err("首选文字请填写 1–64 个普通字符。");
+            return Err("候选内容请填写 1–64 个普通字符。");
         }
         Ok(())
     }
@@ -724,7 +726,7 @@ mod windows_app {
             let _ = MessageBoxW(
                 Some(window),
                 PCWSTR(message.as_ptr()),
-                w!("固定候选"),
+                w!("自定义短语"),
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -737,7 +739,7 @@ mod windows_app {
             let _ = MessageBoxW(
                 None,
                 PCWSTR(message.as_ptr()),
-                w!("固定候选无法启动"),
+                w!("自定义短语无法启动"),
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -746,7 +748,7 @@ mod windows_app {
     fn paths_from_executable(executable: &Path) -> Result<AppState, Box<dyn Error>> {
         let binary_directory = executable.parent().ok_or("无法确定程序目录")?;
         let repository = repository_root_for_user_tool_executable(executable, "aliaspad")
-            .ok_or("固定候选面板必须从项目构建或已验证用户工具包运行")?;
+            .ok_or("自定义短语面板必须从项目构建或已验证用户工具包运行")?;
         Ok(AppState {
             aliasctl: binary_directory.join("aliasctl.exe"),
             alias_root: repository
@@ -818,6 +820,7 @@ mod windows_app {
             assert!(validate_code("qnq").is_ok());
             assert!(validate_code("Qnq").is_err());
             assert!(validate_text("亲亲").is_ok());
+            assert!(validate_text("v2rayN").is_ok());
             assert!(validate_text("含\n换行").is_err());
         }
     }

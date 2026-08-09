@@ -343,11 +343,13 @@ $requiredFiles = @(
     'scripts/resolve-user-tool.cmd',
     'src/bin/aliasctl.rs',
     'src/bin/aliaspad.rs',
+    'src/bin/ziranma-launcher.rs',
     'src/bin/tsf-devctl.rs',
     'src/bin/wishctl.rs',
     'src/bin/wishpad.rs',
     'src/candidate_lab_cli.rs',
     'src/tsf_alpha.rs',
+    'src/user_tool_runtime.rs',
     'src/wish_command.rs',
     'src/wish_feedback.rs',
     'wish-ime.cmd'

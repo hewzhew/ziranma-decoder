@@ -20,14 +20,15 @@ TSF 状态，也不要求关闭正在输入的宿主。
 - `candidatectl`；
 - `personalctl`；
 - `researchctl`；
-- `wishctl`、`wishpad`。
+- `wishctl`、`wishpad`；
+- `ziranma-launcher`。
 
 这里没有 `--lib`，因此不会生成、替换或加载 `ziranma_core.dll`。依赖没有预先
 缓存时构建会直接失败，不回退联网。
 
 ## 不可变版本槽
 
-七个 EXE 的 SHA-256 写入一个规范清单；清单自身的 SHA-256 是包标识。工具包
+八个 EXE 的 SHA-256 写入一个规范清单；清单自身的 SHA-256 是包标识。工具包
 只增不改地进入 `user-tools/builds/<sha256>`，`slots.zut` 只保存 `current` 和
 `previous`。状态文件使用同目录临时文件原子替换：
 
@@ -46,6 +47,14 @@ TSF 状态，也不要求关闭正在输入的宿主。
 到 `target/release`；一旦槽状态存在但损坏，则失败并提示运行只读状态，不静默
 执行不明版本。已经打开的 `aliaspad` 或 `wishpad` 不会被关闭；退出后重新打开
 才使用新的 current。
+
+刷新成功后，还会先把已验证包里的 `ziranma-launcher.exe` 原子复制到固定位置
+`.local/tsf-alpha/desktop-launcher`，再切换 current。固定文件使桌面快捷方式不必
+追随内容寻址目录；复制失败时 current 保持不变。启动器的 `wish` 和 `alias` 模式
+重新验证槽、完整清单、每个 EXE 摘要和包内文件集合，再直接打开 GUI，因此不会
+闪出批处理窗口；`update` 只打开仓库固定的 `update-ime.cmd`，仍使用可见控制台。
+它不接受任意程序或路径。回退只交换工具槽，稳定启动器保持新版并兼容旧的七工具
+清单，因而桌面入口不会随回退失效。
 
 ## 哪些能力会立即变化
 

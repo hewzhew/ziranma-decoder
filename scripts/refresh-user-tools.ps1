@@ -21,9 +21,12 @@ $buildsRoot = Join-Path $UserToolsRoot 'builds'
 $cargoTarget = Join-Path $UserToolsRoot 'cargo-target'
 $statePath = Join-Path $UserToolsRoot 'slots.zut'
 $lockPath = Join-Path $UserToolsRoot 'refresh.lock'
+$desktopLauncherRoot = Join-Path $repositoryRoot '.local\tsf-alpha\desktop-launcher'
+$desktopLauncherPath = Join-Path $desktopLauncherRoot 'ziranma-launcher.exe'
 $schema = 'ziranma-user-tools-slots-v1'
-$bundleSchema = 'ziranma-user-tools-bundle-v1'
-$toolNames = @(
+$legacyBundleSchema = 'ziranma-user-tools-bundle-v1'
+$bundleSchema = 'ziranma-user-tools-bundle-v2'
+$legacyToolNames = @(
     'aliasctl',
     'aliaspad',
     'candidatectl',
@@ -31,6 +34,16 @@ $toolNames = @(
     'researchctl',
     'wishctl',
     'wishpad'
+)
+$toolNames = @(
+    'aliasctl',
+    'aliaspad',
+    'candidatectl',
+    'personalctl',
+    'researchctl',
+    'wishctl',
+    'wishpad',
+    'ziranma-launcher'
 )
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
 
@@ -147,11 +160,19 @@ function Assert-Bundle {
     }
     $manifest = $utf8.GetString($manifestBytes)
     $lines = $manifest.TrimEnd("`r", "`n") -split "`n"
-    if ($lines.Count -ne $toolNames.Count + 1 -or $lines[0].TrimEnd("`r") -ne "schema=$bundleSchema") {
+    $manifestSchema = $lines[0].TrimEnd("`r")
+    if ($manifestSchema -eq "schema=$bundleSchema") {
+        $manifestToolNames = @($toolNames)
+    } elseif ($manifestSchema -eq "schema=$legacyBundleSchema") {
+        $manifestToolNames = @($legacyToolNames)
+    } else {
+        throw 'The user tool manifest schema is invalid.'
+    }
+    if ($lines.Count -ne $manifestToolNames.Count + 1) {
         throw 'The user tool manifest shape is invalid.'
     }
-    for ($index = 0; $index -lt $toolNames.Count; $index++) {
-        $name = "$($toolNames[$index]).exe"
+    for ($index = 0; $index -lt $manifestToolNames.Count; $index++) {
+        $name = "$($manifestToolNames[$index]).exe"
         $line = $lines[$index + 1].TrimEnd("`r")
         $prefix = "tool.$name="
         if (-not $line.StartsWith($prefix, [StringComparison]::Ordinal)) {
@@ -167,7 +188,7 @@ function Assert-Bundle {
             throw "$name does not match the user tool manifest."
         }
     }
-    $expectedNames = @('manifest.zut') + @($toolNames | ForEach-Object { "$_.exe" })
+    $expectedNames = @('manifest.zut') + @($manifestToolNames | ForEach-Object { "$_.exe" })
     $actualItems = @(Get-ChildItem -LiteralPath $bundleRoot -Force)
     if ($actualItems.Count -ne $expectedNames.Count) {
         throw 'The user tool bundle contains unexpected entries.'
@@ -175,6 +196,61 @@ function Assert-Bundle {
     foreach ($item in $actualItems) {
         if ($item.PSIsContainer -or $expectedNames -notcontains $item.Name) {
             throw 'The user tool bundle contains an unexpected entry.'
+        }
+    }
+}
+
+function Publish-DesktopLauncher {
+    param([Parameter(Mandatory = $true)][string]$BundleId)
+
+    Assert-Bundle -BundleId $BundleId
+    $source = Join-Path (Join-Path $buildsRoot $BundleId) 'ziranma-launcher.exe'
+    Assert-NormalFile -Path $source -Label 'Bundled desktop launcher'
+    $expected = Get-Sha256Hex -Path $source
+    New-Item -ItemType Directory -Path $desktopLauncherRoot -Force | Out-Null
+    Assert-NormalDirectory -Path $desktopLauncherRoot -Label 'Desktop launcher root'
+    if (Test-Path -LiteralPath $desktopLauncherPath) {
+        Assert-NormalFile -Path $desktopLauncherPath -Label 'Desktop launcher'
+        if ((Get-Sha256Hex -Path $desktopLauncherPath) -eq $expected) {
+            return
+        }
+    }
+
+    $temporary = Join-Path $desktopLauncherRoot ('.launcher.tmp-' + [Guid]::NewGuid().ToString('N'))
+    $backup = Join-Path $desktopLauncherRoot ('.launcher.backup-' + [Guid]::NewGuid().ToString('N'))
+    $replaced = $false
+    try {
+        [IO.File]::Copy($source, $temporary, $false)
+        Assert-NormalFile -Path $temporary -Label 'Temporary desktop launcher'
+        if ((Get-Sha256Hex -Path $temporary) -ne $expected) {
+            throw 'The temporary desktop launcher digest is invalid.'
+        }
+        if (Test-Path -LiteralPath $desktopLauncherPath -PathType Leaf) {
+            [IO.File]::Replace($temporary, $desktopLauncherPath, $backup)
+        } else {
+            [IO.File]::Move($temporary, $desktopLauncherPath)
+        }
+        $replaced = $true
+        Assert-NormalFile -Path $desktopLauncherPath -Label 'Desktop launcher'
+        if ((Get-Sha256Hex -Path $desktopLauncherPath) -ne $expected) {
+            throw 'The installed desktop launcher digest is invalid.'
+        }
+    } catch {
+        if ($replaced -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
+            if (Test-Path -LiteralPath $desktopLauncherPath -PathType Leaf) {
+                Remove-Item -LiteralPath $desktopLauncherPath -Force
+            }
+            Move-Item -LiteralPath $backup -Destination $desktopLauncherPath
+        } elseif ($replaced -and (Test-Path -LiteralPath $desktopLauncherPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $desktopLauncherPath -Force
+        }
+        throw
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+        if (Test-Path -LiteralPath $backup -PathType Leaf) {
+            Remove-Item -LiteralPath $backup -Force
         }
     }
 }
@@ -260,7 +336,7 @@ function Show-Status {
     if ($null -eq $state) {
         Write-Host 'Current: not published; launchers use target/release'
         Write-Host 'Previous: none'
-        Write-Host 'Tools: 7 managed tools'
+        Write-Host 'Tools: 8 managed tools'
     } else {
         Assert-Bundle -BundleId $state.Current
         if ($null -ne $state.Previous) {
@@ -268,7 +344,13 @@ function Show-Status {
         }
         Write-Host "Current: $(Short-Id -Value $state.Current) (verified)"
         Write-Host "Previous: $(Short-Id -Value $state.Previous)"
-        Write-Host 'Tools: 7 verified executables'
+        Write-Host 'Tools: verified executables'
+    }
+    if (Test-Path -LiteralPath $desktopLauncherPath -PathType Leaf) {
+        Assert-NormalFile -Path $desktopLauncherPath -Label 'Desktop launcher'
+        Write-Host 'Desktop launcher: installed'
+    } else {
+        Write-Host 'Desktop launcher: not installed; refresh to publish it'
     }
     Write-Host 'TSF DLL: unchanged'
     Write-Host 'Administrator: not required'
@@ -361,6 +443,7 @@ try {
     if (-not (Test-BundleId -Value $bundleId)) {
         throw 'User tool publication returned an invalid bundle id.'
     }
+    Publish-DesktopLauncher -BundleId $bundleId
     $state = Read-SlotState
     if ($null -eq $state) {
         Write-SlotState -Current $bundleId -Previous $null
@@ -382,7 +465,7 @@ try {
     Write-Host 'IME user tool refresh completed'
     Write-Host "Current: $(Short-Id -Value $bundleId) ($result)"
     Write-Host "Previous: $(Short-Id -Value $previous)"
-    Write-Host 'Tools: alias, candidate, personal, research, and wish management'
+    Write-Host 'Tools: alias, candidate, personal, research, wish, and desktop launch management'
     Write-Host 'TSF DLL: unchanged'
     Write-Host 'Administrator: not required'
     Write-Host 'Existing tool processes: unchanged; reopen them when convenient'

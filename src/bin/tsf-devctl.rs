@@ -3084,6 +3084,7 @@ mod tests {
             "--bin researchctl",
             "--bin wishctl",
             "--bin wishpad",
+            "--bin ziranma-launcher",
         ] {
             assert!(contents.contains(target), "missing release target {target}");
         }
@@ -3113,11 +3114,14 @@ mod tests {
             "researchctl",
             "wishctl",
             "wishpad",
+            "ziranma-launcher",
         ] {
             assert!(script.contains(&format!("    '{tool}'")));
         }
         assert!(script.contains("'--release', '--locked', '--offline', '--target-dir'"));
         assert!(script.contains("ziranma-user-tools-slots-v1"));
+        assert!(script.contains("ziranma-user-tools-bundle-v2"));
+        assert!(script.contains("Publish-DesktopLauncher -BundleId $bundleId"));
         assert!(script.contains("[IO.File]::Replace"));
         assert!(script.contains("TSF DLL: unchanged"));
         assert!(!script.contains("'--lib'"));

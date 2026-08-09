@@ -51,6 +51,10 @@ fn main() {
         panic!("Windows resource compiler failed for the wishpad image resources");
     }
     println!("cargo:rustc-link-arg-bin=wishpad={}", output.display());
+    println!(
+        "cargo:rustc-link-arg-bin=ziranma-launcher={}",
+        output.display()
+    );
     println!("cargo:rustc-link-arg-cdylib={}", output.display());
 }
 

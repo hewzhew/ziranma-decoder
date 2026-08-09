@@ -13,7 +13,9 @@ pub fn repository_root_for_user_tool_executable(
     expected_stem: &str,
 ) -> Option<PathBuf> {
     if expected_stem.is_empty()
-        || !expected_stem.bytes().all(|byte| byte.is_ascii_lowercase())
+        || !expected_stem
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
         || executable.file_stem()?.to_str()? != expected_stem
     {
         return None;
@@ -37,6 +39,31 @@ pub fn repository_root_for_user_tool_executable(
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         || parent.file_name()?.to_str()? != "builds"
         || user_tools.file_name()?.to_str()? != "user-tools"
+        || tsf_alpha.file_name()?.to_str()? != "tsf-alpha"
+        || local.file_name()?.to_str()? != ".local"
+    {
+        return None;
+    }
+    local.parent().map(Path::to_path_buf)
+}
+
+/// Derives the repository root for the fixed desktop-launcher installation.
+///
+/// Development and immutable user-tool bundle layouts remain accepted so the
+/// same binary can be exercised before it is copied to the stable location.
+pub fn repository_root_for_desktop_launcher_executable(executable: &Path) -> Option<PathBuf> {
+    if let Some(repository) =
+        repository_root_for_user_tool_executable(executable, "ziranma-launcher")
+    {
+        return Some(repository);
+    }
+    if executable.file_name()?.to_str()? != "ziranma-launcher.exe" {
+        return None;
+    }
+    let desktop_launcher = executable.parent()?;
+    let tsf_alpha = desktop_launcher.parent()?;
+    let local = tsf_alpha.parent()?;
+    if desktop_launcher.file_name()?.to_str()? != "desktop-launcher"
         || tsf_alpha.file_name()?.to_str()? != "tsf-alpha"
         || local.file_name()?.to_str()? != ".local"
     {
@@ -84,6 +111,41 @@ mod tests {
         assert!(
             repository_root_for_user_tool_executable(Path::new(r"X:\tools\wishpad.exe"), "wishpad")
                 .is_none()
+        );
+        assert_eq!(
+            repository_root_for_user_tool_executable(
+                Path::new(r"X:\repo\target\release\ziranma-launcher.exe"),
+                "ziranma-launcher"
+            ),
+            Some(PathBuf::from(r"X:\repo"))
+        );
+    }
+
+    #[test]
+    fn desktop_launcher_recognizes_only_its_fixed_or_build_layouts() {
+        assert_eq!(
+            repository_root_for_desktop_launcher_executable(Path::new(
+                r"X:\repo\.local\tsf-alpha\desktop-launcher\ziranma-launcher.exe"
+            )),
+            Some(PathBuf::from(r"X:\repo"))
+        );
+        assert_eq!(
+            repository_root_for_desktop_launcher_executable(Path::new(
+                r"X:\repo\target\release\ziranma-launcher.exe"
+            )),
+            Some(PathBuf::from(r"X:\repo"))
+        );
+        assert!(
+            repository_root_for_desktop_launcher_executable(Path::new(
+                r"X:\repo\.local\desktop-launcher\ziranma-launcher.exe"
+            ))
+            .is_none()
+        );
+        assert!(
+            repository_root_for_desktop_launcher_executable(Path::new(
+                r"X:\repo\.local\tsf-alpha\desktop-launcher\other.exe"
+            ))
+            .is_none()
         );
     }
 }
