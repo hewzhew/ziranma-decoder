@@ -131,8 +131,10 @@ pub use candidate_package::{
 };
 pub use candidate_provenance::{
     CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_PACKAGE_PROVENANCE_FILE,
-    CANDIDATE_PROVENANCE_SCHEMA_V1, CandidatePackageProvenance, CandidateProvenanceError,
-    MAX_CANDIDATE_PROVENANCE_BYTES, candidate_package_authentication_sha256, candidate_sha256_hex,
+    CANDIDATE_PROVENANCE_SCHEMA_V1, CANDIDATE_PROVENANCE_SCHEMA_V2, CandidatePackageProvenance,
+    CandidateProvenanceError, CandidateSourceMaterial, MAX_CANDIDATE_PROVENANCE_BYTES,
+    MAX_CANDIDATE_PROVENANCE_SOURCES, candidate_package_authentication_sha256,
+    candidate_sha256_hex,
 };
 pub use candidate_runtime::{
     CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGES_DIRECTORY,

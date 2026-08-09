@@ -4661,8 +4661,8 @@ fn render_inspect_report(
     .unwrap();
     writeln!(output, "词条：{}", snapshot.entry_count()).unwrap();
     writeln!(output, "载荷：{} 字节", snapshot.payload_bytes()).unwrap();
-    writeln!(output, "来源：{}", provenance.source_id()).unwrap();
-    writeln!(output, "许可：{}", provenance.source_license()).unwrap();
+    writeln!(output, "来源：{}", provenance_source_summary(provenance)).unwrap();
+    writeln!(output, "许可：{}", provenance_license_summary(provenance)).unwrap();
     writeln!(output, "SHA-256 与兼容性：通过").unwrap();
     writeln!(output, "本次操作：只读").unwrap();
     output
@@ -4677,8 +4677,8 @@ fn render_build_report(
         "公开候选包已生成\n版本：{}\n来源：{}\n许可：{}\n词条：{}\n载荷：{} 字节\n\
          发布 SHA-256：{}\n写入：3 个新文件\n",
         snapshot.revision(),
-        provenance.source_id(),
-        provenance.source_license(),
+        provenance_source_summary(provenance),
+        provenance_license_summary(provenance),
         snapshot.entry_count(),
         snapshot.payload_bytes(),
         authentication_sha256
@@ -4690,8 +4690,8 @@ fn render_verify_report(loaded: &LoadedPackage) -> String {
         "候选包验证\n版本：{}\n来源：{}\n许可：{}\n结果：与可信 SHA-256 一致\n\
          本次操作：只读\n",
         loaded.snapshot.revision(),
-        loaded.provenance.source_id(),
-        loaded.provenance.source_license()
+        provenance_source_summary(&loaded.provenance),
+        provenance_license_summary(&loaded.provenance)
     )
 }
 
@@ -4700,10 +4700,29 @@ fn render_signature_verify_report(loaded: &LoadedPackage) -> String {
         "候选包签名验证\n版本：{}\n来源：{}\n许可：{}\n结果：可信 Ed25519 签名有效\n\
          发布 SHA-256：{}\n本次操作：只读\n",
         loaded.snapshot.revision(),
-        loaded.provenance.source_id(),
-        loaded.provenance.source_license(),
+        provenance_source_summary(&loaded.provenance),
+        provenance_license_summary(&loaded.provenance),
         loaded.authentication_sha256
     )
+}
+
+fn provenance_source_summary(provenance: &CandidatePackageProvenance) -> String {
+    if provenance.source_count() == 1 {
+        provenance.source_id().to_owned()
+    } else {
+        format!("{} 份公开材料", provenance.source_count())
+    }
+}
+
+fn provenance_license_summary(provenance: &CandidatePackageProvenance) -> String {
+    provenance
+        .source_materials()
+        .iter()
+        .map(|source| source.license())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 fn render_preflight_report(summary: &PreflightSummary) -> String {
@@ -5209,7 +5228,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use ziranma_core::{
         CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519, CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1,
-        candidate_release_signing_message,
+        CandidateSourceMaterial, candidate_release_signing_message,
     };
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -6257,6 +6276,51 @@ mod tests {
         );
         assert!(!preflight.contains("你好"));
         assert!(!preflight.contains("nihk"));
+    }
+
+    #[test]
+    fn multi_source_package_loads_and_reports_all_materials_without_text() {
+        let manifest = CandidatePackageManifest::parse(MANIFEST).unwrap();
+        let provenance = CandidatePackageProvenance::from_source_materials(
+            vec![
+                CandidateSourceMaterial::from_bytes(
+                    "dictionary",
+                    "Apache-2.0",
+                    "https://example.com/dictionary",
+                    b"dictionary",
+                )
+                .unwrap(),
+                CandidateSourceMaterial::from_bytes(
+                    "phrase-list",
+                    "MIT",
+                    "https://example.com/phrases",
+                    b"phrases",
+                )
+                .unwrap(),
+            ],
+            MANIFEST,
+            LEXICON,
+        )
+        .unwrap();
+        let root = temporary_test_root();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(CANDIDATE_PACKAGE_MANIFEST_FILE), MANIFEST).unwrap();
+        fs::write(root.join(CANDIDATE_PACKAGE_PAYLOAD_FILE), LEXICON).unwrap();
+        fs::write(
+            root.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            provenance.render(),
+        )
+        .unwrap();
+
+        let loaded = load_public_package_directory(&root).unwrap();
+        assert_eq!(loaded.provenance.source_count(), 2);
+        let report = render_inspect_report(&loaded.snapshot, &loaded.provenance);
+        assert!(report.contains("来源：2 份公开材料"));
+        assert!(report.contains("许可：Apache-2.0、MIT"));
+        assert!(!report.contains("你好"));
+        assert_eq!(loaded.manifest, manifest);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

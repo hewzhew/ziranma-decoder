@@ -13,25 +13,101 @@ use crate::CANDIDATE_PACKAGE_SCHEMA_V1;
 
 /// First strict candidate-provenance sidecar schema.
 pub const CANDIDATE_PROVENANCE_SCHEMA_V1: &str = "ziranma-candidate-provenance-v1";
+/// Strict multi-material candidate-provenance sidecar schema.
+pub const CANDIDATE_PROVENANCE_SCHEMA_V2: &str = "ziranma-candidate-provenance-v2";
 /// Decoder/data compatibility boundary accepted by the current TSF alpha.
 pub const CANDIDATE_DECODER_COMPATIBILITY_V1: &str = "ziranma-candidate-decoder-v1";
 /// Fixed provenance filename within one immutable candidate package.
 pub const CANDIDATE_PACKAGE_PROVENANCE_FILE: &str = "provenance.zcp";
 /// Maximum accepted size of one provenance sidecar.
-pub const MAX_CANDIDATE_PROVENANCE_BYTES: usize = 2 * 1024;
+pub const MAX_CANDIDATE_PROVENANCE_BYTES: usize = 8 * 1024;
+/// Largest number of independently authenticated public source materials.
+pub const MAX_CANDIDATE_PROVENANCE_SOURCES: usize = 8;
 
 const MAX_SOURCE_ID_BYTES: usize = 128;
 const MAX_SOURCE_LICENSE_BYTES: usize = 64;
 const MAX_SOURCE_URL_BYTES: usize = 512;
 const SHA256_HEX_BYTES: usize = 64;
 
-/// Strict public-source declaration bound to one manifest and payload.
+/// One bounded public material declaration used to construct a candidate payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateSourceMaterial {
+    id: String,
+    license: String,
+    url: String,
+    sha256: String,
+}
+
+impl CandidateSourceMaterial {
+    /// Constructs one declaration from an independently supplied checksum.
+    pub fn new(
+        id: &str,
+        license: &str,
+        url: &str,
+        sha256: &str,
+    ) -> Result<Self, CandidateProvenanceError> {
+        validate_source_id(id)?;
+        validate_source_license(license)?;
+        validate_source_url(url)?;
+        validate_sha256(sha256).map_err(|_| CandidateProvenanceError::InvalidSourceHash)?;
+        Ok(Self {
+            id: id.to_owned(),
+            license: license.to_owned(),
+            url: url.to_owned(),
+            sha256: sha256.to_owned(),
+        })
+    }
+
+    /// Constructs one declaration while hashing the exact supplied bytes.
+    pub fn from_bytes(
+        id: &str,
+        license: &str,
+        url: &str,
+        bytes: &[u8],
+    ) -> Result<Self, CandidateProvenanceError> {
+        Self::new(id, license, url, &candidate_sha256_hex(bytes))
+    }
+
+    /// Verifies exact source bytes without exposing them in an error.
+    pub fn validate_bytes(&self, bytes: &[u8]) -> Result<(), CandidateProvenanceError> {
+        if self.sha256 != candidate_sha256_hex(bytes) {
+            return Err(CandidateProvenanceError::SourceHashMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the bounded source identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the declared SPDX-style license identifier.
+    pub fn license(&self) -> &str {
+        &self.license
+    }
+
+    /// Returns the declared HTTPS source URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the exact source SHA-256 declaration.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateProvenanceSchema {
+    V1,
+    V2,
+}
+
+/// Strict public-source declarations bound to one manifest and payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidatePackageProvenance {
-    source_id: String,
-    source_license: String,
-    source_url: String,
-    source_sha256: String,
+    schema: CandidateProvenanceSchema,
+    sources: Vec<CandidateSourceMaterial>,
     manifest_sha256: String,
     payload_sha256: String,
 }
@@ -50,21 +126,38 @@ impl CandidatePackageProvenance {
         manifest_text: &str,
         payload_text: &str,
     ) -> Result<Self, CandidateProvenanceError> {
-        validate_source_id(source_id)?;
-        validate_source_license(source_license)?;
-        validate_source_url(source_url)?;
-        validate_sha256(source_sha256).map_err(|_| CandidateProvenanceError::InvalidSourceHash)?;
+        let source =
+            CandidateSourceMaterial::new(source_id, source_license, source_url, source_sha256)?;
         Ok(Self {
-            source_id: source_id.to_owned(),
-            source_license: source_license.to_owned(),
-            source_url: source_url.to_owned(),
-            source_sha256: source_sha256.to_owned(),
+            schema: CandidateProvenanceSchema::V1,
+            sources: vec![source],
             manifest_sha256: candidate_sha256_hex(manifest_text.as_bytes()),
             payload_sha256: candidate_sha256_hex(payload_text.as_bytes()),
         })
     }
 
-    /// Parses the exact nine-line v1 sidecar.
+    /// Constructs canonical v2 provenance for two to eight source materials.
+    pub fn from_source_materials(
+        mut sources: Vec<CandidateSourceMaterial>,
+        manifest_text: &str,
+        payload_text: &str,
+    ) -> Result<Self, CandidateProvenanceError> {
+        if !(2..=MAX_CANDIDATE_PROVENANCE_SOURCES).contains(&sources.len()) {
+            return Err(CandidateProvenanceError::InvalidSourceCount);
+        }
+        sources.sort_by(|left, right| left.id.cmp(&right.id));
+        if sources.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return Err(CandidateProvenanceError::DuplicateSourceId);
+        }
+        Ok(Self {
+            schema: CandidateProvenanceSchema::V2,
+            sources,
+            manifest_sha256: candidate_sha256_hex(manifest_text.as_bytes()),
+            payload_sha256: candidate_sha256_hex(payload_text.as_bytes()),
+        })
+    }
+
+    /// Parses either the exact v1 sidecar or a canonical numbered v2 sidecar.
     pub fn parse(contents: &str) -> Result<Self, CandidateProvenanceError> {
         if contents.is_empty() || contents.len() > MAX_CANDIDATE_PROVENANCE_BYTES {
             return Err(CandidateProvenanceError::InvalidSize);
@@ -73,11 +166,25 @@ impl CandidatePackageProvenance {
             return Err(CandidateProvenanceError::InvalidStructure);
         }
         let lines = contents.split('\n').collect::<Vec<_>>();
-        if lines.len() != 10 || !lines[9].is_empty() {
+        if lines.last() != Some(&"") {
             return Err(CandidateProvenanceError::InvalidStructure);
         }
-        if field(lines[0], "schema")? != CANDIDATE_PROVENANCE_SCHEMA_V1 {
-            return Err(CandidateProvenanceError::UnsupportedSchema);
+        let schema = field(
+            lines
+                .first()
+                .ok_or(CandidateProvenanceError::InvalidStructure)?,
+            "schema",
+        )?;
+        match schema {
+            CANDIDATE_PROVENANCE_SCHEMA_V1 => Self::parse_v1(&lines),
+            CANDIDATE_PROVENANCE_SCHEMA_V2 => Self::parse_v2(&lines),
+            _ => Err(CandidateProvenanceError::UnsupportedSchema),
+        }
+    }
+
+    fn parse_v1(lines: &[&str]) -> Result<Self, CandidateProvenanceError> {
+        if lines.len() != 10 || !lines[9].is_empty() {
+            return Err(CandidateProvenanceError::InvalidStructure);
         }
         if field(lines[1], "package_schema")? != CANDIDATE_PACKAGE_SCHEMA_V1 {
             return Err(CandidateProvenanceError::UnsupportedPackageSchema);
@@ -100,19 +207,73 @@ impl CandidatePackageProvenance {
         validate_sha256(payload_sha256)
             .map_err(|_| CandidateProvenanceError::InvalidPayloadHash)?;
         Ok(Self {
-            source_id: source_id.to_owned(),
-            source_license: source_license.to_owned(),
-            source_url: source_url.to_owned(),
-            source_sha256: source_sha256.to_owned(),
+            schema: CandidateProvenanceSchema::V1,
+            sources: vec![CandidateSourceMaterial {
+                id: source_id.to_owned(),
+                license: source_license.to_owned(),
+                url: source_url.to_owned(),
+                sha256: source_sha256.to_owned(),
+            }],
             manifest_sha256: manifest_sha256.to_owned(),
             payload_sha256: payload_sha256.to_owned(),
         })
     }
 
-    /// Renders the canonical nine-line v1 sidecar.
+    fn parse_v2(lines: &[&str]) -> Result<Self, CandidateProvenanceError> {
+        if lines.len() < 15 {
+            return Err(CandidateProvenanceError::InvalidStructure);
+        }
+        if field(lines[1], "package_schema")? != CANDIDATE_PACKAGE_SCHEMA_V1 {
+            return Err(CandidateProvenanceError::UnsupportedPackageSchema);
+        }
+        if field(lines[2], "decoder_compatibility")? != CANDIDATE_DECODER_COMPATIBILITY_V1 {
+            return Err(CandidateProvenanceError::IncompatibleDecoder);
+        }
+        let source_count = parse_decimal(field(lines[3], "source_count")?)
+            .filter(|count| (2..=MAX_CANDIDATE_PROVENANCE_SOURCES).contains(count))
+            .ok_or(CandidateProvenanceError::InvalidSourceCount)?;
+        if lines.len() != 7 + source_count * 4 || !lines[lines.len() - 1].is_empty() {
+            return Err(CandidateProvenanceError::InvalidStructure);
+        }
+        let mut sources = Vec::<CandidateSourceMaterial>::with_capacity(source_count);
+        for source_index in 0..source_count {
+            let number = source_index + 1;
+            let offset = 4 + source_index * 4;
+            let id = field(lines[offset], &format!("source_{number}_id"))?;
+            let license = field(lines[offset + 1], &format!("source_{number}_license"))?;
+            let url = field(lines[offset + 2], &format!("source_{number}_url"))?;
+            let sha256 = field(lines[offset + 3], &format!("source_{number}_sha256"))?;
+            let source = CandidateSourceMaterial::new(id, license, url, sha256)?;
+            if let Some(previous) = sources.last() {
+                if previous.id == source.id {
+                    return Err(CandidateProvenanceError::DuplicateSourceId);
+                }
+                if previous.id > source.id {
+                    return Err(CandidateProvenanceError::NonCanonicalSourceOrder);
+                }
+            }
+            sources.push(source);
+        }
+        let manifest_offset = 4 + source_count * 4;
+        let manifest_sha256 = field(lines[manifest_offset], "manifest_sha256")?;
+        validate_sha256(manifest_sha256)
+            .map_err(|_| CandidateProvenanceError::InvalidManifestHash)?;
+        let payload_sha256 = field(lines[manifest_offset + 1], "payload_sha256")?;
+        validate_sha256(payload_sha256)
+            .map_err(|_| CandidateProvenanceError::InvalidPayloadHash)?;
+        Ok(Self {
+            schema: CandidateProvenanceSchema::V2,
+            sources,
+            manifest_sha256: manifest_sha256.to_owned(),
+            payload_sha256: payload_sha256.to_owned(),
+        })
+    }
+
+    /// Renders the exact canonical representation for this provenance schema.
     pub fn render(&self) -> String {
-        format!(
-            "schema={CANDIDATE_PROVENANCE_SCHEMA_V1}\n\
+        match self.schema {
+            CandidateProvenanceSchema::V1 => format!(
+                "schema={CANDIDATE_PROVENANCE_SCHEMA_V1}\n\
              package_schema={CANDIDATE_PACKAGE_SCHEMA_V1}\n\
              decoder_compatibility={CANDIDATE_DECODER_COMPATIBILITY_V1}\n\
              source_id={}\n\
@@ -121,13 +282,39 @@ impl CandidatePackageProvenance {
              source_sha256={}\n\
              manifest_sha256={}\n\
              payload_sha256={}\n",
-            self.source_id,
-            self.source_license,
-            self.source_url,
-            self.source_sha256,
-            self.manifest_sha256,
-            self.payload_sha256
-        )
+                self.sources[0].id,
+                self.sources[0].license,
+                self.sources[0].url,
+                self.sources[0].sha256,
+                self.manifest_sha256,
+                self.payload_sha256
+            ),
+            CandidateProvenanceSchema::V2 => {
+                let mut output = format!(
+                    "schema={CANDIDATE_PROVENANCE_SCHEMA_V2}\n\
+                     package_schema={CANDIDATE_PACKAGE_SCHEMA_V1}\n\
+                     decoder_compatibility={CANDIDATE_DECODER_COMPATIBILITY_V1}\n\
+                     source_count={}\n",
+                    self.sources.len()
+                );
+                for (index, source) in self.sources.iter().enumerate() {
+                    let number = index + 1;
+                    writeln!(output, "source_{number}_id={}", source.id)
+                        .expect("writing to String cannot fail");
+                    writeln!(output, "source_{number}_license={}", source.license)
+                        .expect("writing to String cannot fail");
+                    writeln!(output, "source_{number}_url={}", source.url)
+                        .expect("writing to String cannot fail");
+                    writeln!(output, "source_{number}_sha256={}", source.sha256)
+                        .expect("writing to String cannot fail");
+                }
+                writeln!(output, "manifest_sha256={}", self.manifest_sha256)
+                    .expect("writing to String cannot fail");
+                writeln!(output, "payload_sha256={}", self.payload_sha256)
+                    .expect("writing to String cannot fail");
+                output
+            }
+        }
     }
 
     /// Verifies that the sidecar binds the exact manifest and payload bytes.
@@ -145,24 +332,34 @@ impl CandidatePackageProvenance {
         Ok(())
     }
 
-    /// Returns the bounded public source identifier.
+    /// Returns the first canonical source identifier for v1-compatible callers.
     pub fn source_id(&self) -> &str {
-        &self.source_id
+        &self.sources[0].id
     }
 
-    /// Returns the declared single SPDX-style license identifier.
+    /// Returns the first canonical source license for v1-compatible callers.
     pub fn source_license(&self) -> &str {
-        &self.source_license
+        &self.sources[0].license
     }
 
-    /// Returns the declared HTTPS source URL.
+    /// Returns the first canonical source URL for v1-compatible callers.
     pub fn source_url(&self) -> &str {
-        &self.source_url
+        &self.sources[0].url
     }
 
-    /// Returns the independently supplied source checksum.
+    /// Returns the first canonical source checksum for v1-compatible callers.
     pub fn source_sha256(&self) -> &str {
-        &self.source_sha256
+        &self.sources[0].sha256
+    }
+
+    /// Returns every canonical public material declaration.
+    pub fn source_materials(&self) -> &[CandidateSourceMaterial] {
+        &self.sources
+    }
+
+    /// Returns the number of independently declared public materials.
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
     }
 }
 
@@ -205,7 +402,7 @@ pub fn candidate_package_authentication_sha256(
 pub enum CandidateProvenanceError {
     /// The sidecar is empty or exceeds its fixed byte bound.
     InvalidSize,
-    /// The sidecar does not use the exact nine-line LF-terminated shape.
+    /// The sidecar does not use its schema's exact LF-terminated shape.
     InvalidStructure,
     /// A required key is missing, duplicated, reordered, or empty.
     InvalidField,
@@ -223,6 +420,14 @@ pub enum CandidateProvenanceError {
     InvalidSourceUrl,
     /// The declared source checksum is not canonical lowercase SHA-256.
     InvalidSourceHash,
+    /// The number of v2 source materials is outside the fixed two-to-eight bound.
+    InvalidSourceCount,
+    /// Two source materials use the same stable identifier.
+    DuplicateSourceId,
+    /// V2 source materials are not ordered by ascending stable identifier.
+    NonCanonicalSourceOrder,
+    /// Exact supplied source bytes differ from their declaration.
+    SourceHashMismatch,
     /// The manifest checksum is not canonical lowercase SHA-256.
     InvalidManifestHash,
     /// The payload checksum is not canonical lowercase SHA-256.
@@ -246,6 +451,10 @@ impl fmt::Display for CandidateProvenanceError {
             Self::InvalidSourceLicense => "候选包来源许可证标识无效",
             Self::InvalidSourceUrl => "候选包来源网址无效",
             Self::InvalidSourceHash => "候选包源文件 SHA-256 无效",
+            Self::InvalidSourceCount => "候选包来源材料数量无效",
+            Self::DuplicateSourceId => "候选包来源材料标识重复",
+            Self::NonCanonicalSourceOrder => "候选包来源材料顺序不规范",
+            Self::SourceHashMismatch => "候选包来源材料与声明不符",
             Self::InvalidManifestHash => "候选包清单 SHA-256 无效",
             Self::InvalidPayloadHash => "候选包载荷 SHA-256 无效",
             Self::ManifestHashMismatch => "候选包清单与来源声明不符",
@@ -265,6 +474,16 @@ fn field<'a>(line: &'a str, expected_key: &str) -> Result<&'a str, CandidateProv
         return Err(CandidateProvenanceError::InvalidField);
     }
     Ok(value)
+}
+
+fn parse_decimal(value: &str) -> Option<usize> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn validate_source_id(value: &str) -> Result<(), CandidateProvenanceError> {
@@ -367,6 +586,136 @@ mod tests {
         assert_eq!(
             parsed.source_sha256(),
             candidate_sha256_hex(PAYLOAD.as_bytes())
+        );
+    }
+
+    #[test]
+    fn multi_source_provenance_is_canonical_bounded_and_byte_verifiable() {
+        let dictionary = CandidateSourceMaterial::from_bytes(
+            "dictionary",
+            "Apache-2.0",
+            "https://example.com/dictionary",
+            b"dictionary bytes",
+        )
+        .unwrap();
+        let phrase_list = CandidateSourceMaterial::from_bytes(
+            "phrase-list",
+            "MIT",
+            "https://example.com/phrases",
+            b"phrase bytes",
+        )
+        .unwrap();
+        let provenance = CandidatePackageProvenance::from_source_materials(
+            vec![phrase_list.clone(), dictionary.clone()],
+            MANIFEST,
+            PAYLOAD,
+        )
+        .unwrap();
+        let rendered = provenance.render();
+        assert!(rendered.starts_with("schema=ziranma-candidate-provenance-v2\n"));
+        assert!(
+            rendered.find("source_1_id=dictionary").unwrap()
+                < rendered.find("source_2_id=phrase-list").unwrap()
+        );
+
+        let parsed = CandidatePackageProvenance::parse(&rendered).unwrap();
+        assert_eq!(parsed, provenance);
+        assert_eq!(parsed.source_count(), 2);
+        assert_eq!(parsed.source_materials()[0], dictionary);
+        assert_eq!(parsed.source_materials()[1], phrase_list);
+        parsed.validate_materials(MANIFEST, PAYLOAD).unwrap();
+        parsed.source_materials()[0]
+            .validate_bytes(b"dictionary bytes")
+            .unwrap();
+        let error = parsed.source_materials()[1]
+            .validate_bytes(b"changed private-looking text")
+            .unwrap_err();
+        assert_eq!(error, CandidateProvenanceError::SourceHashMismatch);
+        assert!(!error.to_string().contains("private-looking"));
+
+        let changed = CandidatePackageProvenance::from_source_materials(
+            vec![
+                CandidateSourceMaterial::from_bytes(
+                    "dictionary",
+                    "Apache-2.0",
+                    "https://example.com/dictionary",
+                    b"changed dictionary bytes",
+                )
+                .unwrap(),
+                parsed.source_materials()[1].clone(),
+            ],
+            MANIFEST,
+            PAYLOAD,
+        )
+        .unwrap()
+        .render();
+        assert_ne!(
+            candidate_package_authentication_sha256(&rendered, MANIFEST, PAYLOAD),
+            candidate_package_authentication_sha256(&changed, MANIFEST, PAYLOAD)
+        );
+    }
+
+    #[test]
+    fn multi_source_parser_rejects_missing_duplicate_and_reordered_materials() {
+        let source = |id: &str| {
+            CandidateSourceMaterial::from_bytes(
+                id,
+                "MIT",
+                &format!("https://example.com/{id}"),
+                id.as_bytes(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            CandidatePackageProvenance::from_source_materials(
+                vec![source("same"), source("same")],
+                MANIFEST,
+                PAYLOAD,
+            )
+            .unwrap_err(),
+            CandidateProvenanceError::DuplicateSourceId
+        );
+        assert_eq!(
+            CandidatePackageProvenance::from_source_materials(
+                vec![source("only")],
+                MANIFEST,
+                PAYLOAD,
+            )
+            .unwrap_err(),
+            CandidateProvenanceError::InvalidSourceCount
+        );
+
+        let rendered = CandidatePackageProvenance::from_source_materials(
+            vec![source("alpha"), source("zeta")],
+            MANIFEST,
+            PAYLOAD,
+        )
+        .unwrap()
+        .render();
+        let missing = rendered
+            .lines()
+            .filter(|line| !line.starts_with("source_2_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            CandidatePackageProvenance::parse(&missing).unwrap_err(),
+            CandidateProvenanceError::InvalidStructure
+        );
+        let reordered = rendered
+            .replace("source_1_id=alpha", "source_1_id=temporary")
+            .replace("source_2_id=zeta", "source_2_id=alpha")
+            .replace("source_1_id=temporary", "source_1_id=zeta");
+        assert_eq!(
+            CandidatePackageProvenance::parse(&reordered).unwrap_err(),
+            CandidateProvenanceError::NonCanonicalSourceOrder
+        );
+        assert_eq!(
+            CandidatePackageProvenance::parse(
+                &rendered.replace("source_count=2", "source_count=02")
+            )
+            .unwrap_err(),
+            CandidateProvenanceError::InvalidSourceCount
         );
     }
 

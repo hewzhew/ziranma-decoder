@@ -43,6 +43,31 @@ manifest_sha256=<清单 SHA-256>
 payload_sha256=<载荷 SHA-256>
 ```
 
+需要两份或更多公开材料时使用严格的
+`ziranma-candidate-provenance-v2`。它保留相同的包格式与解码兼容字段，增加
+`source_count` 和 `source_1_*` 至 `source_N_*` 材料块；材料数量固定在 2～8，
+按稳定 `source_id` 升序排列，重复 ID、缺行、调换顺序、非规范计数和未知字段
+都会被拒绝。构造器可以直接校验每份显式来源字节的 SHA-256，运行时则继续把
+完整 provenance、manifest 和 payload 字节共同纳入现有存储 ID、预检摘要与
+Ed25519 签名消息。旧的单来源 v1 文件仍按原九行格式解析和渲染，不会被改写：
+
+```text
+schema=ziranma-candidate-provenance-v2
+package_schema=ziranma-candidate-package-v1
+decoder_compatibility=ziranma-candidate-decoder-v1
+source_count=2
+source_1_id=<按 ID 排序的第一份材料>
+source_1_license=<许可证>
+source_1_url=<HTTPS 来源>
+source_1_sha256=<源文件 SHA-256>
+source_2_id=<第二份材料>
+source_2_license=<许可证>
+source_2_url=<HTTPS 来源>
+source_2_sha256=<源文件 SHA-256>
+manifest_sha256=<manifest.zcm 的 SHA-256>
+payload_sha256=<lexicon.tsv 的 SHA-256>
+```
+
 核心快照仍只接收调用者明确提供的清单和载荷内存，不解析路径；来源层独立校验
 侧车及其材料绑定。`candidatectl inspect` 只读打开用户分别点名的三个普通文件；
 它拒绝符号链接、空文件、非 UTF-8 和超过固定上限的文件，不扫描相邻目录。
@@ -213,9 +238,10 @@ target\release\candidatectl.exe phrase-coverage-audit `
 
 三档的公开 token 审计均未丢失原覆盖，但这还没有测量完整候选排序、内存、索引
 建立和首帧成本；5,000 到 10,000 条的留出增益也已经变缓。更重要的是，实际
-候选包将同时依赖基础词典与固定短语表两个文件。当前 v1 provenance 只有一个
-来源材料哈希，因此这条路线在双文件认证和运行时负对照完成前保持为只读实验，
-不得把审计交集伪装成单来源发布包。
+候选包将同时依赖基础词典与固定短语表两个文件。v2 provenance 已能同时绑定
+这两份材料，旧 v1 包也保持兼容；但固定短语实验还没有提供会逐字节验证两份
+本地来源并生成 v2 包的构建命令。因此这条路线继续保持为只读实验，不得把审计
+交集伪装成单来源发布包。
 
 随后新增的 `phrase-layer-audit` 会在内存中建立基础、5,000 条和 10,000 条三个
 真实 `CandidateSnapshot`，让新增目标走现有交互候选合并路径。它把新增目标与
@@ -245,7 +271,7 @@ target\release\candidatectl.exe phrase-layer-audit `
 48 个预热公开码各重复五次时，基础、5,000 和 10,000 条路径的 median 分别约
 34.17/33.88/33.68 ms，P95 约 42.84/44.07/42.58 ms，分布没有显示稳定的层间
 延迟差异。这些结构计数不是实际堆内存，候选查询也不是 TSF 窗口首帧；宿主加载
-后的进程增量、首次绘制和双文件来源认证仍是发布前门槛。因此本轮只能说明
+后的进程增量、首次绘制和具体实验包的双文件逐字节验证仍是发布前门槛。因此本轮只能说明
 10,000 条在该公开留出上有额外召回且未触发固定负对照，不能据此直接换代。
 
 ```powershell
