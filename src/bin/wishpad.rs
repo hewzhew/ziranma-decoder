@@ -1386,6 +1386,9 @@ mod windows_app {
             } => format!(
                 "慢按键　总计 {total_ms} ms；刷新 {refresh_ms} ms，候选 {planning_ms} ms，编辑 {edit_session_ms} ms"
             ),
+            NativeFeedbackEvent::PostCommitBackspaceRouted => {
+                "提交后退格　已交给宿主；结果未观测".to_owned()
+            }
         }
     }
 

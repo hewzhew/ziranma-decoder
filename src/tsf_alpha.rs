@@ -6651,7 +6651,8 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::RawCodeCommitted { code }
         | NativeFeedbackEvent::CompositionCancelled { code, .. } => Some(code),
         NativeFeedbackEvent::CandidatePopupTiming { .. }
-        | NativeFeedbackEvent::SlowKeyPathTiming { .. } => None,
+        | NativeFeedbackEvent::SlowKeyPathTiming { .. }
+        | NativeFeedbackEvent::PostCommitBackspaceRouted => None,
     }
 }
 
@@ -8381,6 +8382,24 @@ impl TsfTextService_Impl {
         }
     }
 
+    fn record_post_commit_backspace_routed(&self) {
+        let Ok(mut feedback) = self.native_feedback.lock() else {
+            return;
+        };
+        if !feedback.is_accepting() {
+            return;
+        }
+        let result = feedback.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::PostCommitBackspaceRouted,
+            native_feedback_monotonic_ms(),
+        );
+        drop(feedback);
+        if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
+            self.native_feedback_language_bar_state.notify();
+        }
+    }
+
     #[cfg(test)]
     fn remember_selection_after_success(&self, selection: PlannedSelection) {
         let learning_context = self
@@ -10079,6 +10098,7 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
         let mut modifiers = self.observed_key_modifiers();
         match self.resolve_pending_personal_selection_for_key(vkey, modifiers)? {
             PendingPersonalKeyResolution::Retracted => {
+                self.record_post_commit_backspace_routed();
                 // The host still owns the actual Backspace. FALSE lets it
                 // delete the committed text after learning is withdrawn.
                 return Ok(false.into());
@@ -12883,6 +12903,18 @@ mod tests {
         unsafe { document_manager.Push(&context) }.expect("context push");
         unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
 
+        assert_eq!(
+            service_object
+                .native_feedback
+                .lock()
+                .unwrap()
+                .start_rolling_memory(
+                    NativeFeedbackAuthorization::explicit_memory_only(),
+                    NativeFeedbackLimits::default(),
+                ),
+            NativeFeedbackStartResult::Started
+        );
+
         service_object
             .native_feedback_context
             .lock()
@@ -12913,6 +12945,15 @@ mod tests {
             "the host must still receive the Backspace after learning is retracted"
         );
         assert!(service_object.pending_personal_selection.borrow().is_none());
+        assert!(matches!(
+            service_object
+                .native_feedback
+                .lock()
+                .unwrap()
+                .events()
+                .last(),
+            Some(NativeFeedbackEvent::PostCommitBackspaceRouted)
+        ));
         assert_eq!(
             service_object
                 .selection_memory

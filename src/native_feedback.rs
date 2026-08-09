@@ -399,6 +399,10 @@ pub enum NativeFeedbackEvent {
         edit_session_ms: u32,
         total_ms: u32,
     },
+    /// The first plain Backspace immediately after a retractable candidate
+    /// commit was returned to the host after personal learning was withdrawn.
+    /// This records the routed action, not an unobserved document result.
+    PostCommitBackspaceRouted,
 }
 
 impl NativeFeedbackEvent {
@@ -495,6 +499,7 @@ impl NativeFeedbackEvent {
                         && measured_phases <= *total_ms
                 })
                 .then_some(0),
+            Self::PostCommitBackspaceRouted => Some(0),
         }
     }
 
@@ -1137,6 +1142,7 @@ impl NativeFeedbackSession {
                     summary.popup_timing_samples = summary.popup_timing_samples.saturating_add(1);
                 }
                 NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
+                NativeFeedbackEvent::PostCommitBackspaceRouted => {}
             }
         }
         summary
@@ -1191,6 +1197,7 @@ impl NativeFeedbackSession {
             event,
             NativeFeedbackEvent::CandidatePopupTiming { .. }
                 | NativeFeedbackEvent::SlowKeyPathTiming { .. }
+                | NativeFeedbackEvent::PostCommitBackspaceRouted
         ) {
             return;
         }
@@ -1328,7 +1335,8 @@ impl NativeFeedbackSession {
                 self.finish_pending_automatic_transposition(TranspositionCalibrationLabel::Unknown)
             }
             NativeFeedbackEvent::CandidatePopupTiming { .. }
-            | NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
+            | NativeFeedbackEvent::SlowKeyPathTiming { .. }
+            | NativeFeedbackEvent::PostCommitBackspaceRouted => {}
         }
     }
 }
@@ -1505,6 +1513,10 @@ mod tests {
         start(&mut session, NativeFeedbackLimits::default());
         assert_eq!(
             record(&mut session, event),
+            NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(
+            record(&mut session, NativeFeedbackEvent::PostCommitBackspaceRouted),
             NativeFeedbackRecordResult::Recorded
         );
         assert_eq!(session.summary().private_bytes, 0);

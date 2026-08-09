@@ -469,7 +469,8 @@ fn observe_event(
             episode.observe_candidates(event);
         }
         NativeFeedbackEvent::CandidatePopupTiming { .. }
-        | NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
+        | NativeFeedbackEvent::SlowKeyPathTiming { .. }
+        | NativeFeedbackEvent::PostCommitBackspaceRouted => {}
         NativeFeedbackEvent::CandidateCommitted { code, text, .. } => {
             let mut episode = pending
                 .take()

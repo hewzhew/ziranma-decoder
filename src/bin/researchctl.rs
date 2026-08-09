@@ -106,9 +106,19 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
         snapshots.push(snapshot);
     }
     review.available_batches = available_batches;
+    let latest_runtime = latest_runtime_review(&snapshots)?;
     let wishes = load_linkable_wishes(root)?;
     let scenes = analyze_linked_research(&snapshots, &wishes)?;
-    println!("{}\n\n{}", review.render(), render_scene_analysis(&scenes));
+    let latest_runtime = latest_runtime.map_or_else(
+        || "最新运行身份：尚无带版本标识的批次。".to_owned(),
+        |(identity, review)| review.render_runtime_summary(&identity),
+    );
+    println!(
+        "{}\n\n{}\n\n{}",
+        latest_runtime,
+        review.render(),
+        render_scene_analysis(&scenes)
+    );
     Ok(())
 }
 
@@ -214,10 +224,13 @@ struct ResearchReview {
     unpaired_commits: usize,
     raw_commits: usize,
     cancellations: usize,
+    post_commit_backspaces_routed: usize,
     shape_frames: usize,
     tab_assembly_frames: usize,
     maximum_loaded_candidates: usize,
     frames_allowing_more_load: usize,
+    odd_code_frames: usize,
+    long_decoder_primary_frames: usize,
     popup_ms: Vec<u32>,
     initial_popup_ms: Vec<u32>,
     slow_key_total_ms: Vec<u32>,
@@ -268,6 +281,7 @@ impl ResearchReview {
                         *may_have_more,
                         false,
                     );
+                    self.observe_code_shape(code, None);
                     frame = Some(PresentedFrame {
                         code: code.clone(),
                         view: *view,
@@ -292,6 +306,7 @@ impl ResearchReview {
                         *may_have_more,
                         tab_assembly.is_some(),
                     );
+                    self.observe_code_shape(code, provenance.first().copied());
                     frame = Some(PresentedFrame {
                         code: code.clone(),
                         view: *view,
@@ -359,6 +374,10 @@ impl ResearchReview {
                     self.slow_key_planning_ms.push(*planning_ms);
                     self.slow_key_edit_session_ms.push(*edit_session_ms);
                 }
+                NativeFeedbackEvent::PostCommitBackspaceRouted => {
+                    self.post_commit_backspaces_routed += 1;
+                    frame = None;
+                }
             }
         }
         for observation in snapshot.automatic_transposition_observations()? {
@@ -383,6 +402,19 @@ impl ResearchReview {
         self.tab_assembly_frames += usize::from(tab_assembly);
         self.maximum_loaded_candidates = self.maximum_loaded_candidates.max(loaded_candidates);
         self.frames_allowing_more_load += usize::from(may_have_more);
+    }
+
+    fn observe_code_shape(
+        &mut self,
+        code: &str,
+        first_candidate: Option<NativeCandidateProvenance>,
+    ) {
+        self.odd_code_frames += usize::from(code.len() % 2 == 1);
+        self.long_decoder_primary_frames += usize::from(
+            code.len() >= 5
+                && first_candidate
+                    .is_some_and(|candidate| candidate.source() == NativeCandidateSource::Decoder),
+        );
     }
 
     fn render(&self) -> String {
@@ -428,8 +460,8 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "其他结束：原码上屏 {}；取消 {}。",
-            self.raw_commits, self.cancellations,
+            "其他结束：原码上屏 {}；取消 {}；提交后紧接退格 {}（已交给宿主，结果未观测）。",
+            self.raw_commits, self.cancellations, self.post_commit_backspaces_routed,
         )
         .unwrap();
         render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
@@ -532,6 +564,80 @@ impl ResearchReview {
         );
         output
     }
+
+    fn render_runtime_summary(&self, identity: &WishRuntimeIdentity) -> String {
+        let mut output = String::new();
+        writeln!(output, "最新运行身份（与旧批次分开）").unwrap();
+        writeln!(
+            output,
+            "DLL {}…；核心 {}；补充 {}。",
+            &identity.module_sha256()[..12],
+            identity.core_candidate_revision(),
+            identity.supplemental_candidate_revision().unwrap_or("无"),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "批次：{}；完整 {}；事件 {}，省略 {}。",
+            self.batches, self.complete_batches, self.events, self.omitted_events,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；取消 {}；原码上屏 {}；提交后紧接退格 {}。",
+            self.candidate_commits,
+            self.top_one_commits,
+            percent(self.top_one_commits, self.candidate_commits),
+            self.non_top_commits,
+            self.paged_commits,
+            self.cancellations,
+            self.raw_commits,
+            self.post_commit_backspaces_routed,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "候选：{} 帧；奇数键中间态 {} 帧；五码及以上且首选来自普通组合 {} 帧。",
+            self.candidate_frames, self.odd_code_frames, self.long_decoder_primary_frames,
+        )
+        .unwrap();
+        render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
+        render_latency(&mut output, "首次出现", &self.initial_popup_ms);
+        render_latency(
+            &mut output,
+            "慢按键总耗时（仅 ≥16 ms）",
+            &self.slow_key_total_ms,
+        );
+        writeln!(
+            output,
+            "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
+            self.transposition_accepted, self.transposition_rejected, self.transposition_unknown,
+        )
+        .unwrap();
+        output.push_str("口径：这里只汇总时间上最新的已标识 DLL；首选提交不自动等于文字正确。");
+        output
+    }
+}
+
+fn latest_runtime_review(
+    snapshots: &[WishSnapshot],
+) -> Result<Option<(WishRuntimeIdentity, ResearchReview)>, Box<dyn Error>> {
+    let Some(identity) = snapshots
+        .iter()
+        .rev()
+        .find_map(|snapshot| snapshot.runtime_identity().cloned())
+    else {
+        return Ok(None);
+    };
+    let mut review = ResearchReview::default();
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| snapshot.runtime_identity() == Some(&identity))
+    {
+        review.observe(snapshot)?;
+    }
+    review.available_batches = review.batches;
+    Ok(Some((identity, review)))
 }
 
 fn percent(numerator: usize, denominator: usize) -> f64 {
@@ -941,6 +1047,26 @@ mod tests {
             review
                 .render()
                 .contains("DLL abababababab…；核心 research-core-v1")
+        );
+
+        let newer = WishSnapshot::from_frozen_with_runtime_identity(
+            &frozen,
+            WishCaptureScope::ContinuousJournal,
+            ziranma_core::WishCategory::Other,
+            Some(
+                WishRuntimeIdentity::new("cd".repeat(32), "research-core-v2".to_owned(), None)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let (latest_identity, latest_review) =
+            latest_runtime_review(&[snapshot, newer]).unwrap().unwrap();
+        assert_eq!(latest_identity.module_sha256(), "cd".repeat(32));
+        assert_eq!(latest_review.batches, 1);
+        assert!(
+            latest_review
+                .render_runtime_summary(&latest_identity)
+                .contains("最新运行身份（与旧批次分开）")
         );
     }
 
