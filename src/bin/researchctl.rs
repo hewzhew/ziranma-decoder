@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use ziranma_core::{
     NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
-    NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, TranspositionCalibrationLabel,
-    WishCaptureScope, WishRuntimeIdentity, WishSnapshot, list_wish_packages,
-    research_feedback_enabled, set_research_feedback_enabled,
+    NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchSceneAnalysis,
+    TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
+    analyze_linked_research, list_wish_packages, research_feedback_enabled,
+    set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -98,13 +99,38 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
     packages.truncate(MAX_REVIEW_BATCHES);
     packages.reverse();
     let mut review = ResearchReview::default();
+    let mut snapshots = Vec::with_capacity(packages.len());
     for package in packages {
         let snapshot = load_wish_snapshot(root, package.id(), &WindowsUserDataProtector)?;
         review.observe(&snapshot)?;
+        snapshots.push(snapshot);
     }
     review.available_batches = available_batches;
-    println!("{}", review.render());
+    let wishes = load_linkable_wishes(root)?;
+    let scenes = analyze_linked_research(&snapshots, &wishes)?;
+    println!("{}\n\n{}", review.render(), render_scene_analysis(&scenes));
     Ok(())
+}
+
+#[cfg(windows)]
+fn load_linkable_wishes(research_root: &Path) -> Result<Vec<WishSnapshot>, Box<dyn Error>> {
+    if research_root.file_name().and_then(|name| name.to_str()) != Some(RESEARCH_FEEDBACK_DIRECTORY)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(user_data_root) = research_root.parent() else {
+        return Ok(Vec::new());
+    };
+    let wish_root = user_data_root.join("wishes");
+    let mut packages = list_wish_packages(&wish_root)?;
+    packages.truncate(MAX_REVIEW_BATCHES);
+    packages
+        .into_iter()
+        .map(|package| {
+            load_wish_snapshot(&wish_root, package.id(), &WindowsUserDataProtector)
+                .map_err(|error| error.into())
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -562,6 +588,76 @@ fn render_runtime_identities(
     }
 }
 
+fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
+    let mut output = String::new();
+    output.push_str("自然片段（不把加密批次当作段落边界）\n");
+    if analysis.linked_batches() == 0 {
+        output.push_str("- 现有批次尚无连续链；换代后的 V8 批次开始积累后才进行分段。\n");
+    } else {
+        writeln!(
+            output,
+            "- {} 个有链批次，{} 条进程内连续流，{} 次完成输入，组成 {} 个自然片段。",
+            analysis.linked_batches(),
+            analysis.linked_streams(),
+            analysis.episodes(),
+            analysis.scenes(),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "- 自适应停顿边界 {} ms；片段中位 {} 次输入 / {} ms；链缺口 {}。",
+            analysis.gap_threshold_ms(),
+            analysis.median_episodes_per_scene(),
+            analysis.median_scene_duration_ms(),
+            analysis.chain_breaks(),
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "- 许愿：有锚点 {}，已连接片段 {}，旧版或未锚定 {}。",
+        analysis.anchored_wishes(),
+        analysis.linked_wishes(),
+        analysis.unanchored_wishes(),
+    )
+    .unwrap();
+
+    output.push_str("手癖线索（不是自动判错）：\n");
+    if analysis.habit_clues().is_empty() {
+        output.push_str("- 暂无达到证据门槛的线索。\n");
+    }
+    for clue in analysis.habit_clues().iter().take(MAX_REVIEW_ITEMS) {
+        match clue.kind() {
+            ResearchHabitKind::AcceptedTransposition => {
+                writeln!(
+                    output,
+                    "- {} → “{}”：实际采用自动换序 {} 次；按键间隔中位 {} ms。",
+                    clue.observed_code(),
+                    clue.committed_text(),
+                    clue.observations(),
+                    clue.median_pair_gap_ms().unwrap_or(0),
+                )
+                .unwrap();
+            }
+            ResearchHabitKind::RepeatedCodeRevision => {
+                writeln!(
+                    output,
+                    "- {} → {} → “{}”：输入中改码 {} 次；保留为待确认线索。",
+                    clue.observed_code(),
+                    clue.resulting_code(),
+                    clue.committed_text(),
+                    clue.observations(),
+                )
+                .unwrap();
+            }
+        }
+    }
+    output.push_str(
+        "口径：失焦/宿主结束是硬边界；停顿是按本批证据自适应的软边界；单次改码不形成手癖结论。",
+    );
+    output
+}
+
 fn candidate_source_index(source: NativeCandidateSource) -> usize {
     match source {
         NativeCandidateSource::Unknown => 0,
@@ -833,5 +929,17 @@ mod tests {
             ))
         );
         assert!(research_root_for_executable(Path::new(r"D:\tools\researchctl.exe")).is_none());
+    }
+
+    #[test]
+    fn scene_rendering_distinguishes_unlinked_legacy_evidence_without_prescribing_a_result() {
+        let analysis = analyze_linked_research(&[], &[]).unwrap();
+        let rendered = render_scene_analysis(&analysis);
+
+        assert!(rendered.contains("现有批次尚无连续链"));
+        assert!(rendered.contains("单次改码不形成手癖结论"));
+        for forbidden in ["最佳配置", "下一步建议", "应该采用", "用户打错"] {
+            assert!(!rendered.contains(forbidden));
+        }
     }
 }

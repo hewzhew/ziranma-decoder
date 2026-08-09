@@ -38,6 +38,7 @@ pub const WISH_SCHEMA_V4: &str = "ziranma-wish-v4";
 pub const WISH_SCHEMA_V5: &str = "ziranma-wish-v5";
 pub const WISH_SCHEMA_V6: &str = "ziranma-wish-v6";
 pub const WISH_SCHEMA_V7: &str = "ziranma-wish-v7";
+pub const WISH_SCHEMA_V8: &str = "ziranma-wish-v8";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -53,6 +54,7 @@ const WISH_PLAINTEXT_MAGIC_V4: &[u8] = b"ziranma-wish-v4\0";
 const WISH_PLAINTEXT_MAGIC_V5: &[u8] = b"ziranma-wish-v5\0";
 const WISH_PLAINTEXT_MAGIC_V6: &[u8] = b"ziranma-wish-v6\0";
 const WISH_PLAINTEXT_MAGIC_V7: &[u8] = b"ziranma-wish-v7\0";
+const WISH_PLAINTEXT_MAGIC_V8: &[u8] = b"ziranma-wish-v8\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-note-dpapi-v1\0";
@@ -127,6 +129,108 @@ pub struct WishRuntimeIdentity {
     supplemental_candidate_revision: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WishJournalSpan {
+    stream_id: String,
+    batch_sequence: u64,
+    first_event_ordinal: u64,
+    previous_event_gap_ms: Option<u64>,
+}
+
+impl WishJournalSpan {
+    pub fn new(
+        stream_id: String,
+        batch_sequence: u64,
+        first_event_ordinal: u64,
+        previous_event_gap_ms: Option<u64>,
+    ) -> Result<Self, WishFeedbackError> {
+        let value = Self {
+            stream_id,
+            batch_sequence,
+            first_event_ordinal,
+            previous_event_gap_ms,
+        };
+        value.validate(1)?;
+        Ok(value)
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn batch_sequence(&self) -> u64 {
+        self.batch_sequence
+    }
+
+    pub fn first_event_ordinal(&self) -> u64 {
+        self.first_event_ordinal
+    }
+
+    pub fn previous_event_gap_ms(&self) -> Option<u64> {
+        self.previous_event_gap_ms
+    }
+
+    fn validate(&self, event_count: usize) -> Result<(), WishFeedbackError> {
+        if !valid_journal_stream_id(&self.stream_id)
+            || event_count == 0
+            || self
+                .first_event_ordinal
+                .checked_add(u64::try_from(event_count - 1).unwrap_or(u64::MAX))
+                .is_none()
+            || (self.batch_sequence == 0 && self.previous_event_gap_ms.is_some())
+            || (self.batch_sequence > 0 && self.previous_event_gap_ms.is_none())
+        {
+            return Err(WishFeedbackError::InvalidSnapshot);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WishJournalAnchor {
+    stream_id: String,
+    event_ordinal: u64,
+}
+
+impl WishJournalAnchor {
+    pub fn new(stream_id: String, event_ordinal: u64) -> Result<Self, WishFeedbackError> {
+        let value = Self {
+            stream_id,
+            event_ordinal,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn event_ordinal(&self) -> u64 {
+        self.event_ordinal
+    }
+
+    fn validate(&self) -> Result<(), WishFeedbackError> {
+        if !valid_journal_stream_id(&self.stream_id) {
+            return Err(WishFeedbackError::InvalidSnapshot);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum WishJournalContext {
+    ContinuousSpan(WishJournalSpan),
+    WishAnchor(WishJournalAnchor),
+}
+
+fn valid_journal_stream_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 impl WishRuntimeIdentity {
     pub fn new(
         module_sha256: String,
@@ -190,6 +294,7 @@ pub struct WishSnapshot {
     capture_scope: WishCaptureScope,
     category: WishCategory,
     runtime_identity: Option<WishRuntimeIdentity>,
+    journal_context: Option<WishJournalContext>,
     focus_event_start: usize,
     focus_event_count: usize,
     lookback_ms: u32,
@@ -224,6 +329,16 @@ impl WishSnapshot {
         category: WishCategory,
         runtime_identity: Option<WishRuntimeIdentity>,
     ) -> Result<Self, WishFeedbackError> {
+        Self::from_frozen_with_context(snapshot, capture_scope, category, runtime_identity, None)
+    }
+
+    pub fn from_frozen_with_context(
+        snapshot: &FrozenNativeFeedbackSnapshot,
+        capture_scope: WishCaptureScope,
+        category: WishCategory,
+        runtime_identity: Option<WishRuntimeIdentity>,
+        journal_context: Option<WishJournalContext>,
+    ) -> Result<Self, WishFeedbackError> {
         let (focus_event_start, focus_event_count) =
             if capture_scope == WishCaptureScope::ContinuousJournal {
                 (0, snapshot.events().len())
@@ -234,6 +349,7 @@ impl WishSnapshot {
             capture_scope,
             category,
             runtime_identity,
+            journal_context,
             focus_event_start,
             focus_event_count,
             lookback_ms: snapshot.lookback_ms(),
@@ -265,6 +381,10 @@ impl WishSnapshot {
 
     pub fn runtime_identity(&self) -> Option<&WishRuntimeIdentity> {
         self.runtime_identity.as_ref()
+    }
+
+    pub fn journal_context(&self) -> Option<&WishJournalContext> {
+        self.journal_context.as_ref()
     }
 
     pub fn focus_event_range(&self) -> std::ops::Range<usize> {
@@ -447,6 +567,20 @@ impl WishSnapshot {
         if let Some(identity) = &self.runtime_identity {
             identity.validate()?;
         }
+        match (&self.capture_scope, &self.journal_context) {
+            (
+                WishCaptureScope::ContinuousJournal,
+                Some(WishJournalContext::ContinuousSpan(span)),
+            ) => {
+                span.validate(self.events.len())?;
+            }
+            (WishCaptureScope::ContinuousJournal, Some(WishJournalContext::WishAnchor(_)))
+            | (_, Some(WishJournalContext::ContinuousSpan(_))) => {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            (_, Some(WishJournalContext::WishAnchor(anchor))) => anchor.validate()?,
+            (_, None) => {}
+        }
         if self.lookback_ms == 0 || self.events.len() > MAX_WISH_EVENTS {
             return Err(WishFeedbackError::InvalidSnapshot);
         }
@@ -490,7 +624,7 @@ impl WishSnapshot {
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V7);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V8);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -504,6 +638,24 @@ impl WishSnapshot {
             ));
             if let Some(revision) = identity.supplemental_candidate_revision() {
                 put_string(&mut output, revision)?;
+            }
+        }
+        match &self.journal_context {
+            None => output.push(0),
+            Some(WishJournalContext::ContinuousSpan(span)) => {
+                output.push(1);
+                put_string(&mut output, span.stream_id())?;
+                put_u64(&mut output, span.batch_sequence());
+                put_u64(&mut output, span.first_event_ordinal());
+                output.push(u8::from(span.previous_event_gap_ms().is_some()));
+                if let Some(gap_ms) = span.previous_event_gap_ms() {
+                    put_u64(&mut output, gap_ms);
+                }
+            }
+            Some(WishJournalContext::WishAnchor(anchor)) => {
+                output.push(2);
+                put_string(&mut output, anchor.stream_id())?;
+                put_u64(&mut output, anchor.event_ordinal());
             }
         }
         put_u32(&mut output, self.lookback_ms);
@@ -528,7 +680,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V7) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V8) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V8)?;
+            8
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V7) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V7)?;
             7
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V6) {
@@ -574,6 +729,28 @@ impl WishSnapshot {
         } else {
             None
         };
+        let journal_context = if version >= 8 {
+            match reader.byte()? {
+                0 => None,
+                1 => Some(WishJournalContext::ContinuousSpan(WishJournalSpan::new(
+                    reader.string()?,
+                    reader.u64()?,
+                    reader.u64()?,
+                    if reader.boolean()? {
+                        Some(reader.u64()?)
+                    } else {
+                        None
+                    },
+                )?)),
+                2 => Some(WishJournalContext::WishAnchor(WishJournalAnchor::new(
+                    reader.string()?,
+                    reader.u64()?,
+                )?)),
+                _ => return Err(WishFeedbackError::InvalidSnapshot),
+            }
+        } else {
+            None
+        };
         let lookback_ms = reader.u32()?;
         let source_complete = reader.boolean()?;
         let source_events = reader.usize()?;
@@ -598,6 +775,7 @@ impl WishSnapshot {
             capture_scope,
             category,
             runtime_identity,
+            journal_context,
             focus_event_start,
             focus_event_count: if version == 1 {
                 events.len()
@@ -1513,6 +1691,10 @@ fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn put_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
 fn put_usize(output: &mut Vec<u8>, value: usize) -> Result<(), WishFeedbackError> {
     put_u32(
         output,
@@ -1578,6 +1760,14 @@ impl<'a> SliceReader<'a> {
 
     fn usize(&mut self) -> Result<usize, WishFeedbackError> {
         usize::try_from(self.u32()?).map_err(|_| WishFeedbackError::InvalidPlaintext)
+    }
+
+    fn u64(&mut self) -> Result<u64, WishFeedbackError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| WishFeedbackError::InvalidPlaintext)?,
+        ))
     }
 
     fn string(&mut self) -> Result<String, WishFeedbackError> {
@@ -1878,7 +2068,7 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V7));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V8));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
@@ -1889,7 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
+    fn v8_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "fuem".to_owned(),
@@ -1915,13 +2105,13 @@ mod tests {
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V7));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V8));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
     }
 
     #[test]
-    fn v7_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
+    fn v8_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "hp".to_owned(),
@@ -1943,7 +2133,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_round_trips_exact_runtime_identity() {
+    fn v8_round_trips_exact_runtime_identity() {
         let mut snapshot = private_snapshot();
         snapshot.runtime_identity = Some(
             WishRuntimeIdentity::new(
@@ -1963,6 +2153,62 @@ mod tests {
             Some("wanxiang-supplement-test-v2")
         );
         assert!(parsed == snapshot);
+    }
+
+    #[test]
+    fn v8_round_trips_continuous_spans_and_wish_anchors() {
+        let mut continuous = private_snapshot();
+        continuous.capture_scope = WishCaptureScope::ContinuousJournal;
+        continuous.journal_context = Some(WishJournalContext::ContinuousSpan(
+            WishJournalSpan::new("34".repeat(32), 2, 16, Some(4_200)).unwrap(),
+        ));
+        let parsed = WishSnapshot::parse(&continuous.render().unwrap()).unwrap();
+        assert!(parsed == continuous);
+        let Some(WishJournalContext::ContinuousSpan(span)) = parsed.journal_context() else {
+            panic!("continuous journal span missing");
+        };
+        assert_eq!(span.batch_sequence(), 2);
+        assert_eq!(span.first_event_ordinal(), 16);
+        assert_eq!(span.previous_event_gap_ms(), Some(4_200));
+
+        let mut wish = private_snapshot();
+        wish.journal_context = Some(WishJournalContext::WishAnchor(
+            WishJournalAnchor::new("34".repeat(32), 17).unwrap(),
+        ));
+        assert!(WishSnapshot::parse(&wish.render().unwrap()).unwrap() == wish);
+        assert!(WishJournalSpan::new("34".repeat(32), 1, 8, None).is_err());
+    }
+
+    #[test]
+    fn v7_snapshot_remains_readable_without_journal_context() {
+        let snapshot = private_snapshot();
+        let identity =
+            WishRuntimeIdentity::new("56".repeat(32), "legacy-v7-core".to_owned(), None).unwrap();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(WISH_PLAINTEXT_MAGIC_V7);
+        legacy.push(snapshot.capture_scope.encoded());
+        legacy.push(snapshot.category.encoded());
+        put_usize(&mut legacy, snapshot.focus_event_start).unwrap();
+        put_usize(&mut legacy, snapshot.focus_event_count).unwrap();
+        legacy.push(1);
+        put_string(&mut legacy, identity.module_sha256()).unwrap();
+        put_string(&mut legacy, identity.core_candidate_revision()).unwrap();
+        legacy.push(0);
+        put_u32(&mut legacy, snapshot.lookback_ms);
+        legacy.push(u8::from(snapshot.source_complete));
+        put_usize(&mut legacy, snapshot.source_events).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_before_window).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_untimed).unwrap();
+        put_usize(&mut legacy, snapshot.omitted_by_event_limit).unwrap();
+        put_usize(&mut legacy, snapshot.events.len()).unwrap();
+        for event in &snapshot.events {
+            put_u32(&mut legacy, event.milliseconds_before_marker);
+            render_event(&mut legacy, &event.event).unwrap();
+        }
+
+        let parsed = WishSnapshot::parse(&legacy).unwrap();
+        assert_eq!(parsed.runtime_identity(), Some(&identity));
+        assert!(parsed.journal_context().is_none());
     }
 
     #[test]

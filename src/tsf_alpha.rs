@@ -46,12 +46,12 @@ use crate::{
     PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
     WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
     WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
-    WishRuntimeIdentity, WishSnapshot, load_candidate_runtime_snapshots,
-    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
-    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
-    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
-    save_personal_ranking_batch, save_personal_ranking_checkpoint,
-    save_personal_ranking_suppression_action, save_wish_snapshot,
+    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishRuntimeIdentity, WishSnapshot,
+    candidate_sha256_hex, load_candidate_runtime_snapshots, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
+    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
+    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -5595,7 +5595,7 @@ impl NativeFeedbackLanguageBarState {
         let frozen = self.feedback.lock().ok().and_then(|feedback| {
             let marker_ms = native_feedback_monotonic_ms();
             let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
-            match scope {
+            let frozen = match scope {
                 WishCaptureScope::RecentEpisodes => {
                     { freeze_recent_wish_with_context(&feedback, marker_ms) }
                         .map(|frozen| (frozen, WishCaptureScope::RecentEpisodes))
@@ -5622,12 +5622,30 @@ impl NativeFeedbackLanguageBarState {
                     )
                     .ok()
                     .map(|frozen| (frozen, WishCaptureScope::RecentWindow)),
-            }
+            }?;
+            Some((
+                frozen.0,
+                frozen.1,
+                feedback.research.runtime_identity(),
+                feedback
+                    .research
+                    .current_anchor()
+                    .map(WishJournalContext::WishAnchor),
+            ))
         });
         let saved_events = frozen
-            .and_then(|(frozen, effective_scope)| {
-                WishSnapshot::from_frozen_with_metadata(&frozen, effective_scope, category).ok()
-            })
+            .and_then(
+                |(frozen, effective_scope, runtime_identity, journal_context)| {
+                    WishSnapshot::from_frozen_with_context(
+                        &frozen,
+                        effective_scope,
+                        category,
+                        runtime_identity,
+                        journal_context,
+                    )
+                    .ok()
+                },
+            )
             .and_then(|snapshot| {
                 let event_count = snapshot.events().len();
                 if event_count == 0 {
@@ -6927,6 +6945,12 @@ struct ResearchFeedbackJournal {
     root: Option<PathBuf>,
     module_sha256: Option<String>,
     candidate_identity: Option<CandidateDataIdentity>,
+    stream_id: String,
+    batch_sequence: u64,
+    next_event_ordinal: u64,
+    first_event_ordinal: Option<u64>,
+    first_event_timestamp_ms: Option<u64>,
+    previous_event_timestamp_ms: Option<u64>,
     enabled: bool,
     last_consent_check_ms: Option<u64>,
     events: Vec<(u64, NativeFeedbackEvent)>,
@@ -6960,6 +6984,12 @@ impl ResearchFeedbackJournal {
             root,
             module_sha256,
             candidate_identity,
+            stream_id: new_research_stream_id(),
+            batch_sequence: 0,
+            next_event_ordinal: 0,
+            first_event_ordinal: None,
+            first_event_timestamp_ms: None,
+            previous_event_timestamp_ms: None,
             enabled,
             last_consent_check_ms: None,
             events: Vec::new(),
@@ -6976,6 +7006,12 @@ impl ResearchFeedbackJournal {
             root,
             module_sha256: None,
             candidate_identity: None,
+            stream_id: new_research_stream_id(),
+            batch_sequence: 0,
+            next_event_ordinal: 0,
+            first_event_ordinal: None,
+            first_event_timestamp_ms: None,
+            previous_event_timestamp_ms: None,
             enabled,
             last_consent_check_ms: None,
             events: Vec::new(),
@@ -6996,6 +7032,7 @@ impl ResearchFeedbackJournal {
             return self.enabled;
         }
         self.last_consent_check_ms = Some(monotonic_ms);
+        let was_enabled = self.enabled;
         self.enabled = self
             .root
             .as_deref()
@@ -7003,6 +7040,9 @@ impl ResearchFeedbackJournal {
         if !self.enabled {
             self.events.clear();
             self.completed_episodes = 0;
+            self.reset_stream();
+        } else if !was_enabled {
+            self.reset_stream();
         }
         self.enabled
     }
@@ -7016,7 +7056,23 @@ impl ResearchFeedbackJournal {
         } else if !self.enabled {
             return;
         }
+        if self.events.is_empty()
+            && self
+                .previous_event_timestamp_ms
+                .is_some_and(|previous| monotonic_ms < previous)
+        {
+            self.reset_stream();
+        }
+        if self.next_event_ordinal == u64::MAX {
+            let _ = self.flush();
+            self.reset_stream();
+        }
+        if self.events.is_empty() {
+            self.first_event_ordinal = Some(self.next_event_ordinal);
+            self.first_event_timestamp_ms = Some(monotonic_ms);
+        }
         self.events.push((monotonic_ms, event));
+        self.next_event_ordinal = self.next_event_ordinal.saturating_add(1);
         if completes_episode {
             self.completed_episodes = self.completed_episodes.saturating_add(1);
         }
@@ -7052,26 +7108,51 @@ impl ResearchFeedbackJournal {
         let Some(marker_ms) = self.events.last().map(|(timestamp, _)| *timestamp) else {
             return true;
         };
+        let Some(first_event_ordinal) = self.first_event_ordinal else {
+            return false;
+        };
+        let Some(first_event_timestamp_ms) = self.first_event_timestamp_ms else {
+            return false;
+        };
+        let previous_event_gap_ms = self
+            .previous_event_timestamp_ms
+            .and_then(|previous| first_event_timestamp_ms.checked_sub(previous));
+        let journal_context = WishJournalSpan::new(
+            self.stream_id.clone(),
+            self.batch_sequence,
+            first_event_ordinal,
+            previous_event_gap_ms,
+        )
+        .ok()
+        .map(WishJournalContext::ContinuousSpan);
         let runtime_identity = self.runtime_identity();
-        let saved =
-            crate::FrozenNativeFeedbackSnapshot::from_journal_events(marker_ms, &self.events)
-                .ok()
-                .and_then(|frozen| {
-                    WishSnapshot::from_frozen_with_runtime_identity(
-                        &frozen,
-                        WishCaptureScope::ContinuousJournal,
-                        WishCategory::Other,
-                        runtime_identity,
-                    )
+        let saved = journal_context
+            .and_then(|journal_context| {
+                crate::FrozenNativeFeedbackSnapshot::from_journal_events(marker_ms, &self.events)
                     .ok()
-                })
-                .and_then(|snapshot| {
-                    save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector).ok()
-                })
-                .is_some();
+                    .map(|frozen| (frozen, journal_context))
+            })
+            .and_then(|(frozen, journal_context)| {
+                WishSnapshot::from_frozen_with_context(
+                    &frozen,
+                    WishCaptureScope::ContinuousJournal,
+                    WishCategory::Other,
+                    runtime_identity,
+                    Some(journal_context),
+                )
+                .ok()
+            })
+            .and_then(|snapshot| {
+                save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector).ok()
+            })
+            .is_some();
         if saved {
             self.events.clear();
             self.completed_episodes = 0;
+            self.first_event_ordinal = None;
+            self.first_event_timestamp_ms = None;
+            self.previous_event_timestamp_ms = Some(marker_ms);
+            self.batch_sequence = self.batch_sequence.saturating_add(1);
         } else {
             // A malformed marker, unavailable DPAPI, or storage failure must
             // never retain an unbounded private buffer inside the host.
@@ -7079,6 +7160,7 @@ impl ResearchFeedbackJournal {
             self.enabled = false;
             self.events.clear();
             self.completed_episodes = 0;
+            self.reset_stream();
         }
         saved
     }
@@ -7092,6 +7174,43 @@ impl ResearchFeedbackJournal {
         )
         .ok()
     }
+
+    fn current_anchor(&self) -> Option<WishJournalAnchor> {
+        self.enabled.then_some(())?;
+        WishJournalAnchor::new(
+            self.stream_id.clone(),
+            self.next_event_ordinal.checked_sub(1)?,
+        )
+        .ok()
+    }
+
+    fn reset_stream(&mut self) {
+        self.stream_id = new_research_stream_id();
+        self.batch_sequence = 0;
+        self.next_event_ordinal = 0;
+        self.first_event_ordinal = None;
+        self.first_event_timestamp_ms = None;
+        self.previous_event_timestamp_ms = None;
+    }
+}
+
+fn new_research_stream_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut seed = Vec::with_capacity(40);
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    seed.extend_from_slice(
+        &NEXT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    candidate_sha256_hex(&seed)
 }
 
 struct NativeFeedbackRuntime {
@@ -13101,6 +13220,12 @@ mod tests {
             snapshot.focus_event_range(),
             0..RESEARCH_FEEDBACK_BATCH_EPISODES
         );
+        let Some(WishJournalContext::ContinuousSpan(span)) = snapshot.journal_context() else {
+            panic!("continuous journal link missing");
+        };
+        assert_eq!(span.batch_sequence(), 0);
+        assert_eq!(span.first_event_ordinal(), 0);
+        assert_eq!(span.previous_event_gap_ms(), None);
         let identity = snapshot.runtime_identity().unwrap();
         assert_eq!(identity.module_sha256(), "cd".repeat(32));
         assert_eq!(identity.core_candidate_revision(), "research-core-v1");
@@ -13109,8 +13234,92 @@ mod tests {
             Some("research-supplement-v2")
         );
 
+        runtime.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "cd".to_owned(),
+            },
+            1_000,
+        );
+        assert!(runtime.flush_research());
+        let linked = crate::list_wish_packages(&root)
+            .unwrap()
+            .into_iter()
+            .map(|package| {
+                crate::load_wish_snapshot(&root, package.id(), &WindowsUserDataProtector).unwrap()
+            })
+            .find(|snapshot| {
+                matches!(
+                    snapshot.journal_context(),
+                    Some(WishJournalContext::ContinuousSpan(span)) if span.batch_sequence() == 1
+                )
+            })
+            .expect("second linked batch");
+        let Some(WishJournalContext::ContinuousSpan(span)) = linked.journal_context() else {
+            unreachable!();
+        };
+        assert_eq!(span.first_event_ordinal(), 8);
+        assert_eq!(span.previous_event_gap_ms(), Some(893));
+
         drop(runtime);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_wish_anchor_matches_the_continuous_stream() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-linked-wish-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let research_root = parent.join("research");
+        let wish_root = parent.join("wishes");
+        crate::set_research_feedback_enabled(&research_root, true).unwrap();
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::with_research_root(
+            research_root.clone(),
+        )));
+        let state = NativeFeedbackLanguageBarState::with_wish_root(
+            Arc::clone(&feedback),
+            Arc::new(Mutex::new(NativeFeedbackContextCache::default())),
+            Rc::new(Cell::new(InputMode::Chinese)),
+            Some(wish_root.clone()),
+        );
+        assert!(state.perform_feedback_action(FEEDBACK_MENU_START).unwrap());
+        feedback.lock().unwrap().record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "ab".to_owned(),
+            },
+            native_feedback_monotonic_ms(),
+        );
+        assert!(state.perform_feedback_action(FEEDBACK_MENU_WISH).unwrap());
+        let wish_packages = crate::list_wish_packages(&wish_root).unwrap();
+        let wish =
+            crate::load_wish_snapshot(&wish_root, wish_packages[0].id(), &WindowsUserDataProtector)
+                .unwrap();
+        let Some(WishJournalContext::WishAnchor(anchor)) = wish.journal_context() else {
+            panic!("wish journal anchor missing");
+        };
+        assert_eq!(anchor.event_ordinal(), 0);
+        let stream_id = anchor.stream_id().to_owned();
+
+        drop(state);
+        drop(feedback);
+        let research_packages = crate::list_wish_packages(&research_root).unwrap();
+        let journal = crate::load_wish_snapshot(
+            &research_root,
+            research_packages[0].id(),
+            &WindowsUserDataProtector,
+        )
+        .unwrap();
+        let Some(WishJournalContext::ContinuousSpan(span)) = journal.journal_context() else {
+            panic!("continuous journal span missing");
+        };
+        assert_eq!(span.stream_id(), stream_id);
+        assert_eq!(span.first_event_ordinal(), 0);
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

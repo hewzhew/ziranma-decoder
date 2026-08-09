@@ -8,9 +8,9 @@ use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateSource,
     NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope,
-    WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError, WishNote,
-    dispatch_wish_command, list_wish_packages, load_wish_note, load_wish_snapshot,
-    move_wish_to_trash, save_wish_note,
+    WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError,
+    WishJournalContext, WishNote, dispatch_wish_command, list_wish_packages, load_wish_note,
+    load_wish_snapshot, move_wish_to_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,6 +348,7 @@ fn show(
     } else {
         println!("运行身份：旧批次未记录");
     }
+    println!("{}", journal_context_label(snapshot.journal_context()));
     let mut previous_role = None;
     let mut previous_completed_episode = false;
     let mut context_segment = 0_usize;
@@ -378,6 +379,26 @@ fn show(
     }
     println!("原文只显示在当前终端；未写模型，未联网。");
     Ok(())
+}
+
+fn journal_context_label(context: Option<&WishJournalContext>) -> String {
+    match context {
+        Some(WishJournalContext::ContinuousSpan(span)) => format!(
+            "连续位置：流 {}… · 批次 {} · 首事件 #{}{}",
+            &span.stream_id()[..12],
+            span.batch_sequence(),
+            span.first_event_ordinal(),
+            span.previous_event_gap_ms()
+                .map(|gap_ms| format!(" · 距前批 {gap_ms} ms"))
+                .unwrap_or_default(),
+        ),
+        Some(WishJournalContext::WishAnchor(anchor)) => format!(
+            "连续位置：锚到流 {}… 的事件 #{}",
+            &anchor.stream_id()[..12],
+            anchor.event_ordinal(),
+        ),
+        None => "连续位置：旧版未记录".to_owned(),
+    }
 }
 
 fn capture_scope_label(scope: WishCaptureScope, lookback_ms: u32) -> String {
@@ -734,5 +755,23 @@ mod tests {
         assert_eq!(candidate_depth_label(0, 6, 12, false), "后面已有候选");
         assert_eq!(candidate_depth_label(6, 6, 12, true), "还可继续加载");
         assert_eq!(candidate_depth_label(6, 6, 12, false), "已到底");
+    }
+
+    #[test]
+    fn journal_context_label_keeps_linked_and_legacy_records_distinct() {
+        let span = ziranma_core::WishJournalSpan::new("12".repeat(32), 3, 24, Some(420)).unwrap();
+        let span_context = WishJournalContext::ContinuousSpan(span);
+        assert_eq!(
+            journal_context_label(Some(&span_context)),
+            "连续位置：流 121212121212… · 批次 3 · 首事件 #24 · 距前批 420 ms"
+        );
+
+        let anchor = ziranma_core::WishJournalAnchor::new("34".repeat(32), 31).unwrap();
+        let anchor_context = WishJournalContext::WishAnchor(anchor);
+        assert_eq!(
+            journal_context_label(Some(&anchor_context)),
+            "连续位置：锚到流 343434343434… 的事件 #31"
+        );
+        assert_eq!(journal_context_label(None), "连续位置：旧版未记录");
     }
 }
