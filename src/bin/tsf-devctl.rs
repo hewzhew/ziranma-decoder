@@ -3101,10 +3101,12 @@ mod tests {
         let script =
             fs::read_to_string(repository.join("scripts").join("refresh-user-tools.ps1")).unwrap();
 
-        assert!(wrapper.contains("Usage: refresh-ime.cmd [refresh^|status^|rollback]"));
+        assert!(wrapper.contains("Usage: refresh-ime.cmd [refresh^|status^|space^|rollback]"));
         assert!(wrapper.contains("-StatusOnly"));
+        assert!(wrapper.contains("-SpaceOnly"));
         assert!(wrapper.contains("-Rollback"));
         assert!(wrapper.contains("if /i \"%action%\"==\"status\" goto status"));
+        assert!(wrapper.contains("if /i \"%action%\"==\"space\" goto space"));
         assert!(wrapper.contains("if /i \"%action%\"==\"rollback\" goto rollback"));
         for tool in [
             "aliasctl",
@@ -3127,6 +3129,8 @@ mod tests {
         assert!(script.contains("ziranma-user-tools-slots-v1"));
         assert!(script.contains("ziranma-user-tools-bundle-v2"));
         assert!(script.contains("Publish-DesktopLauncher -BundleId $bundleId"));
+        assert!(script.contains("Potential reclaim:"));
+        assert!(script.contains("No files were deleted"));
         assert!(script.contains("[IO.File]::Replace"));
         assert!(script.contains("TSF DLL: unchanged"));
         assert!(!script.contains("'--lib'"));
@@ -3276,6 +3280,25 @@ mod tests {
             !root.0.exists(),
             "read-only status must not create its root"
         );
+        let space_without_root = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-SpaceOnly")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(space_without_root.status.success());
+        assert!(
+            !root.0.exists(),
+            "read-only space report must not create its root"
+        );
 
         let first = write_bundle(&root.0, "first");
         let second = write_bundle(&root.0, "second");
@@ -3283,6 +3306,55 @@ mod tests {
             "schema=ziranma-user-tools-slots-v1\r\ncurrent={second}\r\nprevious={first}\r\n"
         );
         fs::write(root.0.join("slots.zut"), &original).unwrap();
+        let _unreferenced = write_bundle(&root.0, "unreferenced");
+        fs::create_dir(root.0.join("cargo-target")).unwrap();
+        fs::write(root.0.join("cargo-target").join("cache.bin"), [0_u8; 1024]).unwrap();
+        fs::create_dir(root.0.join("probe-target")).unwrap();
+        fs::write(root.0.join("probe-target").join("probe.bin"), [0_u8; 2048]).unwrap();
+        let state_before_space = fs::read(root.0.join("slots.zut")).unwrap();
+        let builds_before_space = fs::read_dir(root.0.join("builds")).unwrap().count();
+        let space = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-SpaceOnly")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(
+            space.status.success(),
+            "space report failed: {}",
+            String::from_utf8_lossy(&space.stderr)
+        );
+        let space_stdout = String::from_utf8_lossy(&space.stdout);
+        for expected in [
+            "IME user tool disk usage",
+            "Immutable bundles: 3,",
+            "Unreferenced bundles: 1,",
+            "Other root entries: 1, 2.00 KiB (unmanaged, retained)",
+            "Potential reclaim:",
+            "No files were deleted",
+            "This action: read only",
+        ] {
+            assert!(
+                space_stdout.contains(expected),
+                "space report omitted {expected:?}: {space_stdout}"
+            );
+        }
+        assert_eq!(
+            fs::read(root.0.join("slots.zut")).unwrap(),
+            state_before_space
+        );
+        assert_eq!(
+            fs::read_dir(root.0.join("builds")).unwrap().count(),
+            builds_before_space
+        );
         let rollback = std::process::Command::new(&powershell)
             .args([
                 "-NoProfile",

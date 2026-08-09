@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$StatusOnly,
+    [switch]$SpaceOnly,
     [switch]$Rollback,
     [string]$UserToolsRoot
 )
@@ -8,8 +9,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($StatusOnly -and $Rollback) {
-    throw 'StatusOnly cannot be combined with Rollback.'
+$operationCount = [int][bool]$StatusOnly + [int][bool]$SpaceOnly + [int][bool]$Rollback
+if ($operationCount -gt 1) {
+    throw 'StatusOnly, SpaceOnly, and Rollback cannot be combined.'
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -331,6 +333,177 @@ function Short-Id {
     return $Value.Substring(0, 12)
 }
 
+function Get-DirectoryUsage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [PSCustomObject]@{
+            Bytes = [long]0
+            Files = [long]0
+            Directories = [long]0
+        }
+    }
+    Assert-NormalDirectory -Path $Path -Label $Label
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($Path)
+    [long]$bytes = 0
+    [long]$files = 0
+    [long]$directories = 0
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Label contains a reparse point; refusing an ambiguous size report."
+            }
+            if ($item.PSIsContainer) {
+                $directories++
+                $pending.Push($item.FullName)
+            } else {
+                $files++
+                $bytes += [long]$item.Length
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        Bytes = $bytes
+        Files = $files
+        Directories = $directories
+    }
+}
+
+function Format-ByteSize {
+    param([Parameter(Mandatory = $true)][long]$Bytes)
+
+    $units = @('B', 'KiB', 'MiB', 'GiB', 'TiB')
+    [double]$value = $Bytes
+    $unitIndex = 0
+    while ($value -ge 1024 -and $unitIndex -lt $units.Count - 1) {
+        $value /= 1024
+        $unitIndex++
+    }
+    if ($unitIndex -eq 0) {
+        return "$Bytes B"
+    }
+    return [string]::Format(
+        [Globalization.CultureInfo]::InvariantCulture,
+        '{0:0.00} {1}',
+        $value,
+        $units[$unitIndex]
+    )
+}
+
+function Show-SpaceUsage {
+    $state = Read-SlotState
+    $cargoUsage = Get-DirectoryUsage -Path $cargoTarget -Label 'User tool Cargo target'
+    [long]$bundleBytes = 0
+    [long]$currentBytes = 0
+    [long]$previousBytes = 0
+    [long]$unreferencedBytes = 0
+    [long]$unrecognizedBytes = 0
+    [long]$bundleCount = 0
+    [long]$unreferencedCount = 0
+    [long]$unrecognizedCount = 0
+    [long]$otherRootBytes = 0
+    [long]$otherRootCount = 0
+    [long]$auxiliaryBytes = 0
+    $currentFound = $false
+    $previousFound = $false
+
+    if (Test-Path -LiteralPath $UserToolsRoot) {
+        Assert-NormalDirectory -Path $UserToolsRoot -Label 'User tool root'
+        foreach ($item in @(Get-ChildItem -LiteralPath $UserToolsRoot -Force)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'User tool root contains a reparse point; refusing an ambiguous size report.'
+            }
+            if ($item.Name -in @('builds', 'cargo-target')) {
+                continue
+            }
+            if ($item.Name -in @('slots.zut', 'refresh.lock')) {
+                if (-not $item.PSIsContainer) {
+                    $auxiliaryBytes += [long]$item.Length
+                }
+                continue
+            }
+            if ($item.PSIsContainer) {
+                $usage = Get-DirectoryUsage -Path $item.FullName -Label 'Unmanaged user tool entry'
+                $otherRootBytes += [long]$usage.Bytes
+            } else {
+                $otherRootBytes += [long]$item.Length
+            }
+            $otherRootCount++
+        }
+    }
+
+    if (Test-Path -LiteralPath $buildsRoot) {
+        Assert-NormalDirectory -Path $buildsRoot -Label 'User tool builds root'
+        foreach ($item in @(Get-ChildItem -LiteralPath $buildsRoot -Force)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'User tool builds root contains a reparse point; refusing an ambiguous size report.'
+            }
+            if ($item.PSIsContainer) {
+                $usage = Get-DirectoryUsage -Path $item.FullName -Label 'User tool bundle entry'
+                $entryBytes = [long]$usage.Bytes
+            } else {
+                $entryBytes = [long]$item.Length
+            }
+            if ($item.PSIsContainer -and (Test-BundleId -Value $item.Name)) {
+                $bundleCount++
+                $bundleBytes += $entryBytes
+                if ($null -ne $state -and $item.Name -eq $state.Current) {
+                    $currentFound = $true
+                    $currentBytes = $entryBytes
+                } elseif ($null -ne $state -and $null -ne $state.Previous -and
+                    $item.Name -eq $state.Previous) {
+                    $previousFound = $true
+                    $previousBytes = $entryBytes
+                } else {
+                    $unreferencedCount++
+                    $unreferencedBytes += $entryBytes
+                }
+            } else {
+                $unrecognizedCount++
+                $unrecognizedBytes += $entryBytes
+            }
+        }
+    }
+
+    [long]$totalBytes = [long]$cargoUsage.Bytes + $bundleBytes + $unrecognizedBytes +
+        $otherRootBytes + $auxiliaryBytes
+    Write-Host 'IME user tool disk usage'
+    Write-Host "Root: $UserToolsRoot"
+    Write-Host "Total footprint: $(Format-ByteSize -Bytes $totalBytes)"
+    Write-Host "Cargo cache: $(Format-ByteSize -Bytes $cargoUsage.Bytes) ($($cargoUsage.Files) files; rebuildable, retained)"
+    Write-Host "Immutable bundles: $bundleCount, $(Format-ByteSize -Bytes $bundleBytes)"
+    if ($null -eq $state) {
+        Write-Host 'Current bundle: none'
+        Write-Host 'Previous bundle: none'
+    } else {
+        if ($currentFound) {
+            Write-Host "Current bundle: $(Short-Id -Value $state.Current), $(Format-ByteSize -Bytes $currentBytes)"
+        } else {
+            Write-Host "Current bundle: $(Short-Id -Value $state.Current), missing from builds"
+        }
+        if ($null -eq $state.Previous) {
+            Write-Host 'Previous bundle: none'
+        } elseif ($previousFound) {
+            Write-Host "Previous bundle: $(Short-Id -Value $state.Previous), $(Format-ByteSize -Bytes $previousBytes)"
+        } else {
+            Write-Host "Previous bundle: $(Short-Id -Value $state.Previous), missing from builds"
+        }
+    }
+    Write-Host "Unreferenced bundles: $unreferencedCount, $(Format-ByteSize -Bytes $unreferencedBytes)"
+    Write-Host "Unrecognized build entries: $unrecognizedCount, $(Format-ByteSize -Bytes $unrecognizedBytes)"
+    Write-Host "Other root entries: $otherRootCount, $(Format-ByteSize -Bytes $otherRootBytes) (unmanaged, retained)"
+    Write-Host "Potential reclaim: $(Format-ByteSize -Bytes $unreferencedBytes) (unreferenced bundles; process use not checked)"
+    Write-Host 'No files were deleted'
+    Write-Host 'TSF DLL: unchanged'
+    Write-Host 'Administrator: not required'
+    Write-Host 'This action: read only'
+}
+
 function Show-Status {
     $state = Read-SlotState
     Write-Host 'IME user tool status'
@@ -388,6 +561,11 @@ function Publish-Bundle {
 
 if ($StatusOnly) {
     Show-Status
+    exit 0
+}
+
+if ($SpaceOnly) {
+    Show-SpaceUsage
     exit 0
 }
 

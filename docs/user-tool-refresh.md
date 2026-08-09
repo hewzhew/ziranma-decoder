@@ -10,6 +10,7 @@ TSF 状态，也不要求关闭正在输入的宿主。
 ```powershell
 .\refresh-ime.cmd
 .\refresh-ime.cmd status
+.\refresh-ime.cmd space
 .\refresh-ime.cmd rollback
 ```
 
@@ -39,8 +40,15 @@ TSF 状态，也不要求关闭正在输入的宿主。
 - 构建、复制、摘要或状态校验失败时，原 current 不变。
 
 `status` 不创建目录、不构建、不读取别名、个人排序、研究批次或许愿正文，只
-复核工具槽、清单和 EXE 摘要。旧包暂不自动删除，避免清理动作误伤仍在运行的
-管理器；磁盘回收要等有明确的进程与保留策略后再设计。
+复核工具槽、清单和 EXE 摘要。`space` 同样只读，逐项报告隔离 Cargo 缓存、
+不可变工具包、current/previous、未引用工具包，以及不属于当前布局的根目录或
+builds 条目的逻辑大小。“潜在可回收”只统计未引用包，但明确提示尚未检查进程
+占用；仍用于回滚的两个包、会影响下次构建速度的 Cargo 缓存和来源不明的条目
+都不算进去。它遇到重解析点会拒绝给出含糊结果，也不会删除任何文件。
+
+旧包仍不自动删除，避免刷新动作误伤仍在运行的管理器。需要回收磁盘时先运行
+`space` 留下可核对的基线；实际清理要使用后续单独设计的显式命令，不能成为
+正常刷新过程的隐含副作用。
 
 `alias-ime.cmd`、`candidate-data.cmd`、`personal-ime.cmd`、`research-ime.cmd`
 和 `wish-ime.cmd` 通过固定白名单解析 current。还没有工具槽时，它们兼容回退
