@@ -276,6 +276,45 @@ target\release\candidatectl.exe build-phrase-layer `
 `inspect`、独立摘要 `verify` 与 Windows TSF 合成 `preflight` 均已通过。该验证
 没有采用、暂存、启用或安装短语层。
 
+双字覆盖包与固定短语层可以在采用前合成为一个新的不可变公开包，而不占用第二个
+运行时补充槽。`merge-public-packages` 会先完整加载两边的清单、provenance 和
+载荷，拒绝明文私人包、认证漂移及格式损坏；随后保持基础包顺序不变，只把叠加包
+中尚不存在的 `(文字, 规范双拼码)` 身份按原顺序追加。相同来源 ID 的四项声明
+必须完全一致，否则失败；所有不同来源会去重后写入新的 v2 provenance。合并结果
+仍受 131,072 条和 16 MiB 的固定快照边界约束：
+
+```powershell
+target\release\candidatectl.exe merge-public-packages `
+  --base .local\public-audit\wanxiang-fdda7afb\package-top76300-plus-bigram-cover-v2 `
+  --overlay .local\public-audit\wanxiang-fdda7afb\package-phrase-layer-top10k-v1 `
+  --output .local\public-audit\wanxiang-fdda7afb\package-bigram-cover-plus-phrase-top10k-v1 `
+  --revision wanxiang-fdda7afb-bigram-cover-plus-phrase-top10k-v1 `
+  --public
+```
+
+输出目录必须尚不存在，命令不会覆盖、安装、暂存或切换候选槽。完整校验和合并均
+在创建目录之前完成；写入期间任一步失败时会清理未完成的新目录。叠加包不能覆盖
+基础包已有身份的拼音、频率或顺序，因此该操作不是跨来源权重混合。生成后可用
+`package-query --package <PACKAGE_DIR> --code <KEYS> --limit <N>` 直接做只读候选
+检查，无需先复制进候选槽；它拒绝私人包，也不加载个人数据或运行时重排。
+
+固定两包的实际合并结果为 130,000 条、3,113,973 字节，包认证 SHA-256 为
+`285dd1cb7b87cb86b310eba5b4b80053324a91703d14f681c15e869cc981988c`。
+`inspect`、独立摘要 `verify` 和 TSF 合成 `preflight` 均通过；四组既有完整码
+控制的前七项与基础包逐项相同。目标查询也揭示了选择边界：双字覆盖层让
+`bgdr` 的“绷断”成为首选，但 `blklrbsv` 的“掰开揉碎”并不在固定短语
+allowlist，因而也不在 10,000 条短语层；`wutijc` 的“误提交”同样没有被
+该层解决。`jichu.dict.yaml` 中出现某个词面，不等于它已通过固定短语集合与
+配额两道选择。合并包因此继续保持未采用，不能把生成成功写成三个目标都已修复。
+
+以日用核心和该 130,000 条合并包运行 release 热路径时，本机一次索引建立约
+210/561 ms（核心/补充）；140 个预热查询的核心与启用补充 median 约
+5.86/5.55 ms、p95 约 13.77/13.68 ms，核心完整码首选变化为 0。固定 UD
+组合审计的 128 条正样本由基础 Top-7 32 提高到 89，但 128 条全核心负对照有
+1 条原可见目标掉出 Top-7。样本集合会随补充载荷改变，这些数字不能与旧 120k
+包直接作逐项因果比较；它们足以否定“合并无代价即可换代”，后续需先补来源覆盖
+审计和负对照门槛。
+
 随后新增的 `phrase-layer-audit` 会在内存中建立基础、5,000 条和 10,000 条三个
 真实 `CandidateSnapshot`，让新增目标走现有交互候选合并路径。它把新增目标与
 基础稳定性对照分开，完整检查所有 10,000 条配额命中的 UD 四字目标；基础对照

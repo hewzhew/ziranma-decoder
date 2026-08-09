@@ -31,7 +31,7 @@ use ziranma_core::{
     FourCharacterCorrectionKeepReason, LexiconEntry, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
     MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
     MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
     MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
@@ -86,6 +86,12 @@ enum Options {
         config: PublicRimeSliceConfig,
     },
     BuildPhraseLayer(Box<PhraseLayerBuildOptions>),
+    MergePublicPackages {
+        base: PathBuf,
+        overlay: PathBuf,
+        output: PathBuf,
+        revision: String,
+    },
     Compare {
         base_payload: PathBuf,
         challenger_payload: PathBuf,
@@ -146,6 +152,11 @@ enum Options {
     },
     Preflight {
         package: PathBuf,
+    },
+    PackageQuery {
+        package: PathBuf,
+        code: String,
+        limit: usize,
     },
     Verify {
         package: PathBuf,
@@ -289,6 +300,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base_declaration: &base_declaration,
             })?
         }
+        Options::MergePublicPackages {
+            base,
+            overlay,
+            output,
+            revision,
+        } => merge_public_packages(&base, &overlay, &output, &revision)?,
         Options::Compare {
             base_payload,
             challenger_payload,
@@ -382,6 +399,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => supplement_enable(&root, exact_promotions)?,
         Options::SupplementDisable { root } => supplement_disable(&root)?,
         Options::Preflight { package } => preflight(&package)?,
+        Options::PackageQuery {
+            package,
+            code,
+            limit,
+        } => public_package_query(&package, &code, limit)?,
         Options::Verify {
             package,
             expected_sha256,
@@ -446,6 +468,7 @@ fn parse_options(
         "build-rime" => parse_build(arguments, true),
         "build-rime-slice" => parse_build_rime_slice(arguments),
         "build-phrase-layer" => parse_build_phrase_layer(arguments),
+        "merge-public-packages" => parse_merge_public_packages(arguments),
         "compare" => parse_compare(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
@@ -463,6 +486,7 @@ fn parse_options(
         "preflight" => Ok(Options::Preflight {
             package: parse_package_only(arguments, "preflight")?,
         }),
+        "package-query" => parse_package_query(arguments),
         "verify" => {
             let (package, expected_sha256) =
                 parse_package_and_expected_sha256(arguments, "verify")?;
@@ -824,6 +848,42 @@ fn parse_build_phrase_layer(
     )))
 }
 
+fn parse_merge_public_packages(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut base = None;
+    let mut overlay = None;
+    let mut output = None;
+    let mut revision = None;
+    let mut public = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--base" => set_path(&mut base, &mut arguments, "--base")?,
+            "--overlay" => set_path(&mut overlay, &mut arguments, "--overlay")?,
+            "--output" => set_path(&mut output, &mut arguments, "--output")?,
+            "--revision" => set_value(&mut revision, &mut arguments, "--revision")?,
+            "--public" => {
+                if public {
+                    return Err("--public can be given only once".into());
+                }
+                public = true;
+            }
+            _ => {
+                return Err("unknown merge-public-packages argument; value was suppressed".into());
+            }
+        }
+    }
+    if !public {
+        return Err("merge-public-packages requires explicit --public".into());
+    }
+    Ok(Options::MergePublicPackages {
+        base: base.ok_or("merge-public-packages requires --base")?,
+        overlay: overlay.ok_or("merge-public-packages requires --overlay")?,
+        output: output.ok_or("merge-public-packages requires --output")?,
+        revision: revision.ok_or("merge-public-packages requires --revision")?,
+    })
+}
+
 fn parse_compare(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -998,6 +1058,35 @@ fn parse_runtime_query(
     Ok(Options::RuntimeQuery {
         root: root.ok_or("runtime-query requires --root")?,
         supplemental_root,
+        code,
+        limit,
+    })
+}
+
+fn parse_package_query(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut package = None;
+    let mut code = None;
+    let mut limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--code" => set_value(&mut code, &mut arguments, "--code")?,
+            "--limit" => set_usize(&mut limit, &mut arguments, "--limit")?,
+            _ => return Err("unknown package-query argument; value was suppressed".into()),
+        }
+    }
+    let code = code.ok_or("package-query requires --code")?;
+    if code.is_empty() || code.len() > 64 || !code.as_bytes().iter().all(u8::is_ascii_lowercase) {
+        return Err("package-query --code must be 1..64 lowercase ASCII letters".into());
+    }
+    let limit = limit.ok_or("package-query requires --limit")?;
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&limit) {
+        return Err("package-query --limit is outside the fixed bound".into());
+    }
+    Ok(Options::PackageQuery {
+        package: package.ok_or("package-query requires --package")?,
         code,
         limit,
     })
@@ -1405,6 +1494,9 @@ fn print_usage() {
     eprintln!(
         "  build-phrase-layer --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --allowlist-id <ID> --allowlist-license <SPDX> --allowlist-url <HTTPS_URL> --allowlist-sha256 <SHA256> --base-id <ID> --base-license <SPDX> --base-url <HTTPS_URL> --base-sha256 <SHA256> --public"
     );
+    eprintln!(
+        "  merge-public-packages --base <PACKAGE_DIR> --overlay <PACKAGE_DIR> --output <NEW_PACKAGE_DIR> --revision <REV> --public"
+    );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
@@ -1428,6 +1520,9 @@ fn print_usage() {
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
     eprintln!("  supplement-disable --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  preflight --package <PACKAGE_DIR>");
+    eprintln!(
+        "  package-query --package <PUBLIC_PACKAGE_DIR> --code <LOWERCASE_KEYS> --limit <1..50>"
+    );
     eprintln!("  verify --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
         "  verify-signature --package <PACKAGE_DIR> --signature <STATEMENT> --trusted-public-key <ED25519_HEX>"
@@ -1469,6 +1564,31 @@ fn inspect(
     provenance.validate_materials(&manifest_text, &payload_text)?;
     let snapshot = manifest.load_snapshot(&payload_text)?;
     Ok(render_inspect_report(&snapshot, &provenance))
+}
+
+fn public_package_query(
+    package: &Path,
+    code: &str,
+    limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_public_package_directory(package)?;
+    let candidates = loaded.snapshot.candidate_texts(code, limit)?;
+    let mut output = String::new();
+    writeln!(output, "公开候选包查询")?;
+    writeln!(output, "版本：{}", loaded.snapshot.revision())?;
+    writeln!(output, "输入：{code}")?;
+    for (index, candidate) in candidates.iter().enumerate() {
+        writeln!(output, "{}. {}", index + 1, candidate)?;
+    }
+    if candidates.is_empty() {
+        writeln!(output, "（没有候选）")?;
+    }
+    writeln!(
+        output,
+        "口径：仅查询已验证的公开包；不加载个人数据或运行时重排。"
+    )?;
+    writeln!(output, "本次操作：只读")?;
+    Ok(output)
 }
 
 fn build_public_package(
@@ -1653,6 +1773,112 @@ fn build_phrase_layer_public_package(
         entry_limit,
     )?;
     Ok(report)
+}
+
+struct MergedPublicLexicon {
+    payload: String,
+    base_entries: usize,
+    overlay_entries: usize,
+    appended_entries: usize,
+    duplicate_entries: usize,
+}
+
+fn merge_public_packages(
+    base: &Path,
+    overlay: &Path,
+    output: &Path,
+    revision: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Refuse an existing destination before doing the comparatively expensive
+    // package loads. The writer repeats this check immediately before creation.
+    ensure_path_absent(output, "package output")?;
+    let base = load_public_package_directory(base)?;
+    let overlay = load_public_package_directory(overlay)?;
+    let materials = merge_public_source_materials(&base.provenance, &overlay.provenance)?;
+    let merged = merge_public_lexicon_payloads(
+        &base.payload_text,
+        &overlay.payload_text,
+        MAX_CANDIDATE_SNAPSHOT_ENTRIES,
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let mut report =
+        write_multi_source_public_package(output, revision, materials, &merged.payload)?;
+    writeln!(
+        report,
+        "公开包合并：基础 {} 条；叠加 {} 条；新增 {} 条；重复 {} 条",
+        merged.base_entries,
+        merged.overlay_entries,
+        merged.appended_entries,
+        merged.duplicate_entries,
+    )?;
+    writeln!(report, "顺序：基础保持不变；新增项按叠加包原顺序追加")?;
+    Ok(report)
+}
+
+fn merge_public_source_materials(
+    base: &CandidatePackageProvenance,
+    overlay: &CandidatePackageProvenance,
+) -> Result<Vec<CandidateSourceMaterial>, Box<dyn std::error::Error>> {
+    let mut by_id = HashMap::<String, CandidateSourceMaterial>::new();
+    for material in base
+        .source_materials()
+        .iter()
+        .chain(overlay.source_materials())
+    {
+        if let Some(existing) = by_id.get(material.id()) {
+            if existing != material {
+                return Err("public package source declarations conflict for one source id".into());
+            }
+            continue;
+        }
+        by_id.insert(material.id().to_owned(), material.clone());
+    }
+    let materials = by_id.into_values().collect::<Vec<_>>();
+    if materials.len() < 2 {
+        return Err("merged public package requires at least two distinct source materials".into());
+    }
+    Ok(materials)
+}
+
+fn merge_public_lexicon_payloads(
+    base_payload: &str,
+    overlay_payload: &str,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<MergedPublicLexicon, Box<dyn std::error::Error>> {
+    let mut base_entries = parse_lexicon_tsv(base_payload)?;
+    let overlay_entries = parse_lexicon_tsv(overlay_payload)?;
+    let base_entry_count = base_entries.len();
+    let overlay_entry_count = overlay_entries.len();
+    let mut identities = base_entries
+        .iter()
+        .map(|entry| (entry.text.clone(), entry.code.as_str().to_owned()))
+        .collect::<HashSet<_>>();
+    let mut appended_entries = 0;
+    let mut duplicate_entries = 0;
+    for entry in overlay_entries {
+        let identity = (entry.text.clone(), entry.code.as_str().to_owned());
+        if identities.insert(identity) {
+            base_entries.push(entry);
+            appended_entries += 1;
+        } else {
+            duplicate_entries += 1;
+        }
+    }
+    if base_entries.len() > max_entries {
+        return Err("merged public package exceeds the fixed entry limit".into());
+    }
+    let payload = serialize_lexicon_payload(&base_entries);
+    if payload.len() > max_bytes {
+        return Err("merged public package exceeds the fixed payload byte limit".into());
+    }
+    Ok(MergedPublicLexicon {
+        payload,
+        base_entries: base_entry_count,
+        overlay_entries: overlay_entry_count,
+        appended_entries,
+        duplicate_entries,
+    })
 }
 
 fn verified_source_material(
@@ -5807,6 +6033,66 @@ mod tests {
     }
 
     #[test]
+    fn public_package_merge_parser_requires_explicit_public_inputs() {
+        let arguments = [
+            "merge-public-packages",
+            "--base",
+            "base-package",
+            "--overlay",
+            "overlay-package",
+            "--output",
+            "merged-package",
+            "--revision",
+            "merged-v1",
+            "--public",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            parse_options(arguments.clone()).unwrap(),
+            Options::MergePublicPackages {
+                base: PathBuf::from("base-package"),
+                overlay: PathBuf::from("overlay-package"),
+                output: PathBuf::from("merged-package"),
+                revision: "merged-v1".to_owned(),
+            }
+        );
+        assert!(parse_options(arguments[..arguments.len() - 1].to_vec()).is_err());
+    }
+
+    #[test]
+    fn public_package_query_parser_is_bounded() {
+        assert_eq!(
+            parse_options([
+                "package-query".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--code".to_owned(),
+                "bgdr".to_owned(),
+                "--limit".to_owned(),
+                "7".to_owned(),
+            ])
+            .unwrap(),
+            Options::PackageQuery {
+                package: PathBuf::from("package"),
+                code: "bgdr".to_owned(),
+                limit: 7,
+            }
+        );
+        assert!(
+            parse_options([
+                "package-query".to_owned(),
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--code".to_owned(),
+                "BGDR".to_owned(),
+                "--limit".to_owned(),
+                "7".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn length_coverage_report_is_aggregate_only_and_requires_holdout() {
         const BASE: &str = "text\tpinyin\tfrequency\n双字\tshuang zi\t10\n三字词\tsan zi ci\t9\n";
         const CHALLENGER: &str =
@@ -6644,6 +6930,146 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_package_merge_preserves_base_order_and_deduplicates_identity() {
+        const BASE: &str = "text\tpinyin\tfrequency\n甲\tjia\t30\n乙\tyi\t20\n";
+        const OVERLAY: &str = "text\tpinyin\tfrequency\n乙\tyi\t999\n丙\tbing\t10\n";
+        const EXPECTED: &str = "text\tpinyin\tfrequency\n甲\tjia\t30\n乙\tyi\t20\n丙\tbing\t10\n";
+        let root = temporary_test_root();
+        let base = root.join("base");
+        let overlay = root.join("overlay");
+        let merged = root.join("merged");
+        fs::create_dir(&root).unwrap();
+        write_public_package(
+            &base,
+            "base-v1",
+            &phrase_material_declaration("base-source", BASE),
+            BASE,
+        )
+        .unwrap();
+        write_public_package(
+            &overlay,
+            "overlay-v1",
+            &phrase_material_declaration("overlay-source", OVERLAY),
+            OVERLAY,
+        )
+        .unwrap();
+
+        let report = merge_public_packages(&base, &overlay, &merged, "merged-v1").unwrap();
+        let loaded = load_public_package_directory(&merged).unwrap();
+        assert_eq!(loaded.payload_text, EXPECTED);
+        assert_eq!(loaded.provenance.source_count(), 2);
+        assert_eq!(loaded.snapshot.entry_count(), 3);
+        assert!(report.contains("基础 2 条；叠加 2 条；新增 1 条；重复 1 条"));
+        assert!(!report.contains('甲'));
+        assert!(preflight(&merged).unwrap().contains("结果：通过"));
+        let query = public_package_query(&merged, "jx", 3).unwrap();
+        assert!(query.contains("1. 甲"));
+        assert!(query.contains("本次操作：只读"));
+        assert!(merge_public_packages(&base, &overlay, &merged, "again-v1").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_package_merge_rejects_conflicting_sources_before_creating_output() {
+        const BASE: &str = "text\tpinyin\tfrequency\n甲\tjia\t30\n";
+        const OVERLAY: &str = "text\tpinyin\tfrequency\n乙\tyi\t20\n";
+        let root = temporary_test_root();
+        let base = root.join("base");
+        let overlay = root.join("overlay");
+        let merged = root.join("merged");
+        fs::create_dir(&root).unwrap();
+        write_public_package(&base, "base-v1", &test_declaration(BASE), BASE).unwrap();
+        write_public_package(&overlay, "overlay-v1", &test_declaration(OVERLAY), OVERLAY).unwrap();
+
+        assert!(merge_public_packages(&base, &overlay, &merged, "merged-v1").is_err());
+        assert!(!merged.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_package_merge_rejects_private_and_corrupted_inputs_fail_closed() {
+        const PUBLIC: &str = "text\tpinyin\tfrequency\n甲\tjia\t30\n";
+        const PRIVATE: &str = "text\tpinyin\tfrequency\n乙\tyi\t20\n";
+        let root = temporary_test_root();
+        let public = root.join("public");
+        let private = root.join("private");
+        let corrupted = root.join("corrupted");
+        let private_output = root.join("private-output");
+        let corrupted_output = root.join("corrupted-output");
+        fs::create_dir(&root).unwrap();
+        write_public_package(
+            &public,
+            "public-v1",
+            &phrase_material_declaration("public-source", PUBLIC),
+            PUBLIC,
+        )
+        .unwrap();
+
+        fs::create_dir(&private).unwrap();
+        let private_manifest = CandidatePackageManifest::from_payload("private-v1", true, PRIVATE)
+            .unwrap()
+            .render();
+        let private_provenance = CandidatePackageProvenance::from_materials(
+            "private-source",
+            "MIT",
+            "https://example.com/private-source",
+            &candidate_sha256_hex(PRIVATE.as_bytes()),
+            &private_manifest,
+            PRIVATE,
+        )
+        .unwrap()
+        .render();
+        fs::write(private.join(CANDIDATE_PACKAGE_PAYLOAD_FILE), PRIVATE).unwrap();
+        fs::write(
+            private.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
+            private_manifest,
+        )
+        .unwrap();
+        fs::write(
+            private.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            private_provenance,
+        )
+        .unwrap();
+        assert!(merge_public_packages(&public, &private, &private_output, "merged-v1").is_err());
+        assert!(public_package_query(&private, "yi", 3).is_err());
+        assert!(!private_output.exists());
+
+        write_public_package(
+            &corrupted,
+            "corrupted-v1",
+            &phrase_material_declaration("corrupted-source", PRIVATE),
+            PRIVATE,
+        )
+        .unwrap();
+        fs::write(
+            corrupted.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+            "text\tpinyin\tfrequency\n丙\tbing\t10\n",
+        )
+        .unwrap();
+        assert!(
+            merge_public_packages(&public, &corrupted, &corrupted_output, "merged-v1").is_err()
+        );
+        assert!(!corrupted_output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_lexicon_merge_checks_entry_and_byte_limits() {
+        const BASE: &str = "text\tpinyin\tfrequency\n甲\tjia\t30\n乙\tyi\t20\n";
+        const OVERLAY: &str = "text\tpinyin\tfrequency\n丙\tbing\t10\n";
+        let merged = merge_public_lexicon_payloads(BASE, OVERLAY, 3, usize::MAX).unwrap();
+        assert_eq!(merged.appended_entries, 1);
+        assert!(merge_public_lexicon_payloads(BASE, OVERLAY, 2, usize::MAX).is_err());
+        assert!(
+            merge_public_lexicon_payloads(BASE, OVERLAY, usize::MAX, merged.payload.len() - 1)
+                .is_err()
+        );
     }
 
     #[test]
