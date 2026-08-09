@@ -32,11 +32,24 @@ pub struct PublicRimeSliceConfig {
     pub max_entries: usize,
     /// Entries reserved for the ordinary global source-weight frontier.
     ///
-    /// Any remaining capacity is used to retain the strongest public
-    /// two-character whole word for canonical full codes that the global
-    /// frontier did not cover. Setting this equal to [`Self::max_entries`]
-    /// preserves the original pure Top-N selection.
+    /// Explicit three/four-character quotas are applied next; any remaining
+    /// capacity retains the strongest public two-character whole word for
+    /// canonical full codes that the global frontier did not cover. Setting
+    /// this equal to [`Self::max_entries`] preserves pure Top-N selection.
     pub frequency_frontier_entries: usize,
+    /// Maximum missing three-character codes represented after the global
+    /// frontier and before the two-character coverage reserve.
+    ///
+    /// The default CLI value is zero, so existing slice commands retain their
+    /// original selection. Each admitted row represents one canonical code.
+    pub three_character_coverage_entries: usize,
+    /// Maximum missing four-character codes represented after the global
+    /// frontier and before the two-character coverage reserve.
+    ///
+    /// The default CLI value is zero. Together with the three-character quota,
+    /// this remains inside [`Self::max_entries`] rather than enlarging a
+    /// runtime snapshot.
+    pub four_character_coverage_entries: usize,
     /// Maximum number of Han characters in one retained entry.
     pub max_text_characters: usize,
 }
@@ -73,8 +86,16 @@ pub struct PublicRimeSliceImportStats {
     pub eligible_rows: usize,
     /// Unique canonical full codes represented by eligible two-character rows.
     pub eligible_two_character_codes: usize,
+    /// Unique canonical full codes represented by eligible three-character rows.
+    pub eligible_three_character_codes: usize,
+    /// Unique canonical full codes represented by eligible four-character rows.
+    pub eligible_four_character_codes: usize,
     /// Unique two-character codes already represented by the global frontier.
     pub frequency_frontier_two_character_codes: usize,
+    /// Unique three-character codes represented by the global frontier.
+    pub frequency_frontier_three_character_codes: usize,
+    /// Unique four-character codes represented by the global frontier.
+    pub frequency_frontier_four_character_codes: usize,
     /// Global source-weight rows retained before identity deduplication.
     pub frequency_frontier_selected_rows: usize,
     /// Missing two-character codes considered for the coverage reserve.
@@ -83,8 +104,24 @@ pub struct PublicRimeSliceImportStats {
     pub two_character_coverage_admitted: usize,
     /// Coverage candidates that did not fit within the overall entry cap.
     pub two_character_coverage_dropped: usize,
+    /// Missing three-character codes considered for their explicit quota.
+    pub three_character_coverage_candidates: usize,
+    /// Three-character code representatives admitted by their explicit quota.
+    pub three_character_coverage_admitted: usize,
+    /// Three-character coverage candidates outside their explicit quota.
+    pub three_character_coverage_dropped: usize,
+    /// Missing four-character codes considered for their explicit quota.
+    pub four_character_coverage_candidates: usize,
+    /// Four-character code representatives admitted by their explicit quota.
+    pub four_character_coverage_admitted: usize,
+    /// Four-character coverage candidates outside their explicit quota.
+    pub four_character_coverage_dropped: usize,
     /// Additional global-frequency rows admitted after code coverage.
     pub frequency_backfill_admitted: usize,
+    /// Unique three-character codes represented by the final slice.
+    pub imported_three_character_codes: usize,
+    /// Unique four-character codes represented by the final slice.
+    pub imported_four_character_codes: usize,
     /// Eligible rows outside the bounded best-weight frontier.
     pub dropped_by_entry_cap: usize,
     /// Duplicate text/code identities removed from the selected frontier.
@@ -369,6 +406,19 @@ struct RankedEntry {
     entry: LexiconEntry,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RankedEntryReference {
+    source_line: usize,
+    frequency: u64,
+}
+
+impl RankedEntryReference {
+    fn is_better_than(self, other: Self) -> bool {
+        self.frequency > other.frequency
+            || (self.frequency == other.frequency && self.source_line < other.source_line)
+    }
+}
+
 impl RankedEntry {
     fn is_better_than(&self, other: &Self) -> bool {
         self.entry.frequency > other.entry.frequency
@@ -401,6 +451,89 @@ impl Ord for RankedEntry {
     }
 }
 
+fn retain_best_ranked_reference(
+    entries: &mut HashMap<KeySequence, RankedEntryReference>,
+    code: KeySequence,
+    candidate: RankedEntryReference,
+) {
+    match entries.entry(code) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            if candidate.is_better_than(*slot.get()) {
+                slot.insert(candidate);
+            }
+        }
+    }
+}
+
+fn select_ranked_coverage_references(
+    entries: HashMap<KeySequence, RankedEntryReference>,
+    frequency_frontier_codes: &HashSet<KeySequence>,
+) -> Vec<RankedEntryReference> {
+    let mut selected = entries
+        .into_iter()
+        .filter_map(|(code, reference)| {
+            (!frequency_frontier_codes.contains(&code)).then_some(reference)
+        })
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by(|left, right| {
+        right
+            .frequency
+            .cmp(&left.frequency)
+            .then_with(|| left.source_line.cmp(&right.source_line))
+    });
+    selected
+}
+
+fn materialize_ranked_entries(contents: &str, source_lines: &HashSet<usize>) -> Vec<RankedEntry> {
+    if source_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut entries = Vec::with_capacity(source_lines.len());
+    for (zero_based_line, raw_line) in contents.lines().enumerate() {
+        let source_line = zero_based_line + 1;
+        if !source_lines.contains(&source_line) {
+            continue;
+        }
+        let line = raw_line.trim_end_matches('\r');
+        let mut fields = line.split('\t');
+        let text = fields
+            .next()
+            .expect("a selected public source row retains its text field");
+        let toned_pinyin = fields
+            .next()
+            .expect("a selected public source row retains its pinyin field");
+        let frequency = fields
+            .next()
+            .expect("a selected public source row retains its weight field")
+            .parse::<u64>()
+            .expect("a selected public source row retains its validated positive weight");
+        debug_assert!(fields.next().is_none());
+        let pinyin = normalize_pinyin_tone_marks(toned_pinyin)
+            .expect("a selected public source row retains its validated pinyin");
+        let encoded = encode_pinyin_phrase(&pinyin)
+            .expect("a selected public source row retains its encodable pinyin");
+        entries.push(RankedEntry {
+            source_line,
+            entry: LexiconEntry {
+                text: text.to_owned(),
+                pinyin,
+                code: encoded.full_code,
+                syllable_codes: encoded.syllable_codes,
+                frequency,
+            },
+        });
+    }
+    assert_eq!(
+        entries.len(),
+        source_lines.len(),
+        "every selected public source row remains materializable"
+    );
+    entries
+}
+
 /// Selects a deterministic, Han-only, exact-syllable slice from a large
 /// public Rime dictionary with Unicode tone marks.
 pub fn parse_public_rime_slice(
@@ -412,6 +545,9 @@ pub fn parse_public_rime_slice(
     let mut saw_data_marker = false;
     let mut global_frontier = BinaryHeap::<RankedEntry>::with_capacity(config.max_entries);
     let mut best_two_character_entry_by_code = HashMap::<KeySequence, RankedEntry>::new();
+    let mut best_three_character_entry_by_code =
+        HashMap::<KeySequence, RankedEntryReference>::new();
+    let mut best_four_character_entry_by_code = HashMap::<KeySequence, RankedEntryReference>::new();
     let mut stats = PublicRimeSliceImportStats::default();
 
     for (zero_based_line, raw_line) in contents.lines().enumerate() {
@@ -504,6 +640,24 @@ pub fn parse_public_rime_slice(
                     }
                 }
             }
+        } else if text_characters == 3 {
+            retain_best_ranked_reference(
+                &mut best_three_character_entry_by_code,
+                ranked.entry.code.clone(),
+                RankedEntryReference {
+                    source_line,
+                    frequency: weight,
+                },
+            );
+        } else if text_characters == 4 {
+            retain_best_ranked_reference(
+                &mut best_four_character_entry_by_code,
+                ranked.entry.code.clone(),
+                RankedEntryReference {
+                    source_line,
+                    frequency: weight,
+                },
+            );
         }
         if global_frontier.len() < config.max_entries {
             global_frontier.push(ranked);
@@ -523,6 +677,8 @@ pub fn parse_public_rime_slice(
         return Err(PublicRimeSliceError::MissingDataMarker);
     }
     stats.eligible_two_character_codes = best_two_character_entry_by_code.len();
+    stats.eligible_three_character_codes = best_three_character_entry_by_code.len();
+    stats.eligible_four_character_codes = best_four_character_entry_by_code.len();
     let mut global_frontier = global_frontier.into_vec();
     global_frontier.sort_by(|left, right| {
         right
@@ -556,6 +712,60 @@ pub fn parse_public_rime_slice(
         .map(|ranked| ranked.entry.code.clone())
         .collect::<HashSet<_>>();
     stats.frequency_frontier_two_character_codes = frequency_frontier_codes.len();
+    let frequency_frontier_three_character_codes = selected
+        .iter()
+        .filter(|ranked| ranked.entry.syllable_codes.len() == 3)
+        .map(|ranked| ranked.entry.code.clone())
+        .collect::<HashSet<_>>();
+    stats.frequency_frontier_three_character_codes = frequency_frontier_three_character_codes.len();
+    let frequency_frontier_four_character_codes = selected
+        .iter()
+        .filter(|ranked| ranked.entry.syllable_codes.len() == 4)
+        .map(|ranked| ranked.entry.code.clone())
+        .collect::<HashSet<_>>();
+    stats.frequency_frontier_four_character_codes = frequency_frontier_four_character_codes.len();
+
+    let mut three_character_coverage = select_ranked_coverage_references(
+        best_three_character_entry_by_code,
+        &frequency_frontier_three_character_codes,
+    );
+    stats.three_character_coverage_candidates = three_character_coverage.len();
+    three_character_coverage.truncate(config.three_character_coverage_entries);
+    stats.three_character_coverage_admitted = three_character_coverage.len();
+    stats.three_character_coverage_dropped = stats
+        .three_character_coverage_candidates
+        .saturating_sub(stats.three_character_coverage_admitted);
+
+    let mut four_character_coverage = select_ranked_coverage_references(
+        best_four_character_entry_by_code,
+        &frequency_frontier_four_character_codes,
+    );
+    stats.four_character_coverage_candidates = four_character_coverage.len();
+    four_character_coverage.truncate(config.four_character_coverage_entries);
+    stats.four_character_coverage_admitted = four_character_coverage.len();
+    stats.four_character_coverage_dropped = stats
+        .four_character_coverage_candidates
+        .saturating_sub(stats.four_character_coverage_admitted);
+
+    let three_character_source_lines = three_character_coverage
+        .iter()
+        .map(|reference| reference.source_line)
+        .collect::<HashSet<_>>();
+    let four_character_source_lines = four_character_coverage
+        .iter()
+        .map(|reference| reference.source_line)
+        .collect::<HashSet<_>>();
+    let selected_long_source_lines = three_character_source_lines
+        .union(&four_character_source_lines)
+        .copied()
+        .collect::<HashSet<_>>();
+    for ranked in materialize_ranked_entries(contents, &selected_long_source_lines) {
+        let identity = (ranked.entry.text.clone(), ranked.entry.code.clone());
+        if identities.insert(identity) {
+            selected_source_lines.insert(ranked.source_line);
+            selected.push(ranked);
+        }
+    }
     let mut coverage = best_two_character_entry_by_code
         .into_iter()
         .filter(|(code, _)| !frequency_frontier_codes.contains(code))
@@ -604,6 +814,18 @@ pub fn parse_public_rime_slice(
             .cmp(&left.entry.frequency)
             .then_with(|| left.source_line.cmp(&right.source_line))
     });
+    stats.imported_three_character_codes = selected
+        .iter()
+        .filter(|ranked| ranked.entry.syllable_codes.len() == 3)
+        .map(|ranked| ranked.entry.code.clone())
+        .collect::<HashSet<_>>()
+        .len();
+    stats.imported_four_character_codes = selected
+        .iter()
+        .filter(|ranked| ranked.entry.syllable_codes.len() == 4)
+        .map(|ranked| ranked.entry.code.clone())
+        .collect::<HashSet<_>>()
+        .len();
     stats.dropped_by_entry_cap = stats
         .eligible_rows
         .saturating_sub(selected.len().saturating_add(stats.selected_duplicate_rows));
@@ -633,6 +855,15 @@ fn validate_config(config: PublicRimeSliceConfig) -> Result<(), PublicRimeSliceE
     {
         return Err(PublicRimeSliceError::InvalidFrequencyFrontierLimit);
     }
+    if config
+        .three_character_coverage_entries
+        .saturating_add(config.four_character_coverage_entries)
+        > config
+            .max_entries
+            .saturating_sub(config.frequency_frontier_entries)
+    {
+        return Err(PublicRimeSliceError::InvalidLongWordCoverageLimit);
+    }
     Ok(())
 }
 
@@ -654,6 +885,8 @@ pub enum PublicRimeSliceError {
     InvalidEntryLimit,
     /// The global frequency frontier is zero or exceeds the total entry cap.
     InvalidFrequencyFrontierLimit,
+    /// Explicit three/four-character coverage exceeds post-frontier capacity.
+    InvalidLongWordCoverageLimit,
     /// The text-length cap is zero or above the decoder's fixed bound.
     InvalidTextLimit,
     /// No YAML document start marker was found.
@@ -670,6 +903,9 @@ impl fmt::Display for PublicRimeSliceError {
             Self::InvalidEntryLimit => write!(formatter, "公开词表裁剪的词条上限无效"),
             Self::InvalidFrequencyFrontierLimit => {
                 write!(formatter, "公开词表裁剪的全局高频前沿上限无效")
+            }
+            Self::InvalidLongWordCoverageLimit => {
+                write!(formatter, "公开词表裁剪的三字、四字覆盖配额超出剩余容量")
             }
             Self::InvalidTextLimit => write!(formatter, "公开词表裁剪的文字长度上限无效"),
             Self::MissingDocumentStart => write!(formatter, "公开 Rime 词表缺少 YAML 起始标记 ---"),
@@ -701,6 +937,8 @@ A词\ta cí\t100\n\
             PublicRimeSliceConfig {
                 max_entries: 3,
                 frequency_frontier_entries: 3,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 4,
             },
         )
@@ -740,6 +978,8 @@ A词\ta cí\t100\n\
             PublicRimeSliceConfig {
                 max_entries: 4,
                 frequency_frontier_entries: 4,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 4,
             },
         )
@@ -758,6 +998,8 @@ A词\ta cí\t100\n\
             validate_config(PublicRimeSliceConfig {
                 max_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
                 frequency_frontier_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 1,
             })
             .is_ok()
@@ -766,6 +1008,8 @@ A词\ta cí\t100\n\
             validate_config(PublicRimeSliceConfig {
                 max_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES + 1,
                 frequency_frontier_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 1,
             }),
             Err(PublicRimeSliceError::InvalidEntryLimit)
@@ -774,9 +1018,21 @@ A词\ta cí\t100\n\
             validate_config(PublicRimeSliceConfig {
                 max_entries: 10,
                 frequency_frontier_entries: 11,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 1,
             }),
             Err(PublicRimeSliceError::InvalidFrequencyFrontierLimit)
+        );
+        assert_eq!(
+            validate_config(PublicRimeSliceConfig {
+                max_entries: 10,
+                frequency_frontier_entries: 9,
+                three_character_coverage_entries: 1,
+                four_character_coverage_entries: 1,
+                max_text_characters: 1,
+            }),
+            Err(PublicRimeSliceError::InvalidLongWordCoverageLimit)
         );
         assert_eq!(
             parse_public_rime_slice(
@@ -784,6 +1040,8 @@ A词\ta cí\t100\n\
                 PublicRimeSliceConfig {
                     max_entries: 0,
                     frequency_frontier_entries: 0,
+                    three_character_coverage_entries: 0,
+                    four_character_coverage_entries: 0,
                     max_text_characters: 1,
                 }
             )
@@ -796,6 +1054,8 @@ A词\ta cí\t100\n\
                 PublicRimeSliceConfig {
                     max_entries: 1,
                     frequency_frontier_entries: 1,
+                    three_character_coverage_entries: 0,
+                    four_character_coverage_entries: 0,
                     max_text_characters: 1,
                 }
             ),
@@ -817,6 +1077,8 @@ A词\ta cí\t100\n\
             PublicRimeSliceConfig {
                 max_entries: 5,
                 frequency_frontier_entries: 2,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 4,
             },
         )
@@ -852,6 +1114,8 @@ A词\ta cí\t100\n\
             PublicRimeSliceConfig {
                 max_entries: 2,
                 frequency_frontier_entries: 1,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 2,
             },
         )
@@ -868,6 +1132,49 @@ A词\ta cí\t100\n\
         assert_eq!(imported.stats.two_character_coverage_candidates, 2);
         assert_eq!(imported.stats.two_character_coverage_admitted, 1);
         assert_eq!(imported.stats.two_character_coverage_dropped, 1);
+    }
+
+    #[test]
+    fn slice_applies_bounded_three_and_four_character_code_coverage() {
+        const SOURCE: &str = "---\n...\n\
+二字\ter zi\t100\n\
+三字甲\tsan zi jia\t90\n\
+三字钾\tsan zi jia\t80\n\
+四字短语\tsi zi duan yu\t70\n\
+另三字\tling san zi\t60\n\
+另四字词\tling si zi ci\t50\n";
+        let imported = parse_public_rime_slice(
+            SOURCE,
+            PublicRimeSliceConfig {
+                max_entries: 4,
+                frequency_frontier_entries: 2,
+                three_character_coverage_entries: 1,
+                four_character_coverage_entries: 1,
+                max_text_characters: 4,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            imported
+                .entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["二字", "三字甲", "四字短语", "另三字"]
+        );
+        assert_eq!(imported.stats.eligible_three_character_codes, 2);
+        assert_eq!(imported.stats.frequency_frontier_three_character_codes, 1);
+        assert_eq!(imported.stats.three_character_coverage_candidates, 1);
+        assert_eq!(imported.stats.three_character_coverage_admitted, 1);
+        assert_eq!(imported.stats.three_character_coverage_dropped, 0);
+        assert_eq!(imported.stats.imported_three_character_codes, 2);
+        assert_eq!(imported.stats.eligible_four_character_codes, 2);
+        assert_eq!(imported.stats.frequency_frontier_four_character_codes, 0);
+        assert_eq!(imported.stats.four_character_coverage_candidates, 2);
+        assert_eq!(imported.stats.four_character_coverage_admitted, 1);
+        assert_eq!(imported.stats.four_character_coverage_dropped, 1);
+        assert_eq!(imported.stats.imported_four_character_codes, 1);
     }
 
     #[test]

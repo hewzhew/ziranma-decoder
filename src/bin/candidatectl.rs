@@ -36,7 +36,7 @@ use ziranma_core::{
     PublicRimeSliceConfig, PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
     SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
-    SupplementalCompositionOrder, audit_public_supplemental_layer,
+    SupplementalCompositionOrder, are_qwerty_neighbors, audit_public_supplemental_layer,
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
@@ -512,6 +512,8 @@ fn parse_build_rime_slice(
     let mut source_sha256 = None;
     let mut max_entries = None;
     let mut frequency_frontier_entries = None;
+    let mut three_character_coverage_entries = None;
+    let mut four_character_coverage_entries = None;
     let mut max_text_characters = None;
     let mut public = false;
     while let Some(argument) = arguments.next() {
@@ -530,6 +532,16 @@ fn parse_build_rime_slice(
                 &mut frequency_frontier_entries,
                 &mut arguments,
                 "--frequency-frontier-entries",
+            )?,
+            "--three-character-coverage-entries" => set_usize(
+                &mut three_character_coverage_entries,
+                &mut arguments,
+                "--three-character-coverage-entries",
+            )?,
+            "--four-character-coverage-entries" => set_usize(
+                &mut four_character_coverage_entries,
+                &mut arguments,
+                "--four-character-coverage-entries",
             )?,
             "--max-text-characters" => set_usize(
                 &mut max_text_characters,
@@ -552,6 +564,8 @@ fn parse_build_rime_slice(
     let config = PublicRimeSliceConfig {
         max_entries,
         frequency_frontier_entries: frequency_frontier_entries.unwrap_or(max_entries),
+        three_character_coverage_entries: three_character_coverage_entries.unwrap_or(0),
+        four_character_coverage_entries: four_character_coverage_entries.unwrap_or(0),
         max_text_characters: max_text_characters
             .ok_or("build-rime-slice requires --max-text-characters")?,
     };
@@ -568,6 +582,17 @@ fn parse_build_rime_slice(
     {
         return Err(
             "build-rime-slice --frequency-frontier-entries must be within --max-entries".into(),
+        );
+    }
+    if config
+        .three_character_coverage_entries
+        .saturating_add(config.four_character_coverage_entries)
+        > config
+            .max_entries
+            .saturating_sub(config.frequency_frontier_entries)
+    {
+        return Err(
+            "build-rime-slice three/four-character coverage exceeds post-frontier capacity".into(),
         );
     }
     Ok(Options::BuildRimeSlice {
@@ -1039,7 +1064,7 @@ fn print_usage() {
         "  build-rime --source <RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
     eprintln!(
-        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] --max-text-characters <1..12> --public"
+        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] [--three-character-coverage-entries <N>] [--four-character-coverage-entries <N>] --max-text-characters <1..12> --public"
     );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
@@ -2832,7 +2857,7 @@ fn benchmark_candidate_layers(
         snapshot_from_payload("layer-benchmark-supplemental-v1", &supplemental_text)?;
     let supplemental_build = supplemental_started.elapsed();
     let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
-    let correction_audit =
+    let correction_audits =
         audit_four_character_correction_gate(&core, &supplemental, &supplemental_entries, 256)?;
     let config = SupplementalCandidateLayerConfig { exact_promotions };
     let codes = layer_benchmark_codes()?;
@@ -2925,8 +2950,26 @@ fn benchmark_candidate_layers(
         .ok_or("layer benchmark produced no correction samples")?;
     let median_delta_ms = layered_latency.median.as_secs_f64() * 1_000.0
         - core_latency.median.as_secs_f64() * 1_000.0;
+    let mut correction_audit_summary = String::new();
+    for edit in SyntheticFourCharacterEdit::ALL {
+        let audit = correction_audits[edit.index()];
+        writeln!(
+            correction_audit_summary,
+            "四字公开合成（{}）：样本 {}；恢复提示 {}，目标首项 {}，目标可见 {}，原码碰撞 {}，多码歧义 {}，无恢复 {}，错误目标码 {}，原码保护失败 {}",
+            edit.label(),
+            audit.samples,
+            audit.offered,
+            audit.target_first,
+            audit.target_visible,
+            audit.original_code_collision,
+            audit.ambiguous_codes,
+            audit.no_recovery,
+            audit.wrong_intended_code,
+            audit.exact_protection_failures,
+        )?;
+    }
     Ok(format!(
-        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n四字公开正例：{}；恢复提示 {}，目标首项 {}，目标可见 {}，原码碰撞 {}，多码歧义 {}，无恢复 {}，错误目标码 {}\n四字公开负例：原码整词保护失败 {}\n候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
+        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n{correction_audit_summary}候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
         codes.len(),
         core_latency.samples,
         duration_ms(core_build),
@@ -2942,15 +2985,6 @@ fn benchmark_candidate_layers(
         duration_ms(correction_latency.median),
         duration_ms(correction_latency.p95),
         duration_ms(correction_latency.maximum),
-        correction_audit.samples,
-        correction_audit.offered,
-        correction_audit.target_first,
-        correction_audit.target_visible,
-        correction_audit.original_code_collision,
-        correction_audit.ambiguous_codes,
-        correction_audit.no_recovery,
-        correction_audit.wrong_intended_code,
-        correction_audit.exact_protection_failures,
     ))
 }
 
@@ -3007,15 +3041,90 @@ fn layer_benchmark_codes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
 
 fn four_character_correction_benchmark_codes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut codes = Vec::new();
-    for phrase in ["bai kai rou sui", "zi xiang mao dun", "hua she tian zu"] {
+    for (sample_index, phrase) in ["bai kai rou sui", "zi xiang mao dun", "hua she tian zu"]
+        .into_iter()
+        .enumerate()
+    {
         let encoded = encode_pinyin_phrase(phrase)?;
-        let mut observed = encoded.full_code.as_str().as_bytes().to_vec();
-        if observed[0] != observed[1] {
-            observed.swap(0, 1);
+        for edit in SyntheticFourCharacterEdit::ALL {
+            let observed =
+                synthesize_four_character_edit(encoded.full_code.as_str(), edit, sample_index)
+                    .ok_or("fixed four-character benchmark phrase could not be edited")?;
+            if !codes.contains(&observed) {
+                codes.push(observed);
+            }
         }
-        codes.push(String::from_utf8(observed).expect("the codec emits lowercase ASCII"));
     }
     Ok(codes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyntheticFourCharacterEdit {
+    NeighborSubstitution,
+    AdjacentTransposition,
+    MissingKey,
+    ExtraKey,
+}
+
+impl SyntheticFourCharacterEdit {
+    const ALL: [Self; 4] = [
+        Self::NeighborSubstitution,
+        Self::AdjacentTransposition,
+        Self::MissingKey,
+        Self::ExtraKey,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::NeighborSubstitution => 0,
+            Self::AdjacentTransposition => 1,
+            Self::MissingKey => 2,
+            Self::ExtraKey => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NeighborSubstitution => "邻键替换",
+            Self::AdjacentTransposition => "相邻换序",
+            Self::MissingKey => "少按一键",
+            Self::ExtraKey => "多按一键",
+        }
+    }
+}
+
+fn synthesize_four_character_edit(
+    intended_code: &str,
+    edit: SyntheticFourCharacterEdit,
+    sample_index: usize,
+) -> Option<String> {
+    let mut observed = intended_code.as_bytes().to_vec();
+    if observed.len() != 8 || !observed.iter().all(u8::is_ascii_lowercase) {
+        return None;
+    }
+    match edit {
+        SyntheticFourCharacterEdit::NeighborSubstitution => {
+            let index = sample_index % observed.len();
+            let actual =
+                (b'a'..=b'z').find(|&actual| are_qwerty_neighbors(observed[index], actual))?;
+            observed[index] = actual;
+        }
+        SyntheticFourCharacterEdit::AdjacentTransposition => {
+            let initial_start = sample_index % (observed.len() - 1);
+            let start = (0..observed.len() - 1)
+                .map(|offset| (initial_start + offset) % (observed.len() - 1))
+                .find(|&start| observed[start] != observed[start + 1])?;
+            observed.swap(start, start + 1);
+        }
+        SyntheticFourCharacterEdit::MissingKey => {
+            observed.remove(sample_index % observed.len());
+        }
+        SyntheticFourCharacterEdit::ExtraKey => {
+            let index = sample_index % (observed.len() + 1);
+            observed.insert(index, b'a' + (sample_index % 26) as u8);
+        }
+    }
+    String::from_utf8(observed).ok()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3036,7 +3145,7 @@ fn audit_four_character_correction_gate(
     supplemental: &CandidateSnapshot,
     supplemental_entries: &[ziranma_core::LexiconEntry],
     sample_limit: usize,
-) -> Result<FourCharacterCorrectionAudit, Box<dyn std::error::Error>> {
+) -> Result<[FourCharacterCorrectionAudit; 4], Box<dyn std::error::Error>> {
     let mut selected_codes = HashSet::new();
     let mut samples = Vec::new();
     for entry in supplemental_entries {
@@ -3046,80 +3155,80 @@ fn audit_four_character_correction_gate(
         {
             continue;
         }
-        let mut observed = entry.code.as_str().as_bytes().to_vec();
-        let Some(start) = (0..4)
-            .map(|syllable| syllable * 2)
-            .find(|&start| observed[start] != observed[start + 1])
-        else {
+        if !SyntheticFourCharacterEdit::ALL.iter().all(|&edit| {
+            synthesize_four_character_edit(entry.code.as_str(), edit, samples.len()).is_some()
+        }) {
             continue;
-        };
-        observed.swap(start, start + 1);
-        samples.push((
-            entry.text.clone(),
-            entry.code.as_str().to_owned(),
-            String::from_utf8(observed).expect("the codec emits lowercase ASCII"),
-        ));
+        }
+        samples.push((entry.text.clone(), entry.code.as_str().to_owned()));
         if samples.len() == sample_limit {
             break;
         }
     }
 
-    let mut audit = FourCharacterCorrectionAudit::default();
-    for (target_text, intended_code, observed) in samples {
-        audit.samples += 1;
-        if !matches!(
-            layered_four_character_correction_decision(
+    let mut audits = [FourCharacterCorrectionAudit::default(); 4];
+    for (sample_index, (target_text, intended_code)) in samples.into_iter().enumerate() {
+        for edit in SyntheticFourCharacterEdit::ALL {
+            let audit = &mut audits[edit.index()];
+            let observed = synthesize_four_character_edit(&intended_code, edit, sample_index)
+                .ok_or("four-character audit could not synthesize a selected edit")?;
+            audit.samples += 1;
+            if !matches!(
+                layered_four_character_correction_decision(
+                    core,
+                    Some(supplemental),
+                    &intended_code,
+                    1,
+                )?,
+                FourCharacterCorrectionDecision::KeepOrdinary(
+                    FourCharacterCorrectionKeepReason::OriginalHasExactFullCode
+                )
+            ) {
+                audit.exact_protection_failures += 1;
+            }
+            match layered_four_character_correction_decision(
                 core,
                 Some(supplemental),
-                &intended_code,
-                1,
-            )?,
-            FourCharacterCorrectionDecision::KeepOrdinary(
-                FourCharacterCorrectionKeepReason::OriginalHasExactFullCode
-            )
-        ) {
-            audit.exact_protection_failures += 1;
-        }
-        match layered_four_character_correction_decision(
-            core,
-            Some(supplemental),
-            &observed,
-            MAX_CANDIDATE_SNAPSHOT_RANK,
-        )? {
-            FourCharacterCorrectionDecision::Offer(offer) => {
-                audit.offered += 1;
-                audit.wrong_intended_code += usize::from(offer.intended_code != intended_code);
-                audit.target_first += usize::from(
-                    offer
-                        .candidates
-                        .first()
-                        .map(|candidate| candidate.text.as_str())
-                        == Some(target_text.as_str()),
-                );
-                audit.target_visible += usize::from(
-                    offer
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.text == target_text),
-                );
+                &observed,
+                MAX_CANDIDATE_SNAPSHOT_RANK,
+            )? {
+                FourCharacterCorrectionDecision::Offer(offer) => {
+                    audit.offered += 1;
+                    audit.wrong_intended_code += usize::from(offer.intended_code != intended_code);
+                    audit.target_first += usize::from(
+                        offer
+                            .candidates
+                            .first()
+                            .map(|candidate| candidate.text.as_str())
+                            == Some(target_text.as_str()),
+                    );
+                    audit.target_visible += usize::from(
+                        offer
+                            .candidates
+                            .iter()
+                            .any(|candidate| candidate.text == target_text),
+                    );
+                }
+                FourCharacterCorrectionDecision::KeepOrdinary(reason) => match reason {
+                    FourCharacterCorrectionKeepReason::OriginalHasExactFullCode => {
+                        audit.original_code_collision += 1;
+                    }
+                    FourCharacterCorrectionKeepReason::AmbiguousIntendedCodes => {
+                        audit.ambiguous_codes += 1;
+                    }
+                    FourCharacterCorrectionKeepReason::NoSingleEditRecovery => {
+                        audit.no_recovery += 1;
+                    }
+                    FourCharacterCorrectionKeepReason::UnsupportedInputShape => {
+                        return Err(
+                            "four-character audit produced an unsupported input shape".into()
+                        );
+                    }
+                },
             }
-            FourCharacterCorrectionDecision::KeepOrdinary(reason) => match reason {
-                FourCharacterCorrectionKeepReason::OriginalHasExactFullCode => {
-                    audit.original_code_collision += 1;
-                }
-                FourCharacterCorrectionKeepReason::AmbiguousIntendedCodes => {
-                    audit.ambiguous_codes += 1;
-                }
-                FourCharacterCorrectionKeepReason::NoSingleEditRecovery => {
-                    audit.no_recovery += 1;
-                }
-                FourCharacterCorrectionKeepReason::UnsupportedInputShape => {
-                    return Err("four-character audit produced an unsupported input shape".into());
-                }
-            },
         }
     }
-    Ok(audit)
+    Ok(audits)
 }
 
 #[derive(Clone, Copy)]
@@ -3188,6 +3297,34 @@ fn write_slice_stats(output: &mut String, stats: PublicRimeSliceImportStats) {
         stats.two_character_coverage_admitted,
         stats.two_character_coverage_dropped,
         stats.frequency_backfill_admitted,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "三字码覆盖：合格码 {}，全局前沿 {}，补充候选 {}，保留 {}，配额外 {}，最终切片 {}，缺口 {}",
+        stats.eligible_three_character_codes,
+        stats.frequency_frontier_three_character_codes,
+        stats.three_character_coverage_candidates,
+        stats.three_character_coverage_admitted,
+        stats.three_character_coverage_dropped,
+        stats.imported_three_character_codes,
+        stats
+            .eligible_three_character_codes
+            .saturating_sub(stats.imported_three_character_codes),
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "四字码覆盖：合格码 {}，全局前沿 {}，补充候选 {}，保留 {}，配额外 {}，最终切片 {}，缺口 {}",
+        stats.eligible_four_character_codes,
+        stats.frequency_frontier_four_character_codes,
+        stats.four_character_coverage_candidates,
+        stats.four_character_coverage_admitted,
+        stats.four_character_coverage_dropped,
+        stats.imported_four_character_codes,
+        stats
+            .eligible_four_character_codes
+            .saturating_sub(stats.imported_four_character_codes),
     )
     .unwrap();
 }
@@ -4146,6 +4283,41 @@ mod tests {
     }
 
     #[test]
+    fn four_character_synthetic_audit_covers_each_single_edit_shape() {
+        let intended = "abcdefgh";
+        let substitution = synthesize_four_character_edit(
+            intended,
+            SyntheticFourCharacterEdit::NeighborSubstitution,
+            0,
+        )
+        .unwrap();
+        assert_eq!(substitution.len(), intended.len());
+        assert!(are_qwerty_neighbors(
+            intended.as_bytes()[0],
+            substitution.as_bytes()[0]
+        ));
+        assert_eq!(&substitution[1..], &intended[1..]);
+
+        let transposition = synthesize_four_character_edit(
+            intended,
+            SyntheticFourCharacterEdit::AdjacentTransposition,
+            2,
+        )
+        .unwrap();
+        assert_eq!(transposition, "abdcefgh");
+
+        let missing =
+            synthesize_four_character_edit(intended, SyntheticFourCharacterEdit::MissingKey, 3)
+                .unwrap();
+        assert_eq!(missing, "abcefgh");
+
+        let extra =
+            synthesize_four_character_edit(intended, SyntheticFourCharacterEdit::ExtraKey, 4)
+                .unwrap();
+        assert_eq!(extra, "abcdeefgh");
+    }
+
+    #[test]
     fn parser_requires_explicit_write_intent_and_paths() {
         let source_hash = candidate_sha256_hex(LEXICON.as_bytes());
         assert_eq!(
@@ -4225,6 +4397,10 @@ mod tests {
                 "100000".to_owned(),
                 "--frequency-frontier-entries".to_owned(),
                 "80000".to_owned(),
+                "--three-character-coverage-entries".to_owned(),
+                "6000".to_owned(),
+                "--four-character-coverage-entries".to_owned(),
+                "4000".to_owned(),
                 "--max-text-characters".to_owned(),
                 "8".to_owned(),
             ])
@@ -4233,6 +4409,8 @@ mod tests {
                 config: PublicRimeSliceConfig {
                     max_entries: 100_000,
                     frequency_frontier_entries: 80_000,
+                    three_character_coverage_entries: 6_000,
+                    four_character_coverage_entries: 4_000,
                     max_text_characters: 8,
                 },
                 ..
@@ -4664,6 +4842,8 @@ mod tests {
             PublicRimeSliceConfig {
                 max_entries: 2,
                 frequency_frontier_entries: 2,
+                three_character_coverage_entries: 0,
+                four_character_coverage_entries: 0,
                 max_text_characters: 4,
             },
         )

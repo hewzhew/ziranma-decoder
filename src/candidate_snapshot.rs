@@ -2939,6 +2939,8 @@ mod tests {
         transposition.swap(0, 1);
         let mut missing = intended.to_vec();
         missing.remove(2);
+        let mut missing_that_is_also_an_abbreviation = intended.to_vec();
+        missing_that_is_also_an_abbreviation.remove(1);
         let mut extra = intended.to_vec();
         extra.insert(2, b'x');
 
@@ -2946,6 +2948,7 @@ mod tests {
             (substitution, "邻键替换"),
             (transposition, "顺序颠倒"),
             (missing, "遗漏"),
+            (missing_that_is_also_an_abbreviation, "遗漏"),
             (extra, "多按"),
         ] {
             let observed = std::str::from_utf8(&observed).unwrap();

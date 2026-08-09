@@ -894,14 +894,29 @@ impl Decoder {
         }
 
         let mut stats = DecodeSearchStats::default();
-        let mut candidates = self.lookup_candidates_with_stats(observed.as_str(), true, &mut stats);
-        candidates.retain(|candidate| {
-            candidate.source == CandidateSource::Lexicon
-                && candidate.text.chars().count() == syllable_count
-                && candidate.code.as_str().len() == intended_keys
-                && candidate.spelling.abbreviated_syllables.is_empty()
-                && candidate.correction != Correction::Exact
-        });
+        let mut best_by_entry = HashMap::<usize, Candidate>::new();
+        for terminal in self.trie.lookup_noisy(observed.as_str(), true, &mut stats) {
+            let entry = &self.lexicon[terminal.entry_index];
+            let candidate = self.make_candidate(entry, terminal.spelling, terminal.correction);
+            if candidate.text.chars().count() != syllable_count
+                || candidate.code.as_str().len() != intended_keys
+                || !candidate.spelling.abbreviated_syllables.is_empty()
+                || candidate.correction == Correction::Exact
+            {
+                continue;
+            }
+            match best_by_entry.entry(terminal.entry_index) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if candidate_order(&candidate, slot.get()) == Ordering::Less {
+                        slot.insert(candidate);
+                    }
+                }
+            }
+        }
+        let mut candidates = best_by_entry.into_values().collect::<Vec<_>>();
         candidates.sort_by(candidate_order);
         candidates.dedup_by(|left, right| left.text == right.text && left.code == right.code);
         candidates.truncate(top_k);
@@ -4060,7 +4075,12 @@ fn single_removed_index(shorter: &[u8], longer: &[u8]) -> Option<usize> {
     (shorter[first_difference..] == longer[first_difference + 1..]).then_some(first_difference)
 }
 
-pub(crate) fn are_qwerty_neighbors(left: u8, right: u8) -> bool {
+/// Returns whether two lowercase ASCII keys are physical QWERTY neighbors.
+///
+/// This is the shared keyboard geometry used by both the decoder's error
+/// channel and public synthetic audits. Non-lowercase-ASCII input is never a
+/// neighbor.
+pub fn are_qwerty_neighbors(left: u8, right: u8) -> bool {
     match left {
         b'q' => matches!(right, b'w' | b'a'),
         b'w' => matches!(right, b'q' | b'e' | b'a' | b's'),
