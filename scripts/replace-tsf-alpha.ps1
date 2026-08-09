@@ -1,4 +1,6 @@
 [CmdletBinding()]
+# Keep this file ASCII unless it gains a UTF-8 BOM. update-ime.cmd invokes
+# Windows PowerShell 5.1, which otherwise decodes BOM-less scripts by code page.
 param(
     [switch]$AdminPhase,
     [switch]$EnableCurrentUserAfterReplace,
@@ -180,41 +182,41 @@ function Write-ReplacementSummary {
 
     Write-Host ''
     Write-Host $Result
-    Write-Host "版本：$Digest"
+    Write-Host "DLL SHA-256: $Digest"
     if ($script:EnableCurrentUserAfterReplace) {
-        Write-Host '当前用户：已启用'
+        Write-Host 'Current user enable requested: True'
     } else {
-        Write-Host '当前用户：未请求启用'
+        Write-Host 'Current user enable requested: False'
     }
     if (-not $HostCacheState.ScanAvailable) {
-        Write-Host '应用：未能检查版本缓存'
+        Write-Host 'Host cache: inspection unavailable'
     } elseif ($HostCacheState.MatchingVersion -eq 0 -and
         $HostCacheState.OtherVersions -eq 0) {
-        Write-Host '应用：暂未发现载入 Alpha 的可见进程'
+        Write-Host 'Host cache: no visible process has loaded TSF Alpha'
     } elseif ($HostCacheState.OtherVersions -eq 0) {
         Write-Host (
-            "应用：{0} 个可见进程已载入新版，没有发现旧版缓存" -f
+            "Host cache: {0} visible process(es) loaded the current build; no old build found" -f
                 $HostCacheState.MatchingVersion
         )
     } elseif ($HostCacheState.MatchingVersion -eq 0) {
         Write-Host (
-            "应用：{0} 个可见进程仍在使用旧版" -f
+            "Host cache: {0} visible process(es) still use an old build" -f
                 $HostCacheState.OtherVersions
         )
     } else {
         Write-Host (
-            "应用：{0} 个可见进程已载入新版，{1} 个仍在使用旧版" -f
+            "Host cache: {0} visible process(es) loaded the current build; {1} still use an old build" -f
                 $HostCacheState.MatchingVersion,
                 $HostCacheState.OtherVersions
         )
     }
     if ($HostCacheState.ScanAvailable -and
         $HostCacheState.OtherVersions -gt 0) {
-        Write-Host '无需关闭这些应用；下次打开时会载入新版。'
+        Write-Host 'No process must be closed now; old hosts will load the current build next time.'
     } else {
-        Write-Host '无需进行其他操作。'
+        Write-Host 'No further host action is needed.'
     }
-    Write-Host '微软拼音和默认输入法未更改'
+    Write-Host 'Microsoft Pinyin and the default input method were unchanged'
 }
 
 function Get-HostCacheState {
@@ -450,7 +452,7 @@ if (-not $ForceReregister -and
         $hostCacheState = Get-HostCacheState
         Write-ReplacementSummary `
             -Digest $sourceDigest `
-            -Result '自然码 Alpha 已是最新版' `
+            -Result 'TSF Alpha is already current' `
             -HostCacheState $hostCacheState
         exit 0
     } catch {
@@ -532,5 +534,5 @@ Invoke-DevCtl -Arguments @('inspect', '--dll', $sourceDll) -Quiet
 $hostCacheState = Get-HostCacheState
 Write-ReplacementSummary `
     -Digest $sourceDigest `
-    -Result '自然码 Alpha 换代完成' `
+    -Result 'TSF Alpha replacement completed' `
     -HostCacheState $hostCacheState

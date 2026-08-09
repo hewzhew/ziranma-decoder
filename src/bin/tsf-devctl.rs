@@ -2994,6 +2994,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_powershell_51_parses_the_replacement_script() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("replace-tsf-alpha.ps1");
+        let bytes = fs::read(&script).unwrap();
+        assert!(
+            bytes.is_ascii() || bytes.starts_with(&[0xef, 0xbb, 0xbf]),
+            "Windows PowerShell 5.1 requires ASCII or a UTF-8 BOM for this script"
+        );
+
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let checker = "$parseTokens=$null; $parseErrors=$null; ".to_owned()
+            + "[void][System.Management.Automation.Language.Parser]::ParseFile("
+            + "$env:ZIRANMA_REPLACE_PARSE_TARGET, [ref]$parseTokens, [ref]$parseErrors); "
+            + "if ($parseErrors.Count -ne 0) { exit 1 }";
+        let output = std::process::Command::new(powershell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &checker])
+            .env("ZIRANMA_REPLACE_PARSE_TARGET", &script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Windows PowerShell 5.1 rejected the replacement script: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn parser_requires_one_explicit_dll() {
         assert_eq!(parse_options(Vec::<String>::new()).unwrap(), Options::Help);
         assert_eq!(
