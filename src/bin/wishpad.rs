@@ -18,8 +18,8 @@ mod windows_app {
     use std::error::Error;
     use std::ffi::c_void;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -55,18 +55,19 @@ mod windows_app {
         RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW,
         ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
         WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT,
-        WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_COMPOSITED,
-        WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        WM_SETFONT, WM_SETREDRAW, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+        WS_EX_COMPOSITED, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+        WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
     use ziranma_core::{
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
         NativeAutomaticTranspositionTier, NativeFeedbackEvent, WindowsUserDataProtector,
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
-        WishPackageInfo, WishReviewStatus, list_trashed_wish_packages, list_wish_packages,
-        load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot,
-        move_wish_to_trash, repository_root_for_user_tool_executable, restore_wish_from_trash,
-        save_or_replace_wish_note,
+        WishPackageInfo, WishReviewStatus, WishSnapshot, list_trashed_wish_packages,
+        list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
+        load_wish_snapshot, move_wish_to_trash, repository_root_for_user_tool_executable,
+        restore_wish_from_trash, save_or_replace_wish_note,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -124,6 +125,34 @@ mod windows_app {
         info: WishPackageInfo,
         note: Option<WishNote>,
         note_unavailable: bool,
+        snapshot: ManagerSnapshotCache,
+    }
+
+    #[derive(Clone, Default)]
+    enum ManagerSnapshotCache {
+        #[default]
+        Unloaded,
+        Loaded(Arc<WishSnapshot>),
+        Unavailable,
+    }
+
+    impl ManagerSnapshotCache {
+        fn needs_load(&self) -> bool {
+            matches!(self, Self::Unloaded)
+        }
+
+        fn loaded(&self) -> Option<&WishSnapshot> {
+            match self {
+                Self::Loaded(snapshot) => Some(snapshot.as_ref()),
+                Self::Unloaded | Self::Unavailable => None,
+            }
+        }
+
+        fn discard_loaded(&mut self) {
+            if matches!(self, Self::Loaded(_)) {
+                *self = Self::Unloaded;
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -1471,16 +1500,19 @@ mod windows_app {
                         info,
                         note: Some(note),
                         note_unavailable: false,
+                        snapshot: ManagerSnapshotCache::Unloaded,
                     },
                     Err(WishFeedbackError::NoteUnavailable) => ManagerRecord {
                         info,
                         note: None,
                         note_unavailable: false,
+                        snapshot: ManagerSnapshotCache::Unloaded,
                     },
                     Err(_) => ManagerRecord {
                         info,
                         note: None,
                         note_unavailable: true,
+                        snapshot: ManagerSnapshotCache::Unloaded,
                     },
                 }
             })
@@ -1535,6 +1567,22 @@ mod windows_app {
             .selected
             .and_then(|index| state.records.get(index))
             .map(|record| record.info.id().to_owned())
+    }
+
+    fn set_selected_manager_record(state: &mut ManagerState, selected: Option<usize>) {
+        if state.selected == selected {
+            return;
+        }
+        if let Some(previous) = state.selected
+            && let Some(record) = state.records.get_mut(previous)
+        {
+            // Retain only the detail for the record selected on each cached
+            // page. Failed reads contain no private payload and remain cached
+            // until an explicit refresh so a broken file cannot cause a loop.
+            record.snapshot.discard_loaded();
+        }
+        state.selected = selected;
+        state.show_context = false;
     }
 
     fn activate_cached_manager_view(window: HWND, view: ManagerView) -> bool {
@@ -1846,8 +1894,7 @@ mod windows_app {
                             .find(|index| state.records[*index].info.id() == id)
                     })
                     .or_else(|| state.visible_indices.first().copied());
-                state.selected = selected;
-                state.show_context = false;
+                set_selected_manager_record(state, selected);
                 let labels = state
                     .visible_indices
                     .iter()
@@ -1871,6 +1918,11 @@ mod windows_app {
             return;
         };
         if let Ok(list) = unsafe { GetDlgItem(Some(window), MANAGER_LIST_ID) } {
+            // Rebuilding an owner-drawn list one row at a time exposes a blank
+            // intermediate frame during page and filter changes. Keep the
+            // existing pixels until the replacement list is complete, then
+            // request one repaint.
+            let _ = unsafe { SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None) };
             let _ = unsafe { SendMessageW(list, LB_RESETCONTENT, None, None) };
             for label in &labels {
                 let wide = wide(label);
@@ -1886,6 +1938,8 @@ mod windows_app {
             if let Some(index) = selected_list_index {
                 let _ = unsafe { SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None) };
             }
+            let _ = unsafe { SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None) };
+            let _ = unsafe { InvalidateRect(Some(list), None, true) };
         }
         set_control_text(
             window,
@@ -1974,10 +2028,10 @@ mod windows_app {
         if let Ok(mut state) = MANAGER_STATE.lock()
             && let Some(state) = state.as_mut()
         {
-            state.selected = selected_list_index
+            let selected = selected_list_index
                 .and_then(|index| state.visible_indices.get(index))
                 .copied();
-            state.show_context = false;
+            set_selected_manager_record(state, selected);
         }
         render_selected_record(window);
     }
@@ -1993,26 +2047,19 @@ mod windows_app {
     }
 
     fn render_selected_record(window: HWND) {
-        let (selected, has_records, view) = MANAGER_STATE
+        let (has_selection, has_records, view) = MANAGER_STATE
             .lock()
             .ok()
             .and_then(|state| {
                 let state = state.as_ref()?;
-                let selected = state.selected.and_then(|index| {
-                    let record = state.records.get(index)?;
-                    Some((
-                        state.root.clone(),
-                        record.info.id().to_owned(),
-                        record.info.modified(),
-                        record.note.clone(),
-                        record.note_unavailable,
-                        state.show_context,
-                    ))
-                });
-                Some((selected, !state.records.is_empty(), state.view))
+                Some((
+                    state.selected.is_some(),
+                    !state.records.is_empty(),
+                    state.view,
+                ))
             })
-            .unwrap_or((None, false, ManagerView::Active));
-        let Some((root, wish_id, modified, note, note_unavailable, show_context)) = selected else {
+            .unwrap_or((false, false, ManagerView::Active));
+        if !has_selection {
             show_empty_details(
                 window,
                 if has_records {
@@ -2025,6 +2072,44 @@ mod windows_app {
             );
             set_manager_actions(window, view, false, false, false);
             return;
+        }
+
+        ensure_selected_snapshot_loaded();
+        let details = MANAGER_STATE.lock().ok().and_then(|state| {
+            let state = state.as_ref()?;
+            let record = state.records.get(state.selected?)?;
+            let Some(snapshot) = record.snapshot.loaded() else {
+                return Some((state.view, None));
+            };
+            let (output, has_context) =
+                manager_detail_output(record, snapshot, state.show_context, SystemTime::now());
+            Some((state.view, Some((output, has_context, state.show_context))))
+        });
+        let Some((view, Some((output, has_context, show_context)))) = details else {
+            show_empty_details(window, "这条记录暂时无法读取；原文件没有被修改。");
+            set_manager_actions(window, view, true, false, false);
+            return;
+        };
+        set_control_text(window, MANAGER_DETAIL_ID, &output);
+        set_manager_actions(window, view, true, has_context, show_context);
+    }
+
+    fn ensure_selected_snapshot_loaded() {
+        let request = MANAGER_STATE.lock().ok().and_then(|state| {
+            let state = state.as_ref()?;
+            let selected = state.selected?;
+            let record = state.records.get(selected)?;
+            record.snapshot.needs_load().then(|| {
+                (
+                    state.root.clone(),
+                    state.view,
+                    selected,
+                    record.info.id().to_owned(),
+                )
+            })
+        });
+        let Some((root, view, selected, wish_id)) = request else {
+            return;
         };
         let snapshot = match view {
             ManagerView::Active => load_wish_snapshot(&root, &wish_id, &WindowsUserDataProtector),
@@ -2032,23 +2117,40 @@ mod windows_app {
                 load_trashed_wish_snapshot(&root, &wish_id, &WindowsUserDataProtector)
             }
         };
-        let snapshot = match snapshot {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                show_empty_details(window, "这条记录暂时无法读取；原文件没有被修改。");
-                set_manager_actions(window, view, true, false, false);
-                return;
-            }
-        };
-        let category = note
+        if let Ok(mut state) = MANAGER_STATE.lock()
+            && let Some(state) = state.as_mut()
+            && state.root == root
+            && state.view == view
+            && state.selected == Some(selected)
+            && let Some(record) = state.records.get_mut(selected)
+            && record.info.id() == wish_id
+            && record.snapshot.needs_load()
+        {
+            record.snapshot = match snapshot {
+                Ok(snapshot) => ManagerSnapshotCache::Loaded(Arc::new(snapshot)),
+                Err(_) => ManagerSnapshotCache::Unavailable,
+            };
+        }
+    }
+
+    fn manager_detail_output(
+        record: &ManagerRecord,
+        snapshot: &WishSnapshot,
+        show_context: bool,
+        now: SystemTime,
+    ) -> (String, bool) {
+        let category = record
+            .note
             .as_ref()
             .map(WishNote::category)
             .unwrap_or_else(|| snapshot.category());
-        let review_status = note
+        let review_status = record
+            .note
             .as_ref()
             .map(WishNote::review_status)
             .unwrap_or(WishReviewStatus::Inbox);
-        let importance = note
+        let importance = record
+            .note
             .as_ref()
             .map(WishNote::importance)
             .unwrap_or(WishImportance::Normal);
@@ -2060,7 +2162,7 @@ mod windows_app {
         output.push_str("　·　");
         output.push_str(category_label(category));
         output.push_str("　·　");
-        output.push_str(&relative_time(modified, SystemTime::now()));
+        output.push_str(&relative_time(record.info.modified(), now));
         output.push_str("\r\n");
         output.push_str(capture_scope_label(snapshot.capture_scope()));
         output.push_str(&format!(
@@ -2068,9 +2170,9 @@ mod windows_app {
             snapshot.events().len()
         ));
         output.push_str("宝宝想说\r\n");
-        if note_unavailable {
+        if record.note_unavailable {
             output.push_str("这条说明暂时无法读取。\r\n");
-        } else if let Some(note) = &note
+        } else if let Some(note) = &record.note
             && !note.text().trim().is_empty()
         {
             output.push_str(note.text());
@@ -2102,8 +2204,7 @@ mod windows_app {
             }
         }
         let has_context = focus.start > 0 || focus.end < snapshot.events().len();
-        set_control_text(window, MANAGER_DETAIL_ID, &output);
-        set_manager_actions(window, view, true, has_context, show_context);
+        (output, has_context)
     }
 
     fn show_empty_details(window: HWND, message: &str) {
@@ -3183,6 +3284,18 @@ mod windows_app {
                 }
                 .matches(None, true)
             );
+        }
+
+        #[test]
+        fn manager_snapshot_cache_retries_only_after_an_explicit_refresh() {
+            let unread = ManagerSnapshotCache::Unloaded;
+            assert!(unread.needs_load());
+            assert!(unread.loaded().is_none());
+
+            let mut failed = ManagerSnapshotCache::Unavailable;
+            failed.discard_loaded();
+            assert!(!failed.needs_load());
+            assert!(failed.loaded().is_none());
         }
 
         #[test]
