@@ -240,6 +240,9 @@ Typora 等进程使用的旧 DLL。
 .\refresh-ime.cmd rollback
 ```
 
+三个入口都从脚本自身位置定位仓库和 `Cargo.toml`，可以在任意当前目录中使用绝对路径
+调用，不要求先执行 `Set-Location`。
+
 默认命令离线、锁定依赖地构建八个别名、候选、个人排序、研究、许愿和桌面启动 EXE，
 并发布到 Git 忽略的不可变 `current / previous` 用户工具槽。现有工具进程不被
 关闭，新打开的 `aliaspad` / `wishpad` 和下一次管理命令使用 current；状态只读，

@@ -13,6 +13,7 @@ if ($StatusOnly -and $Rollback) {
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$manifestPath = Join-Path $repositoryRoot 'Cargo.toml'
 if ([string]::IsNullOrWhiteSpace($UserToolsRoot)) {
     $UserToolsRoot = Join-Path $repositoryRoot '.local\tsf-alpha\user-tools'
 }
@@ -418,6 +419,7 @@ $cargo = Get-Command cargo.exe -ErrorAction SilentlyContinue
 if ($null -eq $cargo) {
     throw 'Cargo is missing from PATH. Nothing was published or installed.'
 }
+Assert-NormalFile -Path $manifestPath -Label 'Cargo manifest'
 New-Item -ItemType Directory -Path $UserToolsRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $buildsRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $cargoTarget -Force | Out-Null
@@ -427,7 +429,14 @@ Assert-NormalDirectory -Path $cargoTarget -Label 'User tool Cargo target'
 $lock = $null
 try {
     $lock = Open-RefreshLock
-    $arguments = @('build', '--release', '--locked', '--offline', '--target-dir', $cargoTarget)
+    $arguments = @(
+        'build',
+        '--manifest-path', $manifestPath,
+        '--release',
+        '--locked',
+        '--offline',
+        '--target-dir', $cargoTarget
+    )
     foreach ($tool in $toolNames) {
         $arguments += @('--bin', $tool)
     }

@@ -3118,7 +3118,12 @@ mod tests {
         ] {
             assert!(script.contains(&format!("    '{tool}'")));
         }
-        assert!(script.contains("'--release', '--locked', '--offline', '--target-dir'"));
+        assert!(script.contains("$manifestPath = Join-Path $repositoryRoot 'Cargo.toml'"));
+        assert!(script.contains("'--manifest-path', $manifestPath"));
+        assert!(script.contains("'--release'"));
+        assert!(script.contains("'--locked'"));
+        assert!(script.contains("'--offline'"));
+        assert!(script.contains("'--target-dir', $cargoTarget"));
         assert!(script.contains("ziranma-user-tools-slots-v1"));
         assert!(script.contains("ziranma-user-tools-bundle-v2"));
         assert!(script.contains("Publish-DesktopLauncher -BundleId $bundleId"));
