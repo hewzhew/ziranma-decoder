@@ -3055,6 +3055,8 @@ mod tests {
         assert!(contents.contains("-StatusOnly"));
         assert!(contents.contains("-EnableCurrentUserAfterReplace"));
         assert!(contents.contains("if /i \"%update_mode%\"==\"status\" goto status"));
+        assert!(contents.contains("call \"%~dp0wish-ime.cmd\""));
+        assert!(!contents.contains("target\\release\\wishpad.exe"));
 
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("scripts")
@@ -3089,6 +3091,238 @@ mod tests {
         assert!(!contents.contains("-EnableCurrentUserAfterReplace"));
         assert!(!contents.contains("register-machine"));
         assert!(contents.contains("Nothing was installed"));
+    }
+
+    #[test]
+    fn user_tool_refresh_is_isolated_versioned_and_never_replaces_tsf() {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let wrapper = fs::read_to_string(repository.join("refresh-ime.cmd")).unwrap();
+        let script =
+            fs::read_to_string(repository.join("scripts").join("refresh-user-tools.ps1")).unwrap();
+
+        assert!(wrapper.contains("Usage: refresh-ime.cmd [refresh^|status^|rollback]"));
+        assert!(wrapper.contains("-StatusOnly"));
+        assert!(wrapper.contains("-Rollback"));
+        assert!(wrapper.contains("if /i \"%action%\"==\"status\" goto status"));
+        assert!(wrapper.contains("if /i \"%action%\"==\"rollback\" goto rollback"));
+        for tool in [
+            "aliasctl",
+            "aliaspad",
+            "candidatectl",
+            "personalctl",
+            "researchctl",
+            "wishctl",
+            "wishpad",
+        ] {
+            assert!(script.contains(&format!("    '{tool}'")));
+        }
+        assert!(script.contains("'--release', '--locked', '--offline', '--target-dir'"));
+        assert!(script.contains("ziranma-user-tools-slots-v1"));
+        assert!(script.contains("[IO.File]::Replace"));
+        assert!(script.contains("TSF DLL: unchanged"));
+        assert!(!script.contains("'--lib'"));
+        assert!(!script.contains("register-machine"));
+        assert!(!script.contains("EnableCurrentUserAfterReplace"));
+    }
+
+    #[test]
+    fn user_tool_launchers_resolve_only_the_fixed_allowlist() {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resolver =
+            fs::read_to_string(repository.join("scripts").join("resolve-user-tool.cmd")).unwrap();
+        for tool in [
+            "aliasctl",
+            "aliaspad",
+            "candidatectl",
+            "personalctl",
+            "researchctl",
+            "wishctl",
+            "wishpad",
+        ] {
+            assert!(resolver.contains(&format!("if /i \"%tool%\"==\"{tool}\" goto tool_ok")));
+        }
+        assert!(resolver.contains("ziranma-user-tools-slots-v1"));
+        assert!(resolver.contains("find /v /c \"\""));
+        assert!(resolver.contains("current=[0-9a-f][0-9a-f]*"));
+        assert!(resolver.contains("target\\release\\%tool%.exe"));
+        assert!(resolver.contains("user-tools\\builds\\%bundle_id%\\%tool%.exe"));
+
+        for wrapper in [
+            "alias-ime.cmd",
+            "candidate-data.cmd",
+            "personal-ime.cmd",
+            "research-ime.cmd",
+            "wish-ime.cmd",
+        ] {
+            let contents = fs::read_to_string(repository.join(wrapper)).unwrap();
+            assert!(contents.contains("scripts\\resolve-user-tool.cmd"));
+        }
+    }
+
+    #[test]
+    fn windows_powershell_51_parses_user_tool_refresh_script() {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = repository.join("scripts").join("refresh-user-tools.ps1");
+        let bytes = fs::read(&script).unwrap();
+        assert!(
+            bytes.is_ascii() || bytes.starts_with(&[0xef, 0xbb, 0xbf]),
+            "Windows PowerShell 5.1 requires ASCII or a UTF-8 BOM for this script"
+        );
+
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let checker = "$parseTokens=$null; $parseErrors=$null; ".to_owned()
+            + "[void][System.Management.Automation.Language.Parser]::ParseFile("
+            + "$env:ZIRANMA_USER_TOOLS_PARSE_TARGET, [ref]$parseTokens, [ref]$parseErrors); "
+            + "if ($parseErrors.Count -ne 0) { exit 1 }";
+        let output = std::process::Command::new(powershell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &checker])
+            .env("ZIRANMA_USER_TOOLS_PARSE_TARGET", &script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Windows PowerShell 5.1 rejected the user tool refresh script: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn user_tool_slots_roll_back_atomically_and_fail_closed() {
+        const TOOLS: [&str; 7] = [
+            "aliasctl",
+            "aliaspad",
+            "candidatectl",
+            "personalctl",
+            "researchctl",
+            "wishctl",
+            "wishpad",
+        ];
+
+        struct TestDirectory(PathBuf);
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn write_bundle(root: &Path, seed: &str) -> String {
+            let payloads = TOOLS
+                .iter()
+                .map(|tool| {
+                    let bytes = format!("synthetic {seed} {tool}").into_bytes();
+                    (*tool, hex_sha256(&bytes), bytes)
+                })
+                .collect::<Vec<_>>();
+            let mut manifest = "schema=ziranma-user-tools-bundle-v1\n".to_owned();
+            for (tool, digest, _) in &payloads {
+                writeln!(manifest, "tool.{tool}.exe={digest}").unwrap();
+            }
+            let bundle_id = hex_sha256(manifest.as_bytes());
+            let bundle = root.join("builds").join(&bundle_id);
+            fs::create_dir_all(&bundle).unwrap();
+            fs::write(bundle.join("manifest.zut"), manifest).unwrap();
+            for (tool, _, bytes) in payloads {
+                fs::write(bundle.join(format!("{tool}.exe")), bytes).unwrap();
+            }
+            bundle_id
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = TestDirectory(std::env::temp_dir().join(format!(
+            "ziranma-user-tool-slots-{}-{unique}",
+            std::process::id()
+        )));
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = repository.join("scripts").join("refresh-user-tools.ps1");
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+
+        let status = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-StatusOnly")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            !root.0.exists(),
+            "read-only status must not create its root"
+        );
+
+        let first = write_bundle(&root.0, "first");
+        let second = write_bundle(&root.0, "second");
+        let original = format!(
+            "schema=ziranma-user-tools-slots-v1\r\ncurrent={second}\r\nprevious={first}\r\n"
+        );
+        fs::write(root.0.join("slots.zut"), &original).unwrap();
+        let rollback = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-Rollback")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(
+            rollback.status.success(),
+            "valid rollback failed: {}",
+            String::from_utf8_lossy(&rollback.stderr)
+        );
+        let swapped = format!(
+            "schema=ziranma-user-tools-slots-v1\r\ncurrent={first}\r\nprevious={second}\r\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.0.join("slots.zut")).unwrap(),
+            swapped
+        );
+
+        fs::write(
+            root.0.join("builds").join(&second).join("wishctl.exe"),
+            b"corrupt",
+        )
+        .unwrap();
+        let before = fs::read(root.0.join("slots.zut")).unwrap();
+        let rejected = std::process::Command::new(powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script)
+            .arg("-Rollback")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert_eq!(fs::read(root.0.join("slots.zut")).unwrap(), before);
     }
 
     #[test]

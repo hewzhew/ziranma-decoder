@@ -226,6 +226,22 @@ cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchct
 处理、候选窗和新增采集字段仍需替换宿主内 DLL；系统不会冒险强制热卸载仍被 Codex、
 Typora 等进程使用的旧 DLL。
 
+日常工具还可以完全避开 `target/release` 与 TSF DLL：
+
+```powershell
+.\refresh-ime.cmd
+.\refresh-ime.cmd status
+.\refresh-ime.cmd rollback
+```
+
+默认命令离线、锁定依赖地构建七个别名、候选、个人排序、研究和许愿管理 EXE，
+并发布到 Git 忽略的不可变 `current / previous` 用户工具槽。现有工具进程不被
+关闭，新打开的 `aliaspad` / `wishpad` 和下一次管理命令使用 current；状态只读，
+回退先复核完整摘要。这个入口不构建 `--lib`，不生成或替换 TSF DLL，也不读取
+私人数据根。`candidate-data.cmd` 可调用当前候选管理器，`personal-ime.cmd` 则把
+个人排序命令固定到既有当前用户数据根；具体生效边界见
+[用户态工具独立刷新](docs/user-tool-refresh.md)。
+
 本地许愿放在 Git 忽略的 `.local/tsf-alpha/user-data/wishes`。默认管理命令只显示
 数量和随机内容 ID；查看输入原文必须显式确认，说明另存为绑定同一 ID 的加密
 文件，移除则进入可恢复的本地 `trash`：

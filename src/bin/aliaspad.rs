@@ -48,6 +48,7 @@ mod windows_app {
         WS_VISIBLE,
     };
     use windows::core::{PCWSTR, w};
+    use ziranma_core::repository_root_for_user_tool_executable;
 
     const CODE_EDIT_ID: i32 = 101;
     const TEXT_EDIT_ID: i32 = 102;
@@ -744,15 +745,8 @@ mod windows_app {
 
     fn paths_from_executable(executable: &Path) -> Result<AppState, Box<dyn Error>> {
         let binary_directory = executable.parent().ok_or("无法确定程序目录")?;
-        let target_directory = binary_directory.parent().ok_or("无法确定 target 目录")?;
-        if !matches!(
-            binary_directory.file_name().and_then(|name| name.to_str()),
-            Some("debug" | "release")
-        ) || target_directory.file_name().and_then(|name| name.to_str()) != Some("target")
-        {
-            return Err("固定候选面板必须从项目的 target\\debug 或 target\\release 运行".into());
-        }
-        let repository = target_directory.parent().ok_or("无法确定项目目录")?;
+        let repository = repository_root_for_user_tool_executable(executable, "aliaspad")
+            .ok_or("固定候选面板必须从项目构建或已验证用户工具包运行")?;
         Ok(AppState {
             aliasctl: binary_directory.join("aliasctl.exe"),
             alias_root: repository
@@ -789,6 +783,20 @@ mod windows_app {
             );
             assert_eq!(
                 state.alias_root,
+                PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\aliases")
+            );
+            let bundled = paths_from_executable(Path::new(
+                r"D:\repo\.local\tsf-alpha\user-tools\builds\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\aliaspad.exe",
+            ))
+            .unwrap();
+            assert_eq!(
+                bundled.aliasctl,
+                PathBuf::from(
+                    r"D:\repo\.local\tsf-alpha\user-tools\builds\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\aliasctl.exe"
+                )
+            );
+            assert_eq!(
+                bundled.alias_root,
                 PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\aliases")
             );
             assert!(paths_from_executable(Path::new(r"D:\repo\aliaspad.exe")).is_err());

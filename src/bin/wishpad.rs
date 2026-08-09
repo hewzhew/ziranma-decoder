@@ -63,7 +63,7 @@ mod windows_app {
         NativeAutomaticTranspositionTier, NativeFeedbackEvent, WindowsUserDataProtector,
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishNote,
         WishPackageInfo, list_wish_packages, load_wish_note, load_wish_snapshot,
-        save_or_replace_wish_note,
+        repository_root_for_user_tool_executable, save_or_replace_wish_note,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -970,13 +970,7 @@ mod windows_app {
     }
 
     fn wish_root_for_executable(executable: &Path) -> Option<PathBuf> {
-        let release = executable.parent()?;
-        let target = release.parent()?;
-        let repository = target.parent()?;
-        if release.file_name()?.to_str()? != "release" || target.file_name()?.to_str()? != "target"
-        {
-            return None;
-        }
+        let repository = repository_root_for_user_tool_executable(executable, "wishpad")?;
         Some(
             repository
                 .join(".local")
@@ -2034,9 +2028,15 @@ mod windows_app {
         }
 
         #[test]
-        fn note_storage_root_is_derived_only_from_the_release_binary_layout() {
+        fn note_storage_root_is_derived_only_from_managed_binary_layouts() {
             assert_eq!(
                 wish_root_for_executable(Path::new(r"D:\repo\target\release\wishpad.exe")),
+                Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\wishes"))
+            );
+            assert_eq!(
+                wish_root_for_executable(Path::new(
+                    r"D:\repo\.local\tsf-alpha\user-tools\builds\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\wishpad.exe"
+                )),
                 Some(PathBuf::from(r"D:\repo\.local\tsf-alpha\user-data\wishes"))
             );
             assert!(wish_root_for_executable(Path::new(r"D:\tools\wishpad.exe")).is_none());

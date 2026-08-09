@@ -8,8 +8,8 @@ use ziranma_core::{
     NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
     NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchSceneAnalysis,
     TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
-    analyze_linked_research, list_wish_packages, research_feedback_enabled,
-    set_research_feedback_enabled,
+    analyze_linked_research, list_wish_packages, repository_root_for_user_tool_executable,
+    research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -747,15 +747,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
 }
 
 fn research_root_for_executable(executable: &Path) -> Option<PathBuf> {
-    let release = executable.parent()?;
-    let target = release.parent()?;
-    let repository = target.parent()?;
-    if release.file_name()?.to_str()? != "release"
-        || target.file_name()?.to_str()? != "target"
-        || executable.file_stem()?.to_str()? != "researchctl"
-    {
-        return None;
-    }
+    let repository = repository_root_for_user_tool_executable(executable, "researchctl")?;
     Some(
         repository
             .join(".local")
@@ -922,6 +914,14 @@ mod tests {
     fn release_tool_derives_the_stable_installed_user_data_root() {
         assert_eq!(
             research_root_for_executable(Path::new(r"X:\workspace\target\release\researchctl.exe")),
+            Some(PathBuf::from(
+                r"X:\workspace\.local\tsf-alpha\user-data\research-inbox"
+            ))
+        );
+        assert_eq!(
+            research_root_for_executable(Path::new(
+                r"X:\workspace\.local\tsf-alpha\user-tools\builds\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\researchctl.exe"
+            )),
             Some(PathBuf::from(
                 r"X:\workspace\.local\tsf-alpha\user-data\research-inbox"
             ))

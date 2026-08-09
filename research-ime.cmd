@@ -1,12 +1,22 @@
 @echo off
 setlocal
 
-set "researchctl=%~dp0target\release\researchctl.exe"
+set "resolver=%~dp0scripts\resolve-user-tool.cmd"
 set "research_root=%~dp0.local\tsf-alpha\user-data\research-inbox"
 set "action=%~1"
 
+if not exist "%resolver%" (
+    echo User tool resolver is missing.
+    exit /b 1
+)
+set "researchctl="
+for /f "usebackq delims=" %%P in (`call "%resolver%" researchctl`) do set "researchctl=%%P"
+if not defined researchctl (
+    echo Research settings are unavailable. Run refresh-ime.cmd first.
+    exit /b 1
+)
 if not exist "%researchctl%" (
-    echo Research settings are missing. Run cargo build --release --bin researchctl first.
+    echo Research settings are unavailable. Run refresh-ime.cmd status.
     exit /b 1
 )
 

@@ -499,10 +499,21 @@ stderr 的 `NativeCommandError` 包装由脚本先完整捕获，再按真实进
 在任意 PowerShell 当前目录中均可运行：
 
 ```powershell
+.\refresh-ime.cmd
+.\refresh-ime.cmd status
+.\refresh-ime.cmd rollback
 .\prepare-ime.cmd
 .\update-ime.cmd
 .\update-ime.cmd status
 ```
+
+`refresh-ime.cmd` 不进入安装路径。它在独立 Cargo target 中离线构建七个用户态
+管理/分析 EXE，以清单 SHA-256 建立不可变 `current / previous` 槽，并让别名、
+研究和许愿入口解析 current。失败时原指针不变，回退先验证两个包；已运行程序
+继续使用旧映像，退出后重新打开即可自然切换。它不构建 `--lib`，不访问私人数据
+根，也不操作 COM、TSF 配置或默认输入法。公开候选快照仍由已加载类工厂冻结，
+按键、UI 和新增采集字段仍必须安全换代 DLL。详细矩阵见
+[用户态工具独立刷新](user-tool-refresh.md)。
 
 `prepare-ime.cmd` 把构建和安装拆成两个明确授权：它使用 `Cargo.lock` 与 Cargo
 `--offline` 构建 release DLL、安装控制器以及日用别名、个人学习、持续研究和许愿

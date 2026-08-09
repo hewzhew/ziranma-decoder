@@ -62,6 +62,7 @@ mod tracker;
 mod transposition_calibration;
 #[cfg(windows)]
 mod tsf_alpha;
+mod user_tool_layout;
 mod wish_command;
 mod wish_feedback;
 
@@ -359,6 +360,7 @@ pub use transposition_calibration::{
     TranspositionCalibrationObservation, TranspositionCalibrationRecommendation,
     TranspositionCalibrationSummary, TranspositionCalibrator,
 };
+pub use user_tool_layout::repository_root_for_user_tool_executable;
 #[cfg(windows)]
 pub use wish_command::{WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID};
 pub use wish_command::{

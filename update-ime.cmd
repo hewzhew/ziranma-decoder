@@ -29,8 +29,8 @@ if /i "%update_mode%"=="status" goto status
 "%windows_powershell%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%update_script%" -EnableCurrentUserAfterReplace
 set "update_exit_code=%ERRORLEVEL%"
 if "%update_exit_code%"=="0" (
-    if exist "%~dp0target\release\wishpad.exe" (
-        start "" "%~dp0target\release\wishpad.exe"
+    if exist "%~dp0wish-ime.cmd" (
+        call "%~dp0wish-ime.cmd"
     )
 )
 exit /b %update_exit_code%
