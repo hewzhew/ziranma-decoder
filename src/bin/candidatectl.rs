@@ -27,6 +27,7 @@ use ziranma_core::{
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
     CandidateSupplementalState, CharacterBigramLanguageModel, ContinuousCompositionProbe,
+    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_RANK,
@@ -39,9 +40,9 @@ use ziranma_core::{
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
-    layered_candidate_texts_with_consensus, load_candidate_runtime_snapshots,
-    load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
-    parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
+    layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
+    load_candidate_runtime_snapshots, load_current_candidate_snapshot, parse_lexicon_tsv,
+    parse_public_rime_slice, parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
     select_public_bigram_training_sequences, select_public_character_training_texts,
     select_public_continuous_composition_cases, select_public_supplemental_composition_cases,
     supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
@@ -510,6 +511,7 @@ fn parse_build_rime_slice(
     let mut source_url = None;
     let mut source_sha256 = None;
     let mut max_entries = None;
+    let mut frequency_frontier_entries = None;
     let mut max_text_characters = None;
     let mut public = false;
     while let Some(argument) = arguments.next() {
@@ -524,6 +526,11 @@ fn parse_build_rime_slice(
             "--source-url" => set_value(&mut source_url, &mut arguments, "--source-url")?,
             "--source-sha256" => set_value(&mut source_sha256, &mut arguments, "--source-sha256")?,
             "--max-entries" => set_usize(&mut max_entries, &mut arguments, "--max-entries")?,
+            "--frequency-frontier-entries" => set_usize(
+                &mut frequency_frontier_entries,
+                &mut arguments,
+                "--frequency-frontier-entries",
+            )?,
             "--max-text-characters" => set_usize(
                 &mut max_text_characters,
                 &mut arguments,
@@ -541,8 +548,10 @@ fn parse_build_rime_slice(
     if !public {
         return Err("build-rime-slice requires explicit --public".into());
     }
+    let max_entries = max_entries.ok_or("build-rime-slice requires --max-entries")?;
     let config = PublicRimeSliceConfig {
-        max_entries: max_entries.ok_or("build-rime-slice requires --max-entries")?,
+        max_entries,
+        frequency_frontier_entries: frequency_frontier_entries.unwrap_or(max_entries),
         max_text_characters: max_text_characters
             .ok_or("build-rime-slice requires --max-text-characters")?,
     };
@@ -553,6 +562,13 @@ fn parse_build_rime_slice(
         || config.max_text_characters > MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS
     {
         return Err("build-rime-slice --max-text-characters is outside the fixed bound".into());
+    }
+    if config.frequency_frontier_entries == 0
+        || config.frequency_frontier_entries > config.max_entries
+    {
+        return Err(
+            "build-rime-slice --frequency-frontier-entries must be within --max-entries".into(),
+        );
     }
     Ok(Options::BuildRimeSlice {
         source: source.ok_or("build-rime-slice requires --source")?,
@@ -1023,7 +1039,7 @@ fn print_usage() {
         "  build-rime --source <RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
     eprintln!(
-        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> --max-text-characters <1..12> --public"
+        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] --max-text-characters <1..12> --public"
     );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
@@ -2815,8 +2831,12 @@ fn benchmark_candidate_layers(
     let supplemental =
         snapshot_from_payload("layer-benchmark-supplemental-v1", &supplemental_text)?;
     let supplemental_build = supplemental_started.elapsed();
+    let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
+    let correction_audit =
+        audit_four_character_correction_gate(&core, &supplemental, &supplemental_entries, 256)?;
     let config = SupplementalCandidateLayerConfig { exact_promotions };
     let codes = layer_benchmark_codes()?;
+    let correction_codes = four_character_correction_benchmark_codes()?;
 
     for code in &codes {
         black_box(core.candidate_texts(black_box(code), 6)?);
@@ -2828,9 +2848,19 @@ fn benchmark_candidate_layers(
             config,
         )?);
     }
+    for code in &correction_codes {
+        black_box(layered_four_character_correction_decision(
+            &core,
+            Some(&supplemental),
+            black_box(code),
+            1,
+        )?);
+    }
 
     let mut core_durations = Vec::with_capacity(repetitions * codes.len());
     let mut layered_durations = Vec::with_capacity(repetitions * codes.len());
+    let mut correction_durations =
+        Vec::with_capacity(repetitions.saturating_mul(correction_codes.len()));
     let mut checksum = 0usize;
     for _ in 0..repetitions {
         for code in &codes {
@@ -2846,6 +2876,27 @@ fn benchmark_candidate_layers(
             layered_durations.push(started.elapsed());
             checksum = update_candidate_text_checksum(checksum, &candidates);
             black_box(candidates);
+        }
+        for code in &correction_codes {
+            let started = Instant::now();
+            let decision = layered_four_character_correction_decision(
+                &core,
+                Some(&supplemental),
+                black_box(code),
+                1,
+            )?;
+            correction_durations.push(started.elapsed());
+            if let FourCharacterCorrectionDecision::Offer(offer) = &decision {
+                checksum = update_candidate_text_checksum(
+                    checksum,
+                    &offer
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.text.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            black_box(decision);
         }
     }
 
@@ -2870,10 +2921,12 @@ fn benchmark_candidate_layers(
         .ok_or("layer benchmark produced no core samples")?;
     let layered_latency = summarize_durations(&mut layered_durations)
         .ok_or("layer benchmark produced no layered samples")?;
+    let correction_latency = summarize_durations(&mut correction_durations)
+        .ok_or("layer benchmark produced no correction samples")?;
     let median_delta_ms = layered_latency.median.as_secs_f64() * 1_000.0
         - core_latency.median.as_secs_f64() * 1_000.0;
     Ok(format!(
-        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
+        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n四字公开正例：{}；恢复提示 {}，目标首项 {}，目标可见 {}，原码碰撞 {}，多码歧义 {}，无恢复 {}，错误目标码 {}\n四字公开负例：原码整词保护失败 {}\n候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
         codes.len(),
         core_latency.samples,
         duration_ms(core_build),
@@ -2884,6 +2937,20 @@ fn benchmark_candidate_layers(
         duration_ms(layered_latency.median),
         duration_ms(layered_latency.p95),
         duration_ms(layered_latency.maximum),
+        correction_codes.len(),
+        correction_latency.samples,
+        duration_ms(correction_latency.median),
+        duration_ms(correction_latency.p95),
+        duration_ms(correction_latency.maximum),
+        correction_audit.samples,
+        correction_audit.offered,
+        correction_audit.target_first,
+        correction_audit.target_visible,
+        correction_audit.original_code_collision,
+        correction_audit.ambiguous_codes,
+        correction_audit.no_recovery,
+        correction_audit.wrong_intended_code,
+        correction_audit.exact_protection_failures,
     ))
 }
 
@@ -2936,6 +3003,123 @@ fn layer_benchmark_codes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
         }
     }
     Ok(codes)
+}
+
+fn four_character_correction_benchmark_codes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut codes = Vec::new();
+    for phrase in ["bai kai rou sui", "zi xiang mao dun", "hua she tian zu"] {
+        let encoded = encode_pinyin_phrase(phrase)?;
+        let mut observed = encoded.full_code.as_str().as_bytes().to_vec();
+        if observed[0] != observed[1] {
+            observed.swap(0, 1);
+        }
+        codes.push(String::from_utf8(observed).expect("the codec emits lowercase ASCII"));
+    }
+    Ok(codes)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FourCharacterCorrectionAudit {
+    samples: usize,
+    offered: usize,
+    target_first: usize,
+    target_visible: usize,
+    original_code_collision: usize,
+    ambiguous_codes: usize,
+    no_recovery: usize,
+    wrong_intended_code: usize,
+    exact_protection_failures: usize,
+}
+
+fn audit_four_character_correction_gate(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    supplemental_entries: &[ziranma_core::LexiconEntry],
+    sample_limit: usize,
+) -> Result<FourCharacterCorrectionAudit, Box<dyn std::error::Error>> {
+    let mut selected_codes = HashSet::new();
+    let mut samples = Vec::new();
+    for entry in supplemental_entries {
+        if entry.text.chars().count() != 4
+            || entry.syllable_codes.len() != 4
+            || !selected_codes.insert(entry.code.as_str().to_owned())
+        {
+            continue;
+        }
+        let mut observed = entry.code.as_str().as_bytes().to_vec();
+        let Some(start) = (0..4)
+            .map(|syllable| syllable * 2)
+            .find(|&start| observed[start] != observed[start + 1])
+        else {
+            continue;
+        };
+        observed.swap(start, start + 1);
+        samples.push((
+            entry.text.clone(),
+            entry.code.as_str().to_owned(),
+            String::from_utf8(observed).expect("the codec emits lowercase ASCII"),
+        ));
+        if samples.len() == sample_limit {
+            break;
+        }
+    }
+
+    let mut audit = FourCharacterCorrectionAudit::default();
+    for (target_text, intended_code, observed) in samples {
+        audit.samples += 1;
+        if !matches!(
+            layered_four_character_correction_decision(
+                core,
+                Some(supplemental),
+                &intended_code,
+                1,
+            )?,
+            FourCharacterCorrectionDecision::KeepOrdinary(
+                FourCharacterCorrectionKeepReason::OriginalHasExactFullCode
+            )
+        ) {
+            audit.exact_protection_failures += 1;
+        }
+        match layered_four_character_correction_decision(
+            core,
+            Some(supplemental),
+            &observed,
+            MAX_CANDIDATE_SNAPSHOT_RANK,
+        )? {
+            FourCharacterCorrectionDecision::Offer(offer) => {
+                audit.offered += 1;
+                audit.wrong_intended_code += usize::from(offer.intended_code != intended_code);
+                audit.target_first += usize::from(
+                    offer
+                        .candidates
+                        .first()
+                        .map(|candidate| candidate.text.as_str())
+                        == Some(target_text.as_str()),
+                );
+                audit.target_visible += usize::from(
+                    offer
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.text == target_text),
+                );
+            }
+            FourCharacterCorrectionDecision::KeepOrdinary(reason) => match reason {
+                FourCharacterCorrectionKeepReason::OriginalHasExactFullCode => {
+                    audit.original_code_collision += 1;
+                }
+                FourCharacterCorrectionKeepReason::AmbiguousIntendedCodes => {
+                    audit.ambiguous_codes += 1;
+                }
+                FourCharacterCorrectionKeepReason::NoSingleEditRecovery => {
+                    audit.no_recovery += 1;
+                }
+                FourCharacterCorrectionKeepReason::UnsupportedInputShape => {
+                    return Err("four-character audit produced an unsupported input shape".into());
+                }
+            },
+        }
+    }
+    Ok(audit)
 }
 
 #[derive(Clone, Copy)]
@@ -2992,6 +3176,18 @@ fn write_slice_stats(output: &mut String, stats: PublicRimeSliceImportStats) {
         stats.dropped_by_entry_cap,
         stats.selected_duplicate_rows,
         stats.minimum_selected_frequency,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "双字码覆盖：合格码 {}，全局前沿已覆盖 {}（{} 行），补充候选 {}，保留 {}，上限外 {}，高频回填 {}",
+        stats.eligible_two_character_codes,
+        stats.frequency_frontier_two_character_codes,
+        stats.frequency_frontier_selected_rows,
+        stats.two_character_coverage_candidates,
+        stats.two_character_coverage_admitted,
+        stats.two_character_coverage_dropped,
+        stats.frequency_backfill_admitted,
     )
     .unwrap();
 }
@@ -3065,7 +3261,7 @@ fn runtime_query(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let runtime = load_candidate_runtime_snapshots(root, supplemental_root)?
         .ok_or("candidate runtime root is not configured")?;
-    let (candidates, supplemental_revision) = match runtime.supplemental() {
+    let (mut candidates, supplemental_revision) = match runtime.supplemental() {
         Some(supplemental) => (
             layered_candidate_texts_with_consensus(
                 runtime.core(),
@@ -3078,6 +3274,30 @@ fn runtime_query(
         ),
         None => (runtime.core().candidate_texts(code, limit)?, None),
     };
+    if limit >= 2
+        && !candidates.is_empty()
+        && let FourCharacterCorrectionDecision::Offer(offer) =
+            layered_four_character_correction_decision(
+                runtime.core(),
+                runtime
+                    .supplemental()
+                    .map(|supplemental| supplemental.snapshot().as_ref()),
+                code,
+                1,
+            )?
+        && let Some(recovered) = offer.candidates.into_iter().next()
+    {
+        let existing_index = candidates
+            .iter()
+            .position(|candidate| candidate == &recovered.text);
+        if existing_index != Some(0) {
+            if let Some(existing_index) = existing_index {
+                candidates.remove(existing_index);
+            }
+            candidates.insert(1.min(candidates.len()), recovered.text);
+            candidates.truncate(limit);
+        }
+    }
     let mut output = String::new();
     writeln!(output, "TSF 公共候选管线审计").unwrap();
     writeln!(output, "核心版本：{}", runtime.core().revision()).unwrap();
@@ -4003,6 +4223,8 @@ mod tests {
                 "b".repeat(64),
                 "--max-entries".to_owned(),
                 "100000".to_owned(),
+                "--frequency-frontier-entries".to_owned(),
+                "80000".to_owned(),
                 "--max-text-characters".to_owned(),
                 "8".to_owned(),
             ])
@@ -4010,6 +4232,7 @@ mod tests {
             Options::BuildRimeSlice {
                 config: PublicRimeSliceConfig {
                     max_entries: 100_000,
+                    frequency_frontier_entries: 80_000,
                     max_text_characters: 8,
                 },
                 ..
@@ -4440,6 +4663,7 @@ mod tests {
             &declaration,
             PublicRimeSliceConfig {
                 max_entries: 2,
+                frequency_frontier_entries: 2,
                 max_text_characters: 4,
             },
         )

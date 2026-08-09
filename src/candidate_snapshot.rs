@@ -8,8 +8,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Decoder, KeySequence, KeySequenceError, MAX_LEXICON_SYLLABLES, parse_lexicon_tsv,
-    spelling_is_complete_or_anchored_suffix,
+    Correction, Decoder, KeySequence, KeySequenceError, MAX_LEXICON_SYLLABLES, ScoreBreakdown,
+    parse_lexicon_tsv, spelling_is_complete_or_anchored_suffix,
 };
 
 /// First read-only candidate snapshot schema.
@@ -47,6 +47,7 @@ pub(crate) enum InteractiveCandidateSource {
     CharacterPair,
     CompleteSentence,
     Decoder,
+    FourCharacterCorrection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +100,57 @@ pub struct AutomaticTranspositionPromotion {
     pub intended_code: String,
     /// Exact whole-word candidates in their ordinary lexicon order.
     pub candidates: Vec<String>,
+}
+
+/// One complete four-character whole word reached by exactly one key edit.
+///
+/// The snapshot only exposes evidence here. It does not promote or commit the
+/// candidate, and callers can inspect the intended code, correction, and
+/// score before choosing an interaction policy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FourCharacterCorrectionCandidate {
+    /// Public whole-word text recorded by the snapshot.
+    pub text: String,
+    /// Full pinyin recorded by the public lexicon.
+    pub pinyin: String,
+    /// Corrected canonical eight-key double-pinyin code.
+    pub intended_code: String,
+    /// The one supported edit relating the observed keys to the full code.
+    pub correction: Correction,
+    /// Transparent score produced by the ordinary decoder configuration.
+    pub score: ScoreBreakdown,
+}
+
+/// Host-independent decision for the narrow four-character correction lane.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FourCharacterCorrectionDecision {
+    /// Preserve the ordinary candidates without inserting a recovery.
+    KeepOrdinary(FourCharacterCorrectionKeepReason),
+    /// One corrected canonical code is safe to expose as an advisory lane.
+    Offer(FourCharacterCorrectionOffer),
+}
+
+/// Structural reason why four-character recovery stayed hidden.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FourCharacterCorrectionKeepReason {
+    /// A four-syllable complete code cannot be one edit from this input shape.
+    UnsupportedInputShape,
+    /// The observed eight keys already name a complete four-character word.
+    OriginalHasExactFullCode,
+    /// Neither public layer contained a complete four-character one-edit word.
+    NoSingleEditRecovery,
+    /// One edit led to more than one canonical eight-key code.
+    AmbiguousIntendedCodes,
+}
+
+/// One unambiguous corrected code and its bounded exact-word candidates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FourCharacterCorrectionOffer {
+    /// The sole canonical code reached by a supported single edit.
+    pub intended_code: String,
+    /// Core candidates first, then new supplemental candidates, without
+    /// comparing unrelated raw frequency scales across the two sources.
+    pub candidates: Vec<FourCharacterCorrectionCandidate>,
 }
 
 /// Explicit influence bound for one independent supplemental public lexicon.
@@ -292,6 +344,33 @@ impl CandidateSnapshot {
             })
     }
 
+    /// Finds complete four-character public whole words behind one key edit.
+    ///
+    /// Only four full double-pinyin syllables are accepted. Mixed initials,
+    /// sentence paths, unresolved input, and a second correction are excluded.
+    /// Results remain advisory and do not alter the ordinary candidate order.
+    pub fn four_character_correction_candidates(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<FourCharacterCorrectionCandidate>, KeySequenceError> {
+        let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        self.decoder
+            .decode_complete_word_single_edit(code, 4, limit)
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .map(|candidate| FourCharacterCorrectionCandidate {
+                        text: candidate.text,
+                        pinyin: candidate.pinyin,
+                        intended_code: candidate.code.as_str().to_owned(),
+                        correction: candidate.correction,
+                        score: candidate.score,
+                    })
+                    .collect()
+            })
+    }
+
     fn interactive_candidate_texts(
         &self,
         code: &str,
@@ -410,6 +489,95 @@ impl CandidateSnapshot {
                 limit,
             )
     }
+}
+
+/// Decides whether one complete four-character correction is unambiguous
+/// across the core and optional supplemental public snapshots.
+///
+/// Exact observed words win immediately. Otherwise every supported one-edit
+/// result must agree on one canonical code; raw frequencies from different
+/// snapshots are never compared.
+pub fn layered_four_character_correction_decision(
+    core: &CandidateSnapshot,
+    supplemental: Option<&CandidateSnapshot>,
+    code: &str,
+    limit: usize,
+) -> Result<FourCharacterCorrectionDecision, KeySequenceError> {
+    let observed = KeySequence::new(code)?;
+    if !(7..=9).contains(&observed.as_str().len()) {
+        return Ok(FourCharacterCorrectionDecision::KeepOrdinary(
+            FourCharacterCorrectionKeepReason::UnsupportedInputShape,
+        ));
+    }
+    let supplemental_has_exact = if let Some(snapshot) = supplemental {
+        !snapshot.exact_full_code_texts(code, 1)?.is_empty()
+    } else {
+        false
+    };
+    if observed.as_str().len() == 8
+        && (!core.exact_full_code_texts(code, 1)?.is_empty() || supplemental_has_exact)
+    {
+        return Ok(FourCharacterCorrectionDecision::KeepOrdinary(
+            FourCharacterCorrectionKeepReason::OriginalHasExactFullCode,
+        ));
+    }
+
+    let mut candidates = core
+        .decoder
+        .decode_complete_word_single_edit(code, 4, usize::MAX)?;
+    if let Some(supplemental) = supplemental {
+        candidates.extend(supplemental.decoder.decode_complete_word_single_edit(
+            code,
+            4,
+            usize::MAX,
+        )?);
+    }
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| {
+        seen.insert((candidate.text.clone(), candidate.code.as_str().to_owned()))
+    });
+    if candidates.is_empty() {
+        return Ok(FourCharacterCorrectionDecision::KeepOrdinary(
+            FourCharacterCorrectionKeepReason::NoSingleEditRecovery,
+        ));
+    }
+    let intended_codes = candidates
+        .iter()
+        .map(|candidate| candidate.code.as_str())
+        .collect::<HashSet<_>>();
+    if intended_codes.len() != 1 {
+        return Ok(FourCharacterCorrectionDecision::KeepOrdinary(
+            FourCharacterCorrectionKeepReason::AmbiguousIntendedCodes,
+        ));
+    }
+    let intended_code = intended_codes
+        .into_iter()
+        .next()
+        .expect("a non-empty correction set has one intended code")
+        .to_owned();
+    let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+    let candidates = candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| FourCharacterCorrectionCandidate {
+            text: candidate.text,
+            pinyin: candidate.pinyin,
+            intended_code: candidate.code.as_str().to_owned(),
+            correction: candidate.correction,
+            score: candidate.score,
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(FourCharacterCorrectionDecision::KeepOrdinary(
+            FourCharacterCorrectionKeepReason::NoSingleEditRecovery,
+        ));
+    }
+    Ok(FourCharacterCorrectionDecision::Offer(
+        FourCharacterCorrectionOffer {
+            intended_code,
+            candidates,
+        },
+    ))
 }
 
 /// Merges one core and one supplemental public snapshot without comparing
@@ -1636,6 +1804,23 @@ mod tests {
         expected_entry_count: 50,
     };
 
+    fn load_test_snapshot(
+        revision: &str,
+        lexicon_tsv: &str,
+        expected_entry_count: usize,
+    ) -> CandidateSnapshot {
+        CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision,
+            contains_private_text: false,
+            lexicon_tsv,
+            expected_payload_bytes: lexicon_tsv.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(lexicon_tsv.as_bytes()),
+            expected_entry_count,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn validated_snapshot_exposes_metadata_and_bounded_candidates() {
         let snapshot = CandidateSnapshot::load(DEMO_DESCRIPTOR).unwrap();
@@ -2665,6 +2850,191 @@ mod tests {
                 .transposition_recovery_texts("kkjjceui", 0)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn four_character_correction_view_bypasses_sentence_crowding_without_promoting() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+掰开揉碎\tbai kai rou sui\t1000\n\
+掰\tbai\t900\n\
+开\tkai\t800\n\
+揉\trou\t700\n\
+碎\tsui\t600\n\
+三个汉\tsan ge han\t500\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "four-character-correction-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 6,
+        })
+        .unwrap();
+        let intended = crate::encode_pinyin_phrase("bai kai rou sui")
+            .unwrap()
+            .full_code;
+        let mut observed = intended.as_str().as_bytes().to_vec();
+        observed.swap(0, 1);
+        let observed = std::str::from_utf8(&observed).unwrap();
+
+        let recovered = snapshot
+            .four_character_correction_candidates(observed, 7)
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].text, "掰开揉碎");
+        assert_eq!(recovered[0].pinyin, "bai kai rou sui");
+        assert_eq!(recovered[0].intended_code, intended.as_str());
+        assert!(matches!(
+            recovered[0].correction,
+            Correction::AdjacentTransposition { start: 0, .. }
+        ));
+        assert!(
+            snapshot
+                .four_character_correction_candidates(intended.as_str(), 7)
+                .unwrap()
+                .is_empty(),
+            "an exact whole word is not correction evidence"
+        );
+        assert!(
+            snapshot
+                .four_character_correction_candidates(observed, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn four_character_correction_view_keeps_the_existing_one_edit_channel() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+掰开揉碎\tbai kai rou sui\t1000\n";
+        let snapshot = CandidateSnapshot::load(CandidateSnapshotDescriptor {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            revision: "four-character-error-channel-v1",
+            contains_private_text: false,
+            lexicon_tsv: LEXICON,
+            expected_payload_bytes: LEXICON.len(),
+            expected_payload_fingerprint: candidate_payload_fingerprint(LEXICON.as_bytes()),
+            expected_entry_count: 1,
+        })
+        .unwrap();
+        let intended = crate::encode_pinyin_phrase("bai kai rou sui")
+            .unwrap()
+            .full_code;
+        let intended = intended.as_str().as_bytes();
+
+        let mut substitution = intended.to_vec();
+        let (substitution_index, neighbor) = intended
+            .iter()
+            .enumerate()
+            .find_map(|(index, &key)| {
+                (b'a'..=b'z')
+                    .find(|&actual| crate::are_qwerty_neighbors(key, actual))
+                    .map(|actual| (index, actual))
+            })
+            .unwrap();
+        substitution[substitution_index] = neighbor;
+        let mut transposition = intended.to_vec();
+        transposition.swap(0, 1);
+        let mut missing = intended.to_vec();
+        missing.remove(2);
+        let mut extra = intended.to_vec();
+        extra.insert(2, b'x');
+
+        for (observed, expected) in [
+            (substitution, "邻键替换"),
+            (transposition, "顺序颠倒"),
+            (missing, "遗漏"),
+            (extra, "多按"),
+        ] {
+            let observed = std::str::from_utf8(&observed).unwrap();
+            let recovered = snapshot
+                .four_character_correction_candidates(observed, 1)
+                .unwrap();
+            assert_eq!(recovered.len(), 1, "{expected}: {observed}");
+            assert_eq!(recovered[0].text, "掰开揉碎");
+            assert!(
+                recovered[0].correction.description().contains(expected),
+                "{:?}",
+                recovered[0].correction
+            );
+        }
+    }
+
+    #[test]
+    fn layered_four_character_gate_requires_one_corrected_canonical_code() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+掰开揉碎\tbai kai rou sui\t1000\n";
+        let core = load_test_snapshot("four-character-gate-core-v1", CORE, 1);
+        let intended = crate::encode_pinyin_phrase("bai kai rou sui")
+            .unwrap()
+            .full_code;
+        let mut observed = intended.as_str().as_bytes().to_vec();
+        observed.swap(0, 1);
+        let observed = std::str::from_utf8(&observed).unwrap();
+
+        let decision =
+            layered_four_character_correction_decision(&core, None, observed, 1).unwrap();
+        let FourCharacterCorrectionDecision::Offer(offer) = decision else {
+            panic!("one corrected code should be offered: {decision:?}");
+        };
+        assert_eq!(offer.intended_code, intended.as_str());
+        assert_eq!(offer.candidates.len(), 1);
+        assert_eq!(offer.candidates[0].text, "掰开揉碎");
+
+        assert_eq!(
+            layered_four_character_correction_decision(&core, None, intended.as_str(), 1).unwrap(),
+            FourCharacterCorrectionDecision::KeepOrdinary(
+                FourCharacterCorrectionKeepReason::OriginalHasExactFullCode
+            )
+        );
+        assert_eq!(
+            layered_four_character_correction_decision(&core, None, "abcdef", 1).unwrap(),
+            FourCharacterCorrectionDecision::KeepOrdinary(
+                FourCharacterCorrectionKeepReason::UnsupportedInputShape
+            )
+        );
+        assert_eq!(
+            layered_four_character_correction_decision(&core, None, "aaaaaaaa", 1).unwrap(),
+            FourCharacterCorrectionDecision::KeepOrdinary(
+                FourCharacterCorrectionKeepReason::NoSingleEditRecovery
+            )
+        );
+    }
+
+    #[test]
+    fn layered_four_character_gate_rejects_two_one_edit_target_codes() {
+        const AMBIGUOUS: &str = "text\tpinyin\tfrequency\n\
+甲乙丙跨\tjia yi bing kua\t1000\n\
+甲乙丙宽\tjia yi bing kuan\t900\n";
+        let snapshot = load_test_snapshot("four-character-gate-ambiguous-v1", AMBIGUOUS, 2);
+        let first = crate::encode_pinyin_phrase("jia yi bing kua")
+            .unwrap()
+            .full_code;
+        let second = crate::encode_pinyin_phrase("jia yi bing kuan")
+            .unwrap()
+            .full_code;
+        assert_eq!(&first.as_str()[..6], &second.as_str()[..6]);
+        assert_eq!(&first.as_str()[6..7], &second.as_str()[6..7]);
+        assert_ne!(&first.as_str()[7..], &second.as_str()[7..]);
+        let mut observed = first.as_str().as_bytes().to_vec();
+        observed[7] = b'e';
+        assert!(crate::are_qwerty_neighbors(
+            first.as_str().as_bytes()[7],
+            b'e'
+        ));
+        assert!(crate::are_qwerty_neighbors(
+            second.as_str().as_bytes()[7],
+            b'e'
+        ));
+        let observed = std::str::from_utf8(&observed).unwrap();
+
+        assert_eq!(
+            layered_four_character_correction_decision(&snapshot, None, observed, 7).unwrap(),
+            FourCharacterCorrectionDecision::KeepOrdinary(
+                FourCharacterCorrectionKeepReason::AmbiguousIntendedCodes
+            )
         );
     }
 

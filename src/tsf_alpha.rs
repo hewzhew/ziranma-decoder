@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak as SyncWeak};
 use std::time::Instant;
 
 use crate::candidate_snapshot::{
-    InteractiveCandidateQuery, InteractiveCandidateSource,
-    layered_candidate_query_with_consensus_sources,
+    FourCharacterCorrectionDecision, InteractiveCandidateQuery, InteractiveCandidateSource,
+    layered_candidate_query_with_consensus_sources, layered_four_character_correction_decision,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -674,8 +674,10 @@ impl SnapshotCandidateProvider {
                 let mut seen = HashSet::new();
                 let mut protected_prefix_len = 0;
                 let mut automatic_transposition_blocked = false;
+                let mut has_explicit_exact_prefix = false;
                 if let Some(alias) = self.aliases.as_ref().and_then(|aliases| aliases.text(code)) {
                     automatic_transposition_blocked = true;
+                    has_explicit_exact_prefix = true;
                     seen.insert(alias.clone());
                     candidates.push(alias);
                     protected_prefix_len = 1;
@@ -689,6 +691,7 @@ impl SnapshotCandidateProvider {
                     .unwrap_or_default()
                 {
                     automatic_transposition_blocked = true;
+                    has_explicit_exact_prefix = true;
                     if seen.insert(candidate.text.clone()) {
                         candidates.push(candidate.text);
                         provenance.push(NativeCandidateProvenance::new(
@@ -698,7 +701,7 @@ impl SnapshotCandidateProvider {
                     }
                 }
                 let supplemental = self.supplemental.current();
-                let snapshot_query = supplemental
+                let mut snapshot_query = supplemental
                     .as_ref()
                     .and_then(|(supplemental, config)| {
                         layered_candidate_query_with_consensus_sources(
@@ -718,6 +721,38 @@ impl SnapshotCandidateProvider {
                                 automatic_transposition_blocked: true,
                             })
                     });
+                if !has_explicit_exact_prefix
+                    && limit >= 2
+                    && !snapshot_query.candidates.is_empty()
+                    && let Ok(FourCharacterCorrectionDecision::Offer(offer)) =
+                        layered_four_character_correction_decision(
+                            &self.snapshot,
+                            supplemental.as_ref().map(|(snapshot, _)| snapshot.as_ref()),
+                            code,
+                            1,
+                        )
+                    && let Some(recovered) = offer.candidates.into_iter().next()
+                {
+                    let existing_index = snapshot_query
+                        .candidates
+                        .iter()
+                        .position(|candidate| candidate.text == recovered.text);
+                    if existing_index != Some(0) {
+                        if let Some(existing_index) = existing_index {
+                            snapshot_query.candidates.remove(existing_index);
+                        }
+                        let insertion_index = 1.min(snapshot_query.candidates.len());
+                        snapshot_query.candidates.insert(
+                            insertion_index,
+                            crate::candidate_snapshot::InteractiveCandidateText {
+                                text: recovered.text,
+                                source: InteractiveCandidateSource::FourCharacterCorrection,
+                            },
+                        );
+                        snapshot_query.candidates.truncate(limit);
+                        automatic_transposition_blocked = true;
+                    }
+                }
                 automatic_transposition_blocked |= snapshot_query.automatic_transposition_blocked;
                 for candidate in snapshot_query.candidates {
                     if seen.insert(candidate.text.clone()) {
@@ -771,6 +806,9 @@ fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidat
         InteractiveCandidateSource::CharacterPair => NativeCandidateSource::CharacterPair,
         InteractiveCandidateSource::CompleteSentence => NativeCandidateSource::Decoder,
         InteractiveCandidateSource::Decoder => NativeCandidateSource::Decoder,
+        InteractiveCandidateSource::FourCharacterCorrection => {
+            NativeCandidateSource::FourCharacterCorrection
+        }
     }
 }
 
@@ -11165,6 +11203,69 @@ mod tests {
             item.source() == NativeCandidateSource::TranspositionRecovery
                 && !item.session_promoted()
         }));
+    }
+
+    #[test]
+    fn snapshot_provider_places_one_unambiguous_four_character_recovery_second() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+楼\tlou\t1000\n\
+开\tkai\t900\n\
+揉\trou\t800\n\
+碎\tsui\t700\n\
+掰开揉碎\tbai kai rou sui\t600\n";
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-four-character-correction-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 5,
+            })
+            .unwrap(),
+        );
+        let provider = SnapshotCandidateProvider::new(snapshot, None, None);
+        let intended = crate::encode_pinyin_phrase("bai kai rou sui")
+            .unwrap()
+            .full_code;
+        let mut observed = intended.as_str().as_bytes().to_vec();
+        observed.swap(0, 1);
+        let observed = std::str::from_utf8(&observed).unwrap();
+
+        let shallow =
+            provider.candidates_with_provenance(observed, 1, InteractiveCandidateView::Primary);
+        assert_eq!(shallow.candidates, ["楼开揉碎"]);
+        assert_eq!(
+            shallow.provenance[0].source(),
+            NativeCandidateSource::Decoder
+        );
+
+        let visible =
+            provider.candidates_with_provenance(observed, 6, InteractiveCandidateView::Primary);
+        assert_eq!(visible.candidates[0], "楼开揉碎");
+        assert_eq!(visible.candidates[1], "掰开揉碎");
+        assert_eq!(
+            visible.provenance[1].source(),
+            NativeCandidateSource::FourCharacterCorrection
+        );
+        assert!(visible.automatic_transposition_blocked);
+
+        let exact = provider.candidates_with_provenance(
+            intended.as_str(),
+            6,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            exact.candidates.first().map(String::as_str),
+            Some("掰开揉碎")
+        );
+        assert!(
+            exact
+                .provenance
+                .iter()
+                .all(|item| item.source() != NativeCandidateSource::FourCharacterCorrection)
+        );
     }
 
     #[test]

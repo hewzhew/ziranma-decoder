@@ -1578,6 +1578,7 @@ fn candidate_source_tag(value: NativeCandidateSource) -> u8 {
         NativeCandidateSource::Decoder => 7,
         NativeCandidateSource::TranspositionRecovery => 8,
         NativeCandidateSource::Shape => 9,
+        NativeCandidateSource::FourCharacterCorrection => 10,
     }
 }
 
@@ -1592,6 +1593,7 @@ fn parse_candidate_source(value: u8) -> Result<NativeCandidateSource, WishFeedba
         7 => Ok(NativeCandidateSource::Decoder),
         8 => Ok(NativeCandidateSource::TranspositionRecovery),
         9 => Ok(NativeCandidateSource::Shape),
+        10 => Ok(NativeCandidateSource::FourCharacterCorrection),
         _ => Err(WishFeedbackError::InvalidSnapshot),
     }
 }
@@ -2579,6 +2581,7 @@ mod tests {
             NativeCandidateSource::Decoder,
             NativeCandidateSource::TranspositionRecovery,
             NativeCandidateSource::Shape,
+            NativeCandidateSource::FourCharacterCorrection,
         ] {
             assert_eq!(
                 parse_candidate_source(candidate_source_tag(source)),

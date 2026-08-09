@@ -121,6 +121,32 @@ cargo run --release --bin candidatectl -- build-rime-slice `
 非正权重、文字范围、拼音、字音数量、音节长度、上限外词条和所选重复均分项
 计数。两个已经生成的公开 TSV 可进一步做不显示候选文字的只读对照：
 
+默认不写 `--frequency-frontier-entries` 时，频率前沿等于总上限，行为仍是纯
+Top-N。需要研究全局频率裁剪遗漏的正常双字词时，可以显式缩小频率前沿；剩余
+容量只补入“该规范完整码尚未被前沿覆盖”的最高权重双字整词，总条数仍受
+`--max-entries` 硬上限约束：
+
+```powershell
+cargo run --release --bin candidatectl -- build-rime-slice `
+  --source .local/public-audit/wanxiang-fdda7afb/jichu.dict.yaml `
+  --output .local/public-audit/wanxiang-fdda7afb/package-top76300-plus-bigram-cover-v2 `
+  --revision wanxiang-jichu-fdda7afb-top76300-plus-bigram-cover-v2 `
+  --source-id wanxiang-jichu `
+  --source-license CC-BY-4.0 `
+  --source-url https://github.com/amzxyz/rime_wanxiang `
+  --source-sha256 9d14c0c49588d63b16c554df4711bed5da822c63de9d50f4759c53542138ac00 `
+  --max-entries 120000 `
+  --frequency-frontier-entries 76300 `
+  --max-text-characters 8 `
+  --public
+```
+
+固定万象修订上的本机确定性导入结果为 120,000 条：76,300 条全局频率前沿
+覆盖 24,311 个双字码，随后补入 43,677 个缺码代表，并用 23 条后续全局高频项
+填满剩余容量；67,988 个合格双字码全部获得至少一个公开整词，覆盖候选上限外
+为 0。最低权重降到 1 是覆盖长尾的预期结果，不表示低频词会跨来源抢占核心
+首选。与日用核心做前七、每码补一个的层审计仍保持共有完整码的核心首选不变。
+
 ```powershell
 cargo run --release --bin candidatectl -- compare `
   --base-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
@@ -369,6 +395,20 @@ candidatectl runtime-query `
 相邻换序恢复视图；该视图
 不并入普通候选顺序。它在最多 16 键内逐一尝试一处相邻交换，只保留不需要
 第二次纠错、完全由词典解释且使用完整双拼或锚定尾简的候选。
+
+快照还提供一个更窄的四字完整词单次纠错证据接口。它只接受目标为四个汉字、
+四个完整双拼音节的公开词典项，并沿用解码器唯一一次的全局错误预算；简拼、
+普通句子分段、未解析输入和第二次纠错都被排除。接口返回目标文字、拼音、八键
+规范码、具体纠错操作和评分拆解，也不把所有四字词宣称为“成语”。TSF 只在
+原码没有四字完整词、核心与补充层的一次编辑结果共同指向唯一规范码时，才把该
+码的首个公开整词放在普通首选之后；多个目标码一律保持原候选。它不越过显式
+别名或项目词，不自动提交，也不抢首选；许愿快照把它单独记为“四字纠错”来源。
+
+固定万象覆盖包的公开 release 审计从高频四字完整词中按规范码去重选取 256 条，
+对每条合成一次音节内相邻换序：254 条获得唯一恢复，目标文字在 254 条中均为
+恢复首项；另外 2 条因同时指向多个规范码而安全拒绝。错误目标码为 0，原码整词
+保护失败为 0。同机预热的 15 次固定纠错查询 median 4.790 ms、p95 9.466 ms；
+这是一次实验机诊断，不是跨设备延迟保证。
 
 清单内的 FNV-1a 只用于普通损坏检测，不承担安全含义。外部包的内部目录标识
 截取自三份精确材料的 SHA-256，完整 SHA-256 同时写入预检凭据；这可以绑定

@@ -156,15 +156,18 @@ pub use candidate_slots::{
 pub use candidate_snapshot::{
     AutomaticTranspositionDecision, AutomaticTranspositionKeepReason,
     AutomaticTranspositionPromotion, CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot,
-    CandidateSnapshotDescriptor, CandidateSnapshotError, LayeredCandidateTextsError,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    CandidateSnapshotDescriptor, CandidateSnapshotError, FourCharacterCorrectionCandidate,
+    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason,
+    FourCharacterCorrectionOffer, LayeredCandidateTextsError, MAX_CANDIDATE_SNAPSHOT_BYTES,
+    MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
     SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SupplementalCandidateLayerConfig,
     SupplementalCandidateLayerError, SupplementalCompositionCandidate,
     SupplementalCompositionOrder, SupplementalCompositionSegment,
     SupplementalCompositionSegmentSource, candidate_payload_fingerprint, layered_candidate_texts,
-    layered_candidate_texts_with_consensus, merge_candidate_text_layers,
-    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
+    merge_candidate_text_layers, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 pub use capsule_replay::{
@@ -865,6 +868,44 @@ impl Decoder {
         candidates.sort_by(candidate_order);
         candidates.truncate(top_k);
         Ok((candidates, stats))
+    }
+
+    /// Returns complete whole-word candidates reached by exactly one key
+    /// correction for a fixed syllable count.
+    ///
+    /// This narrow research view bypasses exact sentence-segmentation
+    /// crowding without changing the conservative ordinary decoder order. It
+    /// rejects abbreviations and keeps the decoder's existing single global
+    /// error budget. Interactive policy must still decide whether the public
+    /// whole-word evidence is sufficiently unambiguous to display.
+    pub(crate) fn decode_complete_word_single_edit(
+        &self,
+        observed: &str,
+        syllable_count: usize,
+        top_k: usize,
+    ) -> Result<Vec<Candidate>, KeySequenceError> {
+        let observed = KeySequence::new(observed)?;
+        if top_k == 0 || syllable_count == 0 || syllable_count > MAX_LEXICON_SYLLABLES {
+            return Ok(Vec::new());
+        }
+        let intended_keys = syllable_count * 2;
+        if observed.as_str().len().abs_diff(intended_keys) > 1 {
+            return Ok(Vec::new());
+        }
+
+        let mut stats = DecodeSearchStats::default();
+        let mut candidates = self.lookup_candidates_with_stats(observed.as_str(), true, &mut stats);
+        candidates.retain(|candidate| {
+            candidate.source == CandidateSource::Lexicon
+                && candidate.text.chars().count() == syllable_count
+                && candidate.code.as_str().len() == intended_keys
+                && candidate.spelling.abbreviated_syllables.is_empty()
+                && candidate.correction != Correction::Exact
+        });
+        candidates.sort_by(candidate_order);
+        candidates.dedup_by(|left, right| left.text == right.text && left.code == right.code);
+        candidates.truncate(top_k);
+        Ok(candidates)
     }
 
     /// Returns exact lexicon entries whose complete code is the observed

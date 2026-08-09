@@ -30,6 +30,13 @@ pub const MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS: usize = 12;
 pub struct PublicRimeSliceConfig {
     /// Maximum retained entries after ranking and deduplication.
     pub max_entries: usize,
+    /// Entries reserved for the ordinary global source-weight frontier.
+    ///
+    /// Any remaining capacity is used to retain the strongest public
+    /// two-character whole word for canonical full codes that the global
+    /// frontier did not cover. Setting this equal to [`Self::max_entries`]
+    /// preserves the original pure Top-N selection.
+    pub frequency_frontier_entries: usize,
     /// Maximum number of Han characters in one retained entry.
     pub max_text_characters: usize,
 }
@@ -64,6 +71,20 @@ pub struct PublicRimeSliceImportStats {
     pub too_many_syllable_rows: usize,
     /// Rows eligible before the configured entry cap is applied.
     pub eligible_rows: usize,
+    /// Unique canonical full codes represented by eligible two-character rows.
+    pub eligible_two_character_codes: usize,
+    /// Unique two-character codes already represented by the global frontier.
+    pub frequency_frontier_two_character_codes: usize,
+    /// Global source-weight rows retained before identity deduplication.
+    pub frequency_frontier_selected_rows: usize,
+    /// Missing two-character codes considered for the coverage reserve.
+    pub two_character_coverage_candidates: usize,
+    /// Coverage-reserve rows admitted within the overall entry cap.
+    pub two_character_coverage_admitted: usize,
+    /// Coverage candidates that did not fit within the overall entry cap.
+    pub two_character_coverage_dropped: usize,
+    /// Additional global-frequency rows admitted after code coverage.
+    pub frequency_backfill_admitted: usize,
     /// Eligible rows outside the bounded best-weight frontier.
     pub dropped_by_entry_cap: usize,
     /// Duplicate text/code identities removed from the selected frontier.
@@ -342,7 +363,7 @@ fn top_text_by_code(entries: &[LexiconEntry]) -> HashMap<&str, &str> {
         .collect()
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RankedEntry {
     source_line: usize,
     entry: LexiconEntry,
@@ -389,7 +410,8 @@ pub fn parse_public_rime_slice(
     validate_config(config)?;
     let mut saw_document_start = false;
     let mut saw_data_marker = false;
-    let mut selected = BinaryHeap::<RankedEntry>::with_capacity(config.max_entries);
+    let mut global_frontier = BinaryHeap::<RankedEntry>::with_capacity(config.max_entries);
+    let mut best_two_character_entry_by_code = HashMap::<KeySequence, RankedEntry>::new();
     let mut stats = PublicRimeSliceImportStats::default();
 
     for (zero_based_line, raw_line) in contents.lines().enumerate() {
@@ -471,14 +493,26 @@ pub fn parse_public_rime_slice(
                 frequency: weight,
             },
         };
-        if selected.len() < config.max_entries {
-            selected.push(ranked);
-        } else if selected
+        if text_characters == 2 {
+            match best_two_character_entry_by_code.entry(ranked.entry.code.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(ranked.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if ranked.is_better_than(slot.get()) {
+                        slot.insert(ranked.clone());
+                    }
+                }
+            }
+        }
+        if global_frontier.len() < config.max_entries {
+            global_frontier.push(ranked);
+        } else if global_frontier
             .peek()
             .is_some_and(|worst| ranked.is_better_than(worst))
         {
-            selected.pop();
-            selected.push(ranked);
+            global_frontier.pop();
+            global_frontier.push(ranked);
         }
     }
 
@@ -488,8 +522,81 @@ pub fn parse_public_rime_slice(
     if !saw_data_marker {
         return Err(PublicRimeSliceError::MissingDataMarker);
     }
-    stats.dropped_by_entry_cap = stats.eligible_rows.saturating_sub(selected.len());
-    let mut selected = selected.into_vec();
+    stats.eligible_two_character_codes = best_two_character_entry_by_code.len();
+    let mut global_frontier = global_frontier.into_vec();
+    global_frontier.sort_by(|left, right| {
+        right
+            .entry
+            .frequency
+            .cmp(&left.entry.frequency)
+            .then_with(|| left.source_line.cmp(&right.source_line))
+    });
+    let frequency_overflow = if global_frontier.len() > config.frequency_frontier_entries {
+        global_frontier.split_off(config.frequency_frontier_entries)
+    } else {
+        Vec::new()
+    };
+    stats.frequency_frontier_selected_rows = global_frontier.len();
+    let mut selected = global_frontier;
+    let mut identities = HashSet::<(String, KeySequence)>::new();
+    let mut selected_source_lines = HashSet::new();
+    selected.retain(|ranked| {
+        let identity = (ranked.entry.text.clone(), ranked.entry.code.clone());
+        if identities.insert(identity) {
+            selected_source_lines.insert(ranked.source_line);
+            true
+        } else {
+            stats.selected_duplicate_rows += 1;
+            false
+        }
+    });
+    let frequency_frontier_codes = selected
+        .iter()
+        .filter(|ranked| ranked.entry.syllable_codes.len() == 2)
+        .map(|ranked| ranked.entry.code.clone())
+        .collect::<HashSet<_>>();
+    stats.frequency_frontier_two_character_codes = frequency_frontier_codes.len();
+    let mut coverage = best_two_character_entry_by_code
+        .into_iter()
+        .filter(|(code, _)| !frequency_frontier_codes.contains(code))
+        .map(|(_, ranked)| ranked)
+        .collect::<Vec<_>>();
+    coverage.sort_by(|left, right| {
+        right
+            .entry
+            .frequency
+            .cmp(&left.entry.frequency)
+            .then_with(|| left.source_line.cmp(&right.source_line))
+    });
+    stats.two_character_coverage_candidates = coverage.len();
+    for ranked in coverage {
+        if selected.len() == config.max_entries {
+            stats.two_character_coverage_dropped += 1;
+            continue;
+        }
+        let identity = (ranked.entry.text.clone(), ranked.entry.code.clone());
+        if identities.insert(identity) {
+            selected_source_lines.insert(ranked.source_line);
+            selected.push(ranked);
+            stats.two_character_coverage_admitted += 1;
+        }
+    }
+    for ranked in frequency_overflow {
+        if selected.len() == config.max_entries {
+            break;
+        }
+        if selected_source_lines.contains(&ranked.source_line) {
+            continue;
+        }
+        let identity = (ranked.entry.text.clone(), ranked.entry.code.clone());
+        if identities.insert(identity) {
+            selected_source_lines.insert(ranked.source_line);
+            selected.push(ranked);
+            stats.frequency_backfill_admitted += 1;
+        } else {
+            stats.selected_duplicate_rows += 1;
+        }
+    }
     selected.sort_by(|left, right| {
         right
             .entry
@@ -497,16 +604,9 @@ pub fn parse_public_rime_slice(
             .cmp(&left.entry.frequency)
             .then_with(|| left.source_line.cmp(&right.source_line))
     });
-    let mut identities = HashSet::<(String, KeySequence)>::new();
-    selected.retain(|ranked| {
-        let identity = (ranked.entry.text.clone(), ranked.entry.code.clone());
-        if identities.insert(identity) {
-            true
-        } else {
-            stats.selected_duplicate_rows += 1;
-            false
-        }
-    });
+    stats.dropped_by_entry_cap = stats
+        .eligible_rows
+        .saturating_sub(selected.len().saturating_add(stats.selected_duplicate_rows));
     let entries = selected
         .into_iter()
         .map(|ranked| ranked.entry)
@@ -528,6 +628,11 @@ fn validate_config(config: PublicRimeSliceConfig) -> Result<(), PublicRimeSliceE
     {
         return Err(PublicRimeSliceError::InvalidTextLimit);
     }
+    if config.frequency_frontier_entries == 0
+        || config.frequency_frontier_entries > config.max_entries
+    {
+        return Err(PublicRimeSliceError::InvalidFrequencyFrontierLimit);
+    }
     Ok(())
 }
 
@@ -547,6 +652,8 @@ fn is_han_character(character: char) -> bool {
 pub enum PublicRimeSliceError {
     /// The configured entry cap is zero or above the fixed experiment bound.
     InvalidEntryLimit,
+    /// The global frequency frontier is zero or exceeds the total entry cap.
+    InvalidFrequencyFrontierLimit,
     /// The text-length cap is zero or above the decoder's fixed bound.
     InvalidTextLimit,
     /// No YAML document start marker was found.
@@ -561,6 +668,9 @@ impl fmt::Display for PublicRimeSliceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidEntryLimit => write!(formatter, "公开词表裁剪的词条上限无效"),
+            Self::InvalidFrequencyFrontierLimit => {
+                write!(formatter, "公开词表裁剪的全局高频前沿上限无效")
+            }
             Self::InvalidTextLimit => write!(formatter, "公开词表裁剪的文字长度上限无效"),
             Self::MissingDocumentStart => write!(formatter, "公开 Rime 词表缺少 YAML 起始标记 ---"),
             Self::MissingDataMarker => write!(formatter, "公开 Rime 词表缺少数据起始标记 ..."),
@@ -590,6 +700,7 @@ A词\ta cí\t100\n\
             SOURCE,
             PublicRimeSliceConfig {
                 max_entries: 3,
+                frequency_frontier_entries: 3,
                 max_text_characters: 4,
             },
         )
@@ -628,6 +739,7 @@ A词\ta cí\t100\n\
             SOURCE,
             PublicRimeSliceConfig {
                 max_entries: 4,
+                frequency_frontier_entries: 4,
                 max_text_characters: 4,
             },
         )
@@ -645,6 +757,7 @@ A词\ta cí\t100\n\
         assert!(
             validate_config(PublicRimeSliceConfig {
                 max_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
+                frequency_frontier_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
                 max_text_characters: 1,
             })
             .is_ok()
@@ -652,15 +765,25 @@ A词\ta cí\t100\n\
         assert_eq!(
             validate_config(PublicRimeSliceConfig {
                 max_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES + 1,
+                frequency_frontier_entries: MAX_PUBLIC_RIME_SLICE_ENTRIES,
                 max_text_characters: 1,
             }),
             Err(PublicRimeSliceError::InvalidEntryLimit)
+        );
+        assert_eq!(
+            validate_config(PublicRimeSliceConfig {
+                max_entries: 10,
+                frequency_frontier_entries: 11,
+                max_text_characters: 1,
+            }),
+            Err(PublicRimeSliceError::InvalidFrequencyFrontierLimit)
         );
         assert_eq!(
             parse_public_rime_slice(
                 source,
                 PublicRimeSliceConfig {
                     max_entries: 0,
+                    frequency_frontier_entries: 0,
                     max_text_characters: 1,
                 }
             )
@@ -672,11 +795,79 @@ A词\ta cí\t100\n\
                 "...\n词\tcí\t1\n",
                 PublicRimeSliceConfig {
                     max_entries: 1,
+                    frequency_frontier_entries: 1,
                     max_text_characters: 1,
                 }
             ),
             Err(PublicRimeSliceError::MissingDocumentStart)
         ));
+    }
+
+    #[test]
+    fn slice_uses_reserved_capacity_to_cover_missing_two_character_codes() {
+        const SOURCE: &str = "---\n...\n\
+高频\tgao pin\t100\n\
+高品\tgao pin\t90\n\
+完整\twan zheng\t20\n\
+完正\twan zheng\t10\n\
+另类\tling wai\t15\n\
+四字短语\tsi zi duan yu\t80\n";
+        let imported = parse_public_rime_slice(
+            SOURCE,
+            PublicRimeSliceConfig {
+                max_entries: 5,
+                frequency_frontier_entries: 2,
+                max_text_characters: 4,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            imported
+                .entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["高频", "高品", "四字短语", "完整", "另类"]
+        );
+        assert_eq!(imported.stats.eligible_two_character_codes, 3);
+        assert_eq!(imported.stats.frequency_frontier_two_character_codes, 1);
+        assert_eq!(imported.stats.frequency_frontier_selected_rows, 2);
+        assert_eq!(imported.stats.two_character_coverage_candidates, 2);
+        assert_eq!(imported.stats.two_character_coverage_admitted, 2);
+        assert_eq!(imported.stats.two_character_coverage_dropped, 0);
+        assert_eq!(imported.stats.frequency_backfill_admitted, 1);
+        assert_eq!(imported.stats.imported_entries, 5);
+        assert_eq!(imported.stats.minimum_selected_frequency, 15);
+    }
+
+    #[test]
+    fn slice_bounds_two_character_coverage_by_the_total_entry_cap() {
+        const SOURCE: &str = "---\n...\n\
+高频\tgao pin\t100\n\
+完整\twan zheng\t20\n\
+另类\tling wai\t15\n";
+        let imported = parse_public_rime_slice(
+            SOURCE,
+            PublicRimeSliceConfig {
+                max_entries: 2,
+                frequency_frontier_entries: 1,
+                max_text_characters: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            imported
+                .entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["高频", "完整"]
+        );
+        assert_eq!(imported.stats.two_character_coverage_candidates, 2);
+        assert_eq!(imported.stats.two_character_coverage_admitted, 1);
+        assert_eq!(imported.stats.two_character_coverage_dropped, 1);
     }
 
     #[test]

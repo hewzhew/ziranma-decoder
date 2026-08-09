@@ -109,6 +109,7 @@ pub enum NativeCandidateSource {
     CharacterPair,
     Decoder,
     TranspositionRecovery,
+    FourCharacterCorrection,
     Shape,
 }
 

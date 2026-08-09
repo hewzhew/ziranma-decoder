@@ -159,7 +159,7 @@ struct SelectionPattern {
     manual_selections: usize,
     paged_selections: usize,
     session_promoted_frames: usize,
-    sources: [usize; 9],
+    sources: [usize; 10],
 }
 
 impl SelectionPattern {
@@ -669,6 +669,7 @@ fn candidate_source_index(source: NativeCandidateSource) -> usize {
         NativeCandidateSource::Decoder => 6,
         NativeCandidateSource::TranspositionRecovery => 7,
         NativeCandidateSource::Shape => 8,
+        NativeCandidateSource::FourCharacterCorrection => 9,
     }
 }
 
@@ -682,6 +683,7 @@ fn candidate_source_from_index(index: usize) -> NativeCandidateSource {
         6 => NativeCandidateSource::Decoder,
         7 => NativeCandidateSource::TranspositionRecovery,
         8 => NativeCandidateSource::Shape,
+        9 => NativeCandidateSource::FourCharacterCorrection,
         _ => NativeCandidateSource::Unknown,
     }
 }
@@ -697,6 +699,7 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
         NativeCandidateSource::Decoder => "普通组合",
         NativeCandidateSource::TranspositionRecovery => "自动换序",
         NativeCandidateSource::Shape => "Tab 找字",
+        NativeCandidateSource::FourCharacterCorrection => "四字纠错",
     }
 }
 
