@@ -60,7 +60,8 @@ const WISH_PLAINTEXT_MAGIC_V8: &[u8] = b"ziranma-wish-v8\0";
 const WISH_PLAINTEXT_MAGIC_V9: &[u8] = b"ziranma-wish-v9\0";
 const WISH_PLAINTEXT_MAGIC_V10: &[u8] = b"ziranma-wish-v10\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
-const WISH_NOTE_PLAINTEXT_MAGIC: &[u8] = b"ziranma-wish-note-v1\0";
+const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
+const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
 const WISH_NOTE_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-note-dpapi-v1\0";
 const WISH_ID_PREFIX: &str = "wish-";
 const WISH_ID_HEX_BYTES: usize = 64;
@@ -895,6 +896,55 @@ impl WishCategory {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WishReviewStatus {
+    Inbox,
+    InProgress,
+    Resolved,
+}
+
+impl WishReviewStatus {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::InProgress => "in-progress",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub fn parse_slug(value: &str) -> Option<Self> {
+        match value {
+            "inbox" => Some(Self::Inbox),
+            "in-progress" => Some(Self::InProgress),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WishImportance {
+    Normal,
+    Important,
+}
+
+impl WishImportance {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Important => "important",
+        }
+    }
+
+    pub fn parse_slug(value: &str) -> Option<Self> {
+        match value {
+            "normal" => Some(Self::Normal),
+            "important" => Some(Self::Important),
+            _ => None,
+        }
+    }
+}
+
 /// One explicitly supplied private note bound to an immutable wish ID.
 ///
 /// This type deliberately does not implement `Debug`.
@@ -902,6 +952,8 @@ impl WishCategory {
 pub struct WishNote {
     wish_id: String,
     category: WishCategory,
+    review_status: WishReviewStatus,
+    importance: WishImportance,
     text: String,
 }
 
@@ -911,13 +963,34 @@ impl WishNote {
         category: WishCategory,
         text: &str,
     ) -> Result<Self, WishFeedbackError> {
+        if text.trim().is_empty() {
+            return Err(WishFeedbackError::InvalidNote);
+        }
+        Self::with_organization(
+            wish_id,
+            category,
+            WishReviewStatus::Inbox,
+            WishImportance::Normal,
+            text,
+        )
+    }
+
+    pub fn with_organization(
+        wish_id: &str,
+        category: WishCategory,
+        review_status: WishReviewStatus,
+        importance: WishImportance,
+        text: &str,
+    ) -> Result<Self, WishFeedbackError> {
         validate_wish_id(wish_id)?;
-        if text.trim().is_empty() || text.len() > MAX_WISH_NOTE_BYTES || text.contains('\0') {
+        if text.len() > MAX_WISH_NOTE_BYTES || text.contains('\0') {
             return Err(WishFeedbackError::InvalidNote);
         }
         Ok(Self {
             wish_id: wish_id.to_owned(),
             category,
+            review_status,
+            importance,
             text: text.to_owned(),
         })
     }
@@ -930,36 +1003,70 @@ impl WishNote {
         self.category
     }
 
+    pub fn review_status(&self) -> WishReviewStatus {
+        self.review_status
+    }
+
+    pub fn importance(&self) -> WishImportance {
+        self.importance
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
 
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
-        let checked = Self::new(&self.wish_id, self.category, &self.text)?;
+        let checked = Self::with_organization(
+            &self.wish_id,
+            self.category,
+            self.review_status,
+            self.importance,
+            &self.text,
+        )?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_NOTE_PLAINTEXT_MAGIC);
+        output.extend_from_slice(WISH_NOTE_PLAINTEXT_MAGIC_V2);
         put_string(&mut output, &checked.wish_id)?;
         put_string(&mut output, checked.category.slug())?;
+        put_string(&mut output, checked.review_status.slug())?;
+        put_string(&mut output, checked.importance.slug())?;
         put_string(&mut output, &checked.text)?;
         Ok(output)
     }
 
     fn parse(input: &[u8]) -> Result<Self, WishFeedbackError> {
-        if input.len() <= WISH_NOTE_PLAINTEXT_MAGIC.len()
+        if input.len() <= WISH_NOTE_PLAINTEXT_MAGIC_V1.len()
             || input.len() > MAX_WISH_NOTE_BYTES.saturating_add(512)
         {
             return Err(WishFeedbackError::InvalidNote);
         }
         let mut reader = SliceReader::new(input);
-        reader.expect(WISH_NOTE_PLAINTEXT_MAGIC)?;
+        let version = if input.starts_with(WISH_NOTE_PLAINTEXT_MAGIC_V2) {
+            reader.expect(WISH_NOTE_PLAINTEXT_MAGIC_V2)?;
+            2
+        } else if input.starts_with(WISH_NOTE_PLAINTEXT_MAGIC_V1) {
+            reader.expect(WISH_NOTE_PLAINTEXT_MAGIC_V1)?;
+            1
+        } else {
+            return Err(WishFeedbackError::InvalidNote);
+        };
         let wish_id = reader.string()?;
         let category =
             WishCategory::parse_slug(&reader.string()?).ok_or(WishFeedbackError::InvalidNote)?;
+        let (review_status, importance) = if version == 2 {
+            (
+                WishReviewStatus::parse_slug(&reader.string()?)
+                    .ok_or(WishFeedbackError::InvalidNote)?,
+                WishImportance::parse_slug(&reader.string()?)
+                    .ok_or(WishFeedbackError::InvalidNote)?,
+            )
+        } else {
+            (WishReviewStatus::Inbox, WishImportance::Normal)
+        };
         let text = reader.string()?;
         if !reader.is_empty() {
             return Err(WishFeedbackError::InvalidNote);
         }
-        Self::new(&wish_id, category, &text)
+        Self::with_organization(&wish_id, category, review_status, importance, &text)
     }
 }
 
@@ -2747,6 +2854,46 @@ mod tests {
                 .join(note_filename(receipt.id()).unwrap())
                 .is_file()
         );
+    }
+
+    #[test]
+    fn private_note_v2_adds_organization_and_keeps_v1_readable() {
+        let wish_id = format!("{WISH_ID_PREFIX}{}", "ab".repeat(WISH_ID_HEX_BYTES / 2));
+        let organized = WishNote::with_organization(
+            &wish_id,
+            WishCategory::Latency,
+            WishReviewStatus::InProgress,
+            WishImportance::Important,
+            "偶发卡顿",
+        )
+        .unwrap();
+        let rendered = organized.render().unwrap();
+        assert!(rendered.starts_with(WISH_NOTE_PLAINTEXT_MAGIC_V2));
+        let parsed = WishNote::parse(&rendered).unwrap();
+        assert!(parsed == organized);
+        assert_eq!(parsed.review_status(), WishReviewStatus::InProgress);
+        assert_eq!(parsed.importance(), WishImportance::Important);
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(WISH_NOTE_PLAINTEXT_MAGIC_V1);
+        put_string(&mut legacy, &wish_id).unwrap();
+        put_string(&mut legacy, WishCategory::Display.slug()).unwrap();
+        put_string(&mut legacy, "候选间距").unwrap();
+        let parsed = WishNote::parse(&legacy).unwrap();
+        assert_eq!(parsed.review_status(), WishReviewStatus::Inbox);
+        assert_eq!(parsed.importance(), WishImportance::Normal);
+        assert_eq!(parsed.text(), "候选间距");
+
+        let empty = WishNote::with_organization(
+            &wish_id,
+            WishCategory::Other,
+            WishReviewStatus::Resolved,
+            WishImportance::Normal,
+            "",
+        )
+        .unwrap();
+        assert!(WishNote::parse(&empty.render().unwrap()).unwrap() == empty);
+        assert!(WishNote::new(&wish_id, WishCategory::Other, "").is_err());
     }
 
     #[test]

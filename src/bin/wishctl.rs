@@ -9,8 +9,8 @@ use ziranma_core::{
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateSource,
     NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope,
     WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError,
-    WishJournalContext, WishNote, dispatch_wish_command, list_wish_packages, load_wish_note,
-    load_wish_snapshot, move_wish_to_trash, save_wish_note,
+    WishImportance, WishJournalContext, WishNote, WishReviewStatus, dispatch_wish_command,
+    list_wish_packages, load_wish_note, load_wish_snapshot, move_wish_to_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,7 +372,16 @@ fn show(
     match load_wish_note(root, &id, protector) {
         Ok(note) => {
             println!("说明 [{}]", note.category().slug());
-            println!("{}", note.text());
+            println!(
+                "整理：{} · {}",
+                review_status_label(note.review_status()),
+                importance_label(note.importance())
+            );
+            if note.text().trim().is_empty() {
+                println!("尚未补充文字说明");
+            } else {
+                println!("{}", note.text());
+            }
         }
         Err(WishFeedbackError::NoteUnavailable) => println!("说明：尚未添加"),
         Err(error) => return Err(error.into()),
@@ -663,6 +672,21 @@ fn cancellation_label(source: NativeCancellationSource) -> &'static str {
     }
 }
 
+fn review_status_label(status: WishReviewStatus) -> &'static str {
+    match status {
+        WishReviewStatus::Inbox => "待整理",
+        WishReviewStatus::InProgress => "处理中",
+        WishReviewStatus::Resolved => "已完成",
+    }
+}
+
+fn importance_label(importance: WishImportance) -> &'static str {
+    match importance {
+        WishImportance::Normal => "普通",
+        WishImportance::Important => "重要",
+    }
+}
+
 fn annotate(
     root: &Path,
     protector: &dyn DataProtector,
@@ -691,6 +715,15 @@ fn trash(root: &Path, id: &str, confirmed: bool) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn organization_labels_are_plain_and_stable() {
+        assert_eq!(review_status_label(WishReviewStatus::Inbox), "待整理");
+        assert_eq!(review_status_label(WishReviewStatus::InProgress), "处理中");
+        assert_eq!(review_status_label(WishReviewStatus::Resolved), "已完成");
+        assert_eq!(importance_label(WishImportance::Normal), "普通");
+        assert_eq!(importance_label(WishImportance::Important), "重要");
+    }
 
     #[test]
     fn control_commands_do_not_require_a_storage_root() {

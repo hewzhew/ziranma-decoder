@@ -61,8 +61,8 @@ mod windows_app {
     use ziranma_core::{
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
         NativeAutomaticTranspositionTier, NativeFeedbackEvent, WindowsUserDataProtector,
-        WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishNote,
-        WishPackageInfo, list_wish_packages, load_wish_note, load_wish_snapshot,
+        WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
+        WishPackageInfo, WishReviewStatus, list_wish_packages, load_wish_note, load_wish_snapshot,
         repository_root_for_user_tool_executable, save_or_replace_wish_note,
     };
 
@@ -92,6 +92,10 @@ mod windows_app {
     const NOTE_CATEGORY_LABEL_ID: i32 = 207;
     const NOTE_BODY_LABEL_ID: i32 = 208;
     const NOTE_FOOTNOTE_ID: i32 = 209;
+    const NOTE_STATUS_ID: i32 = 210;
+    const NOTE_STATUS_LABEL_ID: i32 = 211;
+    const NOTE_IMPORTANCE_ID: i32 = 212;
+    const NOTE_IMPORTANCE_LABEL_ID: i32 = 213;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
     const NOTE_TEXT_CHARACTER_LIMIT: usize = 2_048;
     static MANAGER_HEADING_FONT: AtomicIsize = AtomicIsize::new(0);
@@ -1114,13 +1118,23 @@ mod windows_app {
             "说明暂时不可用".to_owned()
         } else if let Some(note) = &record.note {
             let preview = compact_text(note.text(), 24);
-            if preview.is_empty() {
-                category_label(note.category()).to_owned()
+            let important = if note.importance() == WishImportance::Important {
+                "★　"
             } else {
-                format!("{}　{preview}", category_label(note.category()))
+                ""
+            };
+            let organization = format!(
+                "{important}{}　{}",
+                review_status_label(note.review_status()),
+                category_label(note.category())
+            );
+            if preview.is_empty() {
+                organization
+            } else {
+                format!("{organization}　{preview}")
             }
         } else {
-            "待补充说明".to_owned()
+            "待整理　待补充说明".to_owned()
         };
         (primary, secondary)
     }
@@ -1194,7 +1208,20 @@ mod windows_app {
             .as_ref()
             .map(WishNote::category)
             .unwrap_or_else(|| snapshot.category());
+        let review_status = note
+            .as_ref()
+            .map(WishNote::review_status)
+            .unwrap_or(WishReviewStatus::Inbox);
+        let importance = note
+            .as_ref()
+            .map(WishNote::importance)
+            .unwrap_or(WishImportance::Normal);
         let mut output = String::new();
+        if importance == WishImportance::Important {
+            output.push_str("★ 重要　·　");
+        }
+        output.push_str(review_status_label(review_status));
+        output.push_str("　·　");
         output.push_str(category_label(category));
         output.push_str("　·　");
         output.push_str(&relative_time(modified, SystemTime::now()));
@@ -1207,7 +1234,9 @@ mod windows_app {
         output.push_str("宝宝想说\r\n");
         if note_unavailable {
             output.push_str("这条说明暂时无法读取。\r\n");
-        } else if let Some(note) = &note {
+        } else if let Some(note) = &note
+            && !note.text().trim().is_empty()
+        {
             output.push_str(note.text());
             output.push_str("\r\n");
         } else {
@@ -1294,6 +1323,14 @@ mod windows_app {
             WishCategory::InputMode => "输入模式",
             WishCategory::Compatibility => "兼容性",
             WishCategory::Other => "其他",
+        }
+    }
+
+    fn review_status_label(status: WishReviewStatus) -> &'static str {
+        match status {
+            WishReviewStatus::Inbox => "待整理",
+            WishReviewStatus::InProgress => "处理中",
+            WishReviewStatus::Resolved => "已完成",
         }
     }
 
@@ -1508,7 +1545,7 @@ mod windows_app {
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
                     520,
-                    390,
+                    455,
                     Some(owner),
                     None,
                     Some(HINSTANCE(module.0)),
@@ -1657,7 +1694,7 @@ mod windows_app {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("STATIC"),
-                    w!("补充类别和说明，之后仍然可以修改。"),
+                    w!("补充说明，也可以标记进度和重要性。"),
                     control_style(0),
                     88,
                     49,
@@ -1709,10 +1746,82 @@ mod windows_app {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("STATIC"),
+                    w!("状态"),
+                    control_style(0),
+                    24,
+                    136,
+                    68,
+                    24,
+                    Some(window),
+                    Some(control_menu(NOTE_STATUS_LABEL_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("COMBOBOX"),
+                    PCWSTR::null(),
+                    control_style(
+                        windows::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST
+                            | windows::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS
+                            | WS_TABSTOP.0 as i32,
+                    ),
+                    104,
+                    130,
+                    160,
+                    160,
+                    Some(window),
+                    Some(control_menu(NOTE_STATUS_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("重要性"),
+                    control_style(0),
+                    282,
+                    136,
+                    68,
+                    24,
+                    Some(window),
+                    Some(control_menu(NOTE_IMPORTANCE_LABEL_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("COMBOBOX"),
+                    PCWSTR::null(),
+                    control_style(
+                        windows::Win32::UI::WindowsAndMessaging::CBS_DROPDOWNLIST
+                            | windows::Win32::UI::WindowsAndMessaging::CBS_HASSTRINGS
+                            | WS_TABSTOP.0 as i32,
+                    ),
+                    356,
+                    130,
+                    122,
+                    160,
+                    Some(window),
+                    Some(control_menu(NOTE_IMPORTANCE_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
                     w!("宝宝想补充"),
                     control_style(0),
                     24,
-                    130,
+                    174,
                     454,
                     24,
                     Some(window),
@@ -1735,7 +1844,7 @@ mod windows_app {
                             | WS_VSCROLL.0 as i32,
                     ),
                     24,
-                    156,
+                    200,
                     454,
                     116,
                     Some(window),
@@ -1748,10 +1857,10 @@ mod windows_app {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("STATIC"),
-                    w!("类别和说明以后仍可继续修改。"),
+                    w!("这些整理信息以后仍可继续修改。"),
                     control_style(0),
                     24,
-                    284,
+                    328,
                     250,
                     24,
                     Some(window),
@@ -1767,7 +1876,7 @@ mod windows_app {
                     w!("取消"),
                     control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
                     292,
-                    310,
+                    354,
                     88,
                     32,
                     Some(window),
@@ -1783,7 +1892,7 @@ mod windows_app {
                     w!("保存整理"),
                     control_style(BS_OWNERDRAW | BS_DEFPUSHBUTTON | WS_TABSTOP.0 as i32),
                     390,
-                    310,
+                    354,
                     88,
                     32,
                     Some(window),
@@ -1803,6 +1912,10 @@ mod windows_app {
         let button_font = load_manager_font(&MANAGER_BUTTON_FONT);
         for (control, font) in controls.iter().zip([
             heading_font,
+            body_font,
+            section_font,
+            body_font,
+            section_font,
             body_font,
             section_font,
             body_font,
@@ -1850,9 +1963,50 @@ mod windows_app {
                 None,
             )
         };
+        let status = controls[5];
+        for label in ["待整理", "处理中", "已完成"] {
+            let text = wide(label);
+            let _ = unsafe {
+                SendMessageW(
+                    status,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                )
+            };
+        }
+        let selected_status = existing
+            .as_ref()
+            .map(|note| wish_review_status_index(note.review_status()))
+            .unwrap_or(0);
+        let _ = unsafe { SendMessageW(status, CB_SETCURSEL, Some(WPARAM(selected_status)), None) };
+        let importance = controls[7];
+        for label in ["普通", "重要"] {
+            let text = wide(label);
+            let _ = unsafe {
+                SendMessageW(
+                    importance,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                )
+            };
+        }
+        let selected_importance = existing
+            .as_ref()
+            .map(|note| wish_importance_index(note.importance()))
+            .unwrap_or(0);
         let _ = unsafe {
             SendMessageW(
-                controls[5],
+                importance,
+                CB_SETCURSEL,
+                Some(WPARAM(selected_importance)),
+                None,
+            )
+        };
+        let _ = unsafe {
+            SendMessageW(
+                controls[9],
                 EDIT_SET_LIMIT_TEXT,
                 Some(WPARAM(NOTE_TEXT_CHARACTER_LIMIT)),
                 None,
@@ -1860,7 +2014,7 @@ mod windows_app {
         };
         if let Some(note) = existing {
             let text = wide(note.text());
-            let _ = unsafe { SetWindowTextW(controls[5], PCWSTR(text.as_ptr())) };
+            let _ = unsafe { SetWindowTextW(controls[9], PCWSTR(text.as_ptr())) };
         }
         true
     }
@@ -1888,6 +2042,40 @@ mod windows_app {
             .unwrap_or(6)
     }
 
+    fn wish_review_statuses() -> [WishReviewStatus; 3] {
+        [
+            WishReviewStatus::Inbox,
+            WishReviewStatus::InProgress,
+            WishReviewStatus::Resolved,
+        ]
+    }
+
+    fn wish_review_status_at(index: usize) -> Option<WishReviewStatus> {
+        wish_review_statuses().get(index).copied()
+    }
+
+    fn wish_review_status_index(status: WishReviewStatus) -> usize {
+        wish_review_statuses()
+            .iter()
+            .position(|candidate| *candidate == status)
+            .unwrap_or(0)
+    }
+
+    fn wish_importances() -> [WishImportance; 2] {
+        [WishImportance::Normal, WishImportance::Important]
+    }
+
+    fn wish_importance_at(index: usize) -> Option<WishImportance> {
+        wish_importances().get(index).copied()
+    }
+
+    fn wish_importance_index(importance: WishImportance) -> usize {
+        wish_importances()
+            .iter()
+            .position(|candidate| *candidate == importance)
+            .unwrap_or(0)
+    }
+
     unsafe fn save_note(window: HWND) {
         let Some(target) = NOTE_TARGET.lock().ok().and_then(|target| target.clone()) else {
             show_note_message(window, "这条许愿已经不可用，请关闭窗口后重试。", true);
@@ -1903,6 +2091,32 @@ mod windows_app {
             .and_then(wish_category_at)
         else {
             show_note_message(window, "请选择一个类别。", false);
+            return;
+        };
+        let Ok(status_control) = (unsafe { GetDlgItem(Some(window), NOTE_STATUS_ID) }) else {
+            show_note_message(window, "无法读取处理状态。", true);
+            return;
+        };
+        let status_index = unsafe { SendMessageW(status_control, CB_GETCURSEL, None, None) }.0;
+        let Some(review_status) = usize::try_from(status_index)
+            .ok()
+            .and_then(wish_review_status_at)
+        else {
+            show_note_message(window, "请选择一个处理状态。", false);
+            return;
+        };
+        let Ok(importance_control) = (unsafe { GetDlgItem(Some(window), NOTE_IMPORTANCE_ID) })
+        else {
+            show_note_message(window, "无法读取重要性。", true);
+            return;
+        };
+        let importance_index =
+            unsafe { SendMessageW(importance_control, CB_GETCURSEL, None, None) }.0;
+        let Some(importance) = usize::try_from(importance_index)
+            .ok()
+            .and_then(wish_importance_at)
+        else {
+            show_note_message(window, "请选择重要性。", false);
             return;
         };
         let Ok(edit) = (unsafe { GetDlgItem(Some(window), NOTE_EDIT_ID) }) else {
@@ -1924,10 +2138,16 @@ mod windows_app {
             show_note_message(window, "说明内容无法识别。", false);
             return;
         };
-        let note = match WishNote::new(&target.wish_id, category, text.trim()) {
+        let note = match WishNote::with_organization(
+            &target.wish_id,
+            category,
+            review_status,
+            importance,
+            text.trim(),
+        ) {
             Ok(note) => note,
             Err(_) => {
-                show_note_message(window, "请写下一句不为空、长度适中的说明。", false);
+                show_note_message(window, "说明内容过长或无法保存。", false);
                 return;
             }
         };
@@ -2004,6 +2224,21 @@ mod windows_app {
             assert_eq!(wish_category_at(6), Some(WishCategory::Other));
             assert_eq!(wish_category_at(7), None);
             assert_eq!(wish_category_index(WishCategory::Display), 2);
+        }
+
+        #[test]
+        fn note_organization_controls_have_stable_orders_and_labels() {
+            assert_eq!(wish_review_status_at(0), Some(WishReviewStatus::Inbox));
+            assert_eq!(wish_review_status_at(1), Some(WishReviewStatus::InProgress));
+            assert_eq!(wish_review_status_at(2), Some(WishReviewStatus::Resolved));
+            assert_eq!(wish_review_status_at(3), None);
+            assert_eq!(wish_review_status_index(WishReviewStatus::Resolved), 2);
+            assert_eq!(review_status_label(WishReviewStatus::InProgress), "处理中");
+
+            assert_eq!(wish_importance_at(0), Some(WishImportance::Normal));
+            assert_eq!(wish_importance_at(1), Some(WishImportance::Important));
+            assert_eq!(wish_importance_at(2), None);
+            assert_eq!(wish_importance_index(WishImportance::Important), 1);
         }
 
         #[test]
