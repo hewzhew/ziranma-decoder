@@ -468,7 +468,8 @@ fn observe_event(
             let episode = pending.get_or_insert_with(|| PendingEpisode::new(at_ms, ordinal));
             episode.observe_candidates(event);
         }
-        NativeFeedbackEvent::CandidatePopupTiming { .. } => {}
+        NativeFeedbackEvent::CandidatePopupTiming { .. }
+        | NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
         NativeFeedbackEvent::CandidateCommitted { code, text, .. } => {
             let mut episode = pending
                 .take()

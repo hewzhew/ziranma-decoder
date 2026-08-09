@@ -39,6 +39,7 @@ pub const WISH_SCHEMA_V5: &str = "ziranma-wish-v5";
 pub const WISH_SCHEMA_V6: &str = "ziranma-wish-v6";
 pub const WISH_SCHEMA_V7: &str = "ziranma-wish-v7";
 pub const WISH_SCHEMA_V8: &str = "ziranma-wish-v8";
+pub const WISH_SCHEMA_V9: &str = "ziranma-wish-v9";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -55,6 +56,7 @@ const WISH_PLAINTEXT_MAGIC_V5: &[u8] = b"ziranma-wish-v5\0";
 const WISH_PLAINTEXT_MAGIC_V6: &[u8] = b"ziranma-wish-v6\0";
 const WISH_PLAINTEXT_MAGIC_V7: &[u8] = b"ziranma-wish-v7\0";
 const WISH_PLAINTEXT_MAGIC_V8: &[u8] = b"ziranma-wish-v8\0";
+const WISH_PLAINTEXT_MAGIC_V9: &[u8] = b"ziranma-wish-v9\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-note-dpapi-v1\0";
@@ -550,7 +552,8 @@ impl WishSnapshot {
                         )?;
                     }
                 }
-                NativeFeedbackEvent::CandidatePopupTiming { .. } => {}
+                NativeFeedbackEvent::CandidatePopupTiming { .. }
+                | NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
             }
         }
         if let Some(previous) = pending {
@@ -624,7 +627,7 @@ impl WishSnapshot {
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V8);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V9);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -680,7 +683,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V8) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V9) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V9)?;
+            9
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V8) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V8)?;
             8
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V7) {
@@ -1395,6 +1401,18 @@ fn render_event(
             put_u32(output, *fully_visible_ms);
             output.push(u8::from(*initial_show));
         }
+        NativeFeedbackEvent::SlowKeyPathTiming {
+            refresh_ms,
+            planning_ms,
+            edit_session_ms,
+            total_ms,
+        } => {
+            output.push(10);
+            put_u32(output, *refresh_ms);
+            put_u32(output, *planning_ms);
+            put_u32(output, *edit_session_ms);
+            put_u32(output, *total_ms);
+        }
     }
     Ok(())
 }
@@ -1443,6 +1461,12 @@ fn parse_event(
             first_frame_ms: reader.u32()?,
             fully_visible_ms: reader.u32()?,
             initial_show: reader.boolean()?,
+        },
+        10 if version >= 9 => NativeFeedbackEvent::SlowKeyPathTiming {
+            refresh_ms: reader.u32()?,
+            planning_ms: reader.u32()?,
+            edit_session_ms: reader.u32()?,
+            total_ms: reader.u32()?,
         },
         tag if (tag == 6 && version >= 3)
             || (tag == 7 && version >= 4)
@@ -2070,7 +2094,7 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V8));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V9));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
@@ -2081,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
+    fn v9_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "fuem".to_owned(),
@@ -2107,13 +2131,52 @@ mod tests {
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V8));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V9));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
     }
 
     #[test]
-    fn v8_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
+    fn v9_round_trips_content_free_slow_key_path_timing() {
+        let mut snapshot = private_snapshot();
+        snapshot.events.push(WishEvent {
+            milliseconds_before_marker: 0,
+            event: NativeFeedbackEvent::SlowKeyPathTiming {
+                refresh_ms: 2,
+                planning_ms: 17,
+                edit_session_ms: 6,
+                total_ms: 29,
+            },
+        });
+        snapshot.source_events += 1;
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V9));
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert!(parsed == snapshot);
+        assert!(matches!(
+            parsed.events().last().map(WishEvent::event),
+            Some(NativeFeedbackEvent::SlowKeyPathTiming {
+                refresh_ms: 2,
+                planning_ms: 17,
+                edit_session_ms: 6,
+                total_ms: 29,
+            })
+        ));
+    }
+
+    #[test]
+    fn v8_snapshot_remains_readable_without_slow_key_path_events() {
+        let snapshot = private_snapshot();
+        let mut legacy = snapshot.render().unwrap();
+        legacy[..WISH_PLAINTEXT_MAGIC_V8.len()].copy_from_slice(WISH_PLAINTEXT_MAGIC_V8);
+
+        let parsed = WishSnapshot::parse(&legacy).unwrap();
+        assert!(parsed == snapshot);
+    }
+
+    #[test]
+    fn v9_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "hp".to_owned(),
@@ -2135,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_round_trips_exact_runtime_identity() {
+    fn v9_round_trips_exact_runtime_identity() {
         let mut snapshot = private_snapshot();
         snapshot.runtime_identity = Some(
             WishRuntimeIdentity::new(
@@ -2158,7 +2221,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_round_trips_continuous_spans_and_wish_anchors() {
+    fn v9_round_trips_continuous_spans_and_wish_anchors() {
         let mut continuous = private_snapshot();
         continuous.capture_scope = WishCaptureScope::ContinuousJournal;
         continuous.journal_context = Some(WishJournalContext::ContinuousSpan(

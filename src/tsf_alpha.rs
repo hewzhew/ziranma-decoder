@@ -163,6 +163,7 @@ const AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS: u64 = 96;
 const PERSONAL_RANKING_FLUSH_SELECTIONS: usize = 8;
 const BACKGROUND_PERSISTENCE_QUEUE_CAPACITY: usize = 16;
 const CANDIDATE_RUNTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SLOW_KEY_PATH_THRESHOLD_MS: u32 = 16;
 const INLINE_WISH_TRIGGER_CODE: &str = "xuy";
 const INLINE_WISH_NOTICE_TIMER_ID: usize = 1;
 const INLINE_WISH_NOTICE_DURATION_MS: u32 = 1_200;
@@ -6649,8 +6650,27 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::CandidateCommitted { code, .. }
         | NativeFeedbackEvent::RawCodeCommitted { code }
         | NativeFeedbackEvent::CompositionCancelled { code, .. } => Some(code),
-        NativeFeedbackEvent::CandidatePopupTiming { .. } => None,
+        NativeFeedbackEvent::CandidatePopupTiming { .. }
+        | NativeFeedbackEvent::SlowKeyPathTiming { .. } => None,
     }
+}
+
+fn elapsed_milliseconds(started_at: Instant) -> u32 {
+    started_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+}
+
+fn slow_key_path_timing_event(
+    refresh_ms: u32,
+    planning_ms: u32,
+    edit_session_ms: u32,
+    total_ms: u32,
+) -> Option<NativeFeedbackEvent> {
+    (total_ms >= SLOW_KEY_PATH_THRESHOLD_MS).then_some(NativeFeedbackEvent::SlowKeyPathTiming {
+        refresh_ms,
+        planning_ms,
+        edit_session_ms,
+        total_ms,
+    })
 }
 
 fn native_feedback_monotonic_ms() -> u64 {
@@ -9643,6 +9663,8 @@ impl TsfTextService_Impl {
         let Some(context) = context.cloned() else {
             return Ok(false.into());
         };
+        let key_started_at = Instant::now();
+        let refresh_started_at = Instant::now();
         if self.input_mode.get() == InputMode::Chinese
             && !self.has_active_logical_composition()?
             && u16::try_from(wparam.0)
@@ -9660,8 +9682,10 @@ impl TsfTextService_Impl {
                 feedback.update_candidate_identity(provider.candidate_data_identity());
             }
         }
+        let refresh_ms = elapsed_milliseconds(refresh_started_at);
         let (pair_gap_ms, next_letter_anchor) = self.delivered_letter_timing(wparam, modifiers);
         let previous_pair_timing = self.last_completed_pair_timing.get();
+        let planning_started_at = Instant::now();
         let Some(plan) = self.plan_key_with_transposition_timing(
             wparam,
             modifiers,
@@ -9684,6 +9708,7 @@ impl TsfTextService_Impl {
             }
             return Ok(false.into());
         };
+        let planning_ms = elapsed_milliseconds(planning_started_at);
         self.last_delivered_letter.set(next_letter_anchor);
         let after_code_len = plan.after.phonetic().len();
         let next_completed_pair_timing = completed_pair_timing_after_key(
@@ -9727,14 +9752,11 @@ impl TsfTextService_Impl {
                 || candidate_forget_action_after_success.is_some());
         // A synchronous commit ends the candidate UI and clears its cached
         // input-scope classification. Capture that classification before the
-        // document edit so both explicit learning and the process-local left
-        // context stay inside the same eligibility boundary.
-        let candidate_learning_context = feedback_after_success
+        // document edit so explicit learning, process-local left context and
+        // slow-key diagnostics stay inside the same eligibility boundary.
+        let feedback_event_context = feedback_after_success
             .as_ref()
-            .and_then(|event| match event {
-                NativeFeedbackEvent::CandidateCommitted { code, .. } => Some(code.as_str()),
-                _ => None,
-            })
+            .and_then(native_feedback_event_code)
             .map(|code| {
                 self.native_feedback_context
                     .lock()
@@ -9742,6 +9764,14 @@ impl TsfTextService_Impl {
                     .unwrap_or(NativeFeedbackContext::Unknown)
             })
             .unwrap_or(NativeFeedbackContext::Unknown);
+        let candidate_learning_context = if feedback_after_success
+            .as_ref()
+            .is_some_and(|event| matches!(event, NativeFeedbackEvent::CandidateCommitted { .. }))
+        {
+            feedback_event_context
+        } else {
+            NativeFeedbackContext::Unknown
+        };
         let personal_left_context_update = match feedback_after_success.as_ref() {
             Some(NativeFeedbackEvent::CandidateCommitted { text, source, .. }) => Some(
                 if candidate_learning_context == NativeFeedbackContext::Eligible
@@ -9762,7 +9792,9 @@ impl TsfTextService_Impl {
             _ => None,
         };
         let ui_only = edit.is_none();
+        let mut edit_session_ms = 0;
         if let Some(edit) = edit {
+            let edit_started_at = Instant::now();
             self.request_document_edit_session(
                 &context,
                 client_id,
@@ -9774,7 +9806,9 @@ impl TsfTextService_Impl {
                     cleanup_target: None,
                 },
             )?;
+            edit_session_ms = elapsed_milliseconds(edit_started_at);
         }
+        let timing_context = feedback_event_context;
 
         let mut composition = self
             .composition
@@ -9814,16 +9848,7 @@ impl TsfTextService_Impl {
             candidate_display = Some(updated_display);
         }
         if ui_only && let Some(display) = candidate_display {
-            let feedback_context = feedback_after_success
-                .as_ref()
-                .and_then(native_feedback_event_code)
-                .map(|code| {
-                    self.native_feedback_context
-                        .lock()
-                        .map(|cache| cache.context_for(code))
-                        .unwrap_or(NativeFeedbackContext::Unknown)
-                })
-                .unwrap_or(NativeFeedbackContext::Unknown);
+            let feedback_context = feedback_event_context;
             let presented = self
                 .candidate_ui
                 .try_borrow_mut()
@@ -9840,6 +9865,18 @@ impl TsfTextService_Impl {
                 if matches!(record_result, NativeFeedbackRecordResult::Stopped(_)) {
                     self.native_feedback_language_bar_state.notify();
                 }
+            }
+        }
+        let total_ms = elapsed_milliseconds(key_started_at);
+        if let Some(event) =
+            slow_key_path_timing_event(refresh_ms, planning_ms, edit_session_ms, total_ms)
+            && let Ok(mut feedback) = self.native_feedback.lock()
+            && feedback.is_accepting()
+        {
+            let result = feedback.record_at(timing_context, event, native_feedback_monotonic_ms());
+            drop(feedback);
+            if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
+                self.native_feedback_language_bar_state.notify();
             }
         }
         Ok(true.into())
@@ -13970,6 +14007,20 @@ mod tests {
             NativeFeedbackContext::Unknown
         );
         assert_eq!(classify_input_scopes(&[]), NativeFeedbackContext::Unknown);
+    }
+
+    #[test]
+    fn slow_key_path_diagnostic_starts_at_one_frame() {
+        assert!(slow_key_path_timing_event(1, 8, 5, 15).is_none());
+        assert!(matches!(
+            slow_key_path_timing_event(1, 8, 5, 16),
+            Some(NativeFeedbackEvent::SlowKeyPathTiming {
+                refresh_ms: 1,
+                planning_ms: 8,
+                edit_session_ms: 5,
+                total_ms: 16,
+            })
+        ));
     }
 
     #[test]

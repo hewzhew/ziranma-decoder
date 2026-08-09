@@ -387,7 +387,7 @@ pub use wish_command::{
 pub use wish_feedback::{
     MAX_WISH_NOTE_BYTES, MAX_WISH_PACKAGE_BYTES, WISH_NOTE_FILE_SUFFIX, WISH_PACKAGE_FILE_SUFFIX,
     WISH_SCHEMA_V1, WISH_SCHEMA_V2, WISH_SCHEMA_V3, WISH_SCHEMA_V4, WISH_SCHEMA_V5, WISH_SCHEMA_V6,
-    WISH_SCHEMA_V7, WISH_SCHEMA_V8, WishCaptureScope, WishCategory, WishEventRole,
+    WISH_SCHEMA_V7, WISH_SCHEMA_V8, WISH_SCHEMA_V9, WishCaptureScope, WishCategory, WishEventRole,
     WishFeedbackError, WishJournalAnchor, WishJournalContext, WishJournalSpan, WishNote,
     WishPackageInfo, WishRuntimeIdentity, WishSaveReceipt, WishSnapshot, list_wish_packages,
     load_wish_note, load_wish_snapshot, move_wish_to_trash, save_or_replace_wish_note,

@@ -15,6 +15,8 @@ const MAX_FEEDBACK_CODE_BYTES: usize = 64;
 const MAX_FEEDBACK_CANDIDATES_PER_PAGE: usize = 7;
 const MAX_FEEDBACK_TEXT_CHARACTERS: usize = 128;
 const MAX_FEEDBACK_POPUP_TIMING_MS: u32 = 60_000;
+const MIN_FEEDBACK_SLOW_KEY_PATH_MS: u32 = 16;
+const MAX_FEEDBACK_KEY_PATH_TIMING_MS: u32 = 60_000;
 const MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS: usize = 4;
 const MAX_FEEDBACK_STROKE_PREFIX_BYTES: usize = 8;
 
@@ -389,6 +391,14 @@ pub enum NativeFeedbackEvent {
         fully_visible_ms: u32,
         initial_show: bool,
     },
+    /// Content-free phase timings for a handled key whose total latency
+    /// crossed one 60 Hz frame. Normal keys do not produce this event.
+    SlowKeyPathTiming {
+        refresh_ms: u32,
+        planning_ms: u32,
+        edit_session_ms: u32,
+        total_ms: u32,
+    },
 }
 
 impl NativeFeedbackEvent {
@@ -470,6 +480,20 @@ impl NativeFeedbackEvent {
                 ..
             } => (*first_frame_ms <= *fully_visible_ms
                 && *fully_visible_ms <= MAX_FEEDBACK_POPUP_TIMING_MS)
+                .then_some(0),
+            Self::SlowKeyPathTiming {
+                refresh_ms,
+                planning_ms,
+                edit_session_ms,
+                total_ms,
+            } => refresh_ms
+                .checked_add(*planning_ms)
+                .and_then(|total| total.checked_add(*edit_session_ms))
+                .is_some_and(|measured_phases| {
+                    *total_ms >= MIN_FEEDBACK_SLOW_KEY_PATH_MS
+                        && *total_ms <= MAX_FEEDBACK_KEY_PATH_TIMING_MS
+                        && measured_phases <= *total_ms
+                })
                 .then_some(0),
         }
     }
@@ -1112,6 +1136,7 @@ impl NativeFeedbackSession {
                 NativeFeedbackEvent::CandidatePopupTiming { .. } => {
                     summary.popup_timing_samples = summary.popup_timing_samples.saturating_add(1);
                 }
+                NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
             }
         }
         summary
@@ -1162,7 +1187,11 @@ impl NativeFeedbackSession {
     fn observe_half_pair_gap(&mut self, event: &NativeFeedbackEvent, monotonic_ms: Option<u64>) {
         // Paint diagnostics are orthogonal to key-pair timing and can arrive
         // between the odd and even double-pinyin frames.
-        if matches!(event, NativeFeedbackEvent::CandidatePopupTiming { .. }) {
+        if matches!(
+            event,
+            NativeFeedbackEvent::CandidatePopupTiming { .. }
+                | NativeFeedbackEvent::SlowKeyPathTiming { .. }
+        ) {
             return;
         }
         let (
@@ -1298,7 +1327,8 @@ impl NativeFeedbackSession {
             | NativeFeedbackEvent::CompositionCancelled { .. } => {
                 self.finish_pending_automatic_transposition(TranspositionCalibrationLabel::Unknown)
             }
-            NativeFeedbackEvent::CandidatePopupTiming { .. } => {}
+            NativeFeedbackEvent::CandidatePopupTiming { .. }
+            | NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
         }
     }
 }
@@ -1444,6 +1474,40 @@ mod tests {
             ),
             NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
         );
+    }
+
+    #[test]
+    fn slow_key_path_timing_is_content_free_and_phase_bounded() {
+        let event = NativeFeedbackEvent::SlowKeyPathTiming {
+            refresh_ms: 2,
+            planning_ms: 9,
+            edit_session_ms: 5,
+            total_ms: 18,
+        };
+        assert_eq!(event.validate_and_measure(), Some(0));
+
+        let too_fast = NativeFeedbackEvent::SlowKeyPathTiming {
+            refresh_ms: 2,
+            planning_ms: 7,
+            edit_session_ms: 4,
+            total_ms: 15,
+        };
+        assert_eq!(too_fast.validate_and_measure(), None);
+        let overlapping_phases = NativeFeedbackEvent::SlowKeyPathTiming {
+            refresh_ms: 5,
+            planning_ms: 8,
+            edit_session_ms: 8,
+            total_ms: 20,
+        };
+        assert_eq!(overlapping_phases.validate_and_measure(), None);
+
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        assert_eq!(
+            record(&mut session, event),
+            NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(session.summary().private_bytes, 0);
     }
 
     #[test]

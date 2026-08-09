@@ -220,6 +220,10 @@ struct ResearchReview {
     frames_allowing_more_load: usize,
     popup_ms: Vec<u32>,
     initial_popup_ms: Vec<u32>,
+    slow_key_total_ms: Vec<u32>,
+    slow_key_refresh_ms: Vec<u32>,
+    slow_key_planning_ms: Vec<u32>,
+    slow_key_edit_session_ms: Vec<u32>,
     transposition_accepted: usize,
     transposition_rejected: usize,
     transposition_unknown: usize,
@@ -344,6 +348,17 @@ impl ResearchReview {
                         self.initial_popup_ms.push(*fully_visible_ms);
                     }
                 }
+                NativeFeedbackEvent::SlowKeyPathTiming {
+                    refresh_ms,
+                    planning_ms,
+                    edit_session_ms,
+                    total_ms,
+                } => {
+                    self.slow_key_total_ms.push(*total_ms);
+                    self.slow_key_refresh_ms.push(*refresh_ms);
+                    self.slow_key_planning_ms.push(*planning_ms);
+                    self.slow_key_edit_session_ms.push(*edit_session_ms);
+                }
             }
         }
         for observation in snapshot.automatic_transposition_observations()? {
@@ -419,6 +434,22 @@ impl ResearchReview {
         .unwrap();
         render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
         render_latency(&mut output, "首次出现", &self.initial_popup_ms);
+        render_latency(
+            &mut output,
+            "慢按键总耗时（仅 ≥16 ms）",
+            &self.slow_key_total_ms,
+        );
+        render_latency(&mut output, "慢按键刷新阶段", &self.slow_key_refresh_ms);
+        render_latency(
+            &mut output,
+            "慢按键候选规划阶段",
+            &self.slow_key_planning_ms,
+        );
+        render_latency(
+            &mut output,
+            "慢按键编辑会话阶段",
+            &self.slow_key_edit_session_ms,
+        );
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",

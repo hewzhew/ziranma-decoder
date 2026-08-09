@@ -545,6 +545,14 @@ fn print_event(event: &NativeFeedbackEvent) {
                 ""
             }
         ),
+        NativeFeedbackEvent::SlowKeyPathTiming {
+            refresh_ms,
+            planning_ms,
+            edit_session_ms,
+            total_ms,
+        } => println!(
+            "慢按键  总计 {total_ms} ms；刷新 {refresh_ms} ms，候选 {planning_ms} ms，编辑 {edit_session_ms} ms"
+        ),
     }
 }
 
