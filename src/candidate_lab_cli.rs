@@ -143,8 +143,11 @@ fn render_candidate_lab_concise(
         report.top_k
     )
     .expect("writing to String cannot fail");
-    writeln!(output, "固定公开词典；只读；不会学习本次输入。")
-        .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "固定研究词典；不读取当前 TSF 候选包、会话记忆或个人学习。"
+    )
+    .expect("writing to String cannot fail");
     writeln!(output).expect("writing to String cannot fail");
     render_concise_lane(&mut output, "普通候选", &report.primary);
 
@@ -163,7 +166,7 @@ fn render_candidate_lab_concise(
     }
 
     writeln!(output).expect("writing to String cannot fail");
-    writeln!(output, "这是实验排序，不代表最终输入法效果。")
+    writeln!(output, "这是离线研究排序，不得当作实机候选名次。")
         .expect("writing to String cannot fail");
     if !show_recovery {
         writeln!(output, "如需查看可能的按键颠倒候选，请加 --recovery。")
@@ -301,7 +304,7 @@ fn render_candidate_lab_verbose(
     let mut output = String::new();
     writeln!(
         output,
-        "候选实验台（详细模式；固定公开词典；只读；不学习输入）"
+        "候选实验台（详细模式；固定公开研究词典；不读取当前 TSF 或个人层）"
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -319,7 +322,7 @@ fn render_candidate_lab_verbose(
     .expect("writing to String cannot fail");
     writeln!(
         output,
-        "协议提醒：普通候选沿用研究解码器，仍可能出现自由混合简拼，不代表最终默认输入协议。"
+        "证据提醒：普通候选沿用研究解码器，仍可能出现自由混合简拼；其名次不得当作实机 TSF 现场。"
     )
     .expect("writing to String cannot fail");
     render_verbose_lane(&mut output, "普通候选（研究排序）", &report.primary);
@@ -454,7 +457,9 @@ fn render_candidate_lab_json(
     expected_text: Option<&str>,
 ) -> String {
     let mut output = String::new();
-    output.push_str("{\"schema\":\"ziranma-candidate-lab-v1\",\"contains_text\":true,\"input\":");
+    output.push_str(
+        "{\"schema\":\"ziranma-candidate-lab-v1\",\"contains_text\":true,\"evidence_scope\":\"fixed-research-decoder\",\"tsf_runtime\":false,\"input\":",
+    );
     push_json_string(&mut output, report.observed.as_str());
     write!(
         output,
@@ -847,6 +852,8 @@ text\tpinyin\tfrequency
         );
         assert!(output.starts_with("{\"schema\":\"ziranma-candidate-lab-v1\""));
         assert!(output.contains("\"contains_text\":true"));
+        assert!(output.contains("\"evidence_scope\":\"fixed-research-decoder\""));
+        assert!(output.contains("\"tsf_runtime\":false"));
         assert!(output.contains("\"recovery_included\":false"));
         assert!(output.contains("\"expectation\":null"));
         assert!(output.contains("\"anchored_transposition_recovery\":[]"));

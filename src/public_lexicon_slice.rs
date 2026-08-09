@@ -95,6 +95,9 @@ pub struct PublicLexiconComparison {
     pub same_top_text_codes: usize,
     /// Shared codes whose highest-frequency text differs.
     pub changed_top_text_codes: usize,
+    /// Differing Top-1 codes where the challenger Top-1 is independently
+    /// present under the same complete code in the baseline lexicon.
+    pub consensus_top_reorder_eligible_codes: usize,
 }
 
 /// Aggregate-only result of applying the bounded supplemental exact-word lane.
@@ -177,6 +180,7 @@ pub fn compare_public_lexicons(
     let challenger_top = top_text_by_code(challenger);
     let mut shared_codes = 0;
     let mut same_top_text_codes = 0;
+    let mut consensus_top_reorder_eligible_codes = 0;
     for (code, base_text) in &base_top {
         let Some(challenger_text) = challenger_top.get(code) else {
             continue;
@@ -184,6 +188,8 @@ pub fn compare_public_lexicons(
         shared_codes += 1;
         if base_text == challenger_text {
             same_top_text_codes += 1;
+        } else if base_identities.contains(&(*challenger_text, *code)) {
+            consensus_top_reorder_eligible_codes += 1;
         }
     }
 
@@ -197,6 +203,7 @@ pub fn compare_public_lexicons(
         shared_codes,
         same_top_text_codes,
         changed_top_text_codes: shared_codes - same_top_text_codes,
+        consensus_top_reorder_eligible_codes,
     }
 }
 
@@ -702,6 +709,7 @@ A词\ta cí\t100\n\
                 shared_codes: 2,
                 same_top_text_codes: 1,
                 changed_top_text_codes: 1,
+                consensus_top_reorder_eligible_codes: 1,
             }
         );
     }

@@ -18,6 +18,26 @@ cargo run --release -- candidate-lab mafmkm 3 --json
 
 每栏显示数必须在 1～10。按键串必须是非空的小写英文字母。
 
+## 证据边界
+
+`candidate-lab` 只证明固定公开研究解码器在该输入下返回了什么。它不读取
+当前候选数据槽、万象补充层、项目覆盖、显式别名、TSF 分页缓存、会话记忆、
+个人学习或左侧上下文，因此它的名次不得写成“实际 TSF 候选”或“实机第 N 名”。
+
+需要核对当前公开运行包时，使用只读的 `candidatectl runtime-query`：
+
+```powershell
+candidatectl runtime-query `
+  --root .\target\release\candidate-data `
+  --supplemental-root .\.local\tsf-alpha\user-data\public-supplement `
+  --code daigle `
+  --limit 10
+```
+
+该命令复用 TSF 的公开包分层与冷启动共识校准，但仍明确排除别名、项目覆盖、
+会话记忆、个人学习和上下文重排。只有输入法候选窗、或由许愿保存的
+`CandidatesPresented` 现场，才是该宿主当时真正显示过的候选证据。
+
 ## 三层输出
 
 - **默认层**使用简洁中文，只保留候选文字、预计操作、与完整输入相比
@@ -27,7 +47,9 @@ cargo run --release -- candidate-lab mafmkm 3 --json
 - **机器层**由 `--json` 显式开启，使用
   `ziranma-candidate-lab-v1` 模式和稳定英文字段名。成功输出不夹带
   人类提示文字，可以直接交给 JSON 解析器；顶层 `contains_text: true`
-  明示结果含输入、候选及可选目标文字，不是脱敏报告。
+  明示结果含输入、候选及可选目标文字，不是脱敏报告；
+  `evidence_scope: "fixed-research-decoder"` 与 `tsf_runtime: false` 防止自动化
+  把这一结果误标成实机 TSF 现场。
 
 `--verbose` 与 `--json` 不能同时使用。命令名、选项名、模式版本和 JSON
 字段保留英文；候选解释、操作提示与错误信息使用中文。

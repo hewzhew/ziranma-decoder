@@ -54,7 +54,7 @@
 - 文本服务停用或对象释放。
 
 绝对单调时钟不会写入文件；批次只保留相对末尾的毫秒数。发布复用
-`ziranma-wish-v5` 的有界事件格式，scope 为 `continuous-journal`，整个批次都
+`ziranma-wish-v6` 的有界事件格式，scope 为 `continuous-journal`，整个批次都
 属于研究范围。明文在内存中形成后立即使用 Windows 当前用户 DPAPI 保护，临时文件
 和最终 `.ziw` 都只含密文。文件名由密文内容摘要确定，不覆盖既有包。
 

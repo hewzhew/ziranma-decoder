@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
-    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateView,
-    NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope, WishCategory, WishCommand,
-    WishCommandAckStatus, WishEventRole, WishFeedbackError, WishNote, dispatch_wish_command,
-    list_wish_packages, load_wish_note, load_wish_snapshot, move_wish_to_trash, save_wish_note,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateSource,
+    NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope,
+    WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError, WishNote,
+    dispatch_wish_command, list_wish_packages, load_wish_note, load_wish_snapshot,
+    move_wish_to_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -415,14 +416,6 @@ fn print_event(event: &NativeFeedbackEvent) {
             page_start,
             candidates,
             may_have_more,
-        }
-        | NativeFeedbackEvent::CandidatesPresentedWithProvenance {
-            code,
-            view,
-            page_start,
-            candidates,
-            may_have_more,
-            ..
         } => {
             let candidates = candidates
                 .iter()
@@ -435,11 +428,61 @@ fn print_event(event: &NativeFeedbackEvent) {
                 view_label(*view),
                 if *may_have_more { " · …" } else { "" }
             );
-            if let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
-                automatic_transposition: Some(decision),
-                ..
-            } = event
-            {
+        }
+        NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code,
+            view,
+            page_start,
+            candidates,
+            provenance,
+            automatic_transposition,
+            loaded_candidates,
+            tab_assembly,
+            may_have_more,
+        } => {
+            let depth_label = candidate_depth_label(
+                *page_start,
+                candidates.len(),
+                *loaded_candidates,
+                *may_have_more,
+            );
+            let candidates = candidates
+                .iter()
+                .zip(provenance)
+                .enumerate()
+                .map(|(index, (text, provenance))| {
+                    format!(
+                        "{} {text}〔{}{}〕",
+                        page_start + index + 1,
+                        candidate_source_label(provenance.source()),
+                        if provenance.session_promoted() {
+                            "，个人/会话提升"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!(
+                "候选  {code} [{}；已加载 {} 项，{}] → {candidates}",
+                view_label(*view),
+                loaded_candidates,
+                depth_label,
+            );
+            if let Some(tab) = tab_assembly {
+                println!(
+                    "      Tab 组词：第 {}/{} 字；笔画前缀：{}",
+                    tab.position(),
+                    tab.total_characters(),
+                    if tab.stroke_prefix().is_empty() {
+                        "未输入"
+                    } else {
+                        tab.stroke_prefix()
+                    }
+                );
+            }
+            if let Some(decision) = automatic_transposition {
                 println!("      {}", automatic_transposition_label(decision));
             }
         }
@@ -471,6 +514,35 @@ fn print_event(event: &NativeFeedbackEvent) {
                 ""
             }
         ),
+    }
+}
+
+fn candidate_depth_label(
+    page_start: usize,
+    visible_candidates: usize,
+    loaded_candidates: usize,
+    may_load_more: bool,
+) -> &'static str {
+    if loaded_candidates > page_start.saturating_add(visible_candidates) {
+        "后面已有候选"
+    } else if may_load_more {
+        "还可继续加载"
+    } else {
+        "已到底"
+    }
+}
+
+fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
+    match source {
+        NativeCandidateSource::Unknown => "来源未知",
+        NativeCandidateSource::ExplicitAlias => "显式别名",
+        NativeCandidateSource::ProjectOverlay => "项目词",
+        NativeCandidateSource::CoreExact => "核心整词",
+        NativeCandidateSource::SupplementalExact => "补充整词/组合",
+        NativeCandidateSource::CharacterPair => "双字自由组合",
+        NativeCandidateSource::Decoder => "完整或普通组合",
+        NativeCandidateSource::TranspositionRecovery => "自动纠序",
+        NativeCandidateSource::Shape => "Tab 找字",
     }
 }
 
@@ -645,5 +717,12 @@ mod tests {
             .is_ok(),
             "exact id validation belongs to the storage boundary"
         );
+    }
+
+    #[test]
+    fn candidate_depth_distinguishes_loaded_pages_from_future_loading() {
+        assert_eq!(candidate_depth_label(0, 6, 12, false), "后面已有候选");
+        assert_eq!(candidate_depth_label(6, 6, 12, true), "还可继续加载");
+        assert_eq!(candidate_depth_label(6, 6, 12, false), "已到底");
     }
 }

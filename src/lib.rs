@@ -159,8 +159,8 @@ pub use candidate_snapshot::{
     SupplementalCandidateLayerError, SupplementalCompositionCandidate,
     SupplementalCompositionOrder, SupplementalCompositionSegment,
     SupplementalCompositionSegmentSource, candidate_payload_fingerprint, layered_candidate_texts,
-    merge_candidate_text_layers, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    layered_candidate_texts_with_consensus, merge_candidate_text_layers,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 pub use capsule_replay::{
@@ -254,7 +254,7 @@ pub use native_feedback::{
     NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError, NativeFeedbackLifecycle,
     NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
     NativeFeedbackStartResult, NativeFeedbackStopReason, NativeFeedbackStopResult,
-    NativeFeedbackSummary, NativeSelectionSource,
+    NativeFeedbackSummary, NativeSelectionSource, NativeTabAssemblyState,
 };
 pub use personal_context::{
     MAX_PERSONAL_CONTEXT_CODE_KEYS, MAX_PERSONAL_CONTEXT_ENTRIES,
@@ -362,7 +362,7 @@ pub use wish_command::{
 };
 pub use wish_feedback::{
     MAX_WISH_NOTE_BYTES, MAX_WISH_PACKAGE_BYTES, WISH_NOTE_FILE_SUFFIX, WISH_PACKAGE_FILE_SUFFIX,
-    WISH_SCHEMA_V1, WISH_SCHEMA_V2, WISH_SCHEMA_V3, WISH_SCHEMA_V4, WISH_SCHEMA_V5,
+    WISH_SCHEMA_V1, WISH_SCHEMA_V2, WISH_SCHEMA_V3, WISH_SCHEMA_V4, WISH_SCHEMA_V5, WISH_SCHEMA_V6,
     WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishNote, WishPackageInfo,
     WishSaveReceipt, WishSnapshot, list_wish_packages, load_wish_note, load_wish_snapshot,
     move_wish_to_trash, save_or_replace_wish_note, save_wish_note, save_wish_snapshot,

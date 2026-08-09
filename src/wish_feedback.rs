@@ -26,7 +26,8 @@ use crate::{
     NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateProvenance,
     NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
-    TranspositionCalibrationLabel, TranspositionCalibrationObservation, candidate_sha256_hex,
+    NativeTabAssemblyState, TranspositionCalibrationLabel, TranspositionCalibrationObservation,
+    candidate_sha256_hex,
 };
 
 pub const WISH_SCHEMA_V1: &str = "ziranma-wish-v1";
@@ -34,6 +35,7 @@ pub const WISH_SCHEMA_V2: &str = "ziranma-wish-v2";
 pub const WISH_SCHEMA_V3: &str = "ziranma-wish-v3";
 pub const WISH_SCHEMA_V4: &str = "ziranma-wish-v4";
 pub const WISH_SCHEMA_V5: &str = "ziranma-wish-v5";
+pub const WISH_SCHEMA_V6: &str = "ziranma-wish-v6";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -47,6 +49,7 @@ const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
 const WISH_PLAINTEXT_MAGIC_V4: &[u8] = b"ziranma-wish-v4\0";
 const WISH_PLAINTEXT_MAGIC_V5: &[u8] = b"ziranma-wish-v5\0";
+const WISH_PLAINTEXT_MAGIC_V6: &[u8] = b"ziranma-wish-v6\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-note-dpapi-v1\0";
@@ -409,7 +412,7 @@ impl WishSnapshot {
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V5);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V6);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -436,7 +439,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V5) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V6) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V6)?;
+            6
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V5) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V5)?;
             5
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V4) {
@@ -1030,11 +1036,11 @@ fn render_event(
             candidates,
             provenance,
             automatic_transposition,
+            loaded_candidates,
+            tab_assembly,
             may_have_more,
         } => {
-            output.push(automatic_transposition.as_ref().map_or(6, |decision| {
-                if decision.syllable_count() == 1 { 7 } else { 8 }
-            }));
+            output.push(9);
             put_string(output, code)?;
             output.push(view_tag(*view));
             put_usize(output, *page_start)?;
@@ -1047,11 +1053,10 @@ fn render_event(
                 output.push(candidate_source_tag(provenance.source()));
                 output.push(u8::from(provenance.session_promoted()));
             }
+            output.push(u8::from(automatic_transposition.is_some()));
             if let Some(decision) = automatic_transposition {
                 put_usize(output, decision.syllable_index())?;
-                if decision.syllable_count() > 1 {
-                    put_usize(output, decision.syllable_count())?;
-                }
+                put_usize(output, decision.syllable_count())?;
                 put_u32(output, decision.pair_gap_ms());
                 output.push(automatic_transposition_tier_tag(decision.cold_tier()));
                 output.push(automatic_transposition_tier_tag(decision.tier()));
@@ -1061,6 +1066,13 @@ fn render_event(
                     put_string(output, text)?;
                 }
                 put_usize(output, decision.visible_rank().unwrap_or(0))?;
+            }
+            put_usize(output, *loaded_candidates)?;
+            output.push(u8::from(tab_assembly.is_some()));
+            if let Some(tab_assembly) = tab_assembly {
+                put_usize(output, tab_assembly.position())?;
+                put_usize(output, tab_assembly.total_characters())?;
+                put_string(output, tab_assembly.stroke_prefix())?;
             }
             output.push(u8::from(*may_have_more));
         }
@@ -1150,7 +1162,8 @@ fn parse_event(
         },
         tag if (tag == 6 && version >= 3)
             || (tag == 7 && version >= 4)
-            || (tag == 8 && version >= 5) =>
+            || (tag == 8 && version >= 5)
+            || (tag == 9 && version >= 6) =>
         {
             let code = reader.string()?;
             let view = parse_view(reader.byte()?)?;
@@ -1174,7 +1187,32 @@ fn parse_event(
                     reader.boolean()?,
                 ));
             }
-            let automatic_transposition = if matches!(tag, 7 | 8) {
+            let automatic_transposition = if tag == 9 {
+                if reader.boolean()? {
+                    let syllable_index = reader.usize()?;
+                    let syllable_count = reader.usize()?;
+                    let pair_gap_ms = reader.u32()?;
+                    let cold_tier = parse_automatic_transposition_tier(reader.byte()?)?;
+                    let tier = parse_automatic_transposition_tier(reader.byte()?)?;
+                    let outcome = parse_automatic_transposition_outcome(reader.byte()?)?;
+                    let recovered_text = reader.boolean()?.then(|| reader.string()).transpose()?;
+                    let visible_rank = match reader.usize()? {
+                        0 => None,
+                        rank => Some(rank),
+                    };
+                    Some(NativeAutomaticTranspositionDecision::new_span(
+                        syllable_index..syllable_index.saturating_add(syllable_count),
+                        pair_gap_ms,
+                        cold_tier,
+                        tier,
+                        outcome,
+                        recovered_text,
+                        visible_rank,
+                    ))
+                } else {
+                    None
+                }
+            } else if matches!(tag, 7 | 8) {
                 let syllable_index = reader.usize()?;
                 let syllable_count = if tag == 8 { reader.usize()? } else { 1 };
                 let pair_gap_ms = reader.u32()?;
@@ -1210,6 +1248,21 @@ fn parse_event(
             } else {
                 None
             };
+            let (loaded_candidates, tab_assembly) = if tag == 9 {
+                let loaded_candidates = reader.usize()?;
+                let tab_assembly = if reader.boolean()? {
+                    Some(NativeTabAssemblyState::new(
+                        reader.usize()?,
+                        reader.usize()?,
+                        &reader.string()?,
+                    ))
+                } else {
+                    None
+                };
+                (loaded_candidates, tab_assembly)
+            } else {
+                (page_start.saturating_add(candidate_count), None)
+            };
             NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                 code,
                 view,
@@ -1217,6 +1270,8 @@ fn parse_event(
                 candidates,
                 provenance,
                 automatic_transposition,
+                loaded_candidates,
+                tab_assembly,
                 may_have_more: reader.boolean()?,
             }
         }
@@ -1717,7 +1772,7 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V5));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V6));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
@@ -1728,7 +1783,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_round_trips_candidate_provenance_and_multi_syllable_transposition() {
+    fn v6_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "fuem".to_owned(),
@@ -1748,45 +1803,91 @@ mod tests {
                 Some("什么".to_owned()),
                 Some(1),
             )),
+            loaded_candidates: 6,
+            tab_assembly: None,
             may_have_more: false,
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V5));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V6));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
     }
 
     #[test]
-    fn v5_reader_keeps_v4_single_syllable_transposition_compatibility() {
+    fn v6_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
-            code: "am".to_owned(),
-            view: NativeCandidateView::Ordinary,
-            page_start: 0,
-            candidates: vec!["马".to_owned()],
+            code: "hp".to_owned(),
+            view: NativeCandidateView::Shape,
+            page_start: 6,
+            candidates: vec!["魂".to_owned()],
             provenance: vec![NativeCandidateProvenance::new(
-                NativeCandidateSource::TranspositionRecovery,
+                NativeCandidateSource::Shape,
                 false,
             )],
-            automatic_transposition: Some(NativeAutomaticTranspositionDecision::new(
-                0,
-                31,
-                NativeAutomaticTranspositionTier::Primary,
-                NativeAutomaticTranspositionTier::Primary,
-                NativeAutomaticTranspositionOutcome::RecoveryAvailable,
-                Some("马".to_owned()),
-                Some(1),
-            )),
-            may_have_more: false,
+            automatic_transposition: None,
+            loaded_candidates: 12,
+            tab_assembly: Some(NativeTabAssemblyState::new(2, 4, "hs")),
+            may_have_more: true,
         };
 
-        let rendered_v5 = snapshot.render().unwrap();
-        let mut rendered_v4 = Vec::with_capacity(rendered_v5.len());
-        rendered_v4.extend_from_slice(WISH_PLAINTEXT_MAGIC_V4);
-        rendered_v4.extend_from_slice(&rendered_v5[WISH_PLAINTEXT_MAGIC_V5.len()..]);
-        let parsed = WishSnapshot::parse(&rendered_v4).unwrap();
+        let parsed = WishSnapshot::parse(&snapshot.render().unwrap()).unwrap();
         assert!(parsed == snapshot);
+    }
+
+    #[test]
+    fn v6_reader_keeps_v4_single_syllable_transposition_compatibility() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(WISH_PLAINTEXT_MAGIC_V4);
+        legacy.push(WishCaptureScope::RecentWindow.encoded());
+        legacy.push(WishCategory::Other.encoded());
+        put_usize(&mut legacy, 0).unwrap();
+        put_usize(&mut legacy, 1).unwrap();
+        put_u32(&mut legacy, 30_000);
+        legacy.push(1);
+        put_usize(&mut legacy, 1).unwrap();
+        put_usize(&mut legacy, 0).unwrap();
+        put_usize(&mut legacy, 0).unwrap();
+        put_usize(&mut legacy, 0).unwrap();
+        put_usize(&mut legacy, 1).unwrap();
+        put_u32(&mut legacy, 0);
+        legacy.push(7);
+        put_string(&mut legacy, "am").unwrap();
+        legacy.push(view_tag(NativeCandidateView::Ordinary));
+        put_usize(&mut legacy, 0).unwrap();
+        put_usize(&mut legacy, 1).unwrap();
+        put_string(&mut legacy, "马").unwrap();
+        put_usize(&mut legacy, 1).unwrap();
+        legacy.push(candidate_source_tag(
+            NativeCandidateSource::TranspositionRecovery,
+        ));
+        legacy.push(0);
+        put_usize(&mut legacy, 0).unwrap();
+        put_u32(&mut legacy, 31);
+        legacy.push(automatic_transposition_tier_tag(
+            NativeAutomaticTranspositionTier::Primary,
+        ));
+        legacy.push(automatic_transposition_tier_tag(
+            NativeAutomaticTranspositionTier::Primary,
+        ));
+        legacy.push(automatic_transposition_outcome_tag(
+            NativeAutomaticTranspositionOutcome::RecoveryAvailable,
+        ));
+        legacy.push(1);
+        put_string(&mut legacy, "马").unwrap();
+        put_usize(&mut legacy, 1).unwrap();
+        legacy.push(0);
+
+        let parsed = WishSnapshot::parse(&legacy).unwrap();
+        assert!(matches!(
+            parsed.events()[0].event(),
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                loaded_candidates: 1,
+                tab_assembly: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1818,6 +1919,8 @@ mod tests {
                     Some(recovered.to_owned()),
                     visible_rank,
                 )),
+                loaded_candidates: 2,
+                tab_assembly: None,
                 may_have_more: false,
             }
         };

@@ -141,6 +141,10 @@ Top-12；已经失效的记忆不会继续增加普通按键更新的解码深�
 cargo run --release --bin personalctl -- status `
   --root .local/tsf-alpha/user-data/personal-ranking
 
+# 从标准输入提供一个已知 code + text，只回答是否有证据/是否当前首选/是否已忘记
+cargo run --release --bin personalctl -- explain `
+  --root .local/tsf-alpha/user-data/personal-ranking
+
 cargo run --release --bin personalctl -- forget `
   --root .local/tsf-alpha/user-data/personal-ranking
 
@@ -151,6 +155,10 @@ cargo run --release --bin personalctl -- clear `
   --root .local/tsf-alpha/user-data/personal-ranking `
   --confirm-clear-personal-ranking
 ```
+
+`explain` 不枚举私人模型，也不把编码或文字放进命令行；它启动后从标准输入
+读取一个已知身份，只返回三个布尔结论。这可用来区分“公共冷启动顺序”与
+“已经被个人层提升”，但不能倒推出首次选择发生前的历史候选名次。
 
 候选窗发出的忘记或恢复动作在当前宿主立即生效；`personalctl` 从外部追加的动作
 会在输入法下次激活时由活动宿主刷新。清空前应先停用输入法或关闭相关宿主；否则

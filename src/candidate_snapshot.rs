@@ -45,6 +45,7 @@ pub(crate) enum InteractiveCandidateSource {
     CoreExact,
     SupplementalExact,
     CharacterPair,
+    CompleteSentence,
     Decoder,
 }
 
@@ -448,6 +449,79 @@ pub(crate) fn layered_candidate_texts_with_sources(
         .map(|query| query.candidates)
 }
 
+/// Applies one host-facing cold-order calibration on top of the ordinary
+/// public layer merge.
+///
+/// Raw frequency scales from unrelated dictionaries remain incomparable. A
+/// supplemental Top-1 may therefore move to the front only when the core
+/// dictionary independently confirms the same text as an exact candidate for
+/// the same complete code. New supplemental-only words keep the conservative
+/// merge order.
+pub fn layered_candidate_texts_with_consensus(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    config: SupplementalCandidateLayerConfig,
+) -> Result<Vec<String>, LayeredCandidateTextsError> {
+    layered_candidate_query_with_consensus_sources(core, supplemental, code, limit, config).map(
+        |query| {
+            query
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .collect()
+        },
+    )
+}
+
+pub(crate) fn layered_candidate_query_with_consensus_sources(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    config: SupplementalCandidateLayerConfig,
+) -> Result<InteractiveCandidateQuery, LayeredCandidateTextsError> {
+    let mut query = layered_candidate_query_with_sources(core, supplemental, code, limit, config)?;
+    let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+    if config.exact_promotions == 0 || limit == 0 {
+        return Ok(query);
+    }
+    let core_exact = core.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+    let supplemental_top = supplemental
+        .exact_full_code_texts(code, 1)?
+        .into_iter()
+        .next();
+    let Some(consensus_top) =
+        supplemental_top.filter(|candidate| core_exact.iter().any(|core| core == candidate))
+    else {
+        return Ok(query);
+    };
+    if let Some(index) = query
+        .candidates
+        .iter()
+        .position(|candidate| candidate.text == consensus_top)
+        .filter(|index| *index != 0)
+    {
+        let candidate = query.candidates.remove(index);
+        query.candidates.insert(0, candidate);
+    } else if query
+        .candidates
+        .first()
+        .is_none_or(|candidate| candidate.text != consensus_top)
+    {
+        query.candidates.insert(
+            0,
+            InteractiveCandidateText {
+                text: consensus_top,
+                source: InteractiveCandidateSource::CoreExact,
+            },
+        );
+        query.candidates.truncate(limit);
+    }
+    Ok(query)
+}
+
 pub(crate) fn layered_candidate_query_with_sources(
     core: &CandidateSnapshot,
     supplemental: &CandidateSnapshot,
@@ -481,6 +555,34 @@ pub(crate) fn layered_candidate_query_with_sources(
         limit,
         config,
     )?;
+    let promoted_supplemental_exact = supplemental_exact
+        .iter()
+        .filter(|candidate| !core_exact.iter().any(|core| core == *candidate))
+        .take(config.exact_promotions)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut seen = merged.iter().cloned().collect::<HashSet<_>>();
+    // A supplemental whole word may suppress permissive core abbreviation
+    // paths, but it must not erase complete two-key-per-syllable paths. Those
+    // are the ordinary way an interactive user reaches a phrase assembled
+    // from known public words (for example `打` + `成了`). Preserve both
+    // strong composition lanes before considering one extra mixed-layer path.
+    for candidate in core_primary
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.source,
+                InteractiveCandidateSource::CharacterPair
+                    | InteractiveCandidateSource::CompleteSentence
+            )
+        })
+        .map(|candidate| &candidate.text)
+    {
+        if merged.len() == limit {
+            break;
+        }
+        push_unique(&mut merged, &mut seen, candidate, limit);
+    }
     let mut promoted_composition = None;
     if config.exact_promotions != 0 {
         let composition_candidates = supplemental_complete_composition_texts(
@@ -499,8 +601,10 @@ pub(crate) fn layered_candidate_query_with_sources(
             .take_while(|text| whole_exact_texts.contains(text.as_str()))
             .count();
         let core_primary_top_boundary = core_primary
-            .first()
-            .filter(|candidate| candidate.text != code)
+            .iter()
+            .find(|candidate| {
+                candidate.text != code && !whole_exact_texts.contains(candidate.text.as_str())
+            })
             .and_then(|candidate| {
                 merged
                     .iter()
@@ -526,26 +630,14 @@ pub(crate) fn layered_candidate_query_with_sources(
             break;
         }
     }
-    let mut seen = merged.iter().cloned().collect::<HashSet<_>>();
-    for candidate in core_primary
-        .iter()
-        .filter(|candidate| candidate.source == InteractiveCandidateSource::CharacterPair)
-        .map(|candidate| &candidate.text)
-    {
-        if merged.len() == limit {
-            break;
-        }
-        push_unique(&mut merged, &mut seen, candidate, limit);
-    }
     let core_exact = core_exact.into_iter().collect::<HashSet<_>>();
-    let supplemental_exact = supplemental_exact.into_iter().collect::<HashSet<_>>();
     Ok(InteractiveCandidateQuery {
         candidates: merged
             .into_iter()
             .map(|text| {
                 let source = if core_exact.contains(&text) {
                     InteractiveCandidateSource::CoreExact
-                } else if supplemental_exact.contains(&text)
+                } else if promoted_supplemental_exact.contains(&text)
                     || promoted_composition.as_ref() == Some(&text)
                 {
                     InteractiveCandidateSource::SupplementalExact
@@ -1177,7 +1269,7 @@ impl Decoder {
             if seen.insert(candidate.text.clone()) {
                 visible.push(InteractiveCandidateText {
                     text: candidate.text.clone(),
-                    source: InteractiveCandidateSource::Decoder,
+                    source: InteractiveCandidateSource::CompleteSentence,
                 });
             }
         }
@@ -1828,6 +1920,49 @@ mod tests {
     }
 
     #[test]
+    fn supplemental_exact_word_keeps_a_distinct_complete_core_sentence_visible() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+打\tda\t107925\n\
+达\tda\t9692\n\
+成\tcheng\t33117\n\
+称\tcheng\t13485\n\
+了\tle\t1500186\n\
+成了\tcheng le\t10802\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+达成了\tda cheng le\t4459\n\
+打成了\tda cheng le\t1190\n\
+称了\tcheng le\t1033\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count,
+            })
+            .unwrap()
+        };
+        let core = load("complete-core-survival-v1", CORE, 6);
+        let supplemental = load("complete-supplement-survival-v1", SUPPLEMENTAL, 3);
+
+        let visible = layered_candidate_texts(
+            &core,
+            &supplemental,
+            "daigle",
+            6,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(visible.first().map(String::as_str), Some("达成了"));
+        assert_eq!(visible.get(1).map(String::as_str), Some("打成了"));
+    }
+
+    #[test]
     fn supplemental_exact_word_keeps_the_bounded_character_pair_lane() {
         const CORE: &str = "text\tpinyin\tfrequency\n\
 制\tzhi\t1000\n\
@@ -2256,6 +2391,70 @@ mod tests {
             )
             .unwrap(),
             ["什么", "甚么"]
+        );
+    }
+
+    #[test]
+    fn shared_supplemental_top_calibrates_cold_exact_order() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+大国\tda guo\t1657\n\
+打过\tda guo\t1390\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+打过\tda guo\t9480\n\
+大国\tda guo\t8656\n";
+        let load = |revision: &str, lexicon: &str| {
+            CandidateSnapshot::load(CandidateSnapshotDescriptor {
+                schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision,
+                contains_private_text: false,
+                lexicon_tsv: lexicon,
+                expected_payload_bytes: lexicon.len(),
+                expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
+                expected_entry_count: 2,
+            })
+            .unwrap()
+        };
+        let core = load("cold-consensus-core-v1", CORE);
+        let supplemental = load("cold-consensus-supplement-v1", SUPPLEMENTAL);
+
+        assert_eq!(
+            layered_candidate_texts_with_consensus(
+                &core,
+                &supplemental,
+                "dago",
+                4,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )
+            .unwrap(),
+            ["打过", "大国"]
+        );
+        assert_eq!(
+            layered_candidate_texts_with_consensus(
+                &core,
+                &supplemental,
+                "dago",
+                1,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )
+            .unwrap(),
+            ["打过"]
+        );
+        assert_eq!(
+            layered_candidate_texts_with_consensus(
+                &core,
+                &supplemental,
+                "dago",
+                2,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 0,
+                },
+            )
+            .unwrap(),
+            ["大国", "打过"]
         );
     }
 

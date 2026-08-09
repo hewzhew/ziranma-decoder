@@ -6,15 +6,17 @@
 //! semantic events only after the corresponding user-visible action succeeds.
 
 use crate::{
-    TranspositionCalibrationLabel, TranspositionCalibrationObservation,
-    TranspositionCalibrationRecommendation, TranspositionCalibrationSummary,
-    TranspositionCalibrator,
+    MAX_CANDIDATE_SNAPSHOT_RANK, TranspositionCalibrationLabel,
+    TranspositionCalibrationObservation, TranspositionCalibrationRecommendation,
+    TranspositionCalibrationSummary, TranspositionCalibrator,
 };
 
 const MAX_FEEDBACK_CODE_BYTES: usize = 64;
 const MAX_FEEDBACK_CANDIDATES_PER_PAGE: usize = 7;
 const MAX_FEEDBACK_TEXT_CHARACTERS: usize = 128;
 const MAX_FEEDBACK_POPUP_TIMING_MS: u32 = 60_000;
+const MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS: usize = 4;
+const MAX_FEEDBACK_STROKE_PREFIX_BYTES: usize = 8;
 
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS: usize = 4_096;
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES: usize = 1024 * 1024;
@@ -130,6 +132,47 @@ impl NativeCandidateProvenance {
 
     pub fn session_promoted(self) -> bool {
         self.session_promoted
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct NativeTabAssemblyState {
+    position: usize,
+    total_characters: usize,
+    stroke_prefix: String,
+}
+
+impl NativeTabAssemblyState {
+    pub(crate) fn new(position: usize, total_characters: usize, stroke_prefix: &str) -> Self {
+        Self {
+            position,
+            total_characters,
+            stroke_prefix: stroke_prefix.to_owned(),
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn total_characters(&self) -> usize {
+        self.total_characters
+    }
+
+    pub fn stroke_prefix(&self) -> &str {
+        &self.stroke_prefix
+    }
+
+    fn validate_and_measure(&self) -> Option<usize> {
+        ((2..=MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS).contains(&self.total_characters)
+            && (1..=self.total_characters).contains(&self.position)
+            && self.stroke_prefix.len() <= MAX_FEEDBACK_STROKE_PREFIX_BYTES
+            && self
+                .stroke_prefix
+                .as_bytes()
+                .iter()
+                .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z')))
+        .then_some(self.stroke_prefix.len())
     }
 }
 
@@ -319,6 +362,8 @@ pub enum NativeFeedbackEvent {
         candidates: Vec<String>,
         provenance: Vec<NativeCandidateProvenance>,
         automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
+        loaded_candidates: usize,
+        tab_assembly: Option<NativeTabAssemblyState>,
         may_have_more: bool,
     },
     CandidateCommitted {
@@ -372,6 +417,8 @@ impl NativeFeedbackEvent {
                 candidates,
                 provenance,
                 automatic_transposition,
+                loaded_candidates,
+                tab_assembly,
                 ..
             } => {
                 if !valid_code(code)
@@ -379,7 +426,10 @@ impl NativeFeedbackEvent {
                     || candidates.len() > MAX_FEEDBACK_CANDIDATES_PER_PAGE
                     || candidates.len() != provenance.len()
                     || page_start.checked_add(candidates.len()).is_none()
+                    || *loaded_candidates < page_start.saturating_add(candidates.len())
+                    || *loaded_candidates > MAX_CANDIDATE_SNAPSHOT_RANK
                     || (automatic_transposition.is_some() && *view != NativeCandidateView::Ordinary)
+                    || (tab_assembly.is_some() && *view != NativeCandidateView::Shape)
                 {
                     return None;
                 }
@@ -389,7 +439,10 @@ impl NativeFeedbackEvent {
                 let decision = automatic_transposition
                     .as_ref()
                     .map_or(Some(0), |decision| decision.validate_and_measure(code))?;
-                strings.checked_add(decision)
+                let tab = tab_assembly
+                    .as_ref()
+                    .map_or(Some(0), NativeTabAssemblyState::validate_and_measure)?;
+                strings.checked_add(decision)?.checked_add(tab)
             }
             Self::CandidateCommitted {
                 code,
@@ -1409,11 +1462,55 @@ mod tests {
                         false,
                     )],
                     automatic_transposition: None,
+                    loaded_candidates: 2,
+                    tab_assembly: None,
                     may_have_more: false,
                 }
             ),
             NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
         );
+    }
+
+    #[test]
+    fn candidate_runtime_depth_and_tab_assembly_metadata_are_validated() {
+        let event = |view, loaded_candidates, tab_assembly| {
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code: "hp".to_owned(),
+                view,
+                page_start: 0,
+                candidates: vec!["魂".to_owned()],
+                provenance: vec![NativeCandidateProvenance::new(
+                    NativeCandidateSource::Shape,
+                    false,
+                )],
+                automatic_transposition: None,
+                loaded_candidates,
+                tab_assembly,
+                may_have_more: true,
+            }
+        };
+        let tab = NativeTabAssemblyState::new(2, 4, "hs");
+        let mut valid = NativeFeedbackSession::default();
+        start(&mut valid, NativeFeedbackLimits::default());
+        assert_eq!(
+            record(
+                &mut valid,
+                event(NativeCandidateView::Shape, 6, Some(tab.clone()))
+            ),
+            NativeFeedbackRecordResult::Recorded
+        );
+
+        for invalid in [
+            event(NativeCandidateView::Ordinary, 6, Some(tab.clone())),
+            event(NativeCandidateView::Shape, 0, Some(tab)),
+        ] {
+            let mut session = NativeFeedbackSession::default();
+            start(&mut session, NativeFeedbackLimits::default());
+            assert_eq!(
+                record(&mut session, invalid),
+                NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
+            );
+        }
     }
 
     #[test]
@@ -1428,6 +1525,8 @@ mod tests {
                 NativeCandidateProvenance::new(NativeCandidateSource::Decoder, false),
             ],
             automatic_transposition: Some(decision),
+            loaded_candidates: 2,
+            tab_assembly: None,
             may_have_more: false,
         };
 
@@ -1526,6 +1625,8 @@ mod tests {
                             Some("马".to_owned()),
                             Some(2),
                         ),),
+                        loaded_candidates: 2,
+                        tab_assembly: None,
                         may_have_more: false,
                     },
                     index.saturating_mul(10),
@@ -1592,6 +1693,8 @@ mod tests {
                 Some("马".to_owned()),
                 Some(2),
             )),
+            loaded_candidates: 2,
+            tab_assembly: None,
             may_have_more: false,
         };
         let unknown_summary = TranspositionCalibrationSummary {

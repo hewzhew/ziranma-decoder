@@ -39,6 +39,7 @@ use ziranma_core::{
     candidate_package_authentication_sha256, candidate_package_storage_id,
     candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    layered_candidate_texts_with_consensus, load_candidate_runtime_snapshots,
     load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_slice,
     parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
     select_public_bigram_training_sequences, select_public_character_training_texts,
@@ -129,6 +130,12 @@ enum Options {
     },
     RuntimeCheck {
         root: PathBuf,
+    },
+    RuntimeQuery {
+        root: PathBuf,
+        supplemental_root: Option<PathBuf>,
+        code: String,
+        limit: usize,
     },
     Adopt {
         root: PathBuf,
@@ -273,6 +280,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => verify_signature(&package, &signature, &trusted_public_key)?,
         Options::Status { root } => status(&root)?,
         Options::RuntimeCheck { root } => runtime_check(&root)?,
+        Options::RuntimeQuery {
+            root,
+            supplemental_root,
+            code,
+            limit,
+        } => runtime_query(&root, supplemental_root.as_deref(), &code, limit)?,
         Options::Adopt {
             root,
             package,
@@ -348,6 +361,7 @@ fn parse_options(
         "runtime-check" => Ok(Options::RuntimeCheck {
             root: parse_root_only(arguments, "runtime-check")?,
         }),
+        "runtime-query" => parse_runtime_query(arguments),
         "adopt" => {
             let (root, package, expected_sha256) =
                 parse_root_package_and_expected_sha256(arguments, "adopt")?;
@@ -573,6 +587,42 @@ fn parse_compare(
     Ok(Options::Compare {
         base_payload: base_payload.ok_or("compare requires --base-payload")?,
         challenger_payload: challenger_payload.ok_or("compare requires --challenger-payload")?,
+    })
+}
+
+fn parse_runtime_query(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut root = None;
+    let mut supplemental_root = None;
+    let mut code = None;
+    let mut limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--supplemental-root" => set_path(
+                &mut supplemental_root,
+                &mut arguments,
+                "--supplemental-root",
+            )?,
+            "--code" => set_value(&mut code, &mut arguments, "--code")?,
+            "--limit" => set_usize(&mut limit, &mut arguments, "--limit")?,
+            _ => return Err("unknown runtime-query argument; value was suppressed".into()),
+        }
+    }
+    let code = code.ok_or("runtime-query requires --code")?;
+    if code.is_empty() || code.len() > 64 || !code.as_bytes().iter().all(u8::is_ascii_lowercase) {
+        return Err("runtime-query --code must be 1..64 lowercase ASCII letters".into());
+    }
+    let limit = limit.ok_or("runtime-query requires --limit")?;
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&limit) {
+        return Err("runtime-query --limit is outside the fixed bound".into());
+    }
+    Ok(Options::RuntimeQuery {
+        root: root.ok_or("runtime-query requires --root")?,
+        supplemental_root,
+        code,
+        limit,
     })
 }
 
@@ -995,6 +1045,9 @@ fn print_usage() {
     );
     eprintln!("  status --root <SLOT_DIR>");
     eprintln!("  runtime-check --root <SLOT_DIR>");
+    eprintln!(
+        "  runtime-query --root <SLOT_DIR> [--supplemental-root <SUPPLEMENTAL_SLOT_DIR>] --code <LOWERCASE_KEYS> --limit <1..50>"
+    );
     eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
         "  adopt-signed|stage-signed --root <SLOT_DIR> --package <PACKAGE_DIR> --signature <STATEMENT> --trusted-public-key <ED25519_HEX>"
@@ -1136,7 +1189,7 @@ fn compare_payloads(
     let challenger = parse_lexicon_tsv(&challenger_text)?;
     let report = compare_public_lexicons(&base, &challenger);
     Ok(format!(
-        "公开词表对照\n基线词条：{}\n对照词条：{}\n共同词形：{}\n仅基线词形：{}\n仅对照词形：{}\n共同文字与规范码：{}\n共同规范码：{}\n同码首选相同：{}\n同码首选不同：{}\n本次操作：只读\n",
+        "公开词表对照\n基线词条：{}\n对照词条：{}\n共同词形：{}\n仅基线词形：{}\n仅对照词形：{}\n共同文字与规范码：{}\n共同规范码：{}\n同码首选相同：{}\n同码首选不同：{}\n其中对照首选也被基线同码确认：{}\n本次操作：只读\n",
         report.base_entries,
         report.challenger_entries,
         report.shared_surface_texts,
@@ -1146,6 +1199,7 @@ fn compare_payloads(
         report.shared_codes,
         report.same_top_text_codes,
         report.changed_top_text_codes,
+        report.consensus_top_reorder_eligible_codes,
     ))
 }
 
@@ -3003,6 +3057,56 @@ fn runtime_check(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     ))
 }
 
+fn runtime_query(
+    root: &Path,
+    supplemental_root: Option<&Path>,
+    code: &str,
+    limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let runtime = load_candidate_runtime_snapshots(root, supplemental_root)?
+        .ok_or("candidate runtime root is not configured")?;
+    let (candidates, supplemental_revision) = match runtime.supplemental() {
+        Some(supplemental) => (
+            layered_candidate_texts_with_consensus(
+                runtime.core(),
+                supplemental.snapshot(),
+                code,
+                limit,
+                supplemental.config(),
+            )?,
+            Some(supplemental.snapshot().revision()),
+        ),
+        None => (runtime.core().candidate_texts(code, limit)?, None),
+    };
+    let mut output = String::new();
+    writeln!(output, "TSF 公共候选管线审计").unwrap();
+    writeln!(output, "核心版本：{}", runtime.core().revision()).unwrap();
+    writeln!(
+        output,
+        "补充版本：{}",
+        supplemental_revision.unwrap_or(if runtime.supplemental_fell_back() {
+            "加载失败，已回退"
+        } else {
+            "未启用"
+        })
+    )
+    .unwrap();
+    writeln!(output, "输入：{code}").unwrap();
+    for (index, candidate) in candidates.iter().enumerate() {
+        writeln!(output, "{}. {}", index + 1, candidate).unwrap();
+    }
+    if candidates.is_empty() {
+        writeln!(output, "（没有候选）").unwrap();
+    }
+    writeln!(
+        output,
+        "口径：与 TSF 相同的公开包分层；不含显式别名、项目覆盖、会话记忆、个人学习或上下文重排。"
+    )
+    .unwrap();
+    writeln!(output, "本次操作：只读").unwrap();
+    Ok(output)
+}
+
 fn supplement_status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let slots = read_slot_state(root)?;
     let state = read_supplemental_state(root)?;
@@ -3020,7 +3124,7 @@ fn supplement_status(root: &Path) -> Result<String, Box<dyn std::error::Error>> 
             let loaded = load_installed_package(root, package)?;
             validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
             format!(
-                "公开补充词层\n状态：启用\n版本：{}\n每码最多补：{} 个完整词\n核心完整码首选：保持\n本次操作：只读\n",
+                "公开补充词层\n状态：启用\n版本：{}\n每码最多补：{} 个完整词\n冷启动：新增词不越过核心首选；共有词可按补充首选校准\n本次操作：只读\n",
                 loaded.snapshot.revision(),
                 state.exact_promotions(),
             )
@@ -3042,7 +3146,7 @@ fn supplement_enable(
     let state = CandidateSupplementalState::enabled(package, exact_promotions)?;
     write_supplemental_state(root, &state)?;
     Ok(format!(
-        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n核心完整码首选：保持\n生效：新打开的输入法宿主\n",
+        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n冷启动：新增词不越过核心首选；共有词可按补充首选校准\n生效：新打开的输入法宿主\n",
         loaded.snapshot.revision(),
     ))
 }
@@ -4070,6 +4174,38 @@ mod tests {
             }
         );
         assert!(parse_options(["runtime-check".to_owned()]).is_err());
+        assert_eq!(
+            parse_options([
+                "runtime-query".to_owned(),
+                "--root".to_owned(),
+                "slots".to_owned(),
+                "--supplemental-root".to_owned(),
+                "supplement".to_owned(),
+                "--code".to_owned(),
+                "daigle".to_owned(),
+                "--limit".to_owned(),
+                "6".to_owned(),
+            ])
+            .unwrap(),
+            Options::RuntimeQuery {
+                root: PathBuf::from("slots"),
+                supplemental_root: Some(PathBuf::from("supplement")),
+                code: "daigle".to_owned(),
+                limit: 6,
+            }
+        );
+        assert!(
+            parse_options([
+                "runtime-query".to_owned(),
+                "--root".to_owned(),
+                "slots".to_owned(),
+                "--code".to_owned(),
+                "Daigle".to_owned(),
+                "--limit".to_owned(),
+                "6".to_owned(),
+            ])
+            .is_err()
+        );
         assert!(
             parse_options([
                 "supplement-enable".to_owned(),
@@ -4601,7 +4737,7 @@ mod tests {
         );
         let active = supplement_status(&slots).unwrap();
         assert!(active.contains("状态：启用"));
-        assert!(active.contains("核心完整码首选：保持"));
+        assert!(active.contains("共有词可按补充首选校准"));
 
         stage(&slots, &package_b, &package_b_sha256).unwrap();
         promote(&slots).unwrap();

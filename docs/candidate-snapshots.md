@@ -127,8 +127,9 @@ cargo run --release --bin candidatectl -- compare `
   --challenger-payload .local/public-audit/wanxiang-fdda7afb/package-top100k-v1/lexicon.tsv
 ```
 
-对照只报告词形、文字/规范码身份、共同规范码和同码首选变化的聚合计数，
-不声称两个来源的原始权重可以直接合并。
+对照只报告词形、文字/规范码身份、共同规范码、同码首选变化，以及“对照首选
+本身也被基线同码确认”的可校准数量；不显示候选文字，也不声称两个来源的
+原始权重可以直接合并。
 
 两个独立公开载荷还可以运行纯完整词层审计。它不调用 TSF，不写槽位，也不
 比较跨来源权重；核心已有完整码时固定保留核心首选，补充层只允许明确数量的
@@ -315,6 +316,19 @@ cargo run --release --bin candidatectl -- adopt `
   --package .local\candidate-demo-v1 `
   --expected-sha256 1f2f3c81280641d9963b0ea0fac1fcdaf749d76bae778034037f015f8b8434c2
 ```
+
+只读核对当前公开运行管线可使用：
+
+```powershell
+candidatectl runtime-query `
+  --root .\target\release\candidate-data `
+  --supplemental-root .\.local\tsf-alpha\user-data\public-supplement `
+  --code dago `
+  --limit 10
+```
+
+它包含公开核心/补充分层和 TSF 冷启动共有词校准，但不伪装成完整实机现场：
+显式别名、项目覆盖、会话记忆、个人学习和左侧上下文均明确排除。
 
 运行时只打开以下确定路径：`slots.zcs`、`packages/<current>/manifest.zcm`、
 `packages/<current>/provenance.zcp`、`packages/<current>/lexicon.tsv` 与

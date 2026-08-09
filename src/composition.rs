@@ -385,6 +385,12 @@ impl CompositionSession {
             .map(|assembly| assembly.selected.len().saturating_add(1))
     }
 
+    pub(crate) fn tab_assembly_character_count(&self) -> Option<usize> {
+        self.tab_assembly
+            .as_ref()
+            .map(|assembly| assembly.pinyin_segments.len())
+    }
+
     pub fn recovery_mode(&self) -> bool {
         self.recovery_mode
     }

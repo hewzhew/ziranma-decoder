@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak as SyncWeak};
 use std::time::Instant;
 
 use crate::candidate_snapshot::{
-    InteractiveCandidateQuery, InteractiveCandidateSource, layered_candidate_query_with_sources,
+    InteractiveCandidateQuery, InteractiveCandidateSource,
+    layered_candidate_query_with_consensus_sources,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -29,15 +30,16 @@ use crate::{
     CompositionInput, CompositionPunctuation, CompositionSession,
     DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
     DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder,
-    ExplicitAliasSnapshot, LoadedPersonalRanking, LoadedPersonalRankingSuppressions,
-    MAX_CANDIDATE_SNAPSHOT_RANK, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS,
-    NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
-    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateProvenance,
-    NativeCandidateSource, NativeCandidateView, NativeFeedbackAuthorization,
-    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
-    NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle, NativeFeedbackLimits,
-    NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
-    NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource,
+    ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot, LoadedPersonalRanking,
+    LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
+    NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
+    NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
+    NativeCancellationSource, NativeCandidateProvenance, NativeCandidateSource,
+    NativeCandidateView, NativeFeedbackAuthorization, NativeFeedbackClearResult,
+    NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackFreezeAuthorization,
+    NativeFeedbackLifecycle, NativeFeedbackLimits, NativeFeedbackRecordResult,
+    NativeFeedbackSession, NativeFeedbackStartResult, NativeFeedbackStopResult,
+    NativeFeedbackSummary, NativeSelectionSource, NativeTabAssemblyState,
     PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
     PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
     PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
@@ -673,7 +675,7 @@ impl SnapshotCandidateProvider {
                     .supplemental
                     .as_ref()
                     .and_then(|(supplemental, config)| {
-                        layered_candidate_query_with_sources(
+                        layered_candidate_query_with_consensus_sources(
                             &self.snapshot,
                             supplemental,
                             code,
@@ -741,6 +743,7 @@ fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidat
         InteractiveCandidateSource::CoreExact => NativeCandidateSource::CoreExact,
         InteractiveCandidateSource::SupplementalExact => NativeCandidateSource::SupplementalExact,
         InteractiveCandidateSource::CharacterPair => NativeCandidateSource::CharacterPair,
+        InteractiveCandidateSource::CompleteSentence => NativeCandidateSource::Decoder,
         InteractiveCandidateSource::Decoder => NativeCandidateSource::Decoder,
     }
 }
@@ -992,6 +995,7 @@ struct CandidateDisplay {
     provenance: Vec<NativeCandidateProvenance>,
     personalized: Vec<bool>,
     automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
+    tab_assembly: Option<NativeTabAssemblyState>,
     page_start: usize,
     may_have_more: bool,
     view: InteractiveCandidateView,
@@ -1056,9 +1060,15 @@ fn active_shape_code(session: &CompositionSession) -> &str {
 }
 
 fn shape_candidate_display(
-    display: CandidateDisplay,
+    mut display: CandidateDisplay,
     session: &CompositionSession,
 ) -> CandidateDisplay {
+    display.tab_assembly = session
+        .tab_assembly_position()
+        .zip(session.tab_assembly_character_count())
+        .map(|(position, total)| {
+            NativeTabAssemblyState::new(position, total, session.stroke_prefix())
+        });
     let display = display.with_mode(shape_display_mode(session));
     match (
         session.tab_assembly_selected_text(),
@@ -1081,6 +1091,7 @@ impl CandidateDisplay {
             provenance: vec![NativeCandidateProvenance::default(); actions.len()],
             personalized: vec![false; actions.len()],
             automatic_transposition: None,
+            tab_assembly: None,
             page_start: 0,
             may_have_more: false,
             view: InteractiveCandidateView::Primary,
@@ -1106,6 +1117,7 @@ impl CandidateDisplay {
             provenance: vec![NativeCandidateProvenance::default()],
             personalized: vec![false],
             automatic_transposition: None,
+            tab_assembly: None,
             page_start: 0,
             may_have_more: false,
             view: InteractiveCandidateView::Primary,
@@ -1160,6 +1172,7 @@ impl CandidateDisplay {
             provenance,
             personalized,
             automatic_transposition,
+            tab_assembly: None,
             page_start,
             may_have_more,
             view,
@@ -1274,6 +1287,8 @@ impl CandidateDisplay {
             automatic_transposition: (!shape_mode)
                 .then(|| self.automatic_transposition.clone())
                 .flatten(),
+            loaded_candidates: self.candidates.len(),
+            tab_assembly: shape_mode.then(|| self.tab_assembly.clone()).flatten(),
             may_have_more: self.may_have_more,
         }
     }
@@ -5420,6 +5435,36 @@ enum WishSaveStatus {
     Failed,
 }
 
+fn freeze_recent_wish_with_context(
+    feedback: &NativeFeedbackSession,
+    marker_ms: u64,
+) -> Option<FrozenNativeFeedbackSnapshot> {
+    let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
+    feedback
+        .freeze_recent_episodes(
+            authorization,
+            marker_ms,
+            DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
+            DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
+            DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+        )
+        .ok()
+        .flatten()?;
+    // The episode probe above guarantees that the package has a meaningful
+    // completed focus. Persist the wider bounded context as well:
+    // `WishSnapshot` marks the latest completed episode as focus and keeps
+    // earlier events as context. This avoids reducing a report to only the few
+    // inputs immediately before `xuy`.
+    feedback
+        .freeze_recent(
+            authorization,
+            marker_ms,
+            DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
+            DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+        )
+        .ok()
+}
+
 impl NativeFeedbackLanguageBarState {
     fn new(
         feedback: Arc<Mutex<NativeFeedbackRuntime>>,
@@ -5497,28 +5542,21 @@ impl NativeFeedbackLanguageBarState {
             let marker_ms = native_feedback_monotonic_ms();
             let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
             match scope {
-                WishCaptureScope::RecentEpisodes => feedback
-                    .freeze_recent_episodes(
-                        authorization,
-                        marker_ms,
-                        DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
-                        DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
-                        DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(|frozen| (frozen, WishCaptureScope::RecentEpisodes))
-                    .or_else(|| {
-                        feedback
-                            .freeze_recent(
-                                authorization,
-                                marker_ms,
-                                DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
-                                DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
-                            )
-                            .ok()
-                            .map(|frozen| (frozen, WishCaptureScope::RecentWindow))
-                    }),
+                WishCaptureScope::RecentEpisodes => {
+                    { freeze_recent_wish_with_context(&feedback, marker_ms) }
+                        .map(|frozen| (frozen, WishCaptureScope::RecentEpisodes))
+                        .or_else(|| {
+                            feedback
+                                .freeze_recent(
+                                    authorization,
+                                    marker_ms,
+                                    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+                                    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+                                )
+                                .ok()
+                                .map(|frozen| (frozen, WishCaptureScope::RecentWindow))
+                        })
+                }
                 WishCaptureScope::LegacyWindow
                 | WishCaptureScope::RecentWindow
                 | WishCaptureScope::ContinuousJournal => feedback
@@ -11281,6 +11319,105 @@ mod tests {
     }
 
     #[test]
+    fn supplemental_provider_does_not_hide_a_complete_core_sentence() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+打\tda\t107925\n\
+达\tda\t9692\n\
+成\tcheng\t33117\n\
+称\tcheng\t13485\n\
+了\tle\t1500186\n\
+成了\tcheng le\t10802\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+达成了\tda cheng le\t4459\n\
+打成了\tda cheng le\t1190\n\
+称了\tcheng le\t1033\n";
+        let load = |revision: &str, lexicon: &str, expected_entry_count| {
+            Arc::new(
+                CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                    schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                    revision,
+                    contains_private_text: false,
+                    lexicon_tsv: lexicon,
+                    expected_payload_bytes: lexicon.len(),
+                    expected_payload_fingerprint: crate::candidate_payload_fingerprint(
+                        lexicon.as_bytes(),
+                    ),
+                    expected_entry_count,
+                })
+                .unwrap(),
+            )
+        };
+        let provider = SnapshotCandidateProvider::new(
+            load("tsf-complete-core-survival-v1", CORE, 6),
+            Some((
+                load("tsf-complete-supplement-survival-v1", SUPPLEMENTAL, 3),
+                crate::SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )),
+            None,
+        );
+
+        let output =
+            provider.candidates_with_provenance("daigle", 6, InteractiveCandidateView::Primary);
+        assert_eq!(
+            output.candidates.first().map(String::as_str),
+            Some("达成了")
+        );
+        assert_eq!(output.candidates.get(1).map(String::as_str), Some("打成了"));
+        assert_eq!(
+            output.provenance.get(1).map(|item| item.source()),
+            Some(NativeCandidateSource::Decoder)
+        );
+    }
+
+    #[test]
+    fn supplemental_provider_uses_shared_exact_top_for_cold_order() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+大国\tda guo\t1657\n\
+打过\tda guo\t1390\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+打过\tda guo\t9480\n\
+大国\tda guo\t8656\n";
+        let load = |revision: &str, lexicon: &str| {
+            Arc::new(
+                CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                    schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                    revision,
+                    contains_private_text: false,
+                    lexicon_tsv: lexicon,
+                    expected_payload_bytes: lexicon.len(),
+                    expected_payload_fingerprint: crate::candidate_payload_fingerprint(
+                        lexicon.as_bytes(),
+                    ),
+                    expected_entry_count: 2,
+                })
+                .unwrap(),
+            )
+        };
+        let provider = SnapshotCandidateProvider::new(
+            load("tsf-cold-consensus-core-v1", CORE),
+            Some((
+                load("tsf-cold-consensus-supplement-v1", SUPPLEMENTAL),
+                crate::SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )),
+            None,
+        );
+
+        let output =
+            provider.candidates_with_provenance("dago", 2, InteractiveCandidateView::Primary);
+        assert_eq!(output.candidates, ["打过", "大国"]);
+        assert!(
+            output
+                .provenance
+                .iter()
+                .all(|item| item.source() == NativeCandidateSource::CoreExact)
+        );
+    }
+
+    #[test]
     fn public_preflight_api_commits_snapshot_candidate_without_retaining_text() {
         let _guard = test_state_lock();
         let manifest = CandidatePackageManifest::parse(TSF_DEVELOPMENT_MANIFEST).unwrap();
@@ -13765,6 +13902,8 @@ mod tests {
                                     Some(2),
                                 ),
                             ),
+                            loaded_candidates: 2,
+                            tab_assembly: None,
                             may_have_more: false,
                         },
                         index.saturating_mul(10),
@@ -14095,8 +14234,13 @@ mod tests {
             Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                 code,
                 view: NativeCandidateView::Shape,
+                loaded_candidates: 3,
+                tab_assembly: Some(tab),
                 ..
             }) if code == "qthp"
+                && tab.position() == 2
+                && tab.total_characters() == 2
+                && tab.stroke_prefix().is_empty()
         ));
         *service.composition.borrow_mut() = first.after;
 
@@ -14857,6 +15001,78 @@ mod tests {
                 category: WishCategory::Other,
             }))
         );
+    }
+
+    #[test]
+    fn episode_wish_keeps_older_context_outside_the_three_episode_focus_probe() {
+        let mut feedback = NativeFeedbackSession::default();
+        assert_eq!(
+            feedback.start_rolling_memory(
+                NativeFeedbackAuthorization::explicit_memory_only(),
+                NativeFeedbackLimits::default(),
+            ),
+            NativeFeedbackStartResult::Started
+        );
+        for (index, code) in ["aa", "bb", "cc", "dd"].into_iter().enumerate() {
+            let timestamp = 1_000 + u64::try_from(index).unwrap() * 1_000;
+            assert_eq!(
+                feedback.record_at(
+                    NativeFeedbackContext::Eligible,
+                    NativeFeedbackEvent::CandidatesPresented {
+                        code: code.to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: 0,
+                        candidates: vec!["甲".to_owned()],
+                        may_have_more: false,
+                    },
+                    timestamp,
+                ),
+                NativeFeedbackRecordResult::Recorded
+            );
+            assert_eq!(
+                feedback.record_at(
+                    NativeFeedbackContext::Eligible,
+                    NativeFeedbackEvent::CandidateCommitted {
+                        code: code.to_owned(),
+                        text: "甲".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        source: NativeSelectionSource::FirstCandidate,
+                        absolute_rank: 1,
+                        visible_rank: 1,
+                    },
+                    timestamp + 1,
+                ),
+                NativeFeedbackRecordResult::Recorded
+            );
+        }
+        assert_eq!(
+            feedback.record_at(
+                NativeFeedbackContext::Eligible,
+                NativeFeedbackEvent::CandidatesPresented {
+                    code: "xuy".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["许愿".to_owned()],
+                    may_have_more: false,
+                },
+                4_500,
+            ),
+            NativeFeedbackRecordResult::Recorded
+        );
+
+        let frozen = freeze_recent_wish_with_context(&feedback, 5_000).unwrap();
+        assert_eq!(frozen.source_events(), 9);
+        assert_eq!(frozen.events().len(), 9);
+        assert_eq!(frozen.omitted_before_window(), 0);
+        let wish = WishSnapshot::from_frozen_with_metadata(
+            &frozen,
+            WishCaptureScope::RecentEpisodes,
+            WishCategory::Other,
+        )
+        .unwrap();
+        assert_eq!(wish.focus_event_range(), 6..8);
+        assert_eq!(wish.event_role(0), Some(crate::WishEventRole::Context));
+        assert_eq!(wish.event_role(8), Some(crate::WishEventRole::Trigger));
     }
 
     #[test]

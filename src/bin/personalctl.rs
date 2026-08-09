@@ -22,6 +22,7 @@ const MAX_PRIVATE_TEXT_BYTES: usize = 512;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     Status,
+    Explain,
     Clear { confirmed: bool },
     Forget,
     Restore,
@@ -50,6 +51,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let options = parse_options(env::args().skip(1))?;
     match options.command {
         Command::Status => status(&options.root),
+        Command::Explain => explain(&options.root),
         Command::Clear { confirmed } => clear(&options.root, confirmed),
         Command::Forget => change_suppression(
             &options.root,
@@ -81,6 +83,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
     }
     let command = match command.as_str() {
         "status" if !confirmed => Command::Status,
+        "explain" if !confirmed => Command::Explain,
         "clear" => Command::Clear { confirmed },
         "forget" if !confirmed => Command::Forget,
         "restore" if !confirmed => Command::Restore,
@@ -90,7 +93,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
 }
 
 fn usage() -> String {
-    "用法：\n  personalctl status --root <个人排序目录>\n  personalctl forget --root <个人排序目录>\n  personalctl restore --root <个人排序目录>\n  personalctl clear --root <个人排序目录> --confirm-clear-personal-ranking\n\nforget 与 restore 启动后再读取编码和候选文字，不接受私人命令行参数。".to_owned()
+    "用法：\n  personalctl status --root <个人排序目录>\n  personalctl explain --root <个人排序目录>\n  personalctl forget --root <个人排序目录>\n  personalctl restore --root <个人排序目录>\n  personalctl clear --root <个人排序目录> --confirm-clear-personal-ranking\n\nexplain、forget 与 restore 启动后再读取编码和候选文字，不接受私人命令行参数。".to_owned()
 }
 
 #[cfg(windows)]
@@ -107,6 +110,51 @@ fn status(root: &Path) -> Result<(), Box<dyn Error>> {
     println!("  忘记与恢复动作：{}", suppressions.action_count());
     println!("  当前忘记条目：{}", suppressions.snapshot().entry_count());
     println!("  内容：Windows 当前用户加密");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn explain(root: &Path) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut output = io::stdout();
+    let (code, text) = read_private_identity(&mut input, &mut output, true)?;
+    let loaded = load_personal_ranking(root, &WindowsUserDataProtector)?;
+    let suppressions = load_personal_ranking_suppressions(
+        &suppression_root_for_ranking(root)?,
+        &WindowsUserDataProtector,
+    )?;
+    let snapshot = loaded.snapshot();
+    writeln!(
+        output,
+        "个人排序证据：{}",
+        if snapshot.has_evidence(&code, &text) {
+            "有"
+        } else {
+            "无"
+        }
+    )?;
+    writeln!(
+        output,
+        "当前首选身份：{}",
+        if snapshot.preferred_text_with_suppressions(&code, suppressions.snapshot())
+            == Some(text.as_str())
+        {
+            "是"
+        } else {
+            "否"
+        }
+    )?;
+    writeln!(
+        output,
+        "当前已忘记：{}",
+        if suppressions.snapshot().is_suppressed(&code, &text) {
+            "是"
+        } else {
+            "否"
+        }
+    )?;
+    writeln!(output, "内容未写入命令行；本次操作：只读")?;
     Ok(())
 }
 
@@ -276,6 +324,13 @@ mod tests {
             Options {
                 root: PathBuf::from("ranking"),
                 command: Command::Status,
+            }
+        );
+        assert_eq!(
+            parse_options(["explain", "--root", "ranking"].map(str::to_owned)).unwrap(),
+            Options {
+                root: PathBuf::from("ranking"),
+                command: Command::Explain,
             }
         );
         assert_eq!(
