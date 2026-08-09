@@ -46,11 +46,12 @@ use crate::{
     PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
     WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
     WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
-    WishSnapshot, load_candidate_runtime_snapshots, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
-    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
-    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
-    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
+    WishRuntimeIdentity, WishSnapshot, load_candidate_runtime_snapshots,
+    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
+    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
+    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
+    save_personal_ranking_batch, save_personal_ranking_checkpoint,
+    save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -233,10 +234,22 @@ enum AutomaticTranspositionOutcome {
     RecoveryAvailable(AutomaticTranspositionTier),
 }
 
+#[derive(Clone)]
+struct CandidateDataIdentity {
+    core_revision: String,
+    supplemental_revision: Option<String>,
+}
+
 trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, bounded candidate page without learning or
     /// I/O. Implementations should decode once rather than once per rank.
     fn candidates(&self, code: &str, limit: usize, view: InteractiveCandidateView) -> Vec<String>;
+
+    /// Immutable public candidate-data revisions used by this provider.
+    /// Synthetic providers and legacy tests may leave the identity unknown.
+    fn candidate_data_identity(&self) -> Option<CandidateDataIdentity> {
+        None
+    }
 
     fn candidates_with_provenance(
         &self,
@@ -838,6 +851,16 @@ impl ExplicitAliasRuntime {
 impl CandidateProvider for SnapshotCandidateProvider {
     fn candidates(&self, code: &str, limit: usize, view: InteractiveCandidateView) -> Vec<String> {
         self.candidate_output(code, limit, view).candidates
+    }
+
+    fn candidate_data_identity(&self) -> Option<CandidateDataIdentity> {
+        Some(CandidateDataIdentity {
+            core_revision: self.snapshot.revision().to_owned(),
+            supplemental_revision: self
+                .supplemental
+                .as_ref()
+                .map(|(snapshot, _)| snapshot.revision().to_owned()),
+        })
     }
 
     fn candidates_with_provenance(
@@ -1480,6 +1503,37 @@ fn module_path() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
         return Err(CandidateProviderLoadError::ModuleLocation);
     }
     Ok(PathBuf::from(OsString::from_wide(&buffer[..length])))
+}
+
+fn immutable_module_sha256(path: &Path) -> Option<String> {
+    if !path
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("ziranma_core.dll")
+    {
+        return None;
+    }
+    let digest = path.parent()?.file_name()?.to_str()?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !path
+        .parent()?
+        .parent()?
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("builds")
+        || !path
+            .parent()?
+            .parent()?
+            .parent()?
+            .file_name()?
+            .to_str()?
+            .eq_ignore_ascii_case("tsf-alpha")
+    {
+        return None;
+    }
+    Some(digest.to_ascii_lowercase())
 }
 
 fn module_candidate_runtime_root() -> std::result::Result<PathBuf, CandidateProviderLoadError> {
@@ -6871,6 +6925,8 @@ const RESEARCH_FEEDBACK_CONSENT_POLL_MS: u64 = 1_000;
 
 struct ResearchFeedbackJournal {
     root: Option<PathBuf>,
+    module_sha256: Option<String>,
+    candidate_identity: Option<CandidateDataIdentity>,
     enabled: bool,
     last_consent_check_ms: Option<u64>,
     events: Vec<(u64, NativeFeedbackEvent)>,
@@ -6878,7 +6934,10 @@ struct ResearchFeedbackJournal {
 }
 
 impl ResearchFeedbackJournal {
-    fn for_mode(key_advice_mode: KeyAdviceMode) -> Self {
+    fn for_mode(
+        key_advice_mode: KeyAdviceMode,
+        candidate_identity: Option<CandidateDataIdentity>,
+    ) -> Self {
         let root = matches!(key_advice_mode, KeyAdviceMode::Foreground)
             .then(|| {
                 module_path()
@@ -6889,8 +6948,18 @@ impl ResearchFeedbackJournal {
         let enabled = root
             .as_deref()
             .is_some_and(|root| research_feedback_enabled(root).unwrap_or(false));
+        let module_sha256 = matches!(key_advice_mode, KeyAdviceMode::Foreground)
+            .then(|| {
+                module_path()
+                    .ok()
+                    .as_deref()
+                    .and_then(immutable_module_sha256)
+            })
+            .flatten();
         Self {
             root,
+            module_sha256,
+            candidate_identity,
             enabled,
             last_consent_check_ms: None,
             events: Vec::new(),
@@ -6905,6 +6974,8 @@ impl ResearchFeedbackJournal {
             .is_some_and(|root| research_feedback_enabled(root).unwrap_or(false));
         Self {
             root,
+            module_sha256: None,
+            candidate_identity: None,
             enabled,
             last_consent_check_ms: None,
             events: Vec::new(),
@@ -6981,14 +7052,16 @@ impl ResearchFeedbackJournal {
         let Some(marker_ms) = self.events.last().map(|(timestamp, _)| *timestamp) else {
             return true;
         };
+        let runtime_identity = self.runtime_identity();
         let saved =
             crate::FrozenNativeFeedbackSnapshot::from_journal_events(marker_ms, &self.events)
                 .ok()
                 .and_then(|frozen| {
-                    WishSnapshot::from_frozen_with_metadata(
+                    WishSnapshot::from_frozen_with_runtime_identity(
                         &frozen,
                         WishCaptureScope::ContinuousJournal,
                         WishCategory::Other,
+                        runtime_identity,
                     )
                     .ok()
                 })
@@ -7009,6 +7082,16 @@ impl ResearchFeedbackJournal {
         }
         saved
     }
+
+    fn runtime_identity(&self) -> Option<WishRuntimeIdentity> {
+        let candidates = self.candidate_identity.as_ref()?;
+        WishRuntimeIdentity::new(
+            self.module_sha256.clone()?,
+            candidates.core_revision.clone(),
+            candidates.supplemental_revision.clone(),
+        )
+        .ok()
+    }
 }
 
 struct NativeFeedbackRuntime {
@@ -7017,7 +7100,10 @@ struct NativeFeedbackRuntime {
 }
 
 impl NativeFeedbackRuntime {
-    fn for_mode(key_advice_mode: KeyAdviceMode) -> Self {
+    fn for_mode(
+        key_advice_mode: KeyAdviceMode,
+        candidate_identity: Option<CandidateDataIdentity>,
+    ) -> Self {
         let mut session = NativeFeedbackSession::default();
         if matches!(key_advice_mode, KeyAdviceMode::Foreground) {
             let started = session.start_rolling_memory(
@@ -7028,7 +7114,7 @@ impl NativeFeedbackRuntime {
         }
         Self {
             session,
-            research: ResearchFeedbackJournal::for_mode(key_advice_mode),
+            research: ResearchFeedbackJournal::for_mode(key_advice_mode, candidate_identity),
         }
     }
 
@@ -7093,8 +7179,11 @@ impl Drop for NativeFeedbackRuntime {
     }
 }
 
-fn native_feedback_runtime_for_mode(key_advice_mode: KeyAdviceMode) -> NativeFeedbackRuntime {
-    NativeFeedbackRuntime::for_mode(key_advice_mode)
+fn native_feedback_runtime_for_mode(
+    key_advice_mode: KeyAdviceMode,
+    candidate_identity: Option<CandidateDataIdentity>,
+) -> NativeFeedbackRuntime {
+    NativeFeedbackRuntime::for_mode(key_advice_mode, candidate_identity)
 }
 
 impl TsfTextService {
@@ -7103,8 +7192,12 @@ impl TsfTextService {
         key_advice_mode: KeyAdviceMode,
     ) -> Self {
         object_created();
+        let candidate_identity = candidate_provider
+            .as_deref()
+            .and_then(CandidateProvider::candidate_data_identity);
         let native_feedback = Arc::new(Mutex::new(native_feedback_runtime_for_mode(
             key_advice_mode,
+            candidate_identity,
         )));
         let native_feedback_context = Arc::new(Mutex::new(NativeFeedbackContextCache::default()));
         let input_mode = Rc::new(Cell::new(InputMode::Chinese));
@@ -9585,8 +9678,13 @@ mod tests {
                 r"D:\repo\.local\tsf-alpha\user-data\public-supplement"
             ))
         );
+        assert_eq!(immutable_module_sha256(&module), Some(digest));
         assert_eq!(
             explicit_alias_root_for_module(Path::new(r"D:\repo\target\release\ziranma_core.dll")),
+            None
+        );
+        assert_eq!(
+            immutable_module_sha256(Path::new(r"D:\repo\target\release\ziranma_core.dll")),
             None
         );
     }
@@ -12930,14 +13028,14 @@ mod tests {
 
     #[test]
     fn foreground_hosts_keep_a_bounded_memory_only_wish_buffer_ready() {
-        let foreground = native_feedback_runtime_for_mode(KeyAdviceMode::Foreground);
+        let foreground = native_feedback_runtime_for_mode(KeyAdviceMode::Foreground, None);
         assert_eq!(
             foreground.summary().lifecycle,
             NativeFeedbackLifecycle::Recording
         );
         assert_eq!(foreground.summary().events, 0);
 
-        let synthetic = native_feedback_runtime_for_mode(KeyAdviceMode::SyntheticHost);
+        let synthetic = native_feedback_runtime_for_mode(KeyAdviceMode::SyntheticHost, None);
         assert_eq!(
             synthetic.summary().lifecycle,
             NativeFeedbackLifecycle::Disabled
@@ -12955,6 +13053,11 @@ mod tests {
         ));
         crate::set_research_feedback_enabled(&root, true).unwrap();
         let mut runtime = NativeFeedbackRuntime::with_research_root(root.clone());
+        runtime.research.module_sha256 = Some("cd".repeat(32));
+        runtime.research.candidate_identity = Some(CandidateDataIdentity {
+            core_revision: "research-core-v1".to_owned(),
+            supplemental_revision: Some("research-supplement-v2".to_owned()),
+        });
         runtime.record_at(
             NativeFeedbackContext::Password,
             NativeFeedbackEvent::CandidateCommitted {
@@ -12997,6 +13100,13 @@ mod tests {
         assert_eq!(
             snapshot.focus_event_range(),
             0..RESEARCH_FEEDBACK_BATCH_EPISODES
+        );
+        let identity = snapshot.runtime_identity().unwrap();
+        assert_eq!(identity.module_sha256(), "cd".repeat(32));
+        assert_eq!(identity.core_candidate_revision(), "research-core-v1");
+        assert_eq!(
+            identity.supplemental_candidate_revision(),
+            Some("research-supplement-v2")
         );
 
         drop(runtime);

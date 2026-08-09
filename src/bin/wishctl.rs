@@ -338,6 +338,16 @@ fn show(
             "否"
         }
     );
+    if let Some(identity) = snapshot.runtime_identity() {
+        println!(
+            "运行身份：DLL {}…；核心 {}；补充 {}",
+            &identity.module_sha256()[..12],
+            identity.core_candidate_revision(),
+            identity.supplemental_candidate_revision().unwrap_or("无"),
+        );
+    } else {
+        println!("运行身份：旧批次未记录");
+    }
     let mut previous_role = None;
     let mut previous_completed_episode = false;
     let mut context_segment = 0_usize;

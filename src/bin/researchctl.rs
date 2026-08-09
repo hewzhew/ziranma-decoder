@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use ziranma_core::{
     NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
     NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, TranspositionCalibrationLabel,
-    WishCaptureScope, WishSnapshot, list_wish_packages, research_feedback_enabled,
-    set_research_feedback_enabled,
+    WishCaptureScope, WishRuntimeIdentity, WishSnapshot, list_wish_packages,
+    research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -132,7 +132,7 @@ struct SelectionPattern {
     maximum_rank: usize,
     manual_selections: usize,
     paged_selections: usize,
-    promoted_frames: usize,
+    session_promoted_frames: usize,
     sources: [usize; 9],
 }
 
@@ -156,7 +156,7 @@ impl SelectionPattern {
         self.manual_selections += usize::from(selection != NativeSelectionSource::FirstCandidate);
         self.paged_selections += usize::from(rank > 6);
         if let Some(provenance) = provenance {
-            self.promoted_frames += usize::from(provenance.session_promoted());
+            self.session_promoted_frames += usize::from(provenance.session_promoted());
             self.sources[candidate_source_index(provenance.source())] += 1;
         }
     }
@@ -197,6 +197,8 @@ struct ResearchReview {
     transposition_accepted: usize,
     transposition_rejected: usize,
     transposition_unknown: usize,
+    runtime_batches: HashMap<WishRuntimeIdentity, usize>,
+    unidentified_runtime_batches: usize,
     selections: HashMap<(String, String), SelectionPattern>,
     cancelled_codes: HashMap<String, usize>,
     raw_codes: HashMap<String, usize>,
@@ -208,6 +210,11 @@ impl ResearchReview {
             return Err("持续研究目录中出现了非持续批次".into());
         }
         self.batches += 1;
+        if let Some(identity) = snapshot.runtime_identity() {
+            *self.runtime_batches.entry(identity.clone()).or_insert(0) += 1;
+        } else {
+            self.unidentified_runtime_batches += 1;
+        }
         self.complete_batches += usize::from(snapshot.source_complete());
         self.events += snapshot.events().len();
         self.source_events += snapshot.source_events();
@@ -351,6 +358,11 @@ impl ResearchReview {
             self.omitted_events,
         )
         .unwrap();
+        render_runtime_identities(
+            &mut output,
+            &self.runtime_batches,
+            self.unidentified_runtime_batches,
+        );
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；显式选择 {}；无法配对现场 {}。",
@@ -408,7 +420,7 @@ impl ResearchReview {
         for ((code, text), pattern) in non_top.into_iter().take(MAX_REVIEW_ITEMS) {
             writeln!(
                 output,
-                "- {code} → “{text}”：非首选 {}/{} 次；名次 {}–{}；显式选择 {} 次；翻页 {} 次；来源 {}；个人/会话提升现场 {} 次。",
+                "- {code} → “{text}”：非首选 {}/{} 次；名次 {}–{}；显式选择 {} 次；翻页 {} 次；来源 {}；会话提升标记 {} 次。",
                 pattern.non_top_selections,
                 pattern.selections,
                 pattern.minimum_rank,
@@ -416,7 +428,7 @@ impl ResearchReview {
                 pattern.manual_selections,
                 pattern.paged_selections,
                 candidate_source_label(pattern.dominant_source()),
-                pattern.promoted_frames,
+                pattern.session_promoted_frames,
             )
             .unwrap();
         }
@@ -509,6 +521,44 @@ fn render_code_counts(output: &mut String, title: &str, counts: &HashMap<String,
     }
     for (code, count) in counts.into_iter().take(MAX_REVIEW_ITEMS) {
         writeln!(output, "- {code}：{count} 次。").unwrap();
+    }
+}
+
+fn render_runtime_identities(
+    output: &mut String,
+    identities: &HashMap<WishRuntimeIdentity, usize>,
+    unidentified_batches: usize,
+) {
+    let mut identities = identities.iter().collect::<Vec<_>>();
+    identities.sort_by(|left, right| {
+        right
+            .1
+            .cmp(left.1)
+            .then_with(|| {
+                left.0
+                    .core_candidate_revision()
+                    .cmp(right.0.core_candidate_revision())
+            })
+            .then_with(|| left.0.module_sha256().cmp(right.0.module_sha256()))
+    });
+    writeln!(
+        output,
+        "运行身份：已标识 {} 组、{} 批；旧批次未记录 {} 批。",
+        identities.len(),
+        identities.iter().map(|(_, count)| **count).sum::<usize>(),
+        unidentified_batches,
+    )
+    .unwrap();
+    for (identity, count) in identities.into_iter().take(MAX_REVIEW_ITEMS) {
+        writeln!(
+            output,
+            "- DLL {}…；核心 {}；补充 {}：{} 批。",
+            &identity.module_sha256()[..12],
+            identity.core_candidate_revision(),
+            identity.supplemental_candidate_revision().unwrap_or("无"),
+            count,
+        )
+        .unwrap();
     }
 }
 
@@ -742,10 +792,14 @@ mod tests {
                 16,
             )
             .unwrap();
-        let snapshot = WishSnapshot::from_frozen_with_metadata(
+        let snapshot = WishSnapshot::from_frozen_with_runtime_identity(
             &frozen,
             WishCaptureScope::ContinuousJournal,
             ziranma_core::WishCategory::Other,
+            Some(
+                WishRuntimeIdentity::new("ab".repeat(32), "research-core-v1".to_owned(), None)
+                    .unwrap(),
+            ),
         )
         .unwrap();
         let mut review = ResearchReview::default();
@@ -759,8 +813,13 @@ mod tests {
             .unwrap();
         assert_eq!(pattern.first_rank, Some(2));
         assert_eq!(pattern.last_rank, Some(1));
-        assert_eq!(pattern.promoted_frames, 1);
+        assert_eq!(pattern.session_promoted_frames, 1);
         assert!(review.render().contains("首次第 2，最近第 1"));
+        assert!(
+            review
+                .render()
+                .contains("DLL abababababab…；核心 research-core-v1")
+        );
     }
 
     #[test]
