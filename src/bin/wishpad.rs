@@ -62,8 +62,10 @@ mod windows_app {
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
         NativeAutomaticTranspositionTier, NativeFeedbackEvent, WindowsUserDataProtector,
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
-        WishPackageInfo, WishReviewStatus, list_wish_packages, load_wish_note, load_wish_snapshot,
-        repository_root_for_user_tool_executable, save_or_replace_wish_note,
+        WishPackageInfo, WishReviewStatus, list_trashed_wish_packages, list_wish_packages,
+        load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot,
+        repository_root_for_user_tool_executable, restore_wish_from_trash,
+        save_or_replace_wish_note,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -87,6 +89,8 @@ mod windows_app {
     const MANAGER_STATUS_FILTER_ID: i32 = 114;
     const MANAGER_IMPORTANCE_FILTER_ID: i32 = 115;
     const MANAGER_CLEAR_FILTER_ID: i32 = 116;
+    const MANAGER_TRASH_VIEW_ID: i32 = 117;
+    const MANAGER_RESTORE_ID: i32 = 118;
     const NOTE_CATEGORY_ID: i32 = 201;
     const NOTE_EDIT_ID: i32 = 202;
     const NOTE_SAVE_ID: i32 = 203;
@@ -119,10 +123,69 @@ mod windows_app {
 
     struct ManagerState {
         root: PathBuf,
+        view: ManagerView,
         records: Vec<ManagerRecord>,
         visible_indices: Vec<usize>,
         selected: Option<usize>,
         show_context: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum ManagerView {
+        #[default]
+        Active,
+        Trash,
+    }
+
+    impl ManagerView {
+        fn title(self) -> &'static str {
+            match self {
+                Self::Active => "许愿记录",
+                Self::Trash => "回收站",
+            }
+        }
+
+        fn description(self) -> &'static str {
+            match self {
+                Self::Active => "在输入法里输入 xuy 后按 Tab 留下现场；这里负责查看和整理。",
+                Self::Trash => "这里保留已移走的加密记录；恢复前不会重新进入许愿列表。",
+            }
+        }
+
+        fn switch_label(self) -> &'static str {
+            match self {
+                Self::Active => "回收站",
+                Self::Trash => "返回记录",
+            }
+        }
+
+        fn empty_title(self) -> &'static str {
+            match self {
+                Self::Active => "猫猫正在听",
+                Self::Trash => "回收站是空的",
+            }
+        }
+
+        fn empty_body(self) -> &'static str {
+            match self {
+                Self::Active => {
+                    "遇到不舒服的地方时，在输入法里输入 xuy，再按 Tab，\r\n就能把现场留在这里。"
+                }
+                Self::Trash => "移走的记录会留在这里，需要时可以再恢复。",
+            }
+        }
+
+        fn list_title(self, total: usize, visible: usize, filtered: bool) -> String {
+            if filtered {
+                format!("筛选结果　{visible} / {total}")
+            } else {
+                let noun = match self {
+                    Self::Active => "所有记录",
+                    Self::Trash => "已移走记录",
+                };
+                format!("{noun}　{total}")
+            }
+        }
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -192,10 +255,12 @@ mod windows_app {
 
     fn manager_button_tone(id: i32) -> Option<ManagerButtonTone> {
         match id {
-            MANAGER_EDIT_ID | NOTE_SAVE_ID => Some(ManagerButtonTone::Primary),
-            MANAGER_REFRESH_ID | MANAGER_CONTEXT_ID | MANAGER_CLEAR_FILTER_ID | NOTE_CANCEL_ID => {
-                Some(ManagerButtonTone::Secondary)
-            }
+            MANAGER_EDIT_ID | MANAGER_RESTORE_ID | NOTE_SAVE_ID => Some(ManagerButtonTone::Primary),
+            MANAGER_REFRESH_ID
+            | MANAGER_CONTEXT_ID
+            | MANAGER_CLEAR_FILTER_ID
+            | MANAGER_TRASH_VIEW_ID
+            | NOTE_CANCEL_ID => Some(ManagerButtonTone::Secondary),
             _ => None,
         }
     }
@@ -328,6 +393,8 @@ mod windows_app {
                         apply_manager_filter(window, selected_wish_id().as_deref())
                     }
                     MANAGER_CLEAR_FILTER_ID => clear_manager_filter(window),
+                    MANAGER_TRASH_VIEW_ID => switch_manager_view(window),
+                    MANAGER_RESTORE_ID => restore_selected_record(window),
                     _ => {}
                 }
                 LRESULT(0)
@@ -779,7 +846,7 @@ mod windows_app {
                     control_style(0),
                     24,
                     18,
-                    620,
+                    540,
                     30,
                     Some(window),
                     Some(control_menu(MANAGER_TITLE_ID)),
@@ -799,6 +866,22 @@ mod windows_app {
                     24,
                     Some(window),
                     Some(control_menu(MANAGER_DESCRIPTION_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
+                    w!("回收站"),
+                    control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
+                    594,
+                    21,
+                    92,
+                    32,
+                    Some(window),
+                    Some(control_menu(MANAGER_TRASH_VIEW_ID)),
                     instance,
                     None,
                 )
@@ -989,6 +1072,22 @@ mod windows_app {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("BUTTON"),
+                    w!("恢复这条记录"),
+                    control_style(BS_OWNERDRAW | WS_TABSTOP.0 as i32),
+                    630,
+                    459,
+                    150,
+                    32,
+                    Some(window),
+                    Some(control_menu(MANAGER_RESTORE_ID)),
+                    instance,
+                    None,
+                )
+            },
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
                     w!("整理这条记录…"),
                     control_style(BS_OWNERDRAW | BS_DEFPUSHBUTTON | WS_TABSTOP.0 as i32),
                     630,
@@ -1061,6 +1160,7 @@ mod windows_app {
             heading_font,
             body_font,
             button_font,
+            button_font,
             body_font,
             body_font,
             body_font,
@@ -1069,6 +1169,7 @@ mod windows_app {
             body_font,
             section_font,
             body_font,
+            button_font,
             button_font,
             button_font,
             body_font,
@@ -1086,7 +1187,7 @@ mod windows_app {
         }
         let _ = unsafe {
             SendMessageW(
-                controls[8],
+                controls[9],
                 LB_SETITEMHEIGHT,
                 Some(WPARAM(0)),
                 Some(LPARAM(58)),
@@ -1094,7 +1195,7 @@ mod windows_app {
         };
         let _ = unsafe {
             SendMessageW(
-                controls[3],
+                controls[4],
                 EDIT_SET_LIMIT_TEXT,
                 Some(WPARAM(MANAGER_SEARCH_CHARACTER_LIMIT)),
                 None,
@@ -1103,25 +1204,13 @@ mod windows_app {
         let cue = wide("搜索说明或整理标签");
         let _ = unsafe {
             SendMessageW(
-                controls[3],
+                controls[4],
                 EDIT_SET_CUE_BANNER,
                 Some(WPARAM(1)),
                 Some(LPARAM(cue.as_ptr() as isize)),
             )
         };
         for label in ["全部状态", "待整理", "处理中", "已完成"] {
-            let text = wide(label);
-            let _ = unsafe {
-                SendMessageW(
-                    controls[4],
-                    CB_ADDSTRING,
-                    None,
-                    Some(LPARAM(text.as_ptr() as isize)),
-                )
-            };
-        }
-        let _ = unsafe { SendMessageW(controls[4], CB_SETCURSEL, Some(WPARAM(0)), None) };
-        for label in ["全部记录", "只看普通", "只看重要"] {
             let text = wide(label);
             let _ = unsafe {
                 SendMessageW(
@@ -1133,6 +1222,19 @@ mod windows_app {
             };
         }
         let _ = unsafe { SendMessageW(controls[5], CB_SETCURSEL, Some(WPARAM(0)), None) };
+        for label in ["全部记录", "只看普通", "只看重要"] {
+            let text = wide(label);
+            let _ = unsafe {
+                SendMessageW(
+                    controls[6],
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                )
+            };
+        }
+        let _ = unsafe { SendMessageW(controls[6], CB_SETCURSEL, Some(WPARAM(0)), None) };
+        let _ = unsafe { ShowWindow(controls[13], SW_HIDE) };
         true
     }
 
@@ -1181,7 +1283,20 @@ mod windows_app {
         })
     }
 
+    fn current_manager_view() -> ManagerView {
+        MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|state| state.view))
+            .unwrap_or_default()
+    }
+
     fn refresh_records(window: HWND, preserve_id: Option<String>) {
+        refresh_records_for_view(window, current_manager_view(), preserve_id);
+    }
+
+    fn refresh_records_for_view(window: HWND, view: ManagerView, preserve_id: Option<String>) {
+        apply_manager_view_chrome(window, view);
         let Some(root) = std::env::current_exe()
             .ok()
             .and_then(|path| wish_root_for_executable(&path))
@@ -1196,10 +1311,14 @@ mod windows_app {
                 "无法定位许愿记录的位置。可以稍后再刷新。",
             );
             set_empty_state(window, true);
+            apply_manager_view_chrome(window, view);
             set_manager_status(window, "无法定位本项目的许愿目录");
             return;
         };
-        let packages = match list_wish_packages(&root) {
+        let packages = match match view {
+            ManagerView::Active => list_wish_packages(&root),
+            ManagerView::Trash => list_trashed_wish_packages(&root),
+        } {
             Ok(packages) => packages,
             Err(WishFeedbackError::RootUnavailable) => Vec::new(),
             Err(_) => {
@@ -1213,14 +1332,23 @@ mod windows_app {
                     "许愿记录目前不可用。原有内容没有被修改，可以稍后再刷新。",
                 );
                 set_empty_state(window, true);
+                apply_manager_view_chrome(window, view);
                 set_manager_status(window, "暂时无法读取许愿记录");
                 return;
             }
         };
         let records = packages
             .into_iter()
-            .map(
-                |info| match load_wish_note(&root, info.id(), &WindowsUserDataProtector) {
+            .map(|info| {
+                let note = match view {
+                    ManagerView::Active => {
+                        load_wish_note(&root, info.id(), &WindowsUserDataProtector)
+                    }
+                    ManagerView::Trash => {
+                        load_trashed_wish_note(&root, info.id(), &WindowsUserDataProtector)
+                    }
+                };
+                match note {
                     Ok(note) => ManagerRecord {
                         info,
                         note: Some(note),
@@ -1236,13 +1364,14 @@ mod windows_app {
                         note: None,
                         note_unavailable: true,
                     },
-                },
-            )
+                }
+            })
             .collect::<Vec<_>>();
         let empty = records.is_empty();
         if let Ok(mut state) = MANAGER_STATE.lock() {
             *state = Some(ManagerState {
                 root,
+                view,
                 records,
                 visible_indices: Vec::new(),
                 selected: None,
@@ -1250,15 +1379,91 @@ mod windows_app {
             });
         }
         if empty {
-            set_control_text(window, MANAGER_EMPTY_TITLE_ID, "猫猫正在听");
-            set_control_text(
-                window,
-                MANAGER_EMPTY_BODY_ID,
-                "遇到不舒服的地方时，在输入法里输入 xuy，再按 Tab，\r\n就能把现场留在这里。",
-            );
+            set_control_text(window, MANAGER_EMPTY_TITLE_ID, view.empty_title());
+            set_control_text(window, MANAGER_EMPTY_BODY_ID, view.empty_body());
         }
         set_empty_state(window, empty);
+        apply_manager_view_chrome(window, view);
         apply_manager_filter(window, preserve_id.as_deref());
+    }
+
+    fn apply_manager_view_chrome(window: HWND, view: ManagerView) {
+        set_control_text(window, MANAGER_TITLE_ID, view.title());
+        set_control_text(window, MANAGER_DESCRIPTION_ID, view.description());
+        set_control_text(window, MANAGER_TRASH_VIEW_ID, view.switch_label());
+        set_control_text(
+            window,
+            MANAGER_DETAIL_TITLE_ID,
+            match view {
+                ManagerView::Active => "记录详情",
+                ManagerView::Trash => "回收站详情",
+            },
+        );
+        let has_records = MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|state| !state.records.is_empty()))
+            .unwrap_or(false);
+        for (id, visible) in [
+            (MANAGER_EDIT_ID, view == ManagerView::Active && has_records),
+            (
+                MANAGER_RESTORE_ID,
+                view == ManagerView::Trash && has_records,
+            ),
+        ] {
+            if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
+                let _ = unsafe { ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE }) };
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(window), None, true);
+        }
+    }
+
+    fn switch_manager_view(window: HWND) {
+        let view = match current_manager_view() {
+            ManagerView::Active => ManagerView::Trash,
+            ManagerView::Trash => ManagerView::Active,
+        };
+        refresh_records_for_view(window, view, None);
+    }
+
+    fn restore_selected_record(window: HWND) {
+        let selected = MANAGER_STATE.lock().ok().and_then(|state| {
+            let state = state.as_ref()?;
+            if state.view != ManagerView::Trash {
+                return None;
+            }
+            let record = state.records.get(state.selected?)?;
+            Some((state.root.clone(), record.info.id().to_owned()))
+        });
+        let Some((root, wish_id)) = selected else {
+            show_note_message(window, "请先选择一条回收站记录。", false);
+            return;
+        };
+        match restore_wish_from_trash(&root, &wish_id, &WindowsUserDataProtector) {
+            Ok(()) => {
+                refresh_records_for_view(window, ManagerView::Active, Some(wish_id));
+                set_manager_status(window, "记录已恢复到许愿列表");
+            }
+            Err(error) => show_note_message(window, restore_error_message(error), true),
+        }
+    }
+
+    fn restore_error_message(error: WishFeedbackError) -> &'static str {
+        match error {
+            WishFeedbackError::WishAlreadyExists | WishFeedbackError::NoteAlreadyExists => {
+                "当前许愿列表中已有同名内容，猫猫没有覆盖。"
+            }
+            WishFeedbackError::InvalidSnapshot
+            | WishFeedbackError::InvalidPlaintext
+            | WishFeedbackError::InvalidProtectedPackage
+            | WishFeedbackError::Protection => "这条回收站记录没有通过完整性检查，猫猫没有恢复它。",
+            WishFeedbackError::WishUnavailable | WishFeedbackError::NoteUnavailable => {
+                "这条回收站记录暂时不完整，猫猫没有移动任何内容。"
+            }
+            _ => "暂时无法恢复这条记录；原有内容没有被修改。",
+        }
     }
 
     fn manager_filter_from_controls(window: HWND) -> ManagerFilter {
@@ -1307,7 +1512,7 @@ mod windows_app {
     fn apply_manager_filter(window: HWND, preserve_id: Option<&str>) {
         let filter = manager_filter_from_controls(window);
         let now = SystemTime::now();
-        let Some((labels, selected_list_index, total, visible)) =
+        let Some((labels, selected_list_index, total, visible, view)) =
             MANAGER_STATE.lock().ok().and_then(|mut state| {
                 let state = state.as_mut()?;
                 state.visible_indices = state
@@ -1347,6 +1552,7 @@ mod windows_app {
                     selected_list_index,
                     state.records.len(),
                     state.visible_indices.len(),
+                    state.view,
                 ))
             })
         else {
@@ -1372,22 +1578,24 @@ mod windows_app {
         set_control_text(
             window,
             MANAGER_LIST_TITLE_ID,
-            &if filter.is_active() {
-                format!("筛选结果　{visible} / {total}")
-            } else {
-                format!("所有记录　{total}")
-            },
+            &view.list_title(total, visible, filter.is_active()),
         );
         set_manager_status(
             window,
             if total == 0 {
-                "还没有许愿记录"
+                match view {
+                    ManagerView::Active => "还没有许愿记录",
+                    ManagerView::Trash => "回收站里没有记录",
+                }
             } else if visible == 0 {
                 "没有符合筛选条件的记录"
             } else if filter.is_active() {
                 "筛选仅在当前窗口内存中进行"
             } else {
-                "选择一条记录查看重点现场"
+                match view {
+                    ManagerView::Active => "选择一条记录查看重点现场",
+                    ManagerView::Trash => "选择一条记录查看或恢复",
+                }
             },
         );
         render_selected_record(window);
@@ -1473,7 +1681,7 @@ mod windows_app {
     }
 
     fn render_selected_record(window: HWND) {
-        let (selected, has_records) = MANAGER_STATE
+        let (selected, has_records, view) = MANAGER_STATE
             .lock()
             .ok()
             .and_then(|state| {
@@ -1489,26 +1697,34 @@ mod windows_app {
                         state.show_context,
                     ))
                 });
-                Some((selected, !state.records.is_empty()))
+                Some((selected, !state.records.is_empty(), state.view))
             })
-            .unwrap_or((None, false));
+            .unwrap_or((None, false, ManagerView::Active));
         let Some((root, wish_id, modified, note, note_unavailable, show_context)) = selected else {
             show_empty_details(
                 window,
                 if has_records {
                     "没有符合当前筛选条件的记录。\r\n\r\n可以修改搜索内容，或者清除筛选。"
+                } else if view == ManagerView::Trash {
+                    "回收站里没有记录。\r\n\r\n可以返回许愿记录继续查看。"
                 } else {
                     "还没有许愿记录。\r\n\r\n遇到不舒服时，在输入法里输入 xuy，再按 Tab。"
                 },
             );
-            set_manager_actions(window, false, false, false);
+            set_manager_actions(window, view, false, false, false);
             return;
         };
-        let snapshot = match load_wish_snapshot(&root, &wish_id, &WindowsUserDataProtector) {
+        let snapshot = match view {
+            ManagerView::Active => load_wish_snapshot(&root, &wish_id, &WindowsUserDataProtector),
+            ManagerView::Trash => {
+                load_trashed_wish_snapshot(&root, &wish_id, &WindowsUserDataProtector)
+            }
+        };
+        let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 show_empty_details(window, "这条记录暂时无法读取；原文件没有被修改。");
-                set_manager_actions(window, true, false, false);
+                set_manager_actions(window, view, true, false, false);
                 return;
             }
         };
@@ -1575,7 +1791,7 @@ mod windows_app {
         }
         let has_context = focus.start > 0 || focus.end < snapshot.events().len();
         set_control_text(window, MANAGER_DETAIL_ID, &output);
-        set_manager_actions(window, true, has_context, show_context);
+        set_manager_actions(window, view, true, has_context, show_context);
     }
 
     fn show_empty_details(window: HWND, message: &str) {
@@ -1590,6 +1806,7 @@ mod windows_app {
             MANAGER_DETAIL_ID,
             MANAGER_CONTEXT_ID,
             MANAGER_EDIT_ID,
+            MANAGER_RESTORE_ID,
             MANAGER_STATUS_ID,
             MANAGER_SEARCH_ID,
             MANAGER_STATUS_FILTER_ID,
@@ -1610,9 +1827,29 @@ mod windows_app {
         }
     }
 
-    fn set_manager_actions(window: HWND, can_edit: bool, has_context: bool, showing: bool) {
-        if let Ok(edit) = unsafe { GetDlgItem(Some(window), MANAGER_EDIT_ID) } {
-            let _ = unsafe { EnableWindow(edit, can_edit) };
+    fn set_manager_actions(
+        window: HWND,
+        view: ManagerView,
+        can_act: bool,
+        has_context: bool,
+        showing: bool,
+    ) {
+        let has_records = MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|state| !state.records.is_empty()))
+            .unwrap_or(false);
+        for (id, visible) in [
+            (MANAGER_EDIT_ID, view == ManagerView::Active && has_records),
+            (
+                MANAGER_RESTORE_ID,
+                view == ManagerView::Trash && has_records,
+            ),
+        ] {
+            if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
+                let _ = unsafe { ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE }) };
+                let _ = unsafe { EnableWindow(control, can_act) };
+            }
         }
         if let Ok(context) = unsafe { GetDlgItem(Some(window), MANAGER_CONTEXT_ID) } {
             let _ = unsafe { EnableWindow(context, has_context) };
@@ -1831,6 +2068,9 @@ mod windows_app {
         }
         let selected = MANAGER_STATE.lock().ok().and_then(|state| {
             let state = state.as_ref()?;
+            if state.view != ManagerView::Active {
+                return None;
+            }
             let record = state.records.get(state.selected?)?;
             Some((
                 state.root.clone(),
@@ -2618,6 +2858,29 @@ mod windows_app {
         }
 
         #[test]
+        fn manager_views_keep_active_and_trash_language_distinct() {
+            assert_eq!(ManagerView::Active.title(), "许愿记录");
+            assert_eq!(ManagerView::Active.switch_label(), "回收站");
+            assert_eq!(ManagerView::Active.list_title(3, 3, false), "所有记录　3");
+            assert_eq!(ManagerView::Trash.title(), "回收站");
+            assert_eq!(ManagerView::Trash.switch_label(), "返回记录");
+            assert_eq!(ManagerView::Trash.list_title(3, 2, false), "已移走记录　3");
+            assert_eq!(ManagerView::Trash.list_title(3, 2, true), "筛选结果　2 / 3");
+            assert!(ManagerView::Trash.description().contains("加密记录"));
+        }
+
+        #[test]
+        fn restore_errors_explain_integrity_and_collision_without_overwrite() {
+            assert!(
+                restore_error_message(WishFeedbackError::InvalidProtectedPackage)
+                    .contains("完整性检查")
+            );
+            assert!(
+                restore_error_message(WishFeedbackError::WishAlreadyExists).contains("没有覆盖")
+            );
+        }
+
+        #[test]
         fn manager_and_note_dialog_keep_primary_and_secondary_actions_distinct() {
             assert_eq!(
                 manager_button_tone(MANAGER_EDIT_ID),
@@ -2629,6 +2892,14 @@ mod windows_app {
             );
             assert_eq!(
                 manager_button_tone(MANAGER_CLEAR_FILTER_ID),
+                Some(ManagerButtonTone::Secondary)
+            );
+            assert_eq!(
+                manager_button_tone(MANAGER_RESTORE_ID),
+                Some(ManagerButtonTone::Primary)
+            );
+            assert_eq!(
+                manager_button_tone(MANAGER_TRASH_VIEW_ID),
                 Some(ManagerButtonTone::Secondary)
             );
             assert_eq!(

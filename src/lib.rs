@@ -392,9 +392,10 @@ pub use wish_feedback::{
     WISH_SCHEMA_V7, WISH_SCHEMA_V8, WISH_SCHEMA_V9, WISH_SCHEMA_V10, WishCaptureScope,
     WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishJournalAnchor,
     WishJournalContext, WishJournalSpan, WishNote, WishPackageInfo, WishReviewStatus,
-    WishRuntimeIdentity, WishSaveReceipt, WishSnapshot, list_wish_packages, load_wish_note,
-    load_wish_snapshot, move_wish_to_trash, save_or_replace_wish_note, save_wish_note,
-    save_wish_snapshot,
+    WishRuntimeIdentity, WishSaveReceipt, WishSnapshot, list_trashed_wish_packages,
+    list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
+    load_wish_snapshot, move_wish_to_trash, restore_wish_from_trash, save_or_replace_wish_note,
+    save_wish_note, save_wish_snapshot,
 };
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;

@@ -1202,6 +1202,15 @@ pub fn load_wish_snapshot(
 }
 
 pub fn list_wish_packages(root: &Path) -> Result<Vec<WishPackageInfo>, WishFeedbackError> {
+    list_wish_packages_in(
+        root,
+        WishFeedbackError::RootUnavailable,
+        WishFeedbackError::InvalidRoot,
+    )
+}
+
+/// Lists recoverable encrypted wishes without decrypting their contents.
+pub fn list_trashed_wish_packages(root: &Path) -> Result<Vec<WishPackageInfo>, WishFeedbackError> {
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(WishFeedbackError::RootUnavailable),
@@ -1210,11 +1219,30 @@ pub fn list_wish_packages(root: &Path) -> Result<Vec<WishPackageInfo>, WishFeedb
         }
         Ok(_) => {}
     }
+    list_wish_packages_in(
+        &root.join(WISH_TRASH_DIRECTORY),
+        WishFeedbackError::InvalidTrash,
+        WishFeedbackError::InvalidTrash,
+    )
+}
+
+fn list_wish_packages_in(
+    directory: &Path,
+    unavailable: WishFeedbackError,
+    invalid: WishFeedbackError,
+) -> Result<Vec<WishPackageInfo>, WishFeedbackError> {
+    match fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(unavailable),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(invalid);
+        }
+        Ok(_) => {}
+    }
     let mut packages = Vec::new();
-    for entry in fs::read_dir(root).map_err(|_| WishFeedbackError::RootUnavailable)? {
-        let entry = entry.map_err(|_| WishFeedbackError::RootUnavailable)?;
-        let metadata =
-            fs::symlink_metadata(entry.path()).map_err(|_| WishFeedbackError::RootUnavailable)?;
+    for entry in fs::read_dir(directory).map_err(|_| unavailable)? {
+        let entry = entry.map_err(|_| unavailable)?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| unavailable)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
@@ -1330,7 +1358,7 @@ pub fn move_wish_to_trash(root: &Path, wish_id: &str) -> Result<(), WishFeedback
     let source = root.join(&wish_name);
     ensure_regular_file(&source, WishFeedbackError::WishUnavailable)?;
     let destination = trash.join(&wish_name);
-    if destination.exists() {
+    if path_entry_exists(&destination)? {
         return Err(WishFeedbackError::WishAlreadyExists);
     }
     let note_name = note_filename(wish_id)?;
@@ -1342,7 +1370,7 @@ pub fn move_wish_to_trash(root: &Path, wish_id: &str) -> Result<(), WishFeedback
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => return Err(WishFeedbackError::NoteUnavailable),
     };
-    if has_note && note_destination.exists() {
+    if has_note && path_entry_exists(&note_destination)? {
         return Err(WishFeedbackError::NoteAlreadyExists);
     }
 
@@ -1354,6 +1382,86 @@ pub fn move_wish_to_trash(root: &Path, wish_id: &str) -> Result<(), WishFeedback
         return Err(WishFeedbackError::Io);
     }
     Ok(())
+}
+
+pub fn load_trashed_wish_snapshot(
+    root: &Path,
+    wish_id: &str,
+    protector: &dyn DataProtector,
+) -> Result<WishSnapshot, WishFeedbackError> {
+    ensure_root(root)?;
+    let trash = root.join(WISH_TRASH_DIRECTORY);
+    ensure_regular_file(
+        &trash.join(wish_filename(wish_id)?),
+        WishFeedbackError::WishUnavailable,
+    )?;
+    load_wish_snapshot(&trash, wish_id, protector)
+}
+
+pub fn load_trashed_wish_note(
+    root: &Path,
+    wish_id: &str,
+    protector: &dyn DataProtector,
+) -> Result<WishNote, WishFeedbackError> {
+    ensure_root(root)?;
+    let trash = root.join(WISH_TRASH_DIRECTORY);
+    ensure_regular_file(
+        &trash.join(note_filename(wish_id)?),
+        WishFeedbackError::NoteUnavailable,
+    )?;
+    load_wish_note(&trash, wish_id, protector)
+}
+
+/// Restores one exact encrypted wish and its optional encrypted note.
+/// Existing active entries are never overwritten.
+pub fn restore_wish_from_trash(
+    root: &Path,
+    wish_id: &str,
+    protector: &dyn DataProtector,
+) -> Result<(), WishFeedbackError> {
+    ensure_root(root)?;
+    let trash = root.join(WISH_TRASH_DIRECTORY);
+    let wish_name = wish_filename(wish_id)?;
+    let source = trash.join(&wish_name);
+    ensure_regular_file(&source, WishFeedbackError::WishUnavailable)?;
+    let destination = root.join(&wish_name);
+    if path_entry_exists(&destination)? {
+        return Err(WishFeedbackError::WishAlreadyExists);
+    }
+
+    // Validate the immutable package before making it active again.
+    let _ = load_trashed_wish_snapshot(root, wish_id, protector)?;
+
+    let note_name = note_filename(wish_id)?;
+    let note_source = trash.join(&note_name);
+    let note_destination = root.join(&note_name);
+    let has_note = match fs::symlink_metadata(&note_source) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => true,
+        Ok(_) => return Err(WishFeedbackError::NoteUnavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err(WishFeedbackError::NoteUnavailable),
+    };
+    if has_note {
+        if path_entry_exists(&note_destination)? {
+            return Err(WishFeedbackError::NoteAlreadyExists);
+        }
+        let _ = load_trashed_wish_note(root, wish_id, protector)?;
+    }
+
+    fs::rename(&source, &destination).map_err(|_| WishFeedbackError::Io)?;
+    if has_note && fs::rename(&note_source, &note_destination).is_err() {
+        let _ = fs::rename(&destination, &source);
+        return Err(WishFeedbackError::Io);
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, WishFeedbackError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(WishFeedbackError::Io),
+    }
 }
 
 fn protect_payload(
@@ -2854,6 +2962,52 @@ mod tests {
                 .join(note_filename(receipt.id()).unwrap())
                 .is_file()
         );
+        let trashed = list_trashed_wish_packages(&root.0).unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].id(), receipt.id());
+        assert!(load_trashed_wish_note(&root.0, receipt.id(), &TestProtector).unwrap() == note);
+
+        restore_wish_from_trash(&root.0, receipt.id(), &TestProtector).unwrap();
+        assert_eq!(list_wish_packages(&root.0).unwrap().len(), 1);
+        assert!(list_trashed_wish_packages(&root.0).unwrap().is_empty());
+        assert!(load_wish_note(&root.0, receipt.id(), &TestProtector).unwrap() == note);
+
+        move_wish_to_trash(&root.0, receipt.id()).unwrap();
+        let trash_wish = root
+            .0
+            .join(WISH_TRASH_DIRECTORY)
+            .join(wish_filename(receipt.id()).unwrap());
+        fs::copy(
+            &trash_wish,
+            root.0.join(wish_filename(receipt.id()).unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            restore_wish_from_trash(&root.0, receipt.id(), &TestProtector),
+            Err(WishFeedbackError::WishAlreadyExists)
+        ));
+        assert!(trash_wish.is_file());
+    }
+
+    #[test]
+    fn restore_rejects_a_corrupted_trashed_package_without_activating_it() {
+        let root = TemporaryDirectory::new();
+        let receipt = save_wish_snapshot(&root.0, &private_snapshot(), &TestProtector).unwrap();
+        move_wish_to_trash(&root.0, receipt.id()).unwrap();
+        let path = root
+            .0
+            .join(WISH_TRASH_DIRECTORY)
+            .join(wish_filename(receipt.id()).unwrap());
+        let mut changed = fs::read(&path).unwrap();
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&path, changed).unwrap();
+
+        assert!(matches!(
+            restore_wish_from_trash(&root.0, receipt.id(), &TestProtector),
+            Err(WishFeedbackError::InvalidProtectedPackage)
+        ));
+        assert!(list_wish_packages(&root.0).unwrap().is_empty());
+        assert_eq!(list_trashed_wish_packages(&root.0).unwrap().len(), 1);
     }
 
     #[test]

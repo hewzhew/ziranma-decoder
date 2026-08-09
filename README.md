@@ -267,6 +267,8 @@ cargo build --release --bin wishctl --bin wishpad
 .\wish-ime.cmd list
 .\wish-ime.cmd annotate --latest --category display --text "候选窗边角不自然"
 .\wish-ime.cmd show --latest --confirm-show-private-text
+.\wish-ime.cmd trash-list
+.\wish-ime.cmd restore --id <许愿编号>
 ```
 
 不带参数的 `wish-ime.cmd` 会打开单实例“猫猫应愿”管理器。它不再承担捕获，也不
@@ -275,7 +277,9 @@ cargo build --release --bin wishctl --bin wishpad
 已完成”和“普通 / 重要”；没有说明文字也能只保存整理状态。原始现场保持不可修改，
 这些整理内容继续由当前 Windows 用户加密保存。旧说明自动按“待整理、普通”读取。
 管理器顶部可以搜索说明和整理标签，并按状态或重要性筛选；比较只发生在当前窗口
-内存中，不建立明文索引。关闭窗口即退出，不设置开机启动或
+内存中，不建立明文索引。“回收站”视图沿用同一套查看和筛选方式，可以把完整性
+校验通过的记录及其说明恢复到许愿列表；恢复不会覆盖已有同名记录。回收站清单本身
+只读取密文文件的编号、大小和时间，不解密现场。关闭窗口即退出，不设置开机启动或
 全局快捷键。成功执行 `update-ime.cmd` 后也会打开或唤回管理器。
 在输入法内也可以精确输入 `xuy` 后按 `Tab`。候选栏只提供“记录刚才的情况”和
 “记录更多内容”两项：空格确认自动分段的默认现场，数字 `2` 选择近 30 秒兜底。

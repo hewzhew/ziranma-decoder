@@ -10,7 +10,8 @@ use ziranma_core::{
     NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope,
     WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError,
     WishImportance, WishJournalContext, WishNote, WishReviewStatus, dispatch_wish_command,
-    list_wish_packages, load_wish_note, load_wish_snapshot, move_wish_to_trash, save_wish_note,
+    list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
+    move_wish_to_trash, restore_wish_from_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +37,10 @@ enum Command {
     Trash {
         id: String,
         confirmed: bool,
+    },
+    TrashList,
+    Restore {
+        id: String,
     },
 }
 
@@ -89,6 +94,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             options.root.as_deref().expect("validated storage root"),
             &id,
             confirmed,
+        ),
+        Command::TrashList => trash_list(options.root.as_deref().expect("validated storage root")),
+        Command::Restore { id } => restore(
+            options.root.as_deref().expect("validated storage root"),
+            &protector,
+            &id,
         ),
     }
 }
@@ -202,6 +213,27 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
                 confirmed: confirm_trash,
             }
         }
+        "trash-list"
+            if id.is_none()
+                && !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::TrashList
+        }
+        "restore"
+            if !latest
+                && category.is_none()
+                && text.is_none()
+                && !show_private_text
+                && !confirm_trash =>
+        {
+            Command::Restore {
+                id: id.ok_or("restore 缺少 --id")?,
+            }
+        }
         _ => return Err(usage().into()),
     };
     if !matches!(command, Command::Control(_)) && root.is_none() {
@@ -227,7 +259,7 @@ fn set_value(
 }
 
 fn usage() -> String {
-    "用法：\n  wishctl start | mark | stop | clear\n  wishctl status --root <目录>\n  wishctl list --root <目录>\n  wishctl show --root <目录> (--id <编号> | --latest) --confirm-show-private-text\n  wishctl annotate --root <目录> (--id <编号> | --latest) --category <类别> --text <说明>\n  wishctl trash --root <目录> --id <编号> --confirm-move-to-trash"
+    "用法：\n  wishctl start | mark | stop | clear\n  wishctl status --root <目录>\n  wishctl list --root <目录>\n  wishctl show --root <目录> (--id <编号> | --latest) --confirm-show-private-text\n  wishctl annotate --root <目录> (--id <编号> | --latest) --category <类别> --text <说明>\n  wishctl trash --root <目录> --id <编号> --confirm-move-to-trash\n  wishctl trash-list --root <目录>\n  wishctl restore --root <目录> --id <编号>"
         .to_owned()
 }
 
@@ -712,6 +744,31 @@ fn trash(root: &Path, id: &str, confirmed: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn trash_list(root: &Path) -> Result<(), Box<dyn Error>> {
+    let packages = list_trashed_wish_packages(root)?;
+    if packages.is_empty() {
+        println!("许愿回收站是空的。");
+        return Ok(());
+    }
+    println!("许愿回收站 · {} 条（最近在前）", packages.len());
+    for package in packages {
+        println!(
+            "{} · {} 字节（加密）",
+            package.id(),
+            package.protected_bytes()
+        );
+    }
+    println!("未解密原文，未联网。");
+    Ok(())
+}
+
+fn restore(root: &Path, protector: &dyn DataProtector, id: &str) -> Result<(), Box<dyn Error>> {
+    restore_wish_from_trash(root, id, protector)?;
+    println!("已从本地回收站恢复：{id}");
+    println!("没有覆盖已有记录，未联网。");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +849,36 @@ mod tests {
             ])
             .is_ok(),
             "exact id validation belongs to the storage boundary"
+        );
+        assert!(matches!(
+            parse_options([
+                "trash-list".to_owned(),
+                "--root".to_owned(),
+                "wishes".to_owned(),
+            ])
+            .unwrap()
+            .command,
+            Command::TrashList
+        ));
+        assert!(matches!(
+            parse_options([
+                "restore".to_owned(),
+                "--root".to_owned(),
+                "wishes".to_owned(),
+                "--id".to_owned(),
+                "wish-invalid".to_owned(),
+            ])
+            .unwrap()
+            .command,
+            Command::Restore { .. }
+        ));
+        assert!(
+            parse_options([
+                "restore".to_owned(),
+                "--root".to_owned(),
+                "wishes".to_owned()
+            ])
+            .is_err()
         );
     }
 
