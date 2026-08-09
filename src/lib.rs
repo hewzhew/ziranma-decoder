@@ -307,12 +307,14 @@ pub use public_corpus::{
     PublicCalibrationSelection, PublicCalibrationSelectionStats, PublicCharacterTrainingCorpus,
     PublicCharacterTrainingStats, PublicLexiconRankProbe, PublicLexiconRankSelection,
     PublicLexiconTokenCoverageAudit, PublicLexiconTokenCoverageByLength, PublicProtocolProbe,
-    PublicProtocolSelection, PublicProtocolSelectionStats, PublicSupplementalCompositionProbe,
-    PublicSupplementalCompositionSelection, PublicSupplementalCompositionSelectionStats, UdCorpus,
-    UdCorpusImportStats, UdCorpusParseError, audit_public_lexicon_token_coverage, parse_ud_conllu,
-    select_public_bigram_training_sequences, select_public_calibration_cases,
-    select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_lexicon_rank_probes, select_public_protocol_audit_cases,
+    PublicProtocolSelection, PublicProtocolSelectionStats, PublicStaticContextProbe,
+    PublicStaticContextSelection, PublicStaticContextSelectionStats,
+    PublicSupplementalCompositionProbe, PublicSupplementalCompositionSelection,
+    PublicSupplementalCompositionSelectionStats, UdCorpus, UdCorpusImportStats, UdCorpusParseError,
+    audit_public_lexicon_token_coverage, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_calibration_cases, select_public_character_training_texts,
+    select_public_continuous_composition_cases, select_public_lexicon_rank_probes,
+    select_public_protocol_audit_cases, select_public_static_context_cases,
     select_public_supplemental_composition_cases,
 };
 pub use public_lexicon_slice::{
@@ -1009,7 +1011,7 @@ impl Decoder {
     /// free abbreviations, corrections, and unresolved edges must not consume
     /// the bounded search slots before a fully typed sentence can be seen.
     /// It does not replace or reorder the ordinary research decoder.
-    pub(crate) fn decode_complete_sentence(
+    pub fn decode_complete_sentence(
         &self,
         observed: &str,
         top_k: usize,

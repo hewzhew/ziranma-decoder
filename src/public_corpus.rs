@@ -135,6 +135,44 @@ pub struct ContinuousCompositionSelectionStats {
     pub selected_tail_keys: usize,
 }
 
+/// One natural adjacent-token context for evaluating a frozen candidate
+/// frontier with a public static language model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicStaticContextProbe {
+    /// Stable upstream-derived identifier.
+    pub id: String,
+    /// Complete two-key spelling assembled from both public source tokens.
+    pub observed: KeySequence,
+    /// Concatenated public source text expected from the input.
+    pub expected_text: String,
+    /// The two exact source tokens used to construct the spelling.
+    pub expected_segments: Vec<String>,
+}
+
+/// Deterministic adjacent-token contexts and auditable selection counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicStaticContextSelection {
+    /// Selected contexts, chosen without consulting decoder output.
+    pub probes: Vec<PublicStaticContextProbe>,
+    /// Filtering and selection counts.
+    pub stats: PublicStaticContextSelectionStats,
+}
+
+/// Filtering counts for public static-context probes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicStaticContextSelectionStats {
+    /// Adjacent non-punctuation token windows examined.
+    pub source_windows: usize,
+    /// Windows containing 2 to 8 Han characters.
+    pub han_length_eligible: usize,
+    /// Eligible windows whose two complete tokens both exist in the lexicon.
+    pub exact_word_coverable: usize,
+    /// Unique one-per-sentence representatives available before spreading.
+    pub sentence_representatives: usize,
+    /// Unique probes retained under the requested limit.
+    pub selected: usize,
+}
+
 /// One natural public phrase with exactly one supplemental-only complete word.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicSupplementalCompositionProbe {
@@ -842,6 +880,81 @@ pub fn select_public_continuous_composition_cases(
         .map(|probe| probe.tail_abbreviated_observed.as_str().len())
         .sum();
     ContinuousCompositionSelection { probes, stats }
+}
+
+/// Selects natural adjacent-token contexts for static language-model audits.
+///
+/// Both source tokens must have exact complete entries. At most one unique
+/// window is retained per sentence, and the requested sample is spread over
+/// those representatives. Decoder output never influences selection.
+pub fn select_public_static_context_cases(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+    limit: usize,
+) -> PublicStaticContextSelection {
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut stats = PublicStaticContextSelectionStats::default();
+    let mut sentence_representatives = Vec::new();
+    let mut seen_text = HashSet::new();
+
+    for sentence in &corpus.sentences {
+        let mut sentence_representative = None;
+        let tokens = sentence
+            .tokens
+            .iter()
+            .filter(|token| token.upos != "PUNCT")
+            .collect::<Vec<_>>();
+        for (window_index, window) in tokens.windows(2).enumerate() {
+            stats.source_windows += 1;
+            let expected_text = window
+                .iter()
+                .map(|token| token.form.as_str())
+                .collect::<String>();
+            let character_count = expected_text.chars().count();
+            if !(2..=8).contains(&character_count) || !expected_text.chars().all(is_han_character) {
+                continue;
+            }
+            stats.han_length_eligible += 1;
+            let Some(first_entry) = entries_by_text.get(window[0].form.as_str()).copied() else {
+                continue;
+            };
+            let Some(second_entry) = entries_by_text.get(window[1].form.as_str()).copied() else {
+                continue;
+            };
+            stats.exact_word_coverable += 1;
+            if sentence_representative.is_some() || !seen_text.insert(expected_text.clone()) {
+                continue;
+            }
+            let observed = format!("{}{}", first_entry.code, second_entry.code);
+            sentence_representative = Some(PublicStaticContextProbe {
+                id: format!("{}:static-context-{}", sentence.id, window_index + 1),
+                observed: KeySequence::new(observed)
+                    .expect("lexicon-derived codes are lowercase ASCII"),
+                expected_text,
+                expected_segments: vec![first_entry.text.clone(), second_entry.text.clone()],
+            });
+        }
+        if let Some(probe) = sentence_representative {
+            sentence_representatives.push(probe);
+        }
+    }
+
+    stats.sentence_representatives = sentence_representatives.len();
+    let selected = limit.min(sentence_representatives.len());
+    let probes = if selected == 0 {
+        Vec::new()
+    } else {
+        (0..selected)
+            .map(|index| {
+                let spread_index = (index * sentence_representatives.len()
+                    + sentence_representatives.len() / 2)
+                    / selected;
+                sentence_representatives[spread_index].clone()
+            })
+            .collect::<Vec<_>>()
+    };
+    stats.selected = probes.len();
+    PublicStaticContextSelection { probes, stats }
 }
 
 /// Selects natural public phrases that exercise exactly one supplemental word.
@@ -1588,7 +1701,7 @@ mod tests {
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_character_training_texts, select_public_continuous_composition_cases,
         select_public_lexicon_rank_probes, select_public_protocol_audit_cases,
-        select_public_supplemental_composition_cases,
+        select_public_static_context_cases, select_public_supplemental_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -1661,6 +1774,35 @@ mod tests {
         assert_eq!(
             selection.probes[0].observed.as_str(),
             lexicon[1].code.as_str()
+        );
+    }
+
+    #[test]
+    fn static_context_selection_includes_two_complete_single_syllable_words() {
+        const CORPUS: &str = "# sent_id = public-one\n\
+1\t甲\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t乙\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        let corpus = parse_ud_conllu(CORPUS).unwrap();
+        let lexicon = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+甲\tjia\t20\n\
+乙\tyi\t10\n",
+        )
+        .unwrap();
+
+        let static_context = select_public_static_context_cases(&corpus, &lexicon, 8);
+        assert_eq!(static_context.stats.source_windows, 1);
+        assert_eq!(static_context.stats.exact_word_coverable, 1);
+        assert_eq!(static_context.probes.len(), 1);
+        assert_eq!(static_context.probes[0].expected_segments, ["甲", "乙"]);
+        assert_eq!(
+            static_context.probes[0].observed.as_str(),
+            format!("{}{}", lexicon[0].code, lexicon[1].code)
+        );
+        assert!(
+            select_public_continuous_composition_cases(&corpus, &lexicon, 8)
+                .probes
+                .is_empty()
         );
     }
 

@@ -52,6 +52,58 @@ libime 没有让用户历史无限累计。`HistoryBigram` 使用容量为
 - [historybigram.cpp](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/core/historybigram.cpp)
 - [userlanguagemodel.cpp](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/core/userlanguagemodel.cpp)
 
+### 2026-08-09 复核：冷启动需要公共静态模型，个人历史不能替代它
+
+本轮继续复核同一固定 libime 提交。`LanguageModel` 用静态 N-gram 模型给
+lattice 上的完整路径累计分数；`UserLanguageModel` 再在概率空间混入有界
+个人历史。`PinyinContext` 在用户确认后更新历史，但第一次新造自定义词不会
+立即写入历史。这套职责分离解释了当前 Alpha 的一个真实缺口：两个完整公共词
+都能组合出来时，纯 unigram 仍可能把机械同音组合排在自然搭配前面；等待用户
+亲自选过一次只能改善热态，不能解决第一次输入的冷启动排序。
+
+libime 当前固定的简体公共模型材料是：
+
+- `https://download.fcitx-im.org/data/lm_sc.arpa-20260629.tar.zst`；
+- 上游压缩包大小：77,670,558 字节；
+- 上游声明 SHA-256：
+  `06808333b9173e5374cf2cb5afc12d08f5625bf9abb536489cac376fc05f2e7f`；
+- 上游先把 ARPA 构建为压缩 trie 二进制，再由运行时加载，并不在每次启动或
+  每次输入时解析完整 ARPA。
+
+当前项目已经做过两个不能泛化的较小对照。用核心词典自身构造字符邻接统计时，
+合理搭配仍会输给高频同音字的机械组合；用现有小型 UD 训练 word/character
+bigram 时，拟合集上的改善没有稳定保持到独立测试集，部分保守档还损失了一个
+原本正确的首选。因此，这两类小模型都不能直接进入 TSF 热路径，也不能仅凭几个
+手工例子宣称有效。
+
+为验证更强公共模型而不先污染运行时，`candidatectl static-context-audit` 采用下面
+的只读闸门：
+
+- 从公开 fit / held-out CoNLL-U 分别选择自然相邻的两个完整词；选样不读取解码
+  结果，并排除整段文字或整串码已经是词典完整词的场景；
+- 冻结当前完整双拼候选及其分词，只允许模型在固定搜索深度内把一个已有挑战者
+  提到首位，不创建新路径；
+- 对解压后的公开 ARPA 做两次有总字节、单行和文件身份边界的流式扫描：第一次
+  确认词表、阶数和 SHA-256，第二次只保留冻结候选真正需要的 N-gram；两次材料
+  不一致就失败关闭；
+- 在 fit 上从预声明的搜索深度和最小平均 log10 增益中选档，held-out 只做一次
+  独立评测；报告只含 Top-K、升降位、正确首选得失和非目标首选变化，不回显词句；
+- 只有 held-out 净改善、没有正确首选损失、也没有非目标首选变化时，才允许继续
+  研究小型、版本化 sidecar。审计本身不会生成 sidecar，也不会接入 TSF。
+
+合成 ARPA 测试已经证明稀疏 parser、标准 backoff、单挑战者门和独立负对照按上述
+口径工作；完整官方模型尚未下载并跑完，因此现在还没有公共静态模型的产品结论。
+若完整模型通过审计，下一步仍应先离线蒸馏出候选实际需要的小型资料，记录来源
+模型 SHA、构建参数和 fit / held-out 收据，再沿用不可变候选槽的热加载与回退协议。
+完整 ARPA 不进入换代脚本、DLL 加载或按键热路径。
+
+参考实现：
+
+- [libime language model](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/core/languagemodel.cpp)
+- [libime user language model](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/core/userlanguagemodel.cpp)
+- [libime pinyin learning boundary](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/pinyin/pinyincontext.cpp#L1098-L1118)
+- [libime pinned model material](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/data/CMakeLists.txt)
+
 ### 2026-08-04 持久化复核：有界快照承担冷启动，事务日志承担并发写入
 
 本轮继续只读复核相同固定提交。Rime 的 LevelDB 后端用 `WriteBatch` 提交事务，

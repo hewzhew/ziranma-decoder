@@ -4,10 +4,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -27,7 +29,7 @@ use ziranma_core::{
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
     CandidateSourceMaterial, CandidateSupplementalState, CharacterBigramLanguageModel,
-    ContinuousCompositionProbe, DecoderIndexStats, FourCharacterCorrectionDecision,
+    ContinuousCompositionProbe, Decoder, DecoderIndexStats, FourCharacterCorrectionDecision,
     FourCharacterCorrectionKeepReason, LexiconEntry, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
     MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
     MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
@@ -49,14 +51,17 @@ use ziranma_core::{
     parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_rime_lexicon,
     parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_lexicon_rank_probes, select_public_supplemental_composition_cases,
-    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    select_public_lexicon_rank_probes, select_public_static_context_cases,
+    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
     "e341598343a0f0f2035bb1aafc34a7f3bb7887deeecb3f60796262aaa2983e6b";
 const MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STATIC_CONTEXT_ARPA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_STATIC_CONTEXT_ARPA_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -146,6 +151,15 @@ enum Options {
         fit_corpus: Option<PathBuf>,
         frontier_limit: usize,
         sample_limit: usize,
+    },
+    StaticContextAudit {
+        model: PathBuf,
+        core_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+        sample_limit: usize,
+        max_order: usize,
     },
     SupplementStatus {
         root: PathBuf,
@@ -406,6 +420,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frontier_limit,
             sample_limit,
         )?,
+        Options::StaticContextAudit {
+            model,
+            core_payload,
+            fit_corpus,
+            held_out_corpus,
+            frontier_limit,
+            sample_limit,
+            max_order,
+        } => audit_static_context(
+            &model,
+            &core_payload,
+            &fit_corpus,
+            &held_out_corpus,
+            frontier_limit,
+            sample_limit,
+            max_order,
+        )?,
         Options::SupplementStatus { root } => supplement_status(&root)?,
         Options::SupplementEnable {
             root,
@@ -491,6 +522,7 @@ fn parse_options(
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
+        "static-context-audit" => parse_static_context_audit(arguments),
         "supplement-status" => Ok(Options::SupplementStatus {
             root: parse_root_only(arguments, "supplement-status")?,
         }),
@@ -1287,6 +1319,58 @@ fn parse_layer_composition_audit(
     })
 }
 
+fn parse_static_context_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut model = None;
+    let mut core_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    let mut sample_limit = None;
+    let mut max_order = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--model" => set_path(&mut model, &mut arguments, "--model")?,
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--max-order" => set_usize(&mut max_order, &mut arguments, "--max-order")?,
+            _ => {
+                return Err("unknown static-context-audit argument; value was suppressed".into());
+            }
+        }
+    }
+    let frontier_limit = frontier_limit.ok_or("static-context-audit requires --frontier-limit")?;
+    let sample_limit = sample_limit.ok_or("static-context-audit requires --sample-limit")?;
+    let max_order = max_order.ok_or("static-context-audit requires --max-order")?;
+    if !(5..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err("static-context-audit --frontier-limit is outside the fixed bound".into());
+    }
+    if !(1..=512).contains(&sample_limit) {
+        return Err("static-context-audit --sample-limit is outside the fixed bound".into());
+    }
+    if !(1..=5).contains(&max_order) {
+        return Err("static-context-audit --max-order is outside the fixed bound".into());
+    }
+    Ok(Options::StaticContextAudit {
+        model: model.ok_or("static-context-audit requires --model")?,
+        core_payload: core_payload.ok_or("static-context-audit requires --core-payload")?,
+        fit_corpus: fit_corpus.ok_or("static-context-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("static-context-audit requires --held-out-corpus")?,
+        frontier_limit,
+        sample_limit,
+        max_order,
+    })
+}
+
 fn parse_supplement_enable(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -1583,6 +1667,9 @@ fn print_usage() {
     );
     eprintln!(
         "  layer-composition-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --corpus <PUBLIC.conllu> [--fit-corpus <PUBLIC-TRAIN.conllu>] --frontier-limit <1..50> --sample-limit <1..512>"
+    );
+    eprintln!(
+        "  static-context-audit --model <PUBLIC.arpa> --core-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <5..50> --sample-limit <1..512> --max-order <1..5>"
     );
     eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
@@ -3009,6 +3096,838 @@ fn write_phrase_latency_report(output: &mut String, label: &str, summary: Durati
         duration_ms(summary.maximum),
     )
     .unwrap();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StaticContextProfile {
+    search_depth: usize,
+    minimum_average_gain: f64,
+}
+
+fn static_context_profiles() -> Vec<StaticContextProfile> {
+    let mut profiles = vec![StaticContextProfile {
+        search_depth: 1,
+        minimum_average_gain: 0.0,
+    }];
+    for search_depth in [8, 16, 32, 50] {
+        for minimum_average_gain in [0.10, 0.25, 0.50, 0.75, 1.00] {
+            profiles.push(StaticContextProfile {
+                search_depth,
+                minimum_average_gain,
+            });
+        }
+    }
+    profiles
+}
+
+#[derive(Clone, Debug)]
+struct FrozenStaticContextCandidate {
+    text: String,
+    segments: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FrozenStaticContextCase {
+    expected_text: String,
+    candidates: Vec<FrozenStaticContextCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StaticContextSelectionStats {
+    source_representatives: usize,
+    whole_text_collisions: usize,
+    whole_code_collisions: usize,
+    selected: usize,
+    empty_frontiers: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StaticContextRankCounts {
+    at_one: usize,
+    at_three: usize,
+    at_five: usize,
+    visible: usize,
+}
+
+impl StaticContextRankCounts {
+    fn observe(&mut self, rank: Option<usize>) {
+        let Some(rank) = rank else {
+            return;
+        };
+        self.visible += 1;
+        self.at_one += usize::from(rank <= 1);
+        self.at_three += usize::from(rank <= 3);
+        self.at_five += usize::from(rank <= 5);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StaticContextProfileReport {
+    total: usize,
+    baseline: StaticContextRankCounts,
+    candidate: StaticContextRankCounts,
+    rank_improved: usize,
+    rank_unchanged: usize,
+    rank_worsened: usize,
+    correct_top_one_gained: usize,
+    correct_top_one_lost: usize,
+    non_target_top_one_changes: usize,
+    any_top_one_changes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SparseArpaRecord {
+    probability_log10: f64,
+    backoff_log10: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ParsedArpaNgram {
+    probability_log10: f64,
+    tokens: Vec<String>,
+    backoff_log10: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct SparseArpaLanguageModel {
+    declared_order: usize,
+    effective_order: usize,
+    bytes: u64,
+    sha256: String,
+    known_query_tokens: HashSet<String>,
+    unknown_query_tokens: usize,
+    required_ngrams: usize,
+    records: HashMap<Vec<String>, SparseArpaRecord>,
+}
+
+impl SparseArpaLanguageModel {
+    fn canonical_token(&self, token: &str) -> String {
+        if self.known_query_tokens.contains(token) {
+            token.to_owned()
+        } else {
+            "<unk>".to_owned()
+        }
+    }
+
+    fn score_candidate(
+        &self,
+        candidate: &FrozenStaticContextCandidate,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let tokens = candidate
+            .segments
+            .iter()
+            .map(|token| self.canonical_token(token))
+            .collect::<Vec<_>>();
+        let mut history = vec!["<s>".to_owned()];
+        let mut total_log10 = 0.0;
+        for token in tokens
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once("</s>"))
+        {
+            total_log10 += self.score_word(&history, token)?;
+            history.push(token.to_owned());
+            let maximum_history = self.effective_order.saturating_sub(1);
+            if history.len() > maximum_history {
+                let remove = history.len() - maximum_history;
+                history.drain(..remove);
+            }
+        }
+        let characters = candidate.text.chars().count().max(1);
+        Ok(total_log10 / characters as f64)
+    }
+
+    fn score_word(
+        &self,
+        history: &[String],
+        word: &str,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let maximum_history = history.len().min(self.effective_order.saturating_sub(1));
+        let mut accumulated_backoff = 0.0;
+        for history_length in (0..=maximum_history).rev() {
+            let history_start = history.len() - history_length;
+            let mut ngram = history[history_start..].to_vec();
+            ngram.push(word.to_owned());
+            if let Some(record) = self.records.get(&ngram) {
+                return Ok(accumulated_backoff + record.probability_log10);
+            }
+            if history_length != 0 {
+                let history_key = history[history_start..].to_vec();
+                if let Some(backoff) = self
+                    .records
+                    .get(&history_key)
+                    .and_then(|record| record.backoff_log10)
+                {
+                    accumulated_backoff += backoff;
+                }
+            }
+        }
+        Err("public ARPA model lacks a required unigram after <unk> mapping".into())
+    }
+}
+
+#[derive(Debug)]
+struct ArpaVocabularyScan {
+    declared_order: usize,
+    bytes: u64,
+    sha256: String,
+    known_query_tokens: HashSet<String>,
+    has_unknown_token: bool,
+}
+
+fn audit_static_context(
+    model_path: &Path,
+    core_payload: &Path,
+    fit_corpus: &Path,
+    held_out_corpus: &Path,
+    frontier_limit: usize,
+    sample_limit: usize,
+    max_order: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        fit_corpus,
+        "public static-context fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public static-context held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    if candidate_sha256_hex(fit_text.as_bytes()) == candidate_sha256_hex(held_out_text.as_bytes()) {
+        return Err("static-context-audit requires a distinct held-out corpus".into());
+    }
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let decoder = Decoder::new(core_entries.clone());
+    let (fit_cases, fit_selection) =
+        freeze_static_context_cases(&fit, &core_entries, &decoder, frontier_limit, sample_limit)?;
+    let (held_out_cases, held_out_selection) = freeze_static_context_cases(
+        &held_out,
+        &core_entries,
+        &decoder,
+        frontier_limit,
+        sample_limit,
+    )?;
+    if fit_cases.is_empty() || held_out_cases.is_empty() {
+        return Err("public corpora produced no eligible static-context cases".into());
+    }
+
+    let language_model = load_sparse_arpa_language_model(
+        model_path,
+        fit_cases.iter().chain(&held_out_cases),
+        max_order,
+    )?;
+    let profiles = static_context_profiles();
+    let mut fit_reports = Vec::with_capacity(profiles.len());
+    for profile in &profiles {
+        fit_reports.push(evaluate_static_context_profile(
+            &fit_cases,
+            &language_model,
+            *profile,
+        )?);
+    }
+    let mut selected_index = 0;
+    for index in 1..fit_reports.len() {
+        if static_context_profile_precedes(&fit_reports[index], &fit_reports[selected_index]) {
+            selected_index = index;
+        }
+    }
+    let selected_profile = profiles[selected_index];
+    let held_out_baseline =
+        evaluate_static_context_profile(&held_out_cases, &language_model, profiles[0])?;
+    let held_out_selected =
+        evaluate_static_context_profile(&held_out_cases, &language_model, selected_profile)?;
+    let held_out_gate_passed = held_out_selected.correct_top_one_gained
+        > held_out_selected.correct_top_one_lost
+        && held_out_selected.correct_top_one_lost == 0
+        && held_out_selected.non_target_top_one_changes == 0;
+
+    let mut output = String::new();
+    writeln!(output, "公开静态上下文离线审计")?;
+    writeln!(
+        output,
+        "模型：{} 字节 · SHA-256 {} · 声明 {}-gram · 本次使用 {}-gram",
+        language_model.bytes,
+        language_model.sha256,
+        language_model.declared_order,
+        language_model.effective_order,
+    )?;
+    writeln!(
+        output,
+        "稀疏装载：需要 {} 条 N-gram，实际命中 {}；候选所需词型中 {} 个映射为 <unk>",
+        language_model.required_ngrams,
+        language_model.records.len(),
+        language_model.unknown_query_tokens,
+    )?;
+    writeln!(
+        output,
+        "核心词典：{} 条 · SHA-256 {}",
+        core_entries.len(),
+        candidate_sha256_hex(core_text.as_bytes()),
+    )?;
+    write_static_context_selection(
+        &mut output,
+        "拟合",
+        &fit,
+        &fit_text,
+        fit_selection,
+        frontier_limit,
+    )?;
+    write_static_context_selection(
+        &mut output,
+        "保留评测",
+        &held_out,
+        &held_out_text,
+        held_out_selection,
+        frontier_limit,
+    )?;
+    writeln!(output, "\n拟合档位")?;
+    for (profile, report) in profiles.iter().zip(&fit_reports) {
+        write_static_context_profile_report(&mut output, *profile, report, frontier_limit)?;
+    }
+    writeln!(
+        output,
+        "拟合选择：{}；选择过程未读取保留评测答案。",
+        static_context_profile_label(selected_profile),
+    )?;
+    writeln!(output, "\n保留评测")?;
+    write_static_context_profile_report(
+        &mut output,
+        profiles[0],
+        &held_out_baseline,
+        frontier_limit,
+    )?;
+    write_static_context_profile_report(
+        &mut output,
+        selected_profile,
+        &held_out_selected,
+        frontier_limit,
+    )?;
+    if held_out_gate_passed {
+        output.push_str(
+            "结论：保留集净改善且未损失正确首选；可以继续研究离线蒸馏的小型 sidecar，但本次没有生成或接入运行时资料。\n",
+        );
+    } else {
+        output.push_str(
+            "结论：未通过保留集安全门；不得把该静态配置或由它推导的排序资料接入运行时。\n",
+        );
+    }
+    output.push_str(
+        "边界：候选与分词均冻结自现有完整双拼前沿；模型最多提升一个已有挑战者，不创建候选。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn freeze_static_context_cases(
+    corpus: &ziranma_core::UdCorpus,
+    core_entries: &[LexiconEntry],
+    decoder: &Decoder,
+    frontier_limit: usize,
+    sample_limit: usize,
+) -> Result<(Vec<FrozenStaticContextCase>, StaticContextSelectionStats), Box<dyn std::error::Error>>
+{
+    let oversample_limit = sample_limit.saturating_mul(8).max(sample_limit);
+    let selection = select_public_static_context_cases(corpus, core_entries, oversample_limit);
+    let core_texts = core_entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<HashSet<_>>();
+    let core_codes = core_entries
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<HashSet<_>>();
+    let mut stats = StaticContextSelectionStats {
+        source_representatives: selection.stats.sentence_representatives,
+        ..StaticContextSelectionStats::default()
+    };
+    let mut cases = Vec::with_capacity(sample_limit);
+    for probe in selection.probes {
+        if core_texts.contains(probe.expected_text.as_str()) {
+            stats.whole_text_collisions += 1;
+            continue;
+        }
+        if core_codes.contains(probe.observed.as_str()) {
+            stats.whole_code_collisions += 1;
+            continue;
+        }
+        let candidates = decoder
+            .decode_complete_sentence(probe.observed.as_str(), frontier_limit)?
+            .into_iter()
+            .map(|candidate| FrozenStaticContextCandidate {
+                text: candidate.text,
+                segments: candidate
+                    .segments
+                    .into_iter()
+                    .map(|segment| segment.candidate.text)
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        stats.empty_frontiers += usize::from(candidates.is_empty());
+        cases.push(FrozenStaticContextCase {
+            expected_text: probe.expected_text,
+            candidates,
+        });
+        if cases.len() == sample_limit {
+            break;
+        }
+    }
+    stats.selected = cases.len();
+    Ok((cases, stats))
+}
+
+fn load_sparse_arpa_language_model<'a>(
+    path: &Path,
+    cases: impl Iterator<Item = &'a FrozenStaticContextCase> + Clone,
+    requested_order: usize,
+) -> Result<SparseArpaLanguageModel, Box<dyn std::error::Error>> {
+    let mut query_tokens = cases
+        .clone()
+        .flat_map(|case| &case.candidates)
+        .flat_map(|candidate| &candidate.segments)
+        .cloned()
+        .collect::<HashSet<_>>();
+    query_tokens.insert("<s>".to_owned());
+    query_tokens.insert("</s>".to_owned());
+    let scan = scan_arpa_vocabulary(path, &query_tokens)?;
+    if !scan.known_query_tokens.contains("<s>") || !scan.known_query_tokens.contains("</s>") {
+        return Err("public ARPA model must contain <s> and </s>".into());
+    }
+    let missing_tokens = query_tokens
+        .iter()
+        .filter(|token| !scan.known_query_tokens.contains(*token))
+        .count();
+    if missing_tokens != 0 && !scan.has_unknown_token {
+        return Err("public ARPA model lacks <unk> for candidate vocabulary misses".into());
+    }
+    let effective_order = requested_order.min(scan.declared_order);
+    let canonicalize = |token: &str| {
+        if scan.known_query_tokens.contains(token) {
+            token.to_owned()
+        } else {
+            "<unk>".to_owned()
+        }
+    };
+    let mut required = HashSet::<Vec<String>>::new();
+    for case in cases {
+        for candidate in &case.candidates {
+            let mut sequence = Vec::with_capacity(candidate.segments.len() + 2);
+            sequence.push("<s>".to_owned());
+            sequence.extend(candidate.segments.iter().map(|token| canonicalize(token)));
+            sequence.push("</s>".to_owned());
+            for start in 0..sequence.len() {
+                for order in 1..=effective_order.min(sequence.len() - start) {
+                    required.insert(sequence[start..start + order].to_vec());
+                }
+            }
+        }
+    }
+    required.insert(vec!["<s>".to_owned()]);
+    required.insert(vec!["</s>".to_owned()]);
+    if missing_tokens != 0 {
+        required.insert(vec!["<unk>".to_owned()]);
+    }
+    let records =
+        load_required_arpa_records(path, &required, effective_order, scan.bytes, &scan.sha256)?;
+    Ok(SparseArpaLanguageModel {
+        declared_order: scan.declared_order,
+        effective_order,
+        bytes: scan.bytes,
+        sha256: scan.sha256,
+        known_query_tokens: scan.known_query_tokens,
+        unknown_query_tokens: missing_tokens,
+        required_ngrams: required.len(),
+        records,
+    })
+}
+
+fn scan_arpa_vocabulary(
+    path: &Path,
+    query_tokens: &HashSet<String>,
+) -> Result<ArpaVocabularyScan, Box<dyn std::error::Error>> {
+    let mut section = None;
+    let mut declared_order = 0;
+    let mut saw_data = false;
+    let mut saw_end = false;
+    let mut known_query_tokens = HashSet::new();
+    let mut has_unknown_token = false;
+    let mut hasher = Sha256::new();
+    let bytes = visit_arpa_lines(path, Some(&mut hasher), |line| {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() {
+            return Ok(());
+        }
+        if line == "\\data\\" {
+            saw_data = true;
+            section = None;
+            return Ok(());
+        }
+        if line == "\\end\\" {
+            saw_end = true;
+            section = None;
+            return Ok(());
+        }
+        if let Some(order) = parse_arpa_section_marker(line)? {
+            section = Some(order);
+            declared_order = declared_order.max(order);
+            return Ok(());
+        }
+        if let Some(declaration) = line.strip_prefix("ngram ") {
+            let (order, _) = declaration
+                .split_once('=')
+                .ok_or("invalid public ARPA ngram declaration")?;
+            let order = order
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "invalid public ARPA ngram order")?;
+            declared_order = declared_order.max(order);
+            return Ok(());
+        }
+        if section == Some(1) {
+            let ngram = parse_arpa_ngram_line(line, 1)?;
+            let token = &ngram.tokens[0];
+            if query_tokens.contains(token) {
+                known_query_tokens.insert(token.clone());
+            }
+            has_unknown_token |= token == "<unk>";
+        }
+        Ok(())
+    })?;
+    if !saw_data || !saw_end || declared_order == 0 {
+        return Err("public ARPA model is missing required structure".into());
+    }
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(ArpaVocabularyScan {
+        declared_order,
+        bytes,
+        sha256,
+        known_query_tokens,
+        has_unknown_token,
+    })
+}
+
+fn load_required_arpa_records(
+    path: &Path,
+    required: &HashSet<Vec<String>>,
+    maximum_order: usize,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<HashMap<Vec<String>, SparseArpaRecord>, Box<dyn std::error::Error>> {
+    let mut section = None;
+    let mut records = HashMap::with_capacity(required.len());
+    let mut hasher = Sha256::new();
+    let bytes = visit_arpa_lines(path, Some(&mut hasher), |line| {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() || line == "\\data\\" || line == "\\end\\" {
+            if line == "\\data\\" || line == "\\end\\" {
+                section = None;
+            }
+            return Ok(());
+        }
+        if let Some(order) = parse_arpa_section_marker(line)? {
+            section = Some(order);
+            return Ok(());
+        }
+        let Some(order) = section else {
+            return Ok(());
+        };
+        if order > maximum_order {
+            return Ok(());
+        }
+        let ngram = parse_arpa_ngram_line(line, order)?;
+        if required.contains(&ngram.tokens)
+            && records
+                .insert(
+                    ngram.tokens,
+                    SparseArpaRecord {
+                        probability_log10: ngram.probability_log10,
+                        backoff_log10: ngram.backoff_log10,
+                    },
+                )
+                .is_some()
+        {
+            return Err("public ARPA model contains a duplicate required N-gram".into());
+        }
+        Ok(())
+    })?;
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if bytes != expected_bytes || sha256 != expected_sha256 {
+        return Err("public ARPA model changed between sparse audit passes".into());
+    }
+    Ok(records)
+}
+
+fn visit_arpa_lines(
+    path: &Path,
+    mut hasher: Option<&mut Sha256>,
+    mut visitor: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "cannot inspect explicitly named public ARPA model")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("public ARPA model must be a regular non-symbolic-link file".into());
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_STATIC_CONTEXT_ARPA_BYTES {
+        return Err("public ARPA model size is outside the fixed byte bound".into());
+    }
+    let file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() || opened_metadata.len() != metadata.len() {
+        return Err("public ARPA model changed while it was being opened".into());
+    }
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    let mut total = 0_u64;
+    loop {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or("public ARPA model byte count overflowed")?;
+        if total > MAX_STATIC_CONTEXT_ARPA_BYTES {
+            return Err("public ARPA model exceeds the fixed byte bound".into());
+        }
+        if buffer.len() > MAX_STATIC_CONTEXT_ARPA_LINE_BYTES {
+            return Err("public ARPA model contains an oversized line".into());
+        }
+        if let Some(hasher) = hasher.as_deref_mut() {
+            hasher.update(&buffer);
+        }
+        let line = std::str::from_utf8(&buffer)?.trim_end_matches(['\r', '\n']);
+        visitor(line)?;
+    }
+    if total != metadata.len() {
+        return Err("public ARPA model changed while it was being read".into());
+    }
+    Ok(total)
+}
+
+fn parse_arpa_section_marker(line: &str) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    let Some(section) = line
+        .strip_prefix('\\')
+        .and_then(|line| line.strip_suffix("-grams:"))
+    else {
+        return Ok(None);
+    };
+    let order = section
+        .parse::<usize>()
+        .map_err(|_| "invalid public ARPA section order")?;
+    if order == 0 {
+        return Err("public ARPA section order must be positive".into());
+    }
+    Ok(Some(order))
+}
+
+fn parse_arpa_ngram_line(
+    line: &str,
+    order: usize,
+) -> Result<ParsedArpaNgram, Box<dyn std::error::Error>> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != order + 1 && fields.len() != order + 2 {
+        return Err("public ARPA N-gram row has an invalid field count".into());
+    }
+    let probability_log10 = fields[0]
+        .parse::<f64>()
+        .map_err(|_| "public ARPA probability is invalid")?;
+    if !probability_log10.is_finite() {
+        return Err("public ARPA probability must be finite".into());
+    }
+    let ngram = fields[1..=order]
+        .iter()
+        .map(|token| (*token).to_owned())
+        .collect::<Vec<_>>();
+    let backoff_log10 = fields.get(order + 1).map(|value| {
+        value
+            .parse::<f64>()
+            .map_err(|_| "public ARPA backoff is invalid")
+    });
+    let backoff_log10 = match backoff_log10 {
+        Some(Ok(value)) if value.is_finite() => Some(value),
+        Some(Ok(_)) => return Err("public ARPA backoff must be finite".into()),
+        Some(Err(error)) => return Err(error.into()),
+        None => None,
+    };
+    Ok(ParsedArpaNgram {
+        probability_log10,
+        tokens: ngram,
+        backoff_log10,
+    })
+}
+
+fn evaluate_static_context_profile(
+    cases: &[FrozenStaticContextCase],
+    model: &SparseArpaLanguageModel,
+    profile: StaticContextProfile,
+) -> Result<StaticContextProfileReport, Box<dyn std::error::Error>> {
+    let mut report = StaticContextProfileReport {
+        total: cases.len(),
+        ..StaticContextProfileReport::default()
+    };
+    for case in cases {
+        let baseline_target = case
+            .candidates
+            .iter()
+            .position(|candidate| candidate.text == case.expected_text);
+        let baseline_rank = baseline_target.map(|index| index + 1);
+        report.baseline.observe(baseline_rank);
+        let scores = case
+            .candidates
+            .iter()
+            .map(|candidate| model.score_candidate(candidate))
+            .collect::<Result<Vec<_>, _>>()?;
+        let promoted = static_context_promoted_index(&scores, profile);
+        let candidate_rank = baseline_target.map(|target| {
+            if promoted == 0 {
+                target + 1
+            } else if target == promoted {
+                1
+            } else if target < promoted {
+                target + 2
+            } else {
+                target + 1
+            }
+        });
+        report.candidate.observe(candidate_rank);
+        match (baseline_rank, candidate_rank) {
+            (Some(before), Some(after)) if after < before => report.rank_improved += 1,
+            (Some(before), Some(after)) if after > before => report.rank_worsened += 1,
+            (Some(_), Some(_)) | (None, None) => report.rank_unchanged += 1,
+            _ => {}
+        }
+        let baseline_correct = baseline_target == Some(0);
+        let candidate_correct = baseline_target == Some(promoted);
+        report.correct_top_one_gained += usize::from(!baseline_correct && candidate_correct);
+        report.correct_top_one_lost += usize::from(baseline_correct && !candidate_correct);
+        if promoted != 0 {
+            report.any_top_one_changes += 1;
+            report.non_target_top_one_changes += usize::from(!candidate_correct);
+        }
+    }
+    Ok(report)
+}
+
+fn static_context_promoted_index(scores: &[f64], profile: StaticContextProfile) -> usize {
+    if scores.len() < 2 || profile.search_depth <= 1 {
+        return 0;
+    }
+    let depth = scores.len().min(profile.search_depth);
+    let challenger = scores.iter().take(depth).enumerate().skip(1).max_by(
+        |(left_index, left), (right_index, right)| {
+            left.total_cmp(right)
+                .then_with(|| right_index.cmp(left_index))
+        },
+    );
+    let Some((index, score)) = challenger else {
+        return 0;
+    };
+    if score - scores[0] >= profile.minimum_average_gain {
+        index
+    } else {
+        0
+    }
+}
+
+fn static_context_profile_precedes(
+    challenger: &StaticContextProfileReport,
+    current: &StaticContextProfileReport,
+) -> bool {
+    let challenger_net =
+        challenger.correct_top_one_gained as isize - challenger.correct_top_one_lost as isize;
+    let current_net =
+        current.correct_top_one_gained as isize - current.correct_top_one_lost as isize;
+    (challenger.correct_top_one_lost == 0)
+        .cmp(&(current.correct_top_one_lost == 0))
+        .then_with(|| challenger_net.cmp(&current_net))
+        .then_with(|| {
+            challenger
+                .correct_top_one_gained
+                .cmp(&current.correct_top_one_gained)
+        })
+        .then_with(|| {
+            current
+                .non_target_top_one_changes
+                .cmp(&challenger.non_target_top_one_changes)
+        })
+        .then_with(|| {
+            challenger
+                .candidate
+                .at_three
+                .cmp(&current.candidate.at_three)
+        })
+        .is_gt()
+}
+
+fn static_context_profile_label(profile: StaticContextProfile) -> String {
+    if profile.search_depth <= 1 {
+        "冻结基线".to_owned()
+    } else {
+        format!(
+            "ARPA-d{}-g{:.2}",
+            profile.search_depth, profile.minimum_average_gain
+        )
+    }
+}
+
+fn write_static_context_profile_report(
+    output: &mut String,
+    profile: StaticContextProfile,
+    report: &StaticContextProfileReport,
+    frontier_limit: usize,
+) -> Result<(), std::fmt::Error> {
+    writeln!(
+        output,
+        "{}：目标 Top-1 {}/{}、Top-3 {}、Top-5 {}、Top-{frontier_limit} {}；升/平/降 {}/{}/{}；正确首选 +{} / -{}；非目标首选变化 {}",
+        static_context_profile_label(profile),
+        report.candidate.at_one,
+        report.total,
+        report.candidate.at_three,
+        report.candidate.at_five,
+        report.candidate.visible,
+        report.rank_improved,
+        report.rank_unchanged,
+        report.rank_worsened,
+        report.correct_top_one_gained,
+        report.correct_top_one_lost,
+        report.non_target_top_one_changes,
+    )
+}
+
+fn write_static_context_selection(
+    output: &mut String,
+    label: &str,
+    corpus: &ziranma_core::UdCorpus,
+    corpus_text: &str,
+    selection: StaticContextSelectionStats,
+    frontier_limit: usize,
+) -> Result<(), std::fmt::Error> {
+    writeln!(
+        output,
+        "{label}：{} 句 · SHA-256 {} · 自然相邻词代表 {}，排除整词/整码碰撞 {}/{}，冻结样本 {}，空前沿 {}，每例最多 {frontier_limit} 个候选",
+        corpus.stats.sentences,
+        candidate_sha256_hex(corpus_text.as_bytes()),
+        selection.source_representatives,
+        selection.whole_text_collisions,
+        selection.whole_code_collisions,
+        selection.selected,
+        selection.empty_frontiers,
+    )
 }
 
 fn audit_candidate_layers(
@@ -6383,6 +7302,51 @@ mod tests {
     }
 
     #[test]
+    fn static_context_parser_binds_model_fit_and_independent_holdout() {
+        assert_eq!(
+            parse_options([
+                "static-context-audit".to_owned(),
+                "--model".to_owned(),
+                "public.arpa".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "32".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+                "--max-order".to_owned(),
+                "3".to_owned(),
+            ])
+            .unwrap(),
+            Options::StaticContextAudit {
+                model: PathBuf::from("public.arpa"),
+                core_payload: PathBuf::from("core.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                frontier_limit: 32,
+                sample_limit: 128,
+                max_order: 3,
+            }
+        );
+        assert!(
+            parse_options([
+                "static-context-audit".to_owned(),
+                "--frontier-limit".to_owned(),
+                "4".to_owned(),
+                "--sample-limit".to_owned(),
+                "1".to_owned(),
+                "--max-order".to_owned(),
+                "3".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn public_package_query_parser_is_bounded() {
         assert_eq!(
             parse_options([
@@ -7621,6 +8585,146 @@ mod tests {
                 .is_err(),
             "the held-out corpus must never be accepted as its own fit source"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sparse_static_context_audit_promotes_public_collocations_without_echoing_text() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+无\twu\t1000\n\
+误\twu\t100\n\
+提交\tti jiao\t1000\n\
+正确\tzheng que\t900\n\
+检查\tjian cha\t800\n";
+        const FIT: &str = "# sent_id = fit-1\n\
+1\t误\t_\tVERB\t_\t_\t0\troot\t_\t_\n\
+2\t提交\t_\tVERB\t_\t_\t1\tobj\t_\t_\n\n";
+        const HELD_OUT: &str = "# sent_id = held-1\n\
+1\t误\t_\tVERB\t_\t_\t0\troot\t_\t_\n\
+2\t检查\t_\tVERB\t_\t_\t1\tobj\t_\t_\n\n\
+# sent_id = held-2\n\
+1\t正确\t_\tADJ\t_\t_\t0\troot\t_\t_\n\
+2\t检查\t_\tVERB\t_\t_\t1\tobj\t_\t_\n\n";
+        const ARPA: &str = "\\data\\\n\
+ngram 1=8\n\
+ngram 2=10\n\n\
+\\1-grams:\n\
+-0.1 <s> 0\n\
+-0.1 </s> 0\n\
+-1.0 <unk> 0\n\
+-0.1 无 0\n\
+-1.0 误 0\n\
+-0.1 提交 0\n\
+-0.1 正确 0\n\
+-0.1 检查 0\n\n\
+\\2-grams:\n\
+-3.0 <s> 无\n\
+-3.0 无 提交\n\
+-3.0 无 检查\n\
+-0.1 <s> 误\n\
+-0.1 误 提交\n\
+-0.1 误 检查\n\
+-0.1 提交 </s>\n\
+-0.1 <s> 正确\n\
+-0.1 正确 检查\n\
+-0.1 检查 </s>\n\n\
+\\end\\\n";
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let fit = root.join("fit.conllu");
+        let held_out = root.join("held-out.conllu");
+        let model = root.join("public.arpa");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&fit, FIT).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+        fs::write(&model, ARPA).unwrap();
+
+        let entries = parse_lexicon_tsv(CORE).unwrap();
+        let decoder = Decoder::new(entries.clone());
+        let fit_corpus = parse_ud_conllu(FIT).unwrap();
+        let held_out_corpus = parse_ud_conllu(HELD_OUT).unwrap();
+        let (fit_cases, _) =
+            freeze_static_context_cases(&fit_corpus, &entries, &decoder, 8, 8).unwrap();
+        let (held_out_cases, _) =
+            freeze_static_context_cases(&held_out_corpus, &entries, &decoder, 8, 8).unwrap();
+        assert_eq!(fit_cases.len(), 1);
+        assert_eq!(held_out_cases.len(), 2);
+        let language_model =
+            load_sparse_arpa_language_model(&model, fit_cases.iter().chain(&held_out_cases), 2)
+                .unwrap();
+        let baseline = evaluate_static_context_profile(
+            &fit_cases,
+            &language_model,
+            StaticContextProfile {
+                search_depth: 1,
+                minimum_average_gain: 0.0,
+            },
+        )
+        .unwrap();
+        let contextual = evaluate_static_context_profile(
+            &fit_cases,
+            &language_model,
+            StaticContextProfile {
+                search_depth: 8,
+                minimum_average_gain: 0.25,
+            },
+        )
+        .unwrap();
+        assert_eq!(baseline.candidate.at_one, 0);
+        assert_eq!(contextual.candidate.at_one, 1);
+        assert_eq!(contextual.correct_top_one_lost, 0);
+        let held_out_contextual = evaluate_static_context_profile(
+            &held_out_cases,
+            &language_model,
+            StaticContextProfile {
+                search_depth: 8,
+                minimum_average_gain: 0.25,
+            },
+        )
+        .unwrap();
+        assert_eq!(held_out_contextual.correct_top_one_gained, 1);
+        assert_eq!(held_out_contextual.correct_top_one_lost, 0);
+
+        let report = audit_static_context(&model, &core, &fit, &held_out, 8, 8, 2).unwrap();
+        assert!(report.contains("保留集净改善且未损失正确首选"));
+        assert!(report.contains("本次操作：只读"));
+        for text in ["误提交", "无提交", "误检查", "正确检查"] {
+            assert!(!report.contains(text));
+        }
+        assert!(audit_static_context(&model, &core, &fit, &fit, 8, 8, 2).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sparse_arpa_scoring_applies_standard_history_backoff() {
+        const ARPA: &str = "\\data\\\n\
+ngram 1=4\n\
+ngram 2=0\n\n\
+\\1-grams:\n\
+-0.1 <s> -0.2\n\
+-0.4 </s> 0\n\
+-2.0 <unk> 0\n\
+-1.0 误 -0.3\n\n\
+\\2-grams:\n\n\
+\\end\\\n";
+        let root = temporary_test_root();
+        let model_path = root.join("backoff.arpa");
+        fs::create_dir(&root).unwrap();
+        fs::write(&model_path, ARPA).unwrap();
+        let cases = [FrozenStaticContextCase {
+            expected_text: "误".to_owned(),
+            candidates: vec![FrozenStaticContextCandidate {
+                text: "误".to_owned(),
+                segments: vec!["误".to_owned()],
+            }],
+        }];
+
+        let model = load_sparse_arpa_language_model(&model_path, cases.iter(), 2).unwrap();
+        let score = model.score_candidate(&cases[0].candidates[0]).unwrap();
+        assert!((score - -1.9).abs() < 1e-12);
 
         fs::remove_dir_all(root).unwrap();
     }
