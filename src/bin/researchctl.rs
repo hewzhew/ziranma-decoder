@@ -350,6 +350,10 @@ struct SelectionPattern {
     selections: usize,
     non_top_selections: usize,
     first_rank: Option<usize>,
+    first_provenance: Option<NativeCandidateProvenance>,
+    first_global_top_provenance: Option<NativeCandidateProvenance>,
+    first_precise_personalization: bool,
+    awaiting_first_global_top: bool,
     first_top_selection: Option<usize>,
     last_top_location: Option<SelectionObservationLocation>,
     last_top_provenance: Option<NativeCandidateProvenance>,
@@ -382,10 +386,17 @@ impl SelectionPattern {
         precise_personalization: bool,
         location: &SelectionObservationLocation,
     ) {
+        self.awaiting_first_global_top = false;
         self.awaiting_first_regression_global_top = false;
+        let first_observation = self.selections == 0;
         self.selections += 1;
         self.non_top_selections += usize::from(rank > 1);
         self.first_rank.get_or_insert(rank);
+        if first_observation {
+            self.first_provenance = provenance;
+            self.first_precise_personalization = precise_personalization;
+            self.awaiting_first_global_top = true;
+        }
         if rank == 1 {
             self.first_top_selection.get_or_insert(self.selections);
             self.last_top_location = Some(location.clone());
@@ -428,6 +439,10 @@ impl SelectionPattern {
     }
 
     fn observe_global_top_provenance(&mut self, provenance: Option<NativeCandidateProvenance>) {
+        if self.awaiting_first_global_top {
+            self.first_global_top_provenance = provenance;
+            self.awaiting_first_global_top = false;
+        }
         if self.awaiting_first_regression_global_top {
             self.first_regression_global_top_provenance = provenance;
             self.awaiting_first_regression_global_top = false;
@@ -506,6 +521,31 @@ struct TopRegressionEvidence {
     marker_unknown: usize,
     blocker_provenance_observations: usize,
     blocker_sources: [usize; 10],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InitialNonTopEvidence {
+    identities: usize,
+    rank_two: usize,
+    rank_three_to_six: usize,
+    rank_after_first_page: usize,
+    target_provenance_observations: usize,
+    target_sources: [usize; 10],
+    top_provenance_observations: usize,
+    top_sources: [usize; 10],
+    source_pairs: [[usize; 10]; 10],
+    precise_personalization_identities: usize,
+    precise_target_missing: usize,
+    precise_top_missing: usize,
+    precise_target_personalization: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    precise_top_personalization: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    compatibility_identities: usize,
+    compatibility_target_marked: usize,
+    compatibility_target_unmarked: usize,
+    compatibility_target_missing: usize,
+    compatibility_top_marked: usize,
+    compatibility_top_unmarked: usize,
+    compatibility_top_missing: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -964,6 +1004,53 @@ impl ResearchReview {
             self.raw_codes.len(),
         )
         .unwrap();
+        let initial = self.initial_non_top_evidence();
+        writeln!(
+            output,
+            "首次非首选位置与来源：身份 {}；首次第 2 名 {}、第 3–6 名 {}、第 7 名以后 {}；目标来源完整 {}/{}（{}）；当时首选来源完整 {}/{}（{}）。",
+            initial.identities,
+            initial.rank_two,
+            initial.rank_three_to_six,
+            initial.rank_after_first_page,
+            initial.target_provenance_observations,
+            initial.identities,
+            render_candidate_source_counts(&initial.target_sources),
+            initial.top_provenance_observations,
+            initial.identities,
+            render_candidate_source_counts(&initial.top_sources),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "首次非首选来源配对（目标→当时首选）：完整 {}/{}；主要配对（最多 6 类）{}。",
+            candidate_source_pair_observations(&initial.source_pairs),
+            initial.identities,
+            render_candidate_source_pairs(&initial.source_pairs),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "首次非首选精确个性化：V11 覆盖 {}/{}；目标原因 {}（来源缺失 {}）；当时首选原因 {}（来源缺失 {}）。",
+            initial.precise_personalization_identities,
+            initial.identities,
+            render_candidate_personalization_counts(&initial.precise_target_personalization),
+            initial.precise_target_missing,
+            render_candidate_personalization_counts(&initial.precise_top_personalization),
+            initial.precise_top_missing,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "首次非首选兼容标记（旧格式）：身份 {}；目标有标记 {}、无标记 {}、来源缺失 {}；当时首选有标记 {}、无标记 {}、来源缺失 {}。",
+            initial.compatibility_identities,
+            initial.compatibility_target_marked,
+            initial.compatibility_target_unmarked,
+            initial.compatibility_target_missing,
+            initial.compatibility_top_marked,
+            initial.compatibility_top_unmarked,
+            initial.compatibility_top_missing,
+        )
+        .unwrap();
         let top_arrival = self.top_arrival_trajectory();
         writeln!(
             output,
@@ -1063,6 +1150,75 @@ impl ResearchReview {
             render_candidate_source_counts(&followup.dominant_top_sources),
         )
         .unwrap();
+    }
+
+    fn initial_non_top_evidence(&self) -> InitialNonTopEvidence {
+        let mut evidence = InitialNonTopEvidence::default();
+        for pattern in self
+            .selections
+            .values()
+            .filter(|pattern| pattern.first_rank.is_some_and(|rank| rank > 1))
+        {
+            evidence.identities += 1;
+            match pattern.first_rank {
+                Some(2) => evidence.rank_two += 1,
+                Some(3..=6) => evidence.rank_three_to_six += 1,
+                Some(7..) => evidence.rank_after_first_page += 1,
+                _ => {}
+            }
+            if let Some(target) = pattern.first_provenance {
+                evidence.target_provenance_observations += 1;
+                evidence.target_sources[candidate_source_index(target.source())] += 1;
+            }
+            if let Some(top) = pattern.first_global_top_provenance {
+                evidence.top_provenance_observations += 1;
+                evidence.top_sources[candidate_source_index(top.source())] += 1;
+            }
+            if let (Some(target), Some(top)) = (
+                pattern.first_provenance,
+                pattern.first_global_top_provenance,
+            ) {
+                evidence.source_pairs[candidate_source_index(target.source())]
+                    [candidate_source_index(top.source())] += 1;
+            }
+
+            if pattern.first_precise_personalization {
+                evidence.precise_personalization_identities += 1;
+                if let Some(target) = pattern.first_provenance {
+                    for (index, (bit, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
+                        evidence.precise_target_personalization[index] +=
+                            usize::from(target.personalization().contains(*bit));
+                    }
+                } else {
+                    evidence.precise_target_missing += 1;
+                }
+                if let Some(top) = pattern.first_global_top_provenance {
+                    for (index, (bit, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
+                        evidence.precise_top_personalization[index] +=
+                            usize::from(top.personalization().contains(*bit));
+                    }
+                } else {
+                    evidence.precise_top_missing += 1;
+                }
+            } else {
+                evidence.compatibility_identities += 1;
+                match pattern.first_provenance {
+                    Some(target) if target.personalization().is_empty() => {
+                        evidence.compatibility_target_unmarked += 1;
+                    }
+                    Some(_) => evidence.compatibility_target_marked += 1,
+                    None => evidence.compatibility_target_missing += 1,
+                }
+                match pattern.first_global_top_provenance {
+                    Some(top) if top.personalization().is_empty() => {
+                        evidence.compatibility_top_unmarked += 1;
+                    }
+                    Some(_) => evidence.compatibility_top_marked += 1,
+                    None => evidence.compatibility_top_missing += 1,
+                }
+            }
+        }
+        evidence
     }
 
     fn top_arrival_trajectory(&self) -> TopArrivalTrajectory {
@@ -1836,6 +1992,52 @@ fn render_candidate_source_counts(counts: &[usize; 10]) -> String {
     }
 }
 
+fn candidate_source_pair_observations(counts: &[[usize; 10]; 10]) -> usize {
+    counts.iter().flatten().sum()
+}
+
+fn render_candidate_source_pairs(counts: &[[usize; 10]; 10]) -> String {
+    let mut pairs = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(target_index, row)| {
+            row.iter()
+                .enumerate()
+                .filter(|(_, count)| **count != 0)
+                .map(move |(top_index, count)| (*count, target_index, top_index))
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let total = pairs.iter().map(|(count, _, _)| *count).sum::<usize>();
+    let leading = pairs.into_iter().take(6).collect::<Vec<_>>();
+    let shown = leading.iter().map(|(count, _, _)| *count).sum::<usize>();
+    let mut rendered = leading
+        .into_iter()
+        .map(|(count, target_index, top_index)| {
+            format!(
+                "{}→{} {}",
+                candidate_source_label(candidate_source_from_index(target_index)),
+                candidate_source_label(candidate_source_from_index(top_index)),
+                count,
+            )
+        })
+        .collect::<Vec<_>>();
+    if total > shown {
+        rendered.push(format!("其余 {}", total - shown));
+    }
+    if rendered.is_empty() {
+        "暂无".to_owned()
+    } else {
+        rendered.join("、")
+    }
+}
+
 fn render_candidate_personalization_counts(
     counts: &[usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
 ) -> String {
@@ -2068,6 +2270,158 @@ mod tests {
         assert!(rendered.contains("第 2 次选择时到达 1"));
         assert!(rendered.contains("到达后又出现非首选 1"));
         for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
+            assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn initial_non_top_evidence_pairs_sources_and_separates_schema_capabilities() {
+        fn observe_case(
+            review: &mut ResearchReview,
+            identity: &str,
+            rank: usize,
+            target: Option<NativeCandidateProvenance>,
+            top: Option<NativeCandidateProvenance>,
+            precise: bool,
+        ) {
+            let pattern = review
+                .selections
+                .entry((identity.to_owned(), "private".to_owned()))
+                .or_default();
+            pattern.observe(
+                rank,
+                NativeSelectionSource::Numeric,
+                target,
+                precise,
+                &SelectionObservationLocation::default(),
+            );
+            pattern.observe_global_top_provenance(top);
+        }
+
+        let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let target_personalized = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+        );
+        let top_personalized = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::ExplicitAlias,
+            NativeCandidatePersonalization::LEFT_CONTEXT,
+        );
+        let legacy_marked = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
+        let mut review = ResearchReview::default();
+        observe_case(
+            &mut review,
+            "precise-paired",
+            2,
+            Some(target_personalized),
+            Some(top_personalized),
+            true,
+        );
+        observe_case(
+            &mut review,
+            "precise-empty",
+            4,
+            Some(plain),
+            Some(plain),
+            true,
+        );
+        observe_case(
+            &mut review,
+            "precise-target-missing",
+            7,
+            None,
+            Some(plain),
+            true,
+        );
+        observe_case(
+            &mut review,
+            "precise-top-missing",
+            8,
+            Some(plain),
+            None,
+            true,
+        );
+        observe_case(
+            &mut review,
+            "legacy-target-marked",
+            2,
+            Some(legacy_marked),
+            Some(plain),
+            false,
+        );
+        observe_case(
+            &mut review,
+            "legacy-top-marked",
+            5,
+            Some(plain),
+            Some(legacy_marked),
+            false,
+        );
+        observe_case(&mut review, "legacy-missing", 9, None, None, false);
+
+        let mut target_sources = [0; 10];
+        target_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 5;
+        let mut top_sources = [0; 10];
+        top_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 1;
+        top_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 4;
+        let mut source_pairs = [[0; 10]; 10];
+        source_pairs[candidate_source_index(NativeCandidateSource::CoreExact)]
+            [candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 1;
+        source_pairs[candidate_source_index(NativeCandidateSource::CoreExact)]
+            [candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
+        let mut precise_target_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        precise_target_personalization[0] = 1;
+        let mut precise_top_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        precise_top_personalization[5] = 1;
+        assert_eq!(
+            review.initial_non_top_evidence(),
+            InitialNonTopEvidence {
+                identities: 7,
+                rank_two: 2,
+                rank_three_to_six: 2,
+                rank_after_first_page: 3,
+                target_provenance_observations: 5,
+                target_sources,
+                top_provenance_observations: 5,
+                top_sources,
+                source_pairs,
+                precise_personalization_identities: 4,
+                precise_target_missing: 1,
+                precise_top_missing: 1,
+                precise_target_personalization,
+                precise_top_personalization,
+                compatibility_identities: 3,
+                compatibility_target_marked: 1,
+                compatibility_target_unmarked: 1,
+                compatibility_target_missing: 1,
+                compatibility_top_marked: 1,
+                compatibility_top_unmarked: 1,
+                compatibility_top_missing: 1,
+            }
+        );
+        let mut rendered = String::new();
+        review.render_selection_pressure(&mut rendered);
+        assert!(rendered.contains("首次第 2 名 2、第 3–6 名 2、第 7 名以后 3"));
+        assert!(rendered.contains("核心整词→核心整词 3、核心整词→显式别名 1"));
+        assert!(rendered.contains("V11 覆盖 4/7"));
+        assert!(rendered.contains("目标原因 持久精确 1（来源缺失 1）"));
+        assert!(rendered.contains("当时首选原因 左侧上下文 1（来源缺失 1）"));
+        assert!(rendered.contains("旧格式）：身份 3"));
+        let mut crowded_pairs = [[0; 10]; 10];
+        for (top_index, count) in crowded_pairs[0].iter_mut().enumerate().take(7) {
+            *count = top_index + 1;
+        }
+        assert!(render_candidate_source_pairs(&crowded_pairs).ends_with("其余 1"));
+        for private_value in [
+            "precise-paired",
+            "precise-empty",
+            "precise-target-missing",
+            "precise-top-missing",
+            "legacy-target-marked",
+            "legacy-top-marked",
+            "legacy-missing",
+            "private",
+        ] {
             assert!(!rendered.contains(private_value));
         }
     }
