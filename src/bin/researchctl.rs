@@ -23,6 +23,7 @@ const MAX_REVIEW_ITEMS: usize = 12;
 const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
 const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
+const POPUP_LATENCY_TAIL_THRESHOLDS_MS: [u32; 4] = [16, 32, 64, 128];
 const CANDIDATE_SOURCE_KIND_COUNT: usize = 11;
 const PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT: usize = 3;
 const INITIAL_NON_TOP_RANK_BUCKET_COUNT: usize = 3;
@@ -635,8 +636,10 @@ struct ResearchReview {
     frames_allowing_more_load: usize,
     odd_code_frames: usize,
     long_decoder_primary_frames: usize,
+    popup_first_frame_ms: Vec<u32>,
     popup_ms: Vec<u32>,
     initial_popup_ms: Vec<u32>,
+    updated_popup_ms: Vec<u32>,
     slow_key_total_ms: Vec<u32>,
     slow_key_refresh_ms: Vec<u32>,
     slow_key_planning_ms: Vec<u32>,
@@ -798,13 +801,16 @@ impl ResearchReview {
                     frame = None;
                 }
                 NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms,
                     fully_visible_ms,
                     initial_show,
-                    ..
                 } => {
+                    self.popup_first_frame_ms.push(*first_frame_ms);
                     self.popup_ms.push(*fully_visible_ms);
                     if *initial_show {
                         self.initial_popup_ms.push(*fully_visible_ms);
+                    } else {
+                        self.updated_popup_ms.push(*fully_visible_ms);
                     }
                 }
                 NativeFeedbackEvent::SlowKeyPathTiming {
@@ -1485,8 +1491,7 @@ impl ResearchReview {
             self.raw_commits, self.cancellations, self.post_commit_backspaces_routed,
         )
         .unwrap();
-        render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
-        render_latency(&mut output, "首次出现", &self.initial_popup_ms);
+        self.render_popup_latencies(&mut output);
         self.render_slow_key_diagnostics(&mut output);
         writeln!(
             output,
@@ -1548,8 +1553,7 @@ impl ResearchReview {
             self.raw_commits, self.cancellations, self.post_commit_backspaces_routed,
         )
         .unwrap();
-        render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
-        render_latency(&mut output, "首次出现", &self.initial_popup_ms);
+        self.render_popup_latencies(&mut output);
         self.render_slow_key_diagnostics(&mut output);
         writeln!(
             output,
@@ -1702,8 +1706,7 @@ impl ResearchReview {
             half_pairs.provenance_comparisons(),
         )
         .unwrap();
-        render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
-        render_latency(&mut output, "首次出现", &self.initial_popup_ms);
+        self.render_popup_latencies(&mut output);
         self.render_slow_key_diagnostics(&mut output);
         writeln!(
             output,
@@ -1713,6 +1716,13 @@ impl ResearchReview {
         .unwrap();
         output.push_str("口径：这里只汇总时间上最新的已标识 DLL；首选提交不自动等于文字正确。");
         output
+    }
+
+    fn render_popup_latencies(&self, output: &mut String) {
+        render_popup_latency(output, "候选窗首帧", &self.popup_first_frame_ms);
+        render_popup_latency(output, "候选窗完全显示", &self.popup_ms);
+        render_popup_latency(output, "首次出现（完全显示）", &self.initial_popup_ms);
+        render_popup_latency(output, "候选更新（完全显示）", &self.updated_popup_ms);
     }
 }
 
@@ -1782,6 +1792,37 @@ fn render_latency(output: &mut String, label: &str, values: &[u32]) {
     } else {
         writeln!(output, "{label}：暂无样本。").unwrap();
     }
+}
+
+fn render_popup_latency(output: &mut String, label: &str, values: &[u32]) {
+    render_latency(output, label, values);
+    if values.is_empty() {
+        return;
+    }
+    let counts = popup_latency_tail_counts(values);
+    writeln!(
+        output,
+        "{label}长尾（固定阈值）：≥16 ms {}（{:.2}%）；≥32 ms {}（{:.2}%）；≥64 ms {}（{:.2}%）；≥128 ms {}（{:.2}%）。",
+        counts[0],
+        percent(counts[0], values.len()),
+        counts[1],
+        percent(counts[1], values.len()),
+        counts[2],
+        percent(counts[2], values.len()),
+        counts[3],
+        percent(counts[3], values.len()),
+    )
+    .unwrap();
+}
+
+fn popup_latency_tail_counts(values: &[u32]) -> [usize; POPUP_LATENCY_TAIL_THRESHOLDS_MS.len()] {
+    let mut counts = [0; POPUP_LATENCY_TAIL_THRESHOLDS_MS.len()];
+    for value in values {
+        for (index, threshold) in POPUP_LATENCY_TAIL_THRESHOLDS_MS.iter().enumerate() {
+            counts[index] += usize::from(value >= threshold);
+        }
+    }
+    counts
 }
 
 fn render_slow_key_phase_dominance(output: &mut String, phases: SlowKeyPhaseDominance) {
@@ -3060,6 +3101,16 @@ mod tests {
                 absolute_rank: 1,
                 visible_rank: 1,
             },
+            NativeFeedbackEvent::CandidatePopupTiming {
+                first_frame_ms: 7,
+                fully_visible_ms: 20,
+                initial_show: true,
+            },
+            NativeFeedbackEvent::CandidatePopupTiming {
+                first_frame_ms: 65,
+                fully_visible_ms: 130,
+                initial_show: false,
+            },
             NativeFeedbackEvent::SlowKeyPathTiming {
                 refresh_ms: 2,
                 planning_ms: 9,
@@ -3102,6 +3153,10 @@ mod tests {
 
         assert_eq!(review.candidate_commits, 2);
         assert_eq!(review.non_top_commits, 1);
+        assert_eq!(review.popup_first_frame_ms, [7, 65]);
+        assert_eq!(review.popup_ms, [20, 130]);
+        assert_eq!(review.initial_popup_ms, [20]);
+        assert_eq!(review.updated_popup_ms, [130]);
         assert_eq!(review.slow_key_remainder_ms, [2]);
         assert_eq!(
             review.slow_key_phase_dominance,
@@ -3130,6 +3185,10 @@ mod tests {
         assert!(!aggregate.contains("打过"));
         assert!(!aggregate.contains("需要复查"));
         assert!(aggregate.contains("慢按键分段覆盖：已确认"));
+        assert!(aggregate.contains("候选窗首帧长尾（固定阈值）：≥16 ms 1（50.00%）"));
+        assert!(aggregate.contains("候选窗完全显示长尾（固定阈值）：≥16 ms 2（100.00%）"));
+        assert!(aggregate.contains("首次出现（完全显示）长尾（固定阈值）：≥16 ms 1（100.00%）"));
+        assert!(aggregate.contains("候选更新（完全显示）长尾（固定阈值）：≥16 ms 1（100.00%）"));
         assert!(aggregate.contains("慢按键其余阶段（UI、状态、反馈及计时取整）：1 次"));
         assert!(aggregate.contains("候选规划 1；编辑会话 0；其余阶段 0；并列 0"));
         assert!(aggregate.contains("精确个性化原因 1/1 批"));
@@ -3204,6 +3263,15 @@ mod tests {
         output.clear();
         render_slow_key_coverage(&mut output, &[21], 4, 4);
         assert!(output.contains("记录中存在分阶段耗时"));
+    }
+
+    #[test]
+    fn popup_latency_tail_thresholds_are_inclusive_and_nested() {
+        assert_eq!(
+            popup_latency_tail_counts(&[0, 15, 16, 31, 32, 63, 64, 127, 128, 256]),
+            [8, 6, 4, 2]
+        );
+        assert_eq!(popup_latency_tail_counts(&[]), [0, 0, 0, 0]);
     }
 
     #[test]
