@@ -51,9 +51,9 @@ use ziranma_core::{
     parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_rime_lexicon,
     parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_lexicon_rank_probes, select_public_static_context_cases,
-    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    select_public_lexicon_rank_probes, select_public_single_character_context_cases,
+    select_public_static_context_cases, select_public_supplemental_composition_cases,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 
@@ -164,6 +164,15 @@ enum Options {
         sample_limit: usize,
     },
     StaticContextAudit {
+        model: PathBuf,
+        core_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+        sample_limit: usize,
+        max_order: usize,
+    },
+    SingleCharacterContextAudit {
         model: PathBuf,
         core_payload: PathBuf,
         fit_corpus: PathBuf,
@@ -464,6 +473,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_limit,
             max_order,
         )?,
+        Options::SingleCharacterContextAudit {
+            model,
+            core_payload,
+            fit_corpus,
+            held_out_corpus,
+            frontier_limit,
+            sample_limit,
+            max_order,
+        } => audit_single_character_context(
+            &model,
+            &core_payload,
+            &fit_corpus,
+            &held_out_corpus,
+            frontier_limit,
+            sample_limit,
+            max_order,
+        )?,
         Options::SupplementStatus { root } => supplement_status(&root)?,
         Options::SupplementEnable {
             root,
@@ -552,6 +578,7 @@ fn parse_options(
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
         "static-context-audit" => parse_static_context_audit(arguments),
+        "single-character-context-audit" => parse_single_character_context_audit(arguments),
         "supplement-status" => Ok(Options::SupplementStatus {
             root: parse_root_only(arguments, "supplement-status")?,
         }),
@@ -1466,6 +1493,67 @@ fn parse_static_context_audit(
     })
 }
 
+fn parse_single_character_context_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut model = None;
+    let mut core_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    let mut sample_limit = None;
+    let mut max_order = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--model" => set_path(&mut model, &mut arguments, "--model")?,
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--max-order" => set_usize(&mut max_order, &mut arguments, "--max-order")?,
+            _ => {
+                return Err(
+                    "unknown single-character-context-audit argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let frontier_limit =
+        frontier_limit.ok_or("single-character-context-audit requires --frontier-limit")?;
+    let sample_limit =
+        sample_limit.ok_or("single-character-context-audit requires --sample-limit")?;
+    let max_order = max_order.ok_or("single-character-context-audit requires --max-order")?;
+    if !(5..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err(
+            "single-character-context-audit --frontier-limit is outside the fixed bound".into(),
+        );
+    }
+    if !(1..=512).contains(&sample_limit) {
+        return Err(
+            "single-character-context-audit --sample-limit is outside the fixed bound".into(),
+        );
+    }
+    if !(1..=5).contains(&max_order) {
+        return Err("single-character-context-audit --max-order is outside the fixed bound".into());
+    }
+    Ok(Options::SingleCharacterContextAudit {
+        model: model.ok_or("single-character-context-audit requires --model")?,
+        core_payload: core_payload
+            .ok_or("single-character-context-audit requires --core-payload")?,
+        fit_corpus: fit_corpus.ok_or("single-character-context-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("single-character-context-audit requires --held-out-corpus")?,
+        frontier_limit,
+        sample_limit,
+        max_order,
+    })
+}
+
 fn parse_supplement_enable(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -1771,6 +1859,9 @@ fn print_usage() {
     );
     eprintln!(
         "  static-context-audit --model <PUBLIC.arpa> --core-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <5..50> --sample-limit <1..512> --max-order <1..5>"
+    );
+    eprintln!(
+        "  single-character-context-audit --model <PUBLIC.arpa> --core-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <5..50> --sample-limit <1..512> --max-order <1..5>"
     );
     eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
@@ -3817,6 +3908,19 @@ fn static_context_profiles() -> Vec<StaticContextProfile> {
     profiles
 }
 
+fn single_character_context_profiles() -> Vec<StaticContextProfile> {
+    let mut profiles = static_context_profiles();
+    for search_depth in [8, 16, 32, 50] {
+        for minimum_average_gain in [1.25, 1.50, 2.00, 3.00, 4.00] {
+            profiles.push(StaticContextProfile {
+                search_depth,
+                minimum_average_gain,
+            });
+        }
+    }
+    profiles
+}
+
 #[derive(Clone, Debug)]
 struct FrozenStaticContextCandidate {
     text: String,
@@ -3836,6 +3940,19 @@ struct StaticContextSelectionStats {
     whole_code_collisions: usize,
     selected: usize,
     empty_frontiers: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SingleCharacterContextSelectionStats {
+    source_windows: usize,
+    single_character_targets: usize,
+    exact_word_coverable: usize,
+    source_representatives: usize,
+    ambiguous_target_surfaces: usize,
+    non_two_key_targets: usize,
+    uncompetitive_exact_pools: usize,
+    target_outside_frontier: usize,
+    selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4132,6 +4249,261 @@ fn audit_static_context(
         "边界：候选与分词均冻结自现有完整双拼前沿；模型最多提升一个已有挑战者，不创建候选。\n本次操作：只读\n",
     );
     Ok(output)
+}
+
+fn audit_single_character_context(
+    model_path: &Path,
+    core_payload: &Path,
+    fit_corpus: &Path,
+    held_out_corpus: &Path,
+    frontier_limit: usize,
+    sample_limit: usize,
+    max_order: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public single-character context payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        fit_corpus,
+        "public single-character context fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public single-character context held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    if candidate_sha256_hex(fit_text.as_bytes()) == candidate_sha256_hex(held_out_text.as_bytes()) {
+        return Err("single-character-context-audit requires a distinct held-out corpus".into());
+    }
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let core = snapshot_from_payload("single-character-context-audit-core-v1", &core_text)?;
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let (fit_cases, fit_selection) = freeze_single_character_context_cases(
+        &fit,
+        &core_entries,
+        &core,
+        frontier_limit,
+        sample_limit,
+    )?;
+    let (held_out_cases, held_out_selection) = freeze_single_character_context_cases(
+        &held_out,
+        &core_entries,
+        &core,
+        frontier_limit,
+        sample_limit,
+    )?;
+    if fit_cases.is_empty() || held_out_cases.is_empty() {
+        return Err("public corpora produced no eligible single-character context cases".into());
+    }
+
+    let language_model = load_sparse_arpa_language_model(
+        model_path,
+        fit_cases.iter().chain(&held_out_cases),
+        max_order,
+    )?;
+    let profiles = single_character_context_profiles();
+    let mut fit_reports = Vec::with_capacity(profiles.len());
+    for profile in &profiles {
+        fit_reports.push(evaluate_static_context_profile(
+            &fit_cases,
+            &language_model,
+            *profile,
+        )?);
+    }
+    let mut selected_index = 0;
+    for index in 1..fit_reports.len() {
+        if static_context_profile_precedes(&fit_reports[index], &fit_reports[selected_index]) {
+            selected_index = index;
+        }
+    }
+    let selected_profile = profiles[selected_index];
+    let held_out_baseline =
+        evaluate_static_context_profile(&held_out_cases, &language_model, profiles[0])?;
+    let held_out_selected =
+        evaluate_static_context_profile(&held_out_cases, &language_model, selected_profile)?;
+    let held_out_gate_passed = held_out_selected.correct_top_one_gained
+        > held_out_selected.correct_top_one_lost
+        && held_out_selected.correct_top_one_lost == 0
+        && held_out_selected.non_target_top_one_changes == 0;
+
+    let mut output = String::new();
+    writeln!(output, "公开单字左上下文离线审计")?;
+    writeln!(
+        output,
+        "模型：{} 字节 · SHA-256 {} · 声明 {}-gram · 本次使用 {}-gram",
+        language_model.bytes,
+        language_model.sha256,
+        language_model.declared_order,
+        language_model.effective_order,
+    )?;
+    writeln!(
+        output,
+        "句界：{}",
+        if language_model.sentence_boundaries {
+            "模型提供 <s>/</s>"
+        } else {
+            "模型未提供；按空上下文起始且不添加句末分"
+        }
+    )?;
+    writeln!(
+        output,
+        "稀疏装载：需要 {} 条 N-gram，实际命中 {}；候选所需词型中 {} 个映射为 <unk>",
+        language_model.required_ngrams,
+        language_model.records.len(),
+        language_model.unknown_query_tokens,
+    )?;
+    writeln!(
+        output,
+        "核心词典：{} 条 · SHA-256 {}",
+        core_entries.len(),
+        candidate_sha256_hex(core_text.as_bytes()),
+    )?;
+    write_single_character_context_selection(
+        &mut output,
+        "拟合",
+        &fit,
+        &fit_text,
+        fit_selection,
+        frontier_limit,
+    )?;
+    write_single_character_context_selection(
+        &mut output,
+        "保留评测",
+        &held_out,
+        &held_out_text,
+        held_out_selection,
+        frontier_limit,
+    )?;
+    writeln!(output, "\n拟合档位")?;
+    for (profile, report) in profiles.iter().zip(&fit_reports) {
+        write_static_context_profile_report(&mut output, *profile, report, frontier_limit)?;
+    }
+    writeln!(
+        output,
+        "拟合选择：{}；选择过程未读取保留评测答案。",
+        static_context_profile_label(selected_profile),
+    )?;
+    writeln!(output, "\n保留评测")?;
+    write_static_context_profile_report(
+        &mut output,
+        profiles[0],
+        &held_out_baseline,
+        frontier_limit,
+    )?;
+    write_static_context_profile_report(
+        &mut output,
+        selected_profile,
+        &held_out_selected,
+        frontier_limit,
+    )?;
+    if held_out_gate_passed {
+        output.push_str(
+            "结论：保留集净改善且没有正确首选损失或非目标首选变化；可以继续研究有界左上下文 sidecar，但本次没有生成或接入运行时资料。\n",
+        );
+    } else {
+        output.push_str(
+            "结论：未通过保留集安全门；不得把该单字左上下文配置或由它推导的排序资料接入运行时。\n",
+        );
+    }
+    output.push_str(
+        "边界：左侧身份和当前单字都来自公开语料与核心精确词；只冻结当前两键码已有精确单字候选，最多提升一个挑战者，不创建候选、不读取个人记录。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn freeze_single_character_context_cases(
+    corpus: &ziranma_core::UdCorpus,
+    core_entries: &[LexiconEntry],
+    core: &CandidateSnapshot,
+    frontier_limit: usize,
+    sample_limit: usize,
+) -> Result<
+    (
+        Vec<FrozenStaticContextCase>,
+        SingleCharacterContextSelectionStats,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let oversample_limit = sample_limit.saturating_mul(8).max(sample_limit);
+    let selection =
+        select_public_single_character_context_cases(corpus, core_entries, oversample_limit);
+    let ambiguous_surfaces = ambiguous_lexicon_surfaces(core_entries);
+    let mut stats = SingleCharacterContextSelectionStats {
+        source_windows: selection.stats.source_windows,
+        single_character_targets: selection.stats.single_character_targets,
+        exact_word_coverable: selection.stats.exact_word_coverable,
+        source_representatives: selection.stats.sentence_representatives,
+        ..SingleCharacterContextSelectionStats::default()
+    };
+    let mut cases = Vec::with_capacity(sample_limit);
+    for probe in selection.probes {
+        if ambiguous_surfaces.contains(probe.expected_text.as_str()) {
+            stats.ambiguous_target_surfaces += 1;
+            continue;
+        }
+        if probe.observed.as_str().len() != 2 {
+            stats.non_two_key_targets += 1;
+            continue;
+        }
+        let mut candidates =
+            core.exact_full_code_texts(probe.observed.as_str(), MAX_CANDIDATE_SNAPSHOT_RANK)?;
+        if candidates.len() < 2 {
+            stats.uncompetitive_exact_pools += 1;
+            continue;
+        }
+        candidates.truncate(frontier_limit);
+        stats.target_outside_frontier +=
+            usize::from(candidate_rank(&candidates, &probe.expected_text).is_none());
+        cases.push(FrozenStaticContextCase {
+            expected_text: probe.expected_text,
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| FrozenStaticContextCandidate {
+                    text: candidate.clone(),
+                    segments: vec![probe.previous_text.clone(), candidate],
+                })
+                .collect(),
+        });
+        if cases.len() == sample_limit {
+            break;
+        }
+    }
+    stats.selected = cases.len();
+    Ok((cases, stats))
+}
+
+fn write_single_character_context_selection(
+    output: &mut String,
+    label: &str,
+    corpus: &ziranma_core::UdCorpus,
+    corpus_text: &str,
+    stats: SingleCharacterContextSelectionStats,
+    frontier_limit: usize,
+) -> Result<(), std::fmt::Error> {
+    writeln!(
+        output,
+        "{label}语料：{} 句，{} 个句法 token · SHA-256 {}",
+        corpus.stats.sentences,
+        corpus.stats.syntactic_tokens,
+        candidate_sha256_hex(corpus_text.as_bytes()),
+    )?;
+    writeln!(
+        output,
+        "  邻接窗 {}；单字目标 {}；双端核心覆盖 {}；句级代表 {}；多音目标排除 {}；非两键排除 {}；无同码竞争排除 {}；冻结 {}；目标在 Top-{frontier_limit} 外 {}",
+        stats.source_windows,
+        stats.single_character_targets,
+        stats.exact_word_coverable,
+        stats.source_representatives,
+        stats.ambiguous_target_surfaces,
+        stats.non_two_key_targets,
+        stats.uncompetitive_exact_pools,
+        stats.selected,
+        stats.target_outside_frontier,
+    )
 }
 
 fn freeze_static_context_cases(
@@ -8139,6 +8511,68 @@ mod tests {
     }
 
     #[test]
+    fn single_character_context_parser_binds_model_fit_and_holdout() {
+        assert_eq!(
+            parse_options([
+                "single-character-context-audit".to_owned(),
+                "--model".to_owned(),
+                "public.arpa".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "32".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+                "--max-order".to_owned(),
+                "3".to_owned(),
+            ])
+            .unwrap(),
+            Options::SingleCharacterContextAudit {
+                model: PathBuf::from("public.arpa"),
+                core_payload: PathBuf::from("core.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                frontier_limit: 32,
+                sample_limit: 128,
+                max_order: 3,
+            }
+        );
+        assert!(
+            parse_options([
+                "single-character-context-audit".to_owned(),
+                "--frontier-limit".to_owned(),
+                "4".to_owned(),
+                "--sample-limit".to_owned(),
+                "1".to_owned(),
+                "--max-order".to_owned(),
+                "3".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn single_character_context_profiles_extend_only_the_fit_search() {
+        let shared = static_context_profiles();
+        let single = single_character_context_profiles();
+        assert_eq!(&single[..shared.len()], shared.as_slice());
+        assert!(
+            single.iter().any(|profile| {
+                profile.search_depth == 8 && profile.minimum_average_gain == 1.25
+            })
+        );
+        assert!(
+            single.iter().any(|profile| {
+                profile.search_depth == 50 && profile.minimum_average_gain == 4.0
+            })
+        );
+    }
+
+    #[test]
     fn public_package_query_parser_is_bounded() {
         assert_eq!(
             parse_options([
@@ -9595,6 +10029,68 @@ ngram 2=10\n\n\
             assert!(!report.contains(text));
         }
         assert!(audit_static_context(&model, &core, &fit, &fit, 8, 8, 2).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_character_context_audit_freezes_only_current_exact_pool() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲\tjia\t1000\n\
+钾\tjia\t100\n\
+前词\tqian ci\t1000\n\
+另词\tling ci\t900\n\
+稳词\twen ci\t800\n";
+        const FIT: &str = "# sent_id = fit-1\n\
+1\t前词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t钾\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        const HELD_OUT: &str = "# sent_id = held-1\n\
+1\t另词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t钾\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n\
+# sent_id = held-2\n\
+1\t稳词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t甲\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        const ARPA: &str = "\\data\\\n\
+ngram 1=6\n\
+ngram 2=6\n\n\
+\\1-grams:\n\
+-2.0 <unk> 0\n\
+-0.1 甲 0\n\
+-0.1 钾 0\n\
+-0.1 前词 0\n\
+-0.1 另词 0\n\
+-0.1 稳词 0\n\n\
+\\2-grams:\n\
+-3.0 前词 甲\n\
+-0.1 前词 钾\n\
+-3.0 另词 甲\n\
+-0.1 另词 钾\n\
+-0.1 稳词 甲\n\
+-3.0 稳词 钾\n\n\
+\\end\\\n";
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let fit = root.join("fit.conllu");
+        let held_out = root.join("held-out.conllu");
+        let model = root.join("public.arpa");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&fit, FIT).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+        fs::write(&model, ARPA).unwrap();
+
+        let report =
+            audit_single_character_context(&model, &core, &fit, &held_out, 8, 8, 2).unwrap();
+        assert!(report.contains("公开单字左上下文离线审计"));
+        assert!(report.contains("无同码竞争排除 0；冻结 1；目标在 Top-8 外 0"));
+        assert!(report.contains("无同码竞争排除 0；冻结 2；目标在 Top-8 外 0"));
+        assert!(report.contains("保留集净改善且没有正确首选损失或非目标首选变化"));
+        assert!(report.contains("只冻结当前两键码已有精确单字候选"));
+        assert!(report.contains("本次操作：只读"));
+        for text in ["甲", "钾", "前词", "另词", "稳词"] {
+            assert!(!report.contains(text));
+        }
+        assert!(audit_single_character_context(&model, &core, &fit, &fit, 8, 8, 2).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }

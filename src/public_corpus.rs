@@ -173,6 +173,43 @@ pub struct PublicStaticContextSelectionStats {
     pub selected: usize,
 }
 
+/// One public left context followed by a single-character exact-code target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicSingleCharacterContextProbe {
+    /// Stable upstream-derived identifier.
+    pub id: String,
+    /// Exact preceding public token, already committed before the target.
+    pub previous_text: String,
+    /// Complete code for the one-character target only.
+    pub observed: KeySequence,
+    /// Public one-character target expected after the left context.
+    pub expected_text: String,
+}
+
+/// Deterministic single-character left contexts and their source accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicSingleCharacterContextSelection {
+    /// Selected source-only contexts.
+    pub probes: Vec<PublicSingleCharacterContextProbe>,
+    /// Filtering and selection counts.
+    pub stats: PublicSingleCharacterContextSelectionStats,
+}
+
+/// Filtering counts for public single-character left-context probes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PublicSingleCharacterContextSelectionStats {
+    /// Adjacent non-punctuation token windows examined.
+    pub source_windows: usize,
+    /// Windows with a bounded Han left token and one Han target character.
+    pub single_character_targets: usize,
+    /// Eligible windows whose two source tokens both have exact entries.
+    pub exact_word_coverable: usize,
+    /// Unique one-per-sentence representatives available before spreading.
+    pub sentence_representatives: usize,
+    /// Unique probes retained under the requested limit.
+    pub selected: usize,
+}
+
 /// One natural public phrase with exactly one supplemental-only complete word.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicSupplementalCompositionProbe {
@@ -957,6 +994,82 @@ pub fn select_public_static_context_cases(
     PublicStaticContextSelection { probes, stats }
 }
 
+/// Selects natural left contexts for one complete single-character code.
+///
+/// Selection uses only public source tokens and exact lexicon membership. At
+/// most one distinct context-target identity is retained per sentence before
+/// deterministic spreading; decoder output never influences selection.
+pub fn select_public_single_character_context_cases(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+    limit: usize,
+) -> PublicSingleCharacterContextSelection {
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut stats = PublicSingleCharacterContextSelectionStats::default();
+    let mut sentence_representatives = Vec::new();
+    let mut seen_identity = HashSet::new();
+
+    for sentence in &corpus.sentences {
+        let mut sentence_representative = None;
+        for (window_index, window) in sentence.tokens.windows(2).enumerate() {
+            if window.iter().any(|token| token.upos == "PUNCT") {
+                continue;
+            }
+            stats.source_windows += 1;
+            let previous_characters = window[0].form.chars().count();
+            if !(1..=4).contains(&previous_characters)
+                || !window[0].form.chars().all(is_han_character)
+                || window[1].form.chars().count() != 1
+                || !window[1].form.chars().all(is_han_character)
+            {
+                continue;
+            }
+            stats.single_character_targets += 1;
+            let Some(previous_entry) = entries_by_text.get(window[0].form.as_str()).copied() else {
+                continue;
+            };
+            let Some(target_entry) = entries_by_text.get(window[1].form.as_str()).copied() else {
+                continue;
+            };
+            stats.exact_word_coverable += 1;
+            let identity = (previous_entry.text.as_str(), target_entry.text.as_str());
+            if sentence_representative.is_some() || !seen_identity.insert(identity) {
+                continue;
+            }
+            sentence_representative = Some(PublicSingleCharacterContextProbe {
+                id: format!(
+                    "{}:single-character-context-{}",
+                    sentence.id,
+                    window_index + 1
+                ),
+                previous_text: previous_entry.text.clone(),
+                observed: target_entry.code.clone(),
+                expected_text: target_entry.text.clone(),
+            });
+        }
+        if let Some(probe) = sentence_representative {
+            sentence_representatives.push(probe);
+        }
+    }
+
+    stats.sentence_representatives = sentence_representatives.len();
+    let selected = limit.min(sentence_representatives.len());
+    let probes = if selected == 0 {
+        Vec::new()
+    } else {
+        (0..selected)
+            .map(|index| {
+                let spread_index = (index * sentence_representatives.len()
+                    + sentence_representatives.len() / 2)
+                    / selected;
+                sentence_representatives[spread_index].clone()
+            })
+            .collect::<Vec<_>>()
+    };
+    stats.selected = probes.len();
+    PublicSingleCharacterContextSelection { probes, stats }
+}
+
 /// Selects natural public phrases that exercise exactly one supplemental word.
 ///
 /// Two-token and three-token windows are selected without consulting either
@@ -1701,7 +1814,8 @@ mod tests {
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_character_training_texts, select_public_continuous_composition_cases,
         select_public_lexicon_rank_probes, select_public_protocol_audit_cases,
-        select_public_static_context_cases, select_public_supplemental_composition_cases,
+        select_public_single_character_context_cases, select_public_static_context_cases,
+        select_public_supplemental_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -1804,6 +1918,39 @@ mod tests {
                 .probes
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn single_character_context_selection_keeps_only_the_target_code() {
+        const CORPUS: &str = "# sent_id = public-one\n\
+1\t前词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t甲\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+3\t后词\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n\
+# sent_id = public-two\n\
+1\t前词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t甲\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n\
+# sent_id = public-three\n\
+1\t前词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t，\t_\tPUNCT\t_\t_\t1\tpunct\t_\t_\n\
+3\t甲\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        let corpus = parse_ud_conllu(CORPUS).unwrap();
+        let lexicon = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+前词\tqian ci\t30\n\
+甲\tjia\t20\n\
+后词\thou ci\t10\n",
+        )
+        .unwrap();
+
+        let selection = select_public_single_character_context_cases(&corpus, &lexicon, 8);
+        assert_eq!(selection.stats.source_windows, 3);
+        assert_eq!(selection.stats.single_character_targets, 2);
+        assert_eq!(selection.stats.exact_word_coverable, 2);
+        assert_eq!(selection.stats.sentence_representatives, 1);
+        assert_eq!(selection.stats.selected, 1);
+        assert_eq!(selection.probes[0].previous_text, "前词");
+        assert_eq!(selection.probes[0].expected_text, "甲");
+        assert_eq!(selection.probes[0].observed, lexicon[1].code);
     }
 
     #[test]

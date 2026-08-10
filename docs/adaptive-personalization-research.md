@@ -111,6 +111,41 @@ bigram 时，拟合集上的改善没有稳定保持到独立测试集，部分�
 配置或由它推导的排序资料接入运行时。完整 ARPA 仍不进入换代脚本、DLL 加载或
 按键热路径。
 
+后续短输入审计发现，两键单字的 500 个公开目标中有 494 个处于至少七个精确
+候选的宽同码池，而上面的 `static-context-audit` 评估的是两个相邻词合并后的整串
+解码，不能回答“左词已经提交、当前两键单字怎样排序”。因此新增一条同样只读的
+冻结候选审计：
+
+```powershell
+cargo run --release --bin candidatectl -- single-character-context-audit `
+  --model .local/research/fcitx-lm/extracted-20260629/lm_sc.arpa `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --fit-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu `
+  --held-out-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu `
+  --frontier-limit 50 --sample-limit 512 --max-order 3
+```
+
+选择器只保留“核心可确认的公开左词 + 无多音规范码歧义的单个汉字”，当前输入
+只使用后一个字的两键完整码；同码池少于两个候选时排除。左词和目标必须是原始语料
+中不跨标点的相邻 token，这与 TSF 在标点后清空左侧锚点的实际边界一致。候选冻结
+后，ARPA 只可依据 `[已提交左词, 当前单字候选]` 提升搜索深度内的一个既有挑战者，
+不能创建候选。拟合侧预声明的搜索深度为 8/16/32/50，最小平均 log10 增益为
+0.10～4.00；加入 1.25～4.00 的严格档发生在保留集仍只运行冻结基线之后，最终
+配置选择不读取保留答案。
+
+固定 65,116 条核心包上，拟合语料产生 71,946 个有效邻接窗、29,025 个单字目标、
+26,093 个双端核心覆盖和 3,813 个句级代表；排除 185 个多音目标后冻结 512 例，
+其中 2 个目标在 Top-50 外。保留语料相应为 8,709、3,484、3,116 和 485；排除
+135 个多音目标后冻结 350 例，目标均在 Top-50 内。模型稀疏查询需要 30,472 条
+N-gram，命中 7,015 条，2,456 个所需词型映射为 `<unk>`。拟合选择
+`ARPA-d16-g1.00`：Top-1 从 301/512 增至 340/512，正确首选 `+39/-0`，但有
+6 次非目标首选变化。保留集 Top-1 从 198/350 增至 226/350，正确首选
+`+28/-0`，仍有 3 次非目标首选变化，因此严格安全门失败。这证明公开左上下文对
+宽同码单字有可观信号，也证明当前门控还不足以无副作用上线。该 test 结果现已冻结；
+不得继续用它调阈值或过滤条件，下一步必须先准备新的 fit/dev 材料或可事先声明的
+置信证据，再保留另一份未观察材料作安全门。本轮没有生成 sidecar，也没有改变
+TSF、个人模型或换代流程。
+
 参考实现：
 
 - [libime language model](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/core/languagemodel.cpp)
