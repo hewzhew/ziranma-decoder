@@ -2438,6 +2438,40 @@ struct PublicConsensusRankAudit {
 }
 
 impl PublicConsensusRankAudit {
+    fn observe(&mut self, before: &[String], after: &[String], expected: &str, instances: usize) {
+        let before_rank = candidate_rank(before, expected);
+        let after_rank = candidate_rank(after, expected);
+        let before_correct = before
+            .first()
+            .is_some_and(|candidate| candidate == expected);
+        let after_correct = after.first().is_some_and(|candidate| candidate == expected);
+        let order_changed = before != after;
+        let top_changed = before.first() != after.first();
+
+        self.probes += 1;
+        self.instances += instances;
+        self.before_correct_top += usize::from(before_correct);
+        self.before_correct_top_instances += instances * usize::from(before_correct);
+        self.after_correct_top += usize::from(after_correct);
+        self.after_correct_top_instances += instances * usize::from(after_correct);
+        self.order_changes += usize::from(order_changed);
+        self.order_change_instances += instances * usize::from(order_changed);
+        self.top_changes += usize::from(top_changed);
+        self.top_change_instances += instances * usize::from(top_changed);
+        if top_changed && !before_correct && after_correct {
+            self.correct_top_gained += 1;
+            self.correct_top_gained_instances += instances;
+        } else if top_changed && before_correct && !after_correct {
+            self.correct_top_lost += 1;
+            self.correct_top_lost_instances += instances;
+        } else if top_changed {
+            self.non_target_top_changes += 1;
+            self.non_target_top_change_instances += instances;
+        }
+        self.target_movement
+            .observe(before_rank, after_rank, instances);
+    }
+
     fn absorb(&mut self, other: Self) {
         self.probes += other.probes;
         self.instances += other.instances;
@@ -2463,6 +2497,12 @@ impl PublicConsensusRankAudit {
             && self.correct_top_lost == 0
             && self.non_target_top_changes == 0
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicConsensusComparison {
+    overall: PublicConsensusRankAudit,
+    by_core_exact_width: [PublicConsensusRankAudit; 3],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2516,6 +2556,7 @@ fn audit_public_consensus(
     let ambiguous_surfaces = ambiguous_lexicon_surfaces(&core_entries);
     let mut lengths = Vec::new();
     let mut overall = PublicConsensusRankAudit::default();
+    let mut by_core_exact_width = [PublicConsensusRankAudit::default(); 3];
     for characters in 1..=4 {
         let selection = select_public_lexicon_rank_probes(&held_out, &core_entries, characters);
         let matched_unique_tokens = selection.probes.len();
@@ -2531,9 +2572,15 @@ fn audit_public_consensus(
                 !ambiguous
             })
             .collect::<Vec<_>>();
-        let ranking =
+        let comparison =
             compare_public_consensus_ranks(&core, &supplemental, &probes, frontier_limit)?;
-        overall.absorb(ranking);
+        overall.absorb(comparison.overall);
+        for (total, row) in by_core_exact_width
+            .iter_mut()
+            .zip(comparison.by_core_exact_width)
+        {
+            total.absorb(row);
+        }
         lengths.push(PublicConsensusLengthAudit {
             characters,
             source_unique_tokens: selection.source_unique_tokens,
@@ -2542,7 +2589,7 @@ fn audit_public_consensus(
             matched_token_instances: selection.matched_token_instances,
             ambiguous_unique_tokens,
             ambiguous_token_instances,
-            ranking,
+            ranking: comparison.overall,
         });
     }
 
@@ -2623,6 +2670,23 @@ fn audit_public_consensus(
         overall.target_movement.lost_visible,
         overall.target_movement.lost_visible_instances,
     )?;
+    writeln!(output, "按核心精确同码宽度：")?;
+    for (label, row) in ["1", "2～6", "≥7"].into_iter().zip(by_core_exact_width) {
+        writeln!(
+            output,
+            "  {label}：评测 {}（实例 {}）；首选变化 {}（实例 {}）；正确首选新增 {}（实例 {}）、丢失 {}（实例 {}）、非目标首选变化 {}（实例 {}）",
+            row.probes,
+            row.instances,
+            row.top_changes,
+            row.top_change_instances,
+            row.correct_top_gained,
+            row.correct_top_gained_instances,
+            row.correct_top_lost,
+            row.correct_top_lost_instances,
+            row.non_target_top_changes,
+            row.non_target_top_change_instances,
+        )?;
+    }
     writeln!(
         output,
         "安全门：{}",
@@ -2888,11 +2952,11 @@ fn compare_public_consensus_ranks(
     supplemental: &CandidateSnapshot,
     probes: &[PublicLexiconRankProbe],
     frontier_limit: usize,
-) -> Result<PublicConsensusRankAudit, Box<dyn std::error::Error>> {
+) -> Result<PublicConsensusComparison, Box<dyn std::error::Error>> {
     let config = SupplementalCandidateLayerConfig {
         exact_promotions: 1,
     };
-    let mut audit = PublicConsensusRankAudit::default();
+    let mut comparison = PublicConsensusComparison::default();
     for probe in probes {
         let before = layered_candidate_texts(
             core,
@@ -2908,38 +2972,26 @@ fn compare_public_consensus_ranks(
             frontier_limit,
             config,
         )?;
-        let before_rank = candidate_rank(&before, &probe.expected_text);
-        let after_rank = candidate_rank(&after, &probe.expected_text);
-        let before_correct = before.first() == Some(&probe.expected_text);
-        let after_correct = after.first() == Some(&probe.expected_text);
-        let order_changed = before != after;
-        let top_changed = before.first() != after.first();
-
-        audit.probes += 1;
-        audit.instances += probe.instances;
-        audit.before_correct_top += usize::from(before_correct);
-        audit.before_correct_top_instances += probe.instances * usize::from(before_correct);
-        audit.after_correct_top += usize::from(after_correct);
-        audit.after_correct_top_instances += probe.instances * usize::from(after_correct);
-        audit.order_changes += usize::from(order_changed);
-        audit.order_change_instances += probe.instances * usize::from(order_changed);
-        audit.top_changes += usize::from(top_changed);
-        audit.top_change_instances += probe.instances * usize::from(top_changed);
-        if top_changed && !before_correct && after_correct {
-            audit.correct_top_gained += 1;
-            audit.correct_top_gained_instances += probe.instances;
-        } else if top_changed && before_correct && !after_correct {
-            audit.correct_top_lost += 1;
-            audit.correct_top_lost_instances += probe.instances;
-        } else if top_changed {
-            audit.non_target_top_changes += 1;
-            audit.non_target_top_change_instances += probe.instances;
-        }
-        audit
-            .target_movement
-            .observe(before_rank, after_rank, probe.instances);
+        comparison
+            .overall
+            .observe(&before, &after, &probe.expected_text, probe.instances);
+        let exact_width = core
+            .exact_full_code_texts(probe.observed.as_str(), MAX_CANDIDATE_SNAPSHOT_RANK)?
+            .len();
+        let width_index = match exact_width {
+            1 => 0,
+            2..=6 => 1,
+            7.. => 2,
+            0 => unreachable!("a selected core lexicon target has an exact candidate"),
+        };
+        comparison.by_core_exact_width[width_index].observe(
+            &before,
+            &after,
+            &probe.expected_text,
+            probe.instances,
+        );
     }
-    Ok(audit)
+    Ok(comparison)
 }
 
 fn audit_length_coverage(
@@ -9262,6 +9314,15 @@ mod tests {
         assert!(report.contains("校准前正确首选 2（实例 2），校准后 2（实例 2）"));
         assert!(report.contains("候选顺序变化 3（实例 3）；首选变化 3（实例 3）"));
         assert!(report.contains("目标名次：改善 1（实例 1），不变 2（实例 2），变差 1（实例 1）"));
+        assert!(report.contains(
+            "1：评测 1（实例 1）；首选变化 0（实例 0）；正确首选新增 0（实例 0）、丢失 0（实例 0）、非目标首选变化 0（实例 0）"
+        ));
+        assert!(report.contains(
+            "2～6：评测 3（实例 3）；首选变化 3（实例 3）；正确首选新增 1（实例 1）、丢失 1（实例 1）、非目标首选变化 1（实例 1）"
+        ));
+        assert!(report.contains(
+            "≥7：评测 0（实例 0）；首选变化 0（实例 0）；正确首选新增 0（实例 0）、丢失 0（实例 0）、非目标首选变化 0（实例 0）"
+        ));
         assert!(report.contains("安全门：未通过"));
         assert!(report.contains("本次操作：只读"));
         for private_value in ["甲", "钾", "吗", "马", "是", "时", "事", "好", "行"] {
