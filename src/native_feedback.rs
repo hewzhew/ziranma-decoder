@@ -123,6 +123,7 @@ pub enum NativeCandidateSource {
     ExplicitAlias,
     ProjectOverlay,
     CoreExact,
+    PublicConsensusExact,
     SupplementalExact,
     CharacterPair,
     Decoder,

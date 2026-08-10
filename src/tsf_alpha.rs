@@ -609,6 +609,7 @@ fn native_source_is_explicit_exact(source: NativeCandidateSource) -> bool {
         NativeCandidateSource::ExplicitAlias
             | NativeCandidateSource::ProjectOverlay
             | NativeCandidateSource::CoreExact
+            | NativeCandidateSource::PublicConsensusExact
             | NativeCandidateSource::SupplementalExact
     )
 }
@@ -850,6 +851,9 @@ impl SnapshotCandidateProvider {
 fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidateSource {
     match source {
         InteractiveCandidateSource::CoreExact => NativeCandidateSource::CoreExact,
+        InteractiveCandidateSource::PublicConsensusExact => {
+            NativeCandidateSource::PublicConsensusExact
+        }
         InteractiveCandidateSource::SupplementalExact => NativeCandidateSource::SupplementalExact,
         InteractiveCandidateSource::CharacterPair => NativeCandidateSource::CharacterPair,
         InteractiveCandidateSource::CompleteSentence
@@ -12541,11 +12545,16 @@ mod tests {
         let output =
             provider.candidates_with_provenance("dago", 2, InteractiveCandidateView::Primary);
         assert_eq!(output.candidates, ["打过", "大国"]);
-        assert!(
+        assert_eq!(
             output
                 .provenance
                 .iter()
-                .all(|item| item.source() == NativeCandidateSource::CoreExact)
+                .map(|item| item.source())
+                .collect::<Vec<_>>(),
+            [
+                NativeCandidateSource::PublicConsensusExact,
+                NativeCandidateSource::CoreExact,
+            ]
         );
     }
 

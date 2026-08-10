@@ -22,6 +22,7 @@ const MAX_REVIEW_ITEMS: usize = 12;
 const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
 const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
+const CANDIDATE_SOURCE_KIND_COUNT: usize = 11;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
     (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
     (
@@ -372,9 +373,9 @@ struct SelectionPattern {
     precise_personalization_observations: usize,
     personalization_frames: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
     provenance_observations: usize,
-    sources: [usize; 10],
+    sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
     top_provenance_observations: usize,
-    top_sources: [usize; 10],
+    top_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
 }
 
 impl SelectionPattern {
@@ -520,7 +521,7 @@ struct TopRegressionEvidence {
     marker_absent: usize,
     marker_unknown: usize,
     blocker_provenance_observations: usize,
-    blocker_sources: [usize; 10],
+    blocker_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -530,10 +531,10 @@ struct InitialNonTopEvidence {
     rank_three_to_six: usize,
     rank_after_first_page: usize,
     target_provenance_observations: usize,
-    target_sources: [usize; 10],
+    target_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
     top_provenance_observations: usize,
-    top_sources: [usize; 10],
-    source_pairs: [[usize; 10]; 10],
+    top_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
+    source_pairs: [[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
     precise_personalization_identities: usize,
     precise_target_missing: usize,
     precise_top_missing: usize,
@@ -595,14 +596,14 @@ struct FollowupNonTopPressure {
     complete_provenance_identities: usize,
     partial_provenance_identities: usize,
     missing_provenance_identities: usize,
-    dominant_sources: [usize; 10],
+    dominant_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
     complete_top_provenance_identities: usize,
     partial_top_provenance_identities: usize,
     missing_top_provenance_identities: usize,
     all_observed_top_alias_identities: usize,
     some_observed_top_alias_identities: usize,
     no_observed_top_alias_identities: usize,
-    dominant_top_sources: [usize; 10],
+    dominant_top_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
 }
 
 #[derive(Default)]
@@ -640,6 +641,7 @@ struct ResearchReview {
     slow_key_timing_capable_batches: usize,
     post_commit_backspace_capable_batches: usize,
     precise_personalization_capable_batches: usize,
+    public_consensus_source_capable_batches: usize,
     source_schema_versions: [usize; WISH_SCHEMA_VERSION_COUNT],
     transposition_accepted: usize,
     transposition_rejected: usize,
@@ -663,6 +665,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_post_commit_backspace_routing());
         self.precise_personalization_capable_batches +=
             usize::from(snapshot.supports_precise_candidate_personalization());
+        self.public_consensus_source_capable_batches +=
+            usize::from(snapshot.supports_public_consensus_candidate_source());
         if let Some(count) = self.source_schema_versions.get_mut(usize::from(
             snapshot.source_schema_version().saturating_sub(1),
         )) {
@@ -881,12 +885,14 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化原因 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化原因 {}/{} 批；公开共识来源 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
             self.batches,
             self.precise_personalization_capable_batches,
+            self.batches,
+            self.public_consensus_source_capable_batches,
             self.batches,
         )
         .unwrap();
@@ -1030,7 +1036,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "首次非首选精确个性化：V11 覆盖 {}/{}；目标原因 {}（来源缺失 {}）；当时首选原因 {}（来源缺失 {}）。",
+            "首次非首选精确个性化：V11+ 覆盖 {}/{}；目标原因 {}（来源缺失 {}）；当时首选原因 {}（来源缺失 {}）。",
             initial.precise_personalization_identities,
             initial.identities,
             render_candidate_personalization_counts(&initial.precise_target_personalization),
@@ -1076,7 +1082,7 @@ impl ResearchReview {
         let regression_evidence = self.top_regression_evidence();
         writeln!(
             output,
-            "首选首次回落精确个性化：V11 前后覆盖 {}/{}；可比较 {}、证据缺失 {}；保留 {}；回落时消失 {}；回落时新出现 {}。",
+            "首选首次回落精确个性化：V11+ 前后覆盖 {}/{}；可比较 {}、证据缺失 {}；保留 {}；回落时消失 {}；回落时新出现 {}。",
             regression_evidence.precise_personalization_identities,
             regression_evidence.identities,
             regression_evidence.precise_personalization_comparable_identities,
@@ -1939,6 +1945,7 @@ fn candidate_source_index(source: NativeCandidateSource) -> usize {
         NativeCandidateSource::TranspositionRecovery => 7,
         NativeCandidateSource::Shape => 8,
         NativeCandidateSource::FourCharacterCorrection => 9,
+        NativeCandidateSource::PublicConsensusExact => 10,
     }
 }
 
@@ -1953,6 +1960,7 @@ fn candidate_source_from_index(index: usize) -> NativeCandidateSource {
         7 => NativeCandidateSource::TranspositionRecovery,
         8 => NativeCandidateSource::Shape,
         9 => NativeCandidateSource::FourCharacterCorrection,
+        10 => NativeCandidateSource::PublicConsensusExact,
         _ => NativeCandidateSource::Unknown,
     }
 }
@@ -1963,6 +1971,7 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
         NativeCandidateSource::ExplicitAlias => "显式别名",
         NativeCandidateSource::ProjectOverlay => "项目词",
         NativeCandidateSource::CoreExact => "核心整词",
+        NativeCandidateSource::PublicConsensusExact => "公开共识整词",
         NativeCandidateSource::SupplementalExact => "补充整词/组合",
         NativeCandidateSource::CharacterPair => "双字自由组合",
         NativeCandidateSource::Decoder => "普通组合",
@@ -1972,7 +1981,7 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
     }
 }
 
-fn render_candidate_source_counts(counts: &[usize; 10]) -> String {
+fn render_candidate_source_counts(counts: &[usize; CANDIDATE_SOURCE_KIND_COUNT]) -> String {
     let rendered = counts
         .iter()
         .enumerate()
@@ -1992,11 +2001,15 @@ fn render_candidate_source_counts(counts: &[usize; 10]) -> String {
     }
 }
 
-fn candidate_source_pair_observations(counts: &[[usize; 10]; 10]) -> usize {
+fn candidate_source_pair_observations(
+    counts: &[[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
+) -> usize {
     counts.iter().flatten().sum()
 }
 
-fn render_candidate_source_pairs(counts: &[[usize; 10]; 10]) -> String {
+fn render_candidate_source_pairs(
+    counts: &[[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
+) -> String {
     let mut pairs = counts
         .iter()
         .enumerate()
@@ -2304,7 +2317,7 @@ mod tests {
             NativeCandidatePersonalization::PERSISTENT_EXACT,
         );
         let top_personalized = NativeCandidateProvenance::with_personalization(
-            NativeCandidateSource::ExplicitAlias,
+            NativeCandidateSource::PublicConsensusExact,
             NativeCandidatePersonalization::LEFT_CONTEXT,
         );
         let legacy_marked = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
@@ -2359,14 +2372,14 @@ mod tests {
         );
         observe_case(&mut review, "legacy-missing", 9, None, None, false);
 
-        let mut target_sources = [0; 10];
+        let mut target_sources = [0; CANDIDATE_SOURCE_KIND_COUNT];
         target_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 5;
-        let mut top_sources = [0; 10];
-        top_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 1;
+        let mut top_sources = [0; CANDIDATE_SOURCE_KIND_COUNT];
+        top_sources[candidate_source_index(NativeCandidateSource::PublicConsensusExact)] = 1;
         top_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 4;
-        let mut source_pairs = [[0; 10]; 10];
+        let mut source_pairs = [[0; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT];
         source_pairs[candidate_source_index(NativeCandidateSource::CoreExact)]
-            [candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 1;
+            [candidate_source_index(NativeCandidateSource::PublicConsensusExact)] = 1;
         source_pairs[candidate_source_index(NativeCandidateSource::CoreExact)]
             [candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
         let mut precise_target_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
@@ -2402,12 +2415,12 @@ mod tests {
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("首次第 2 名 2、第 3–6 名 2、第 7 名以后 3"));
-        assert!(rendered.contains("核心整词→核心整词 3、核心整词→显式别名 1"));
-        assert!(rendered.contains("V11 覆盖 4/7"));
+        assert!(rendered.contains("核心整词→核心整词 3、核心整词→公开共识整词 1"));
+        assert!(rendered.contains("V11+ 覆盖 4/7"));
         assert!(rendered.contains("目标原因 持久精确 1（来源缺失 1）"));
         assert!(rendered.contains("当时首选原因 左侧上下文 1（来源缺失 1）"));
         assert!(rendered.contains("旧格式）：身份 3"));
-        let mut crowded_pairs = [[0; 10]; 10];
+        let mut crowded_pairs = [[0; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT];
         for (top_index, count) in crowded_pairs[0].iter_mut().enumerate().take(7) {
             *count = top_index + 1;
         }
@@ -2699,7 +2712,7 @@ mod tests {
             false,
         );
 
-        let mut blocker_sources = [0; 10];
+        let mut blocker_sources = [0; CANDIDATE_SOURCE_KIND_COUNT];
         blocker_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 4;
         blocker_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
         let mut personalization_retained = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
@@ -2730,7 +2743,7 @@ mod tests {
         );
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
-        assert!(rendered.contains("V11 前后覆盖 3/9"));
+        assert!(rendered.contains("V11+ 前后覆盖 3/9"));
         assert!(rendered.contains("可比较 2、证据缺失 1"));
         assert!(rendered.contains("保留 持久精确 1"));
         assert!(rendered.contains("回落时消失 左侧上下文 1"));
@@ -2855,10 +2868,10 @@ mod tests {
             }
         }
 
-        let mut dominant_sources = [0; 10];
+        let mut dominant_sources = [0; CANDIDATE_SOURCE_KIND_COUNT];
         dominant_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
         dominant_sources[candidate_source_index(NativeCandidateSource::SupplementalExact)] = 1;
-        let mut dominant_top_sources = [0; 10];
+        let mut dominant_top_sources = [0; CANDIDATE_SOURCE_KIND_COUNT];
         dominant_top_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 2;
         dominant_top_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
         let mut personalization_identities = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
@@ -3035,7 +3048,8 @@ mod tests {
         assert!(aggregate.contains("慢按键其余阶段（UI、状态、反馈及计时取整）：1 次"));
         assert!(aggregate.contains("候选规划 1；编辑会话 0；其余阶段 0；并列 0"));
         assert!(aggregate.contains("精确个性化原因 1/1 批"));
-        assert!(aggregate.contains("反馈格式：V11 1"));
+        assert!(aggregate.contains("反馈格式：V12 1"));
+        assert!(aggregate.contains("公开共识来源 1/1 批"));
         assert!(
             review
                 .render()

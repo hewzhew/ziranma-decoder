@@ -641,6 +641,7 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
         NativeCandidateSource::ExplicitAlias => "显式别名",
         NativeCandidateSource::ProjectOverlay => "项目词",
         NativeCandidateSource::CoreExact => "核心整词",
+        NativeCandidateSource::PublicConsensusExact => "公开共识整词",
         NativeCandidateSource::SupplementalExact => "补充整词/组合",
         NativeCandidateSource::CharacterPair => "双字自由组合",
         NativeCandidateSource::Decoder => "完整或普通组合",
@@ -827,6 +828,7 @@ mod tests {
     fn wish_schema_version_label_exposes_the_loaded_source_format() {
         assert_eq!(wish_schema_version_label(8), "V8");
         assert_eq!(wish_schema_version_label(11), "V11");
+        assert_eq!(wish_schema_version_label(12), "V12");
     }
 
     #[test]

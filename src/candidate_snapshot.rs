@@ -48,6 +48,7 @@ pub const MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InteractiveCandidateSource {
     CoreExact,
+    PublicConsensusExact,
     SupplementalExact,
     CharacterPair,
     CompleteSentence,
@@ -685,7 +686,8 @@ pub(crate) fn layered_candidate_query_with_consensus_sources(
         .position(|candidate| candidate.text == consensus_top)
         .filter(|index| *index != 0)
     {
-        let candidate = query.candidates.remove(index);
+        let mut candidate = query.candidates.remove(index);
+        candidate.source = InteractiveCandidateSource::PublicConsensusExact;
         query.candidates.insert(0, candidate);
     } else if query
         .candidates
@@ -696,7 +698,7 @@ pub(crate) fn layered_candidate_query_with_consensus_sources(
             0,
             InteractiveCandidateText {
                 text: consensus_top,
-                source: InteractiveCandidateSource::CoreExact,
+                source: InteractiveCandidateSource::PublicConsensusExact,
             },
         );
         query.candidates.truncate(limit);
@@ -2718,10 +2720,14 @@ mod tests {
     fn shared_supplemental_top_calibrates_cold_exact_order() {
         const CORE: &str = "text\tpinyin\tfrequency\n\
 大国\tda guo\t1657\n\
-打过\tda guo\t1390\n";
+打过\tda guo\t1390\n\
+什么\tshen me\t1200\n\
+甚么\tshen me\t800\n";
         const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
 打过\tda guo\t9480\n\
-大国\tda guo\t8656\n";
+大国\tda guo\t8656\n\
+什么\tshen me\t9000\n\
+甚么\tshen me\t7000\n";
         let load = |revision: &str, lexicon: &str| {
             CandidateSnapshot::load(CandidateSnapshotDescriptor {
                 schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
@@ -2730,7 +2736,7 @@ mod tests {
                 lexicon_tsv: lexicon,
                 expected_payload_bytes: lexicon.len(),
                 expected_payload_fingerprint: candidate_payload_fingerprint(lexicon.as_bytes()),
-                expected_entry_count: 2,
+                expected_entry_count: 4,
             })
             .unwrap()
         };
@@ -2762,6 +2768,36 @@ mod tests {
             )
             .unwrap(),
             ["打过"]
+        );
+        let changed = layered_candidate_query_with_consensus_sources(
+            &core,
+            &supplemental,
+            "dago",
+            2,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            changed.candidates[0].source,
+            InteractiveCandidateSource::PublicConsensusExact
+        );
+        let unchanged = layered_candidate_query_with_consensus_sources(
+            &core,
+            &supplemental,
+            "ufme",
+            2,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(unchanged.candidates[0].text, "什么");
+        assert_eq!(
+            unchanged.candidates[0].source,
+            InteractiveCandidateSource::CoreExact,
+            "source labels an applied reorder, not merely agreement between dictionaries"
         );
         assert_eq!(
             layered_candidate_texts_with_consensus(

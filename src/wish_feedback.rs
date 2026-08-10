@@ -42,6 +42,7 @@ pub const WISH_SCHEMA_V8: &str = "ziranma-wish-v8";
 pub const WISH_SCHEMA_V9: &str = "ziranma-wish-v9";
 pub const WISH_SCHEMA_V10: &str = "ziranma-wish-v10";
 pub const WISH_SCHEMA_V11: &str = "ziranma-wish-v11";
+pub const WISH_SCHEMA_V12: &str = "ziranma-wish-v12";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -50,7 +51,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 11;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 12;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -62,6 +63,7 @@ const WISH_PLAINTEXT_MAGIC_V8: &[u8] = b"ziranma-wish-v8\0";
 const WISH_PLAINTEXT_MAGIC_V9: &[u8] = b"ziranma-wish-v9\0";
 const WISH_PLAINTEXT_MAGIC_V10: &[u8] = b"ziranma-wish-v10\0";
 const WISH_PLAINTEXT_MAGIC_V11: &[u8] = b"ziranma-wish-v11\0";
+const WISH_PLAINTEXT_MAGIC_V12: &[u8] = b"ziranma-wish-v12\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -401,6 +403,10 @@ impl WishSnapshot {
         self.source_schema_version >= 11
     }
 
+    pub fn supports_public_consensus_candidate_source(&self) -> bool {
+        self.source_schema_version >= 12
+    }
+
     pub fn category(&self) -> WishCategory {
         self.category
     }
@@ -659,7 +665,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V11);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V12);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -715,7 +721,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V11) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V12) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V12)?;
+            12
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V11) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V11)?;
             11
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V10) {
@@ -1594,6 +1603,11 @@ fn render_event(
             }
             put_usize(output, provenance.len())?;
             for provenance in provenance {
+                if version < 12
+                    && provenance.source() == NativeCandidateSource::PublicConsensusExact
+                {
+                    return Err(WishFeedbackError::InvalidSnapshot);
+                }
                 output.push(candidate_source_tag(provenance.source()));
                 output.push(if version >= 11 {
                     provenance.personalization().bits()
@@ -1751,7 +1765,7 @@ fn parse_event(
             }
             let mut provenance = Vec::with_capacity(provenance_count);
             for _ in 0..provenance_count {
-                let source = parse_candidate_source(reader.byte()?)?;
+                let source = parse_candidate_source(reader.byte()?, version)?;
                 let item = if tag == 12 {
                     let personalization = NativeCandidatePersonalization::from_bits(reader.byte()?)
                         .ok_or(WishFeedbackError::InvalidSnapshot)?;
@@ -1869,10 +1883,14 @@ fn candidate_source_tag(value: NativeCandidateSource) -> u8 {
         NativeCandidateSource::TranspositionRecovery => 8,
         NativeCandidateSource::Shape => 9,
         NativeCandidateSource::FourCharacterCorrection => 10,
+        NativeCandidateSource::PublicConsensusExact => 11,
     }
 }
 
-fn parse_candidate_source(value: u8) -> Result<NativeCandidateSource, WishFeedbackError> {
+fn parse_candidate_source(
+    value: u8,
+    version: u8,
+) -> Result<NativeCandidateSource, WishFeedbackError> {
     match value {
         1 => Ok(NativeCandidateSource::Unknown),
         2 => Ok(NativeCandidateSource::ExplicitAlias),
@@ -1884,6 +1902,7 @@ fn parse_candidate_source(value: u8) -> Result<NativeCandidateSource, WishFeedba
         8 => Ok(NativeCandidateSource::TranspositionRecovery),
         9 => Ok(NativeCandidateSource::Shape),
         10 => Ok(NativeCandidateSource::FourCharacterCorrection),
+        11 if version >= 12 => Ok(NativeCandidateSource::PublicConsensusExact),
         _ => Err(WishFeedbackError::InvalidSnapshot),
     }
 }
@@ -2363,13 +2382,15 @@ mod tests {
             9
         } else if magic == WISH_PLAINTEXT_MAGIC_V10 {
             10
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V11 {
             11
+        } else {
+            12
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V11.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V12.len()..]);
         rendered
     }
 
@@ -2387,22 +2408,23 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 11);
+        assert_eq!(parsed.source_schema_version(), 12);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
+        assert!(parsed.supports_public_consensus_candidate_source());
         assert!(parsed == snapshot);
         assert!(WishSnapshot::parse(&rendered[..rendered.len() - 1]).is_err());
     }
 
     #[test]
-    fn v11_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
+    fn v12_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "fuem".to_owned(),
@@ -2428,7 +2450,7 @@ mod tests {
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
     }
@@ -2454,16 +2476,41 @@ mod tests {
             may_have_more: false,
         };
 
-        let rendered = snapshot.render().unwrap();
+        let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V11);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
-        assert!(parsed == snapshot);
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 11);
+        assert!(!parsed.supports_public_consensus_candidate_source());
         let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
             parsed.events()[0].event()
         else {
             panic!("candidate provenance event missing");
         };
         assert_eq!(provenance[0].personalization(), personalization);
+    }
+
+    #[test]
+    fn v12_round_trips_public_consensus_source_and_v11_rejects_it() {
+        let mut snapshot = private_snapshot();
+        snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "ab".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: vec!["甲".to_owned()],
+            provenance: vec![NativeCandidateProvenance::new(
+                NativeCandidateSource::PublicConsensusExact,
+                false,
+            )],
+            automatic_transposition: None,
+            loaded_candidates: 1,
+            tab_assembly: None,
+            may_have_more: false,
+        };
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
+        assert!(WishSnapshot::parse(&rendered).unwrap() == snapshot);
+        assert!(snapshot.render_with_event_version(11).is_err());
     }
 
     #[test]
@@ -2533,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn v11_round_trips_post_commit_backspace_without_claiming_document_change() {
+    fn current_schema_round_trips_post_commit_backspace_without_claiming_document_change() {
         let mut snapshot = private_snapshot();
         snapshot.events.push(WishEvent {
             milliseconds_before_marker: 0,
@@ -2542,7 +2589,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
@@ -3066,6 +3113,7 @@ mod tests {
             NativeCandidateSource::ExplicitAlias,
             NativeCandidateSource::ProjectOverlay,
             NativeCandidateSource::CoreExact,
+            NativeCandidateSource::PublicConsensusExact,
             NativeCandidateSource::SupplementalExact,
             NativeCandidateSource::CharacterPair,
             NativeCandidateSource::Decoder,
@@ -3074,10 +3122,17 @@ mod tests {
             NativeCandidateSource::FourCharacterCorrection,
         ] {
             assert_eq!(
-                parse_candidate_source(candidate_source_tag(source)),
+                parse_candidate_source(candidate_source_tag(source), CURRENT_WISH_SCHEMA_VERSION),
                 Ok(source)
             );
         }
+        assert!(
+            parse_candidate_source(
+                candidate_source_tag(NativeCandidateSource::PublicConsensusExact),
+                11,
+            )
+            .is_err()
+        );
     }
 
     #[test]
