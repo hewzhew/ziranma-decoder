@@ -2437,8 +2437,7 @@ mod windows_app {
             } else {
                 "展开前后记录"
             };
-            let text = wide(label);
-            let _ = unsafe { SetWindowTextW(context, PCWSTR(text.as_ptr())) };
+            set_control_text(window, MANAGER_CONTEXT_ID, label);
         }
     }
 
@@ -2645,7 +2644,24 @@ mod windows_app {
             return;
         };
         let text = wide(value);
+        let desired = &text[..text.len().saturating_sub(1)];
+        let current_length = unsafe { GetWindowTextLengthW(control) };
+        if let Ok(current_length) = usize::try_from(current_length)
+            && current_length == desired.len()
+        {
+            let mut current = vec![0_u16; current_length.saturating_add(1)];
+            let copied = unsafe { GetWindowTextW(control, &mut current) };
+            if let Ok(copied) = usize::try_from(copied)
+                && copied_control_text_matches(&current, copied, desired)
+            {
+                return;
+            }
+        }
         let _ = unsafe { SetWindowTextW(control, PCWSTR(text.as_ptr())) };
+    }
+
+    fn copied_control_text_matches(current: &[u16], copied: usize, desired: &[u16]) -> bool {
+        copied == desired.len() && current.get(..copied) == Some(desired)
     }
 
     fn open_note_window(owner: HWND) {
@@ -3520,6 +3536,28 @@ mod windows_app {
                 manager_list_update(&[0, 2], Some(0), &[0, 1, 2], Some(0)),
                 ManagerListUpdate::Rebuild
             );
+        }
+
+        #[test]
+        fn manager_text_updates_compare_exact_utf16_content() {
+            let desired = "猫猫应愿".encode_utf16().collect::<Vec<_>>();
+            let mut terminated = desired.clone();
+            terminated.push(0);
+            assert!(copied_control_text_matches(
+                &terminated,
+                desired.len(),
+                &desired
+            ));
+            assert!(!copied_control_text_matches(
+                &terminated,
+                desired.len().saturating_sub(1),
+                &desired
+            ));
+            assert!(!copied_control_text_matches(
+                &"猫猫许愿".encode_utf16().collect::<Vec<_>>(),
+                desired.len(),
+                &desired
+            ));
         }
 
         #[test]
