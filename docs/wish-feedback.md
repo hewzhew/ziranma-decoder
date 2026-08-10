@@ -190,7 +190,8 @@ TSF DLL 被加载进记事本、Codex 等宿主，不应在宿主 UI 线程里�
   [颜色](https://learn.microsoft.com/en-us/windows/apps/design/style/color)与
   [按钮](https://learn.microsoft.com/en-us/windows/apps/design/controls/buttons)原则：
   标题、正文和说明使用不同字重与字号，只让“整理这条记录…”成为强调按钮，
-  状态和辅助说明降低视觉权重。颜色取自 Windows 系统角色，继续适配系统强调色
+  状态和辅助说明降低视觉权重。页签只用底部系统强调色条表达当前页，不再同时叠加
+  强调色文字与边框；交互底色、边框和禁用态都取自 Windows 系统角色，继续适配系统强调色
   与高对比度模式；原生 `BUTTON` 仍保留键盘焦点和无障碍名称。
 - 独立管理器使用项目内生成的猫猫图标；多尺寸 ICO 被嵌入 `wishpad.exe`，其中
   “捧住愿望”小猫也作为轻量资源嵌入 TSF DLL，只用于明确保存成功后的短暂回执。

@@ -28,14 +28,14 @@ mod windows_app {
         DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_3DFACE, COLOR_GRAYTEXT,
-        COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontW,
-        CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS,
-        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, EndPaint,
-        FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject, GetSysColor,
-        GetSysColorBrush, HGDIOBJ, InvalidateRect, NULL_BRUSH, OPAQUE, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, PS_SOLID, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-        TRANSPARENT,
+        BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_3DFACE, COLOR_3DSHADOW,
+        COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+        CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
+        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect,
+        DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
+        GetSysColor, GetSysColorBrush, HGDIOBJ, InvalidateRect, NULL_BRUSH, OPAQUE,
+        OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, RoundRect, SelectObject, SetBkColor, SetBkMode,
+        SetTextColor, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::SystemServices::SS_CENTER;
@@ -329,6 +329,13 @@ mod windows_app {
         Navigation,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ManagerButtonAccent {
+        None,
+        Fill,
+        SelectionIndicator,
+    }
+
     fn manager_button_tone(id: i32) -> Option<ManagerButtonTone> {
         match id {
             MANAGER_EDIT_ID | MANAGER_RESTORE_ID | NOTE_SAVE_ID => Some(ManagerButtonTone::Primary),
@@ -348,6 +355,17 @@ mod windows_app {
             (MANAGER_ACTIVE_VIEW_ID, ManagerView::Active)
                 | (MANAGER_TRASH_VIEW_ID, ManagerView::Trash)
         )
+    }
+
+    fn manager_button_accent(
+        tone: ManagerButtonTone,
+        navigation_active: bool,
+    ) -> ManagerButtonAccent {
+        match (tone, navigation_active) {
+            (ManagerButtonTone::Primary, _) => ManagerButtonAccent::Fill,
+            (ManagerButtonTone::Navigation, true) => ManagerButtonAccent::SelectionIndicator,
+            _ => ManagerButtonAccent::None,
+        }
     }
 
     pub fn run() -> Result<(), Box<dyn Error>> {
@@ -814,6 +832,7 @@ mod windows_app {
         let navigation = tone == ManagerButtonTone::Navigation;
         let navigation_active =
             navigation && manager_navigation_button_is_active(id, current_manager_view());
+        let accent = manager_button_accent(tone, navigation_active);
         let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
         let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0;
         let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
@@ -823,24 +842,20 @@ mod windows_app {
             unsafe { GetSysColor(COLOR_3DFACE) }
         } else if navigation_active {
             unsafe { GetSysColor(COLOR_WINDOW) }
-        } else if pressed {
-            0x00e8_e8e8
-        } else if hot {
-            0x00f6_f6f6
+        } else if pressed || hot {
+            unsafe { GetSysColor(COLOR_3DFACE) }
         } else {
             unsafe { GetSysColor(COLOR_WINDOW) }
         });
-        let border_color = COLORREF(if (primary || navigation_active) && !disabled {
+        let border_color = COLORREF(if accent == ManagerButtonAccent::Fill && !disabled {
             unsafe { GetSysColor(COLOR_HIGHLIGHT) }
         } else {
-            0x00d1_d1d1
+            unsafe { GetSysColor(COLOR_3DSHADOW) }
         });
         let text_color = COLORREF(if disabled {
             unsafe { GetSysColor(COLOR_GRAYTEXT) }
         } else if primary {
             unsafe { GetSysColor(COLOR_HIGHLIGHTTEXT) }
-        } else if navigation_active {
-            unsafe { GetSysColor(COLOR_HIGHLIGHT) }
         } else {
             unsafe { GetSysColor(COLOR_WINDOWTEXT) }
         });
@@ -861,7 +876,7 @@ mod windows_app {
                 8,
             );
         }
-        if navigation_active && !disabled {
+        if accent == ManagerButtonAccent::SelectionIndicator && !disabled {
             let accent = unsafe { GetSysColorBrush(COLOR_HIGHLIGHT) };
             let accent_rect = RECT {
                 left: rect.left.saturating_add(10),
@@ -3841,6 +3856,22 @@ mod windows_app {
                 MANAGER_TRASH_VIEW_ID,
                 ManagerView::Active
             ));
+            assert_eq!(
+                manager_button_accent(ManagerButtonTone::Primary, false),
+                ManagerButtonAccent::Fill
+            );
+            assert_eq!(
+                manager_button_accent(ManagerButtonTone::Navigation, true),
+                ManagerButtonAccent::SelectionIndicator
+            );
+            assert_eq!(
+                manager_button_accent(ManagerButtonTone::Navigation, false),
+                ManagerButtonAccent::None
+            );
+            assert_eq!(
+                manager_button_accent(ManagerButtonTone::Secondary, false),
+                ManagerButtonAccent::None
+            );
         }
 
         #[test]
