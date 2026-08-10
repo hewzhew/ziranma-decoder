@@ -1,6 +1,6 @@
 //! Explicit construction, inspection, and local slotting of candidate packages.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
@@ -111,6 +111,11 @@ enum Options {
     ConsensusAudit {
         core_payload: PathBuf,
         supplemental_payload: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+    },
+    ShortRankAudit {
+        core_payload: PathBuf,
         held_out_corpus: PathBuf,
         frontier_limit: usize,
     },
@@ -355,6 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &held_out_corpus,
             frontier_limit,
         )?,
+        Options::ShortRankAudit {
+            core_payload,
+            held_out_corpus,
+            frontier_limit,
+        } => audit_public_short_ranks(&core_payload, &held_out_corpus, frontier_limit)?,
         Options::LengthCoverageAudit {
             base_payload,
             challenger_payload,
@@ -534,6 +544,7 @@ fn parse_options(
         "diagnose-public-miss" => parse_diagnose_public_miss(arguments),
         "compare" => parse_compare(arguments),
         "consensus-audit" => parse_consensus_audit(arguments),
+        "short-rank-audit" => parse_short_rank_audit(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
@@ -1054,6 +1065,35 @@ fn parse_consensus_audit(
         supplemental_payload: supplemental_payload
             .ok_or("consensus-audit requires --supplemental-payload")?,
         held_out_corpus: held_out_corpus.ok_or("consensus-audit requires --held-out-corpus")?,
+        frontier_limit,
+    })
+}
+
+fn parse_short_rank_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            _ => return Err("unknown short-rank-audit argument; value was suppressed".into()),
+        }
+    }
+    let frontier_limit = frontier_limit.ok_or("short-rank-audit requires --frontier-limit")?;
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err("short-rank-audit --frontier-limit is outside the fixed bound".into());
+    }
+    Ok(Options::ShortRankAudit {
+        core_payload: core_payload.ok_or("short-rank-audit requires --core-payload")?,
+        held_out_corpus: held_out_corpus.ok_or("short-rank-audit requires --held-out-corpus")?,
         frontier_limit,
     })
 }
@@ -1707,6 +1747,9 @@ fn print_usage() {
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
         "  consensus-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <1..50>"
+    );
+    eprintln!(
+        "  short-rank-audit --core-payload <LEXICON.tsv> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <1..50>"
     );
     eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
@@ -2591,6 +2634,232 @@ fn audit_public_consensus(
     )?;
     output.push_str(
         "口径：只评测独立公开语料中、核心词典可确认且只有一个规范码的 1～4 字 token；语料不参与规则选择。报告不显示词面，不比较跨词典原始权重，不写文件、不改候选槽位。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicShortExactRankAudit {
+    probes: usize,
+    instances: usize,
+    top: usize,
+    top_instances: usize,
+    within_frontier: usize,
+    within_frontier_instances: usize,
+    rank_two: usize,
+    rank_three_to_six: usize,
+    rank_seven_to_fifty: usize,
+    beyond_fifty: usize,
+    sole_exact_candidate: usize,
+    two_to_six_exact_candidates: usize,
+    seven_or_more_exact_candidates: usize,
+}
+
+impl PublicShortExactRankAudit {
+    fn observe(
+        &mut self,
+        exact_candidates: &[String],
+        expected: &str,
+        instances: usize,
+        frontier_limit: usize,
+    ) {
+        let rank = candidate_rank(exact_candidates, expected);
+        self.probes += 1;
+        self.instances += instances;
+        self.top += usize::from(rank == Some(1));
+        self.top_instances += instances * usize::from(rank == Some(1));
+        self.within_frontier += usize::from(rank.is_some_and(|rank| rank <= frontier_limit));
+        self.within_frontier_instances +=
+            instances * usize::from(rank.is_some_and(|rank| rank <= frontier_limit));
+        match rank {
+            Some(1) => {}
+            Some(2) => self.rank_two += 1,
+            Some(3..=6) => self.rank_three_to_six += 1,
+            Some(7..=MAX_CANDIDATE_SNAPSHOT_RANK) => self.rank_seven_to_fifty += 1,
+            Some(_) => unreachable!("candidate snapshot rank is bounded"),
+            None => self.beyond_fifty += 1,
+        }
+        match exact_candidates.len() {
+            1 => self.sole_exact_candidate += 1,
+            2..=6 => self.two_to_six_exact_candidates += 1,
+            7.. => self.seven_or_more_exact_candidates += 1,
+            0 => unreachable!("a selected core lexicon target has an exact candidate"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicShortPrefixAudit {
+    completed_probes: usize,
+    completed_instances: usize,
+    completed_top: usize,
+    completed_visible: usize,
+    continuing_probes: usize,
+    continuing_instances: usize,
+    continuing_top: usize,
+    continuing_visible: usize,
+}
+
+impl PublicShortPrefixAudit {
+    fn observe(&mut self, completed: bool, rank: Option<usize>, instances: usize) {
+        if completed {
+            self.completed_probes += 1;
+            self.completed_instances += instances;
+            self.completed_top += usize::from(rank == Some(1));
+            self.completed_visible += usize::from(rank.is_some());
+        } else {
+            self.continuing_probes += 1;
+            self.continuing_instances += instances;
+            self.continuing_top += usize::from(rank == Some(1));
+            self.continuing_visible += usize::from(rank.is_some());
+        }
+    }
+}
+
+fn audit_public_short_ranks(
+    core_payload: &Path,
+    held_out_corpus: &Path,
+    frontier_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public short-rank payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public short-rank held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let core_sha256 = candidate_sha256_hex(core_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if core_sha256 == held_out_sha256 {
+        return Err("short-rank-audit requires an independent held-out corpus".into());
+    }
+
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let core = snapshot_from_payload("short-rank-audit-core-v1", &core_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let ambiguous_surfaces = ambiguous_lexicon_surfaces(&core_entries);
+
+    let mut source_unique_tokens = 0;
+    let mut source_token_instances = 0;
+    let mut matched_unique_tokens = 0;
+    let mut matched_token_instances = 0;
+    let mut ambiguous_unique_tokens = 0;
+    let mut ambiguous_token_instances = 0;
+    let mut long_code_unique_tokens = 0;
+    let mut long_code_token_instances = 0;
+    let mut probes = Vec::new();
+    for characters in 1..=2 {
+        let selection = select_public_lexicon_rank_probes(&held_out, &core_entries, characters);
+        source_unique_tokens += selection.source_unique_tokens;
+        source_token_instances += selection.source_token_instances;
+        matched_unique_tokens += selection.probes.len();
+        matched_token_instances += selection.matched_token_instances;
+        for probe in selection.probes {
+            if ambiguous_surfaces.contains(probe.expected_text.as_str()) {
+                ambiguous_unique_tokens += 1;
+                ambiguous_token_instances += probe.instances;
+            } else if probe.observed.as_str().len() > 4 {
+                long_code_unique_tokens += 1;
+                long_code_token_instances += probe.instances;
+            } else {
+                probes.push(probe);
+            }
+        }
+    }
+
+    let mut exact_rows = BTreeMap::<(usize, usize), PublicShortExactRankAudit>::new();
+    let mut prefix_rows = [PublicShortPrefixAudit::default(); 4];
+    for probe in &probes {
+        let code = probe.observed.as_str();
+        let exact_candidates = core.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+        exact_rows
+            .entry((code.len(), probe.expected_text.chars().count()))
+            .or_default()
+            .observe(
+                &exact_candidates,
+                &probe.expected_text,
+                probe.instances,
+                frontier_limit,
+            );
+
+        for typed_keys in 1..=code.len() {
+            let prefix = &code[..typed_keys];
+            let candidates = core.candidate_texts(prefix, frontier_limit)?;
+            prefix_rows[typed_keys - 1].observe(
+                typed_keys == code.len(),
+                candidate_rank(&candidates, &probe.expected_text),
+                probe.instances,
+            );
+        }
+    }
+
+    let mut output = String::new();
+    writeln!(output, "公开短输入核心排序审计")?;
+    writeln!(
+        output,
+        "核心词条：{} · SHA-256 {core_sha256}",
+        core_entries.len()
+    )?;
+    writeln!(
+        output,
+        "独立留出：{} 句，{} 个句法 token · SHA-256 {held_out_sha256}",
+        held_out.stats.sentences, held_out.stats.syntactic_tokens
+    )?;
+    writeln!(
+        output,
+        "选样：1～2 字公开词面 {}（实例 {}）；核心匹配 {}（实例 {}）；多音排除 {}（实例 {}）；超过四键排除 {}（实例 {}）；评测 {}（实例 {}）",
+        source_unique_tokens,
+        source_token_instances,
+        matched_unique_tokens,
+        matched_token_instances,
+        ambiguous_unique_tokens,
+        ambiguous_token_instances,
+        long_code_unique_tokens,
+        long_code_token_instances,
+        probes.len(),
+        probes.iter().map(|probe| probe.instances).sum::<usize>(),
+    )?;
+    writeln!(output, "逐键前沿（前 {frontier_limit}）：")?;
+    for (index, row) in prefix_rows.into_iter().enumerate() {
+        let typed_keys = index + 1;
+        writeln!(
+            output,
+            "  {typed_keys} 键：已完成 {}（实例 {}），目标首选 {}、可见 {}；仍在输入 {}（实例 {}），目标预览首选 {}、可见 {}",
+            row.completed_probes,
+            row.completed_instances,
+            row.completed_top,
+            row.completed_visible,
+            row.continuing_probes,
+            row.continuing_instances,
+            row.continuing_top,
+            row.continuing_visible,
+        )?;
+    }
+    writeln!(output, "完整码核心同码次序：")?;
+    for ((keys, characters), row) in exact_rows {
+        writeln!(
+            output,
+            "  {keys} 键 / {characters} 字：评测 {}（实例 {}）；首选 {}（实例 {}），前 {frontier_limit} 可见 {}（实例 {}）；第 2 名 {}、第 3～6 名 {}、第 7～50 名 {}、50 名外 {}；同码宽度 1 / 2～6 / ≥7：{} / {} / {}",
+            row.probes,
+            row.instances,
+            row.top,
+            row.top_instances,
+            row.within_frontier,
+            row.within_frontier_instances,
+            row.rank_two,
+            row.rank_three_to_six,
+            row.rank_seven_to_fifty,
+            row.beyond_fifty,
+            row.sole_exact_candidate,
+            row.two_to_six_exact_candidates,
+            row.seven_or_more_exact_candidates,
+        )?;
+    }
+    output.push_str(
+        "口径：目标只来自独立公开 UD 留出中、核心词典可确认且只有一个规范码的 1～2 字 token；逐键前沿把未完成规范码称为“预览”，不把它冒充已经表达完的用户意图。完整码次序只读取核心精确词候选，不混入补充层、个人记忆或纠错。报告不显示词面，不写文件、不改候选槽位。\n本次操作：只读\n",
     );
     Ok(output)
 }
@@ -7534,6 +7803,39 @@ mod tests {
     }
 
     #[test]
+    fn short_rank_audit_parser_binds_public_holdout_and_frontier() {
+        assert_eq!(
+            parse_options([
+                "short-rank-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "6".to_owned(),
+            ])
+            .unwrap(),
+            Options::ShortRankAudit {
+                core_payload: PathBuf::from("core.tsv"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                frontier_limit: 6,
+            }
+        );
+        assert!(
+            parse_options([
+                "short-rank-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "0".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn phrase_coverage_parser_binds_both_public_materials_and_holdout() {
         assert_eq!(
             parse_options([
@@ -8964,6 +9266,51 @@ mod tests {
         assert!(report.contains("本次操作：只读"));
         for private_value in ["甲", "钾", "吗", "马", "是", "时", "事", "好", "行"] {
             assert!(!report.contains(private_value));
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_rank_audit_separates_prefix_preview_and_exact_code_competition() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲\tjia\t100\n\
+钾\tjia\t90\n\
+吗\tma\t100\n\
+马\tma\t90\n\
+甲吗\tjia ma\t100\n\
+钾吗\tjia ma\t90\n\
+行\txing\t100\n\
+行\thang\t90\n";
+        const HELD_OUT: &str = "# sent_id = held-out\n\
+1\t钾\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t吗\t_\tPART\t_\t_\t1\tdep\t_\t_\n\
+3\t甲吗\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+4\t行\t_\tVERB\t_\t_\t1\tdep\t_\t_\n\n";
+
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let held_out = root.join("held-out.conllu");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+
+        let report = audit_public_short_ranks(&core, &held_out, 6).unwrap();
+        assert!(report.contains(
+            "选样：1～2 字公开词面 4（实例 4）；核心匹配 4（实例 4）；多音排除 1（实例 1）"
+        ));
+        assert!(report.contains("评测 3（实例 3）"));
+        assert!(report.contains("1 键：已完成 0（实例 0）"));
+        assert!(report.contains(
+            "2 键 / 1 字：评测 2（实例 2）；首选 1（实例 1），前 6 可见 2（实例 2）；第 2 名 1、第 3～6 名 0、第 7～50 名 0、50 名外 0；同码宽度 1 / 2～6 / ≥7：0 / 2 / 0"
+        ));
+        assert!(report.contains(
+            "4 键 / 2 字：评测 1（实例 1）；首选 1（实例 1），前 6 可见 1（实例 1）；第 2 名 0、第 3～6 名 0、第 7～50 名 0、50 名外 0；同码宽度 1 / 2～6 / ≥7：0 / 1 / 0"
+        ));
+        assert!(report.contains("不把它冒充已经表达完的用户意图"));
+        assert!(report.contains("本次操作：只读"));
+        for public_value in ["甲", "钾", "吗", "马", "行"] {
+            assert!(!report.contains(public_value));
         }
 
         fs::remove_dir_all(root).unwrap();
