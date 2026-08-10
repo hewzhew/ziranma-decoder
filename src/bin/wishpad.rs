@@ -64,11 +64,11 @@ mod windows_app {
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
         NativeAutomaticTranspositionTier, NativeFeedbackEvent, WindowsUserDataProtector,
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
-        WishPackageInfo, WishReviewStatus, WishSnapshot, list_trashed_wish_packages,
-        list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
-        load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms,
-        repository_root_for_user_tool_executable, restore_wish_from_trash,
-        save_or_replace_wish_note,
+        WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot,
+        list_trashed_wish_packages, list_wish_packages, load_trashed_wish_note,
+        load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot, move_wish_to_trash,
+        native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+        restore_wish_from_trash, save_or_replace_wish_note,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -2166,9 +2166,14 @@ mod windows_app {
         output.push_str(&relative_time(record.info.modified(), now));
         output.push_str("\r\n");
         output.push_str(capture_scope_label(snapshot.capture_scope()));
+        output.push_str(&format!("　·　{} 条现场记录\r\n", snapshot.events().len()));
         output.push_str(&format!(
-            "　·　{} 条现场记录\r\n\r\n",
-            snapshot.events().len()
+            "反馈 V{}　·　{}\r\n\r\n",
+            snapshot.source_schema_version(),
+            manager_public_candidate_order_label(
+                snapshot.supports_public_candidate_order_policy(),
+                snapshot.public_candidate_order_policy(),
+            )
         ));
         output.push_str("宝宝想说\r\n");
         if record.note_unavailable {
@@ -2210,6 +2215,24 @@ mod windows_app {
 
     fn show_empty_details(window: HWND, message: &str) {
         set_control_text(window, MANAGER_DETAIL_ID, message);
+    }
+
+    fn manager_public_candidate_order_label(
+        supported: bool,
+        policy: WishPublicCandidateOrderPolicy,
+    ) -> &'static str {
+        if !supported {
+            return "公开排序：旧记录未采集";
+        }
+        match policy {
+            WishPublicCandidateOrderPolicy::Unrecorded => "公开排序：未指定",
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst => {
+                "公开排序：核心优先（共识关闭）"
+            }
+            WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus => {
+                "公开排序：实验共识"
+            }
+        }
     }
 
     fn set_empty_state(window: HWND, empty: bool) {
@@ -3436,6 +3459,31 @@ mod windows_app {
             );
             assert_eq!(compact_text("一行\r\n二行", 20), "一行 二行");
             assert_eq!(compact_text("一二三四五", 3), "一二三…");
+        }
+
+        #[test]
+        fn manager_public_order_label_separates_legacy_disabled_and_enabled_evidence() {
+            assert_eq!(
+                manager_public_candidate_order_label(
+                    false,
+                    WishPublicCandidateOrderPolicy::Unrecorded
+                ),
+                "公开排序：旧记录未采集"
+            );
+            assert_eq!(
+                manager_public_candidate_order_label(
+                    true,
+                    WishPublicCandidateOrderPolicy::ConservativeCoreFirst
+                ),
+                "公开排序：核心优先（共识关闭）"
+            );
+            assert_eq!(
+                manager_public_candidate_order_label(
+                    true,
+                    WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus
+                ),
+                "公开排序：实验共识"
+            );
         }
 
         #[test]
