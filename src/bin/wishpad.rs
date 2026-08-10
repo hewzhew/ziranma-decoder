@@ -196,6 +196,13 @@ mod windows_app {
         MoveRecordToTrash,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ManagerListUpdate {
+        Unchanged,
+        Select(Option<usize>),
+        Rebuild,
+    }
+
     impl ManagerView {
         fn title(self) -> &'static str {
             match self {
@@ -1895,74 +1902,104 @@ mod windows_app {
     fn apply_manager_filter(window: HWND, preserve_id: Option<&str>) {
         let filter = manager_filter_from_controls(window);
         let now = SystemTime::now();
-        let Some((labels, selected_list_index, total, visible, view)) =
-            MANAGER_STATE.lock().ok().and_then(|mut state| {
-                let state = state.as_mut()?;
-                state.visible_indices = state
-                    .records
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, record)| {
-                        filter
-                            .matches(record.note.as_ref(), record.note_unavailable)
-                            .then_some(index)
-                    })
-                    .collect();
-                let selected = preserve_id
-                    .and_then(|id| {
-                        state
-                            .visible_indices
-                            .iter()
-                            .copied()
-                            .find(|index| state.records[*index].info.id() == id)
-                    })
-                    .or_else(|| state.visible_indices.first().copied());
-                set_selected_manager_record(state, selected);
-                let labels = state
+        let Some((
+            list_update,
+            labels,
+            selected_list_index,
+            selection_changed,
+            total,
+            visible,
+            view,
+        )) = MANAGER_STATE.lock().ok().and_then(|mut state| {
+            let state = state.as_mut()?;
+            let visible_indices = state
+                .records
+                .iter()
+                .enumerate()
+                .filter_map(|(index, record)| {
+                    filter
+                        .matches(record.note.as_ref(), record.note_unavailable)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let selected = preserve_id
+                .and_then(|id| {
+                    visible_indices
+                        .iter()
+                        .copied()
+                        .find(|index| state.records[*index].info.id() == id)
+                })
+                .or_else(|| visible_indices.first().copied());
+            let list_update = manager_list_update(
+                &state.visible_indices,
+                state.selected,
+                &visible_indices,
+                selected,
+            );
+            let selection_changed = state.selected != selected;
+            state.visible_indices = visible_indices;
+            set_selected_manager_record(state, selected);
+            let labels = if list_update == ManagerListUpdate::Rebuild {
+                state
                     .visible_indices
                     .iter()
                     .map(|index| manager_record_label(&state.records[*index], now))
-                    .collect::<Vec<_>>();
-                let selected_list_index = selected.and_then(|selected| {
-                    state
-                        .visible_indices
-                        .iter()
-                        .position(|index| *index == selected)
-                });
-                Some((
-                    labels,
-                    selected_list_index,
-                    state.records.len(),
-                    state.visible_indices.len(),
-                    state.view,
-                ))
-            })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let selected_list_index = selected.and_then(|selected| {
+                state
+                    .visible_indices
+                    .iter()
+                    .position(|index| *index == selected)
+            });
+            Some((
+                list_update,
+                labels,
+                selected_list_index,
+                selection_changed,
+                state.records.len(),
+                state.visible_indices.len(),
+                state.view,
+            ))
+        })
         else {
             return;
         };
         if let Ok(list) = unsafe { GetDlgItem(Some(window), MANAGER_LIST_ID) } {
-            // Rebuilding an owner-drawn list one row at a time exposes a blank
-            // intermediate frame during page and filter changes. Keep the
-            // existing pixels until the replacement list is complete, then
-            // request one repaint.
-            let _ = unsafe { SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None) };
-            let _ = unsafe { SendMessageW(list, LB_RESETCONTENT, None, None) };
-            for label in &labels {
-                let wide = wide(label);
-                let _ = unsafe {
-                    SendMessageW(
-                        list,
-                        LB_ADDSTRING,
-                        None,
-                        Some(LPARAM(wide.as_ptr() as isize)),
-                    )
-                };
+            match list_update {
+                ManagerListUpdate::Unchanged => {}
+                ManagerListUpdate::Select(index) => {
+                    let index = index.unwrap_or(usize::MAX);
+                    let _ = unsafe { SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None) };
+                }
+                ManagerListUpdate::Rebuild => {
+                    // Rebuilding an owner-drawn list one row at a time exposes a blank
+                    // intermediate frame during page and filter changes. Keep the
+                    // existing pixels until the replacement list is complete, then
+                    // request one repaint.
+                    let _ = unsafe { SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None) };
+                    let _ = unsafe { SendMessageW(list, LB_RESETCONTENT, None, None) };
+                    for label in &labels {
+                        let wide = wide(label);
+                        let _ = unsafe {
+                            SendMessageW(
+                                list,
+                                LB_ADDSTRING,
+                                None,
+                                Some(LPARAM(wide.as_ptr() as isize)),
+                            )
+                        };
+                    }
+                    let selected_list_index = selected_list_index.unwrap_or(usize::MAX);
+                    let _ = unsafe {
+                        SendMessageW(list, LB_SETCURSEL, Some(WPARAM(selected_list_index)), None)
+                    };
+                    let _ = unsafe { SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None) };
+                    let _ = unsafe { InvalidateRect(Some(list), None, true) };
+                }
             }
-            if let Some(index) = selected_list_index {
-                let _ = unsafe { SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None) };
-            }
-            let _ = unsafe { SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None) };
-            let _ = unsafe { InvalidateRect(Some(list), None, true) };
         }
         set_control_text(
             window,
@@ -1987,7 +2024,26 @@ mod windows_app {
                 }
             },
         );
-        render_selected_record(window);
+        if selection_changed {
+            render_selected_record(window);
+        }
+    }
+
+    fn manager_list_update(
+        previous_visible: &[usize],
+        previous_selected: Option<usize>,
+        visible: &[usize],
+        selected: Option<usize>,
+    ) -> ManagerListUpdate {
+        if previous_visible != visible {
+            ManagerListUpdate::Rebuild
+        } else if previous_selected != selected {
+            ManagerListUpdate::Select(
+                selected.and_then(|selected| visible.iter().position(|index| *index == selected)),
+            )
+        } else {
+            ManagerListUpdate::Unchanged
+        }
     }
 
     fn clear_manager_filter(window: HWND) {
@@ -3444,6 +3500,26 @@ mod windows_app {
                 Some(ManagerCommand::Refresh)
             );
             assert_eq!(manager_command(MANAGER_REFRESH_ID, 1), None);
+        }
+
+        #[test]
+        fn manager_filter_rebuilds_only_when_visible_rows_change() {
+            assert_eq!(
+                manager_list_update(&[0, 2], Some(0), &[0, 2], Some(0)),
+                ManagerListUpdate::Unchanged
+            );
+            assert_eq!(
+                manager_list_update(&[0, 2], Some(0), &[0, 2], Some(2)),
+                ManagerListUpdate::Select(Some(1))
+            );
+            assert_eq!(
+                manager_list_update(&[], Some(0), &[], None),
+                ManagerListUpdate::Select(None)
+            );
+            assert_eq!(
+                manager_list_update(&[0, 2], Some(0), &[0, 1, 2], Some(0)),
+                ManagerListUpdate::Rebuild
+            );
         }
 
         #[test]
