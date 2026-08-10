@@ -146,6 +146,40 @@ N-gram，命中 7,015 条，2,456 个所需词型映射为 `<unk>`。拟合选�
 置信证据，再保留另一份未观察材料作安全门。本轮没有生成 sidecar，也没有改变
 TSF、个人模型或换代流程。
 
+为避免继续复用已经观察过的 GSDSimp test，同一固定上游修订中此前未纳入仓库的
+官方 dev 随后被逐字节固定，并先作为一次性独立验证集运行冻结的
+`ARPA-d16-g1.00`。357 例的 Top-1 从 211 增至 232，正确首选 `+22/-1`，另有
+4 次非目标首选变化；副作用因此在另一官方切分上复现，原档仍不能上线。这个结果
+之后，dev 明确降为可以选择档位的开发集，不再冒充未观察测试集。
+
+最终验证协议在读取新保留语料正文前实现并由合成测试固定：开发集只允许“正确首选
+损失为 0 且非目标首选变化为 0”的预声明档位竞争，再最大化新增正确首选；最终
+保留集只运行冻结基线和开发选中的唯一档位。新的域外保留集是固定修订
+`2849afd946a8c01b3e9acdf3e7afa8670cf2777d` 的 UD Chinese PUD，来源、CC BY-SA
+3.0 许可、README、SHA-256 和行数账目均保留在快照目录。运行命令为：
+
+```powershell
+cargo run --release --bin candidatectl -- single-character-context-validation-audit `
+  --model .local/research/fcitx-lm/extracted-20260629/lm_sc.arpa `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --development-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-dev.conllu `
+  --held-out-corpus data/public/ud-chinese-pud/zh_pud-ud-test.conllu `
+  --frontier-limit 50 --sample-limit 512 --max-order 3
+```
+
+开发集的 9,198 个有效邻接窗经筛选冻结 357 例；严格规则选择
+`ARPA-d8-g2.00`，Top-1 从 211/357 增至 218/357，正确首选 `+7/-0`，非目标
+首选变化为 0。PUD 的 15,750 个有效邻接窗、6,409 个单字目标和 4,113 个双端
+核心覆盖形成 905 个句级代表；排除 220 个多音目标后冻结 512 例，其中 2 个目标
+在 Top-50 外。稀疏查询需要 29,416 条 N-gram，命中 7,225 条，2,496 个所需
+词型映射为 `<unk>`。最终 Top-1 从 258/512 增至 262/512，正确首选 `+4/-0`，
+但仍有 1 次非目标首选变化，因此最终安全门失败。
+
+三条公开轨道共同证明：已提交左词对宽同码单字具有稳定的纠正信号，单一 ARPA
+分差阈值却无法把收益和偶发误提升完全分开。PUD 结果现已冻结，不得用它继续调
+深度、阈值或过滤条件；本轮仍不生成 sidecar、不接入 TSF。下一次若继续，应改进
+证据形态或学习可撤销的个人上下文，而不是围绕最后一个公开反例收紧常数。
+
 参考实现：
 
 - [libime language model](https://github.com/fcitx/libime/blob/7b638a433815ed7a29d9bcb8d59aed7366bd3b28/src/libime/core/languagemodel.cpp)

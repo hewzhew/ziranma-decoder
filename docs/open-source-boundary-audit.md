@@ -92,6 +92,14 @@ Rust 代码采用 MPL-2.0 的许可冲突，但发行二进制时仍需生成依
 - 限定：上游只明确许可 UD 标注，并声明不主张底层内容的所有权
 - 结论：独立 ShareAlike 数据，不纳入 MPL
 
+### UD Chinese PUD
+
+- 固定提交：`2849afd946a8c01b3e9acdf3e7afa8670cf2777d`
+- 许可：CC BY-SA 3.0
+- 本地保留：完整上游许可、README、来源、SHA-256 与行数账目
+- 限定：上游区分底层新闻/Wikipedia 文字和 UD 标注的权利边界
+- 结论：独立 ShareAlike 数据，不纳入 MPL
+
 ### Conway Stroke Data
 
 - 固定提交：`4449c63198292fd36d68d8068d39641bb6bbf86d`
@@ -99,7 +107,7 @@ Rust 代码采用 MPL-2.0 的许可冲突，但发行二进制时仍需生成依
 - 本地保留：完整许可、上游 README、来源、SHA-256、转换和导入账目
 - 结论：独立署名数据，不纳入 MPL
 
-三个快照目录均由 `.gitattributes` 标为 `-text`，避免跨平台检出时自动
+四个快照目录均由 `.gitattributes` 标为 `-text`，避免跨平台检出时自动
 更改换行并破坏“逐字节固定”与校验和。
 
 ## 自动发布审计

@@ -1821,8 +1821,10 @@ mod tests {
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
     const UD_TRAIN: &str =
         include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu");
+    const UD_DEV: &str = include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-dev.conllu");
     const UD_TEST: &str =
         include_str!("../data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu");
+    const UD_PUD_TEST: &str = include_str!("../data/public/ud-chinese-pud/zh_pud-ud-test.conllu");
 
     #[test]
     fn token_coverage_audit_reports_unique_and_repeated_held_out_changes() {
@@ -2156,6 +2158,28 @@ mod tests {
             ),
             (54, 89, 102, 2, 4)
         );
+    }
+
+    #[test]
+    fn pinned_ud_dev_snapshot_has_stable_accounting() {
+        assert_eq!(UD_DEV.len(), 1_195_377);
+        let corpus = parse_ud_conllu(UD_DEV).unwrap();
+        assert_eq!(corpus.stats.source_lines, 15_165);
+        assert_eq!(corpus.stats.sentences, 500);
+        assert_eq!(corpus.stats.syntactic_tokens, 12_665);
+        assert_eq!(corpus.stats.punctuation_tokens, 1_770);
+        assert_eq!(corpus.stats.special_token_rows, 0);
+    }
+
+    #[test]
+    fn pinned_ud_pud_snapshot_has_stable_accounting() {
+        assert_eq!(UD_PUD_TEST.len(), 2_199_911);
+        let corpus = parse_ud_conllu(UD_PUD_TEST).unwrap();
+        assert_eq!(corpus.stats.source_lines, 28_415);
+        assert_eq!(corpus.stats.sentences, 1_000);
+        assert_eq!(corpus.stats.syntactic_tokens, 21_415);
+        assert_eq!(corpus.stats.punctuation_tokens, 2_902);
+        assert_eq!(corpus.stats.special_token_rows, 0);
     }
 
     #[test]

@@ -37,7 +37,7 @@ endorsement.
 
 ## UD Chinese GSDSimp
 
-The unchanged public CoNLL-U test snapshot under
+The unchanged public CoNLL-U train, dev, and test snapshots under
 `data/public/ud-chinese-gsdsimp/` comes from
 [`UniversalDependencies/UD_Chinese-GSDSimp`](https://github.com/UniversalDependencies/UD_Chinese-GSDSimp),
 pinned to commit `4231dfd59866fa5999ad4a6bc1fdecd7985b3b59`.
@@ -45,7 +45,7 @@ pinned to commit `4231dfd59866fa5999ad4a6bc1fdecd7985b3b59`.
 The upstream metadata names Peng Qi and Koichi Yasuoka as contributors and
 licenses the treebank under Creative Commons Attribution-ShareAlike 4.0
 International. The upstream license notice and README, complete CC BY-SA 4.0
-legal code, exact train/test source URLs, snapshot hashes, and row accounting
+legal code, exact train/dev/test source URLs, snapshot hashes, and row accounting
 are retained beside the data.
 
 The upstream changelog says the license permission applies to the UD
@@ -53,6 +53,23 @@ annotations and that Google claims no ownership or copyright over the
 underlying content. This repository preserves that qualification and does not
 make a broader ownership claim. This notice does not imply endorsement by
 Universal Dependencies, Google, or the named contributors.
+
+## UD Chinese PUD
+
+The unchanged public CoNLL-U snapshot under `data/public/ud-chinese-pud/`
+comes from
+[`UniversalDependencies/UD_Chinese-PUD`](https://github.com/UniversalDependencies/UD_Chinese-PUD),
+pinned to commit `2849afd946a8c01b3e9acdf3e7afa8670cf2777d`.
+
+The upstream metadata identifies the data as 1,000 parallel news and
+Wikipedia sentences produced for the CoNLL 2017 shared task and distributes
+it under Creative Commons Attribution-ShareAlike 3.0. The unchanged license,
+full contributor-bearing README, exact source URL, snapshot hashes, and row
+accounting are retained beside the data.
+
+The upstream README separately explains the rights boundary for underlying
+text and annotations. This repository preserves that qualification and does
+not imply endorsement by Universal Dependencies, Google, or the contributors.
 
 ## Conway Stroke Data
 

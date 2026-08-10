@@ -236,8 +236,13 @@ $trustedPublicSnapshotFiles = [System.Collections.Generic.HashSet[string]]::new(
         'data/public/ud-chinese-gsdsimp/LICENSE.txt',
         'data/public/ud-chinese-gsdsimp/SOURCE.md',
         'data/public/ud-chinese-gsdsimp/UPSTREAM_README.md',
+        'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-dev.conllu',
         'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu',
-        'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu'
+        'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu',
+        'data/public/ud-chinese-pud/LICENSE.txt',
+        'data/public/ud-chinese-pud/SOURCE.md',
+        'data/public/ud-chinese-pud/UPSTREAM_README.md',
+        'data/public/ud-chinese-pud/zh_pud-ud-test.conllu'
     ),
     [System.StringComparer]::Ordinal
 )
@@ -330,8 +335,13 @@ $requiredFiles = @(
     'data/public/ud-chinese-gsdsimp/LICENSE.txt',
     'data/public/ud-chinese-gsdsimp/SOURCE.md',
     'data/public/ud-chinese-gsdsimp/UPSTREAM_README.md',
+    'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-dev.conllu',
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu',
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu',
+    'data/public/ud-chinese-pud/LICENSE.txt',
+    'data/public/ud-chinese-pud/SOURCE.md',
+    'data/public/ud-chinese-pud/UPSTREAM_README.md',
+    'data/public/ud-chinese-pud/zh_pud-ud-test.conllu',
     'docs/candidate-lab.md',
     'docs/open-source-boundary-audit.md',
     'docs/tsf-alpha.md',
@@ -382,13 +392,23 @@ $expectedHashes = @{
     'data/public/ud-chinese-gsdsimp/LICENSE.txt' =
         '899B1804A12EBC090B96339614EEDE1B64B686721B650A71430B55B5235F7F79'
     'data/public/ud-chinese-gsdsimp/SOURCE.md' =
-        'C3BC1A8A5305AECB00AFD939D11CB31A306C45A0D334B79B2AD730B5C745C5C0'
+        '0A94AF83BE2189E26B2137558586C9A2F41E8D2ECCFC8175FDC31780745E5E17'
     'data/public/ud-chinese-gsdsimp/UPSTREAM_README.md' =
         '02287BDF80282151D8CA7EF3C3F7A3C3B98609F7266F145E3E3DD0A05693ABD3'
+    'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-dev.conllu' =
+        'D03F1EEB93B16071BFBBE6C76B971554BE87C9A2307B3F3A820DD7C07F73FB63'
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu' =
         '3AF8046A6F32477B4D5CF3DD06BBF38682A380FE77AADE3F68DE97E51AB94900'
     'data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu' =
         '956636FE612A1166E8B19E7413FEE2E73D68231ACA2F0455BE2C616B947D629D'
+    'data/public/ud-chinese-pud/LICENSE.txt' =
+        'B278EB53FE50B8BB7FA0D90FB8536C35FDCAA80F9D63812CB51DB539555D2A89'
+    'data/public/ud-chinese-pud/SOURCE.md' =
+        '579741F72C505DC80F6C34C6BE0FEBE4B89B94863FE6FAF5375466A1D475334A'
+    'data/public/ud-chinese-pud/UPSTREAM_README.md' =
+        '4ABC2A54F3B38F8DA61C9A751F26D8E3292C99461E9E7FE28B6AD545D3FBD4E7'
+    'data/public/ud-chinese-pud/zh_pud-ud-test.conllu' =
+        'E12582AF2E2BBC2E27155CA7DC12B6FC4A037DBC716E1F805D67E34FFB2596B3'
 }
 foreach ($relativePath in $expectedHashes.Keys | Sort-Object) {
     Assert-Sha256 -RelativePath $relativePath -Expected $expectedHashes[$relativePath]
@@ -420,6 +440,7 @@ $attributes = Get-Content -LiteralPath (Join-Path $resolvedRoot '.gitattributes'
 foreach ($requiredAttribute in @(
     'data/public/rime-pinyin-simp/* -text',
     'data/public/ud-chinese-gsdsimp/* -text',
+    'data/public/ud-chinese-pud/* -text',
     'data/public/conway-stroke-data/* -text'
 )) {
     if (-not $attributes.Contains($requiredAttribute)) {

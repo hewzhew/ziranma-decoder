@@ -181,6 +181,15 @@ enum Options {
         sample_limit: usize,
         max_order: usize,
     },
+    SingleCharacterContextValidationAudit {
+        model: PathBuf,
+        core_payload: PathBuf,
+        development_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+        sample_limit: usize,
+        max_order: usize,
+    },
     SupplementStatus {
         root: PathBuf,
     },
@@ -490,6 +499,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_limit,
             max_order,
         )?,
+        Options::SingleCharacterContextValidationAudit {
+            model,
+            core_payload,
+            development_corpus,
+            held_out_corpus,
+            frontier_limit,
+            sample_limit,
+            max_order,
+        } => audit_single_character_context_validation(
+            &model,
+            &core_payload,
+            &development_corpus,
+            &held_out_corpus,
+            frontier_limit,
+            sample_limit,
+            max_order,
+        )?,
         Options::SupplementStatus { root } => supplement_status(&root)?,
         Options::SupplementEnable {
             root,
@@ -579,6 +605,9 @@ fn parse_options(
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
         "static-context-audit" => parse_static_context_audit(arguments),
         "single-character-context-audit" => parse_single_character_context_audit(arguments),
+        "single-character-context-validation-audit" => {
+            parse_single_character_context_validation_audit(arguments)
+        }
         "supplement-status" => Ok(Options::SupplementStatus {
             root: parse_root_only(arguments, "supplement-status")?,
         }),
@@ -1554,6 +1583,79 @@ fn parse_single_character_context_audit(
     })
 }
 
+fn parse_single_character_context_validation_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut model = None;
+    let mut core_payload = None;
+    let mut development_corpus = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    let mut sample_limit = None;
+    let mut max_order = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--model" => set_path(&mut model, &mut arguments, "--model")?,
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--development-corpus" => set_path(
+                &mut development_corpus,
+                &mut arguments,
+                "--development-corpus",
+            )?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--max-order" => set_usize(&mut max_order, &mut arguments, "--max-order")?,
+            _ => {
+                return Err(
+                    "unknown single-character-context-validation-audit argument; value was suppressed"
+                        .into(),
+                );
+            }
+        }
+    }
+    let frontier_limit = frontier_limit
+        .ok_or("single-character-context-validation-audit requires --frontier-limit")?;
+    let sample_limit =
+        sample_limit.ok_or("single-character-context-validation-audit requires --sample-limit")?;
+    let max_order =
+        max_order.ok_or("single-character-context-validation-audit requires --max-order")?;
+    if !(5..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err(
+            "single-character-context-validation-audit --frontier-limit is outside the fixed bound"
+                .into(),
+        );
+    }
+    if !(1..=512).contains(&sample_limit) {
+        return Err(
+            "single-character-context-validation-audit --sample-limit is outside the fixed bound"
+                .into(),
+        );
+    }
+    if !(1..=5).contains(&max_order) {
+        return Err(
+            "single-character-context-validation-audit --max-order is outside the fixed bound"
+                .into(),
+        );
+    }
+    Ok(Options::SingleCharacterContextValidationAudit {
+        model: model.ok_or("single-character-context-validation-audit requires --model")?,
+        core_payload: core_payload
+            .ok_or("single-character-context-validation-audit requires --core-payload")?,
+        development_corpus: development_corpus
+            .ok_or("single-character-context-validation-audit requires --development-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("single-character-context-validation-audit requires --held-out-corpus")?,
+        frontier_limit,
+        sample_limit,
+        max_order,
+    })
+}
+
 fn parse_supplement_enable(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -1862,6 +1964,9 @@ fn print_usage() {
     );
     eprintln!(
         "  single-character-context-audit --model <PUBLIC.arpa> --core-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <5..50> --sample-limit <1..512> --max-order <1..5>"
+    );
+    eprintln!(
+        "  single-character-context-validation-audit --model <PUBLIC.arpa> --core-payload <LEXICON.tsv> --development-corpus <PUBLIC-DEV.conllu> --held-out-corpus <PUBLIC-HOLDOUT.conllu> --frontier-limit <5..50> --sample-limit <1..512> --max-order <1..5>"
     );
     eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
@@ -4415,6 +4520,186 @@ fn audit_single_character_context(
     Ok(output)
 }
 
+fn audit_single_character_context_validation(
+    model_path: &Path,
+    core_payload: &Path,
+    development_corpus: &Path,
+    held_out_corpus: &Path,
+    frontier_limit: usize,
+    sample_limit: usize,
+    max_order: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public single-character context validation payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let development_text = read_explicit_text(
+        development_corpus,
+        "public single-character context development corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public single-character context final held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    if candidate_sha256_hex(development_text.as_bytes())
+        == candidate_sha256_hex(held_out_text.as_bytes())
+    {
+        return Err(
+            "single-character-context-validation-audit requires a distinct final held-out corpus"
+                .into(),
+        );
+    }
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let core = snapshot_from_payload(
+        "single-character-context-validation-audit-core-v1",
+        &core_text,
+    )?;
+    let development = parse_ud_conllu(&development_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let (development_cases, development_selection) = freeze_single_character_context_cases(
+        &development,
+        &core_entries,
+        &core,
+        frontier_limit,
+        sample_limit,
+    )?;
+    let (held_out_cases, held_out_selection) = freeze_single_character_context_cases(
+        &held_out,
+        &core_entries,
+        &core,
+        frontier_limit,
+        sample_limit,
+    )?;
+    if development_cases.is_empty() || held_out_cases.is_empty() {
+        return Err(
+            "public corpora produced no eligible single-character context validation cases".into(),
+        );
+    }
+
+    let language_model = load_sparse_arpa_language_model(
+        model_path,
+        development_cases.iter().chain(&held_out_cases),
+        max_order,
+    )?;
+    let profiles = single_character_context_profiles();
+    let mut development_reports = Vec::with_capacity(profiles.len());
+    for profile in &profiles {
+        development_reports.push(evaluate_static_context_profile(
+            &development_cases,
+            &language_model,
+            *profile,
+        )?);
+    }
+    let mut selected_index = 0;
+    for index in 1..development_reports.len() {
+        if static_context_safe_profile_precedes(
+            &development_reports[index],
+            &development_reports[selected_index],
+        ) {
+            selected_index = index;
+        }
+    }
+    let selected_profile = profiles[selected_index];
+    let development_selected = development_reports[selected_index];
+    let development_gate_passed = development_selected.correct_top_one_gained > 0
+        && development_selected.correct_top_one_lost == 0
+        && development_selected.non_target_top_one_changes == 0;
+    let held_out_baseline =
+        evaluate_static_context_profile(&held_out_cases, &language_model, profiles[0])?;
+    let held_out_selected =
+        evaluate_static_context_profile(&held_out_cases, &language_model, selected_profile)?;
+    let held_out_gate_passed = held_out_selected.correct_top_one_gained > 0
+        && held_out_selected.correct_top_one_lost == 0
+        && held_out_selected.non_target_top_one_changes == 0;
+
+    let mut output = String::new();
+    writeln!(output, "公开单字左上下文最终验证")?;
+    writeln!(
+        output,
+        "模型：{} 字节 · SHA-256 {} · 声明 {}-gram · 本次使用 {}-gram",
+        language_model.bytes,
+        language_model.sha256,
+        language_model.declared_order,
+        language_model.effective_order,
+    )?;
+    writeln!(
+        output,
+        "句界：{}",
+        if language_model.sentence_boundaries {
+            "模型提供 <s>/</s>"
+        } else {
+            "模型未提供；按空上下文起始且不添加句末分"
+        }
+    )?;
+    writeln!(
+        output,
+        "稀疏装载：需要 {} 条 N-gram，实际命中 {}；候选所需词型中 {} 个映射为 <unk>",
+        language_model.required_ngrams,
+        language_model.records.len(),
+        language_model.unknown_query_tokens,
+    )?;
+    writeln!(
+        output,
+        "核心词典：{} 条 · SHA-256 {}",
+        core_entries.len(),
+        candidate_sha256_hex(core_text.as_bytes()),
+    )?;
+    write_single_character_context_selection(
+        &mut output,
+        "开发",
+        &development,
+        &development_text,
+        development_selection,
+        frontier_limit,
+    )?;
+    write_single_character_context_selection(
+        &mut output,
+        "最终保留评测",
+        &held_out,
+        &held_out_text,
+        held_out_selection,
+        frontier_limit,
+    )?;
+    writeln!(output, "\n开发集档位")?;
+    for (profile, report) in profiles.iter().zip(&development_reports) {
+        write_static_context_profile_report(&mut output, *profile, report, frontier_limit)?;
+    }
+    writeln!(
+        output,
+        "开发选择：{}；只允许正确首选损失为 0、非目标首选变化为 0 的档位竞争，再最大化新增正确首选。",
+        static_context_profile_label(selected_profile),
+    )?;
+    writeln!(output, "\n最终保留评测")?;
+    write_static_context_profile_report(
+        &mut output,
+        profiles[0],
+        &held_out_baseline,
+        frontier_limit,
+    )?;
+    write_static_context_profile_report(
+        &mut output,
+        selected_profile,
+        &held_out_selected,
+        frontier_limit,
+    )?;
+    if development_gate_passed && held_out_gate_passed {
+        output.push_str(
+            "结论：开发集与最终保留集都净改善，且没有正确首选损失或非目标首选变化；可以继续研究离线蒸馏与运行时成本，但本次没有生成或接入运行时资料。\n",
+        );
+    } else {
+        output.push_str(
+            "结论：开发集或最终保留集未通过严格安全门；不得把该配置或由它推导的排序资料接入运行时。\n",
+        );
+    }
+    output.push_str(
+        "边界：开发集可以选择预声明档位；最终保留集只运行冻结基线与开发集选中的一个档位。候选来自当前两键码已有精确单字池，最多提升一个挑战者，不创建候选、不读取个人记录。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
 fn freeze_single_character_context_cases(
     corpus: &ziranma_core::UdCorpus,
     core_entries: &[LexiconEntry],
@@ -4963,6 +5248,30 @@ fn static_context_profile_precedes(
                 .at_three
                 .cmp(&current.candidate.at_three)
         })
+        .is_gt()
+}
+
+fn static_context_safe_profile_precedes(
+    challenger: &StaticContextProfileReport,
+    current: &StaticContextProfileReport,
+) -> bool {
+    let challenger_safe =
+        challenger.correct_top_one_lost == 0 && challenger.non_target_top_one_changes == 0;
+    let current_safe = current.correct_top_one_lost == 0 && current.non_target_top_one_changes == 0;
+    challenger_safe
+        .cmp(&current_safe)
+        .then_with(|| {
+            challenger
+                .correct_top_one_gained
+                .cmp(&current.correct_top_one_gained)
+        })
+        .then_with(|| {
+            challenger
+                .candidate
+                .at_three
+                .cmp(&current.candidate.at_three)
+        })
+        .then_with(|| challenger.candidate.at_five.cmp(&current.candidate.at_five))
         .is_gt()
 }
 
@@ -8556,6 +8865,51 @@ mod tests {
     }
 
     #[test]
+    fn single_character_context_validation_parser_binds_development_and_final_holdout() {
+        assert_eq!(
+            parse_options([
+                "single-character-context-validation-audit".to_owned(),
+                "--model".to_owned(),
+                "public.arpa".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--development-corpus".to_owned(),
+                "dev.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "holdout.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "50".to_owned(),
+                "--sample-limit".to_owned(),
+                "512".to_owned(),
+                "--max-order".to_owned(),
+                "3".to_owned(),
+            ])
+            .unwrap(),
+            Options::SingleCharacterContextValidationAudit {
+                model: PathBuf::from("public.arpa"),
+                core_payload: PathBuf::from("core.tsv"),
+                development_corpus: PathBuf::from("dev.conllu"),
+                held_out_corpus: PathBuf::from("holdout.conllu"),
+                frontier_limit: 50,
+                sample_limit: 512,
+                max_order: 3,
+            }
+        );
+        assert!(
+            parse_options([
+                "single-character-context-validation-audit".to_owned(),
+                "--frontier-limit".to_owned(),
+                "51".to_owned(),
+                "--sample-limit".to_owned(),
+                "1".to_owned(),
+                "--max-order".to_owned(),
+                "3".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn single_character_context_profiles_extend_only_the_fit_search() {
         let shared = static_context_profiles();
         let single = single_character_context_profiles();
@@ -8570,6 +8924,34 @@ mod tests {
                 profile.search_depth == 50 && profile.minimum_average_gain == 4.0
             })
         );
+    }
+
+    #[test]
+    fn strict_context_profile_selection_rejects_any_collateral_top_one_change() {
+        let baseline = StaticContextProfileReport::default();
+        let unsafe_gain = StaticContextProfileReport {
+            correct_top_one_gained: 20,
+            non_target_top_one_changes: 1,
+            ..StaticContextProfileReport::default()
+        };
+        let safe_gain = StaticContextProfileReport {
+            correct_top_one_gained: 1,
+            ..StaticContextProfileReport::default()
+        };
+        let safer_larger_gain = StaticContextProfileReport {
+            correct_top_one_gained: 2,
+            ..StaticContextProfileReport::default()
+        };
+
+        assert!(!static_context_safe_profile_precedes(
+            &unsafe_gain,
+            &baseline
+        ));
+        assert!(static_context_safe_profile_precedes(&safe_gain, &baseline));
+        assert!(static_context_safe_profile_precedes(
+            &safer_larger_gain,
+            &safe_gain
+        ));
     }
 
     #[test]
@@ -10091,6 +10473,79 @@ ngram 2=6\n\n\
             assert!(!report.contains(text));
         }
         assert!(audit_single_character_context(&model, &core, &fit, &fit, 8, 8, 2).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_character_context_validation_uses_strict_development_selection() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲\tjia\t1000\n\
+钾\tjia\t100\n\
+前词\tqian ci\t1000\n\
+另词\tling ci\t900\n";
+        const DEVELOPMENT: &str = "# sent_id = dev-1\n\
+1\t前词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t钾\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        const HELD_OUT: &str = "# sent_id = held-1\n\
+1\t另词\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t钾\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        const ARPA: &str = "\\data\\\n\
+ngram 1=5\n\
+ngram 2=4\n\n\
+\\1-grams:\n\
+-2.0 <unk> 0\n\
+-0.1 甲 0\n\
+-0.1 钾 0\n\
+-0.1 前词 0\n\
+-0.1 另词 0\n\n\
+\\2-grams:\n\
+-3.0 前词 甲\n\
+-0.1 前词 钾\n\
+-3.0 另词 甲\n\
+-0.1 另词 钾\n\n\
+\\end\\\n";
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let development = root.join("development.conllu");
+        let held_out = root.join("held-out.conllu");
+        let model = root.join("public.arpa");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&development, DEVELOPMENT).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+        fs::write(&model, ARPA).unwrap();
+
+        let report = audit_single_character_context_validation(
+            &model,
+            &core,
+            &development,
+            &held_out,
+            8,
+            8,
+            2,
+        )
+        .unwrap();
+        assert!(report.contains("公开单字左上下文最终验证"));
+        assert!(report.contains("开发选择：ARPA-d8-g0.10"));
+        assert!(report.contains("开发集与最终保留集都净改善"));
+        assert!(report.contains("最终保留集只运行冻结基线与开发集选中的一个档位"));
+        assert!(report.contains("本次操作：只读"));
+        for text in ["甲", "钾", "前词", "另词"] {
+            assert!(!report.contains(text));
+        }
+        assert!(
+            audit_single_character_context_validation(
+                &model,
+                &core,
+                &development,
+                &development,
+                8,
+                8,
+                2,
+            )
+            .is_err()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
