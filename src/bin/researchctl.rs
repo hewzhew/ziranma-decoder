@@ -23,6 +23,7 @@ const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
 const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
 const CANDIDATE_SOURCE_KIND_COUNT: usize = 11;
+const INITIAL_NON_TOP_RANK_BUCKET_COUNT: usize = 3;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
     (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
     (
@@ -535,6 +536,8 @@ struct InitialNonTopEvidence {
     top_provenance_observations: usize,
     top_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
     source_pairs: [[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
+    source_pairs_by_rank: [[[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT];
+        INITIAL_NON_TOP_RANK_BUCKET_COUNT],
     precise_personalization_identities: usize,
     precise_target_missing: usize,
     precise_top_missing: usize,
@@ -1036,6 +1039,20 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
+            "首次非首选来源配对按位置：第 2 名 {}/{}（{}）；第 3–6 名 {}/{}（{}）；第 7 名以后 {}/{}（{}）。",
+            candidate_source_pair_observations(&initial.source_pairs_by_rank[0]),
+            initial.rank_two,
+            render_candidate_source_pairs_with_limit(&initial.source_pairs_by_rank[0], 3),
+            candidate_source_pair_observations(&initial.source_pairs_by_rank[1]),
+            initial.rank_three_to_six,
+            render_candidate_source_pairs_with_limit(&initial.source_pairs_by_rank[1], 3),
+            candidate_source_pair_observations(&initial.source_pairs_by_rank[2]),
+            initial.rank_after_first_page,
+            render_candidate_source_pairs_with_limit(&initial.source_pairs_by_rank[2], 3),
+        )
+        .unwrap();
+        writeln!(
+            output,
             "首次非首选精确个性化：V11+ 覆盖 {}/{}；目标原因 {}（来源缺失 {}）；当时首选原因 {}（来源缺失 {}）。",
             initial.precise_personalization_identities,
             initial.identities,
@@ -1184,8 +1201,12 @@ impl ResearchReview {
                 pattern.first_provenance,
                 pattern.first_global_top_provenance,
             ) {
-                evidence.source_pairs[candidate_source_index(target.source())]
-                    [candidate_source_index(top.source())] += 1;
+                let target_index = candidate_source_index(target.source());
+                let top_index = candidate_source_index(top.source());
+                evidence.source_pairs[target_index][top_index] += 1;
+                if let Some(bucket) = pattern.first_rank.and_then(initial_non_top_rank_bucket) {
+                    evidence.source_pairs_by_rank[bucket][target_index][top_index] += 1;
+                }
             }
 
             if pattern.first_precise_personalization {
@@ -2010,6 +2031,13 @@ fn candidate_source_pair_observations(
 fn render_candidate_source_pairs(
     counts: &[[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
 ) -> String {
+    render_candidate_source_pairs_with_limit(counts, 6)
+}
+
+fn render_candidate_source_pairs_with_limit(
+    counts: &[[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
+    limit: usize,
+) -> String {
     let mut pairs = counts
         .iter()
         .enumerate()
@@ -2028,7 +2056,7 @@ fn render_candidate_source_pairs(
             .then_with(|| left.2.cmp(&right.2))
     });
     let total = pairs.iter().map(|(count, _, _)| *count).sum::<usize>();
-    let leading = pairs.into_iter().take(6).collect::<Vec<_>>();
+    let leading = pairs.into_iter().take(limit).collect::<Vec<_>>();
     let shown = leading.iter().map(|(count, _, _)| *count).sum::<usize>();
     let mut rendered = leading
         .into_iter()
@@ -2048,6 +2076,15 @@ fn render_candidate_source_pairs(
         "暂无".to_owned()
     } else {
         rendered.join("、")
+    }
+}
+
+fn initial_non_top_rank_bucket(rank: usize) -> Option<usize> {
+    match rank {
+        2 => Some(0),
+        3..=6 => Some(1),
+        7.. => Some(2),
+        _ => None,
     }
 }
 
@@ -2382,6 +2419,15 @@ mod tests {
             [candidate_source_index(NativeCandidateSource::PublicConsensusExact)] = 1;
         source_pairs[candidate_source_index(NativeCandidateSource::CoreExact)]
             [candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
+        let mut source_pairs_by_rank = [[[0; CANDIDATE_SOURCE_KIND_COUNT];
+            CANDIDATE_SOURCE_KIND_COUNT];
+            INITIAL_NON_TOP_RANK_BUCKET_COUNT];
+        source_pairs_by_rank[0][candidate_source_index(NativeCandidateSource::CoreExact)]
+            [candidate_source_index(NativeCandidateSource::PublicConsensusExact)] = 1;
+        source_pairs_by_rank[0][candidate_source_index(NativeCandidateSource::CoreExact)]
+            [candidate_source_index(NativeCandidateSource::CoreExact)] = 1;
+        source_pairs_by_rank[1][candidate_source_index(NativeCandidateSource::CoreExact)]
+            [candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
         let mut precise_target_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
         precise_target_personalization[0] = 1;
         let mut precise_top_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
@@ -2398,6 +2444,7 @@ mod tests {
                 top_provenance_observations: 5,
                 top_sources,
                 source_pairs,
+                source_pairs_by_rank,
                 precise_personalization_identities: 4,
                 precise_target_missing: 1,
                 precise_top_missing: 1,
@@ -2416,6 +2463,9 @@ mod tests {
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("首次第 2 名 2、第 3–6 名 2、第 7 名以后 3"));
         assert!(rendered.contains("核心整词→核心整词 3、核心整词→公开共识整词 1"));
+        assert!(rendered.contains("第 2 名 2/2（核心整词→核心整词 1、核心整词→公开共识整词 1）"));
+        assert!(rendered.contains("第 3–6 名 2/2（核心整词→核心整词 2）"));
+        assert!(rendered.contains("第 7 名以后 0/3（暂无）"));
         assert!(rendered.contains("V11+ 覆盖 4/7"));
         assert!(rendered.contains("目标原因 持久精确 1（来源缺失 1）"));
         assert!(rendered.contains("当时首选原因 左侧上下文 1（来源缺失 1）"));
@@ -2425,6 +2475,7 @@ mod tests {
             *count = top_index + 1;
         }
         assert!(render_candidate_source_pairs(&crowded_pairs).ends_with("其余 1"));
+        assert!(render_candidate_source_pairs_with_limit(&crowded_pairs, 3).ends_with("其余 10"));
         for private_value in [
             "precise-paired",
             "precise-empty",
