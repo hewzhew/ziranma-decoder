@@ -27,6 +27,7 @@ const POPUP_LATENCY_TAIL_THRESHOLDS_MS: [u32; 4] = [16, 32, 64, 128];
 const CANDIDATE_SOURCE_KIND_COUNT: usize = 11;
 const PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT: usize = 3;
 const INITIAL_NON_TOP_RANK_BUCKET_COUNT: usize = 3;
+const NON_TOP_KEY_LENGTH_BUCKET_COUNT: usize = 5;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
     (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
     (
@@ -531,6 +532,7 @@ struct TopRegressionEvidence {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct InitialNonTopEvidence {
     identities: usize,
+    key_length_buckets: [usize; NON_TOP_KEY_LENGTH_BUCKET_COUNT],
     rank_two: usize,
     rank_three_to_six: usize,
     rank_after_first_page: usize,
@@ -1061,6 +1063,16 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
+            "首次非首选键长（不含原码）：1–2 键 {}、3–4 键 {}、5–6 键 {}、7–8 键 {}、9 键及以上 {}。",
+            initial.key_length_buckets[0],
+            initial.key_length_buckets[1],
+            initial.key_length_buckets[2],
+            initial.key_length_buckets[3],
+            initial.key_length_buckets[4],
+        )
+        .unwrap();
+        writeln!(
+            output,
             "首次非首选来源配对（目标→当时首选）：完整 {}/{}；主要配对（最多 6 类）{}。",
             candidate_source_pair_observations(&initial.source_pairs),
             initial.identities,
@@ -1207,12 +1219,13 @@ impl ResearchReview {
 
     fn initial_non_top_evidence(&self) -> InitialNonTopEvidence {
         let mut evidence = InitialNonTopEvidence::default();
-        for pattern in self
+        for ((code, _), pattern) in self
             .selections
-            .values()
-            .filter(|pattern| pattern.first_rank.is_some_and(|rank| rank > 1))
+            .iter()
+            .filter(|(_, pattern)| pattern.first_rank.is_some_and(|rank| rank > 1))
         {
             evidence.identities += 1;
+            evidence.key_length_buckets[non_top_key_length_bucket(code)] += 1;
             match pattern.first_rank {
                 Some(2) => evidence.rank_two += 1,
                 Some(3..=6) => evidence.rank_three_to_six += 1,
@@ -2161,6 +2174,16 @@ fn initial_non_top_rank_bucket(rank: usize) -> Option<usize> {
     }
 }
 
+fn non_top_key_length_bucket(code: &str) -> usize {
+    match code.len() {
+        0..=2 => 0,
+        3..=4 => 1,
+        5..=6 => 2,
+        7..=8 => 3,
+        _ => 4,
+    }
+}
+
 fn render_candidate_personalization_counts(
     counts: &[usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
 ) -> String {
@@ -2509,6 +2532,7 @@ mod tests {
             review.initial_non_top_evidence(),
             InitialNonTopEvidence {
                 identities: 7,
+                key_length_buckets: [0, 0, 0, 0, 7],
                 rank_two: 2,
                 rank_three_to_six: 2,
                 rank_after_first_page: 3,
@@ -2535,6 +2559,9 @@ mod tests {
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("首次第 2 名 2、第 3–6 名 2、第 7 名以后 3"));
+        assert!(rendered.contains(
+            "首次非首选键长（不含原码）：1–2 键 0、3–4 键 0、5–6 键 0、7–8 键 0、9 键及以上 7"
+        ));
         assert!(rendered.contains("核心整词→核心整词 3、核心整词→公开共识整词 1"));
         assert!(rendered.contains("第 2 名 2/2（核心整词→核心整词 1、核心整词→公开共识整词 1）"));
         assert!(rendered.contains("第 3–6 名 2/2（核心整词→核心整词 2）"));
@@ -2889,6 +2916,24 @@ mod tests {
             "private",
         ] {
             assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn non_top_key_length_buckets_cover_every_boundary_without_text() {
+        for (code, expected) in [
+            ("", 0),
+            ("a", 0),
+            ("ab", 0),
+            ("abc", 1),
+            ("abcd", 1),
+            ("abcde", 2),
+            ("abcdef", 2),
+            ("abcdefg", 3),
+            ("abcdefgh", 3),
+            ("abcdefghi", 4),
+        ] {
+            assert_eq!(non_top_key_length_bucket(code), expected);
         }
     }
 
