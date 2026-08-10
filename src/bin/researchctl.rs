@@ -304,8 +304,11 @@ struct SelectionPressure {
     competing_non_top_codes: usize,
     single_output_non_top_codes: usize,
     first_non_top_identities: usize,
-    later_top_identities: usize,
-    never_top_identities: usize,
+    single_observation_first_non_top_identities: usize,
+    followup_first_non_top_identities: usize,
+    first_non_top_later_top_identities: usize,
+    followup_first_non_top_never_top_identities: usize,
+    first_top_later_non_top_identities: usize,
 }
 
 #[derive(Default)]
@@ -530,19 +533,42 @@ impl ResearchReview {
                 .values()
                 .filter(|pattern| pattern.first_rank.is_some_and(|rank| rank > 1))
                 .count(),
-            later_top_identities: self
+            single_observation_first_non_top_identities: self
+                .selections
+                .values()
+                .filter(|pattern| {
+                    pattern.selections == 1 && pattern.first_rank.is_some_and(|rank| rank > 1)
+                })
+                .count(),
+            followup_first_non_top_identities: self
+                .selections
+                .values()
+                .filter(|pattern| {
+                    pattern.selections >= 2 && pattern.first_rank.is_some_and(|rank| rank > 1)
+                })
+                .count(),
+            first_non_top_later_top_identities: self
                 .selections
                 .values()
                 .filter(|pattern| {
                     pattern.selections >= 2
                         && pattern.first_rank.is_some_and(|rank| rank > 1)
-                        && pattern.last_rank == Some(1)
+                        && pattern.minimum_rank == 1
                 })
                 .count(),
-            never_top_identities: self
+            followup_first_non_top_never_top_identities: self
                 .selections
                 .values()
-                .filter(|pattern| pattern.non_top_selections != 0 && pattern.minimum_rank > 1)
+                .filter(|pattern| {
+                    pattern.selections >= 2
+                        && pattern.first_rank.is_some_and(|rank| rank > 1)
+                        && pattern.minimum_rank > 1
+                })
+                .count(),
+            first_top_later_non_top_identities: self
+                .selections
+                .values()
+                .filter(|pattern| pattern.first_rank == Some(1) && pattern.non_top_selections != 0)
                 .count(),
             ..SelectionPressure::default()
         };
@@ -572,10 +598,13 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "学习轨迹（不含文字）：首次非首选身份 {}；后来成为首选 {}；观察期内从未到首选 {}；原码身份 {}。",
+            "学习轨迹（不含文字）：首次非首选身份 {}；只提交过一次 {}；有后续提交 {}（其中到过首选 {}、仍未到首选 {}）；首次首选后又出现非首选 {}；原码身份 {}。",
             pressure.first_non_top_identities,
-            pressure.later_top_identities,
-            pressure.never_top_identities,
+            pressure.single_observation_first_non_top_identities,
+            pressure.followup_first_non_top_identities,
+            pressure.first_non_top_later_top_identities,
+            pressure.followup_first_non_top_never_top_identities,
+            pressure.first_top_later_non_top_identities,
             self.raw_codes.len(),
         )
         .unwrap();
@@ -1299,10 +1328,10 @@ mod tests {
     fn aggregate_selection_pressure_distinguishes_competing_and_cold_identities() {
         let mut review = ResearchReview::default();
         for (code, text, ranks) in [
-            ("same", "alpha", vec![2, 1]),
+            ("same", "alpha", vec![2, 1, 2]),
             ("same", "beta", vec![2]),
-            ("cold", "gamma", vec![3]),
-            ("easy", "delta", vec![1]),
+            ("cold", "gamma", vec![3, 2]),
+            ("easy", "delta", vec![1, 2]),
         ] {
             let pattern = review
                 .selections
@@ -1313,21 +1342,38 @@ mod tests {
             }
         }
 
+        let pressure = review.selection_pressure();
         assert_eq!(
-            review.selection_pressure(),
+            pressure,
             SelectionPressure {
                 observed_codes: 3,
                 multi_output_codes: 1,
                 competing_non_top_codes: 1,
-                single_output_non_top_codes: 1,
+                single_output_non_top_codes: 2,
                 first_non_top_identities: 3,
-                later_top_identities: 1,
-                never_top_identities: 2,
+                single_observation_first_non_top_identities: 1,
+                followup_first_non_top_identities: 2,
+                first_non_top_later_top_identities: 1,
+                followup_first_non_top_never_top_identities: 1,
+                first_top_later_non_top_identities: 1,
             }
+        );
+        assert_eq!(
+            pressure.first_non_top_identities,
+            pressure.single_observation_first_non_top_identities
+                + pressure.followup_first_non_top_identities
+        );
+        assert_eq!(
+            pressure.followup_first_non_top_identities,
+            pressure.first_non_top_later_top_identities
+                + pressure.followup_first_non_top_never_top_identities
         );
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("至少两种文字都曾从非首选提交 1"));
+        assert!(rendered.contains("只提交过一次 1"));
+        assert!(rendered.contains("有后续提交 2（其中到过首选 1、仍未到首选 1）"));
+        assert!(rendered.contains("首次首选后又出现非首选 1"));
         for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
             assert!(!rendered.contains(private_value));
         }
