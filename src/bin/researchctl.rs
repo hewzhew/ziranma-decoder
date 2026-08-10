@@ -3,6 +3,7 @@ use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use ziranma_core::{
     NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
@@ -17,6 +18,8 @@ use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
 
 const MAX_REVIEW_BATCHES: usize = 4_096;
 const MAX_REVIEW_ITEMS: usize = 12;
+const PARALLEL_LOAD_THRESHOLD: usize = 32;
+const MAX_PARALLEL_LOADERS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
@@ -109,12 +112,10 @@ fn print_summary(root: &Path) -> Result<(), Box<dyn Error>> {
     let available_batches = packages.len();
     packages.truncate(MAX_REVIEW_BATCHES);
     packages.reverse();
+    let snapshots = load_research_snapshots(root, &packages)?;
     let mut review = ResearchReview::default();
-    let mut snapshots = Vec::with_capacity(packages.len());
-    for package in packages {
-        let snapshot = load_wish_snapshot(root, package.id(), &WindowsUserDataProtector)?;
-        review.observe(&snapshot)?;
-        snapshots.push(snapshot);
+    for snapshot in &snapshots {
+        review.observe(snapshot)?;
     }
     review.available_batches = available_batches;
     let latest_runtime = match latest_runtime_review(&snapshots)? {
@@ -139,12 +140,10 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
     let available_batches = packages.len();
     packages.truncate(MAX_REVIEW_BATCHES);
     packages.reverse();
+    let snapshots = load_research_snapshots(root, &packages)?;
     let mut review = ResearchReview::default();
-    let mut snapshots = Vec::with_capacity(packages.len());
-    for package in packages {
-        let snapshot = load_wish_snapshot(root, package.id(), &WindowsUserDataProtector)?;
-        review.observe(&snapshot)?;
-        snapshots.push(snapshot);
+    for snapshot in &snapshots {
+        review.observe(snapshot)?;
     }
     review.available_batches = available_batches;
     let latest_runtime = latest_runtime_review(&snapshots)?;
@@ -164,6 +163,53 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
         render_scene_analysis(&scenes)
     );
     Ok(())
+}
+
+#[cfg(windows)]
+fn load_research_snapshots(
+    root: &Path,
+    packages: &[ziranma_core::WishPackageInfo],
+) -> Result<Vec<WishSnapshot>, ziranma_core::WishFeedbackError> {
+    let available = thread::available_parallelism().map_or(1, usize::from);
+    let workers = available.min(MAX_PARALLEL_LOADERS);
+    ordered_bounded_map(packages, workers, |package| {
+        load_wish_snapshot(root, package.id(), &WindowsUserDataProtector)
+    })
+}
+
+fn ordered_bounded_map<T, U, E, F>(
+    items: &[T],
+    maximum_workers: usize,
+    operation: F,
+) -> Result<Vec<U>, E>
+where
+    T: Sync,
+    U: Send,
+    E: Send,
+    F: Fn(&T) -> Result<U, E> + Sync,
+{
+    let worker_count = maximum_workers.max(1).min(items.len().max(1));
+    if worker_count == 1 || items.len() < PARALLEL_LOAD_THRESHOLD {
+        return items.iter().map(&operation).collect();
+    }
+    let chunk_size = items.len().div_ceil(worker_count);
+    thread::scope(|scope| {
+        let handles = items
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(|| chunk.iter().map(&operation).collect::<Result<Vec<_>, E>>())
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::with_capacity(items.len());
+        for handle in handles {
+            output.extend(
+                handle
+                    .join()
+                    .expect("bounded research loader worker must not panic")?,
+            );
+        }
+        Ok(output)
+    })
 }
 
 #[cfg(windows)]
@@ -1169,6 +1215,29 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_parallel_map_preserves_order_and_propagates_errors() {
+        let inputs = (0_u32..96).collect::<Vec<_>>();
+        assert_eq!(
+            ordered_bounded_map(&inputs, 4, |value| Ok::<_, u32>(value * 3)).unwrap(),
+            inputs.iter().map(|value| value * 3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ordered_bounded_map(&inputs, 4, |value| {
+                if *value == 37 {
+                    Err(*value)
+                } else {
+                    Ok(*value)
+                }
+            }),
+            Err(37)
+        );
+        assert_eq!(
+            ordered_bounded_map(&inputs[..8], 4, |value| Ok::<_, u32>(*value)).unwrap(),
+            inputs[..8]
+        );
+    }
 
     #[test]
     fn parser_requires_the_private_capture_confirmation_only_for_enable() {
