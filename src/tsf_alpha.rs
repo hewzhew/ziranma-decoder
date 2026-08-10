@@ -37,12 +37,12 @@ use crate::{
     LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
     NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
-    NativeCancellationSource, NativeCandidateProvenance, NativeCandidateSource,
-    NativeCandidateView, NativeFeedbackAuthorization, NativeFeedbackClearResult,
-    NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackFreezeAuthorization,
-    NativeFeedbackLifecycle, NativeFeedbackLimits, NativeFeedbackRecordResult,
-    NativeFeedbackSession, NativeFeedbackStartResult, NativeFeedbackStopResult,
-    NativeFeedbackSummary, NativeSelectionSource, NativeTabAssemblyState,
+    NativeCancellationSource, NativeCandidatePersonalization, NativeCandidateProvenance,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackAuthorization,
+    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
+    NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle, NativeFeedbackLimits,
+    NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
+    NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource, NativeTabAssemblyState,
     PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
     PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
     PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
@@ -348,7 +348,7 @@ struct CandidateBatch {
 fn mirror_candidate_promotion(
     batch: &mut CandidateBatch,
     promotion: CandidateTextPromotion,
-    mark_personalized: bool,
+    personalization: NativeCandidatePersonalization,
 ) {
     let final_len = batch.candidates.len();
     if !promotion.mirror_into(
@@ -361,8 +361,13 @@ fn mirror_candidate_promotion(
     if !promotion.mirror_into(&mut batch.personalized, false, final_len) {
         batch.personalized = vec![false; final_len];
     }
-    if mark_personalized && let Some(marker) = batch.personalized.get_mut(promotion.index) {
-        *marker = true;
+    if !personalization.is_empty() {
+        if let Some(provenance) = batch.provenance.get_mut(promotion.index) {
+            provenance.add_personalization(personalization);
+        }
+        if let Some(marker) = batch.personalized.get_mut(promotion.index) {
+            *marker = true;
+        }
     }
 }
 
@@ -1518,9 +1523,9 @@ impl CandidateDisplay {
             self.visible_provenance()
                 .iter()
                 .map(|item| {
-                    NativeCandidateProvenance::new(
+                    NativeCandidateProvenance::with_personalization(
                         NativeCandidateSource::Shape,
-                        item.session_promoted(),
+                        item.personalization(),
                     )
                 })
                 .collect()
@@ -8062,7 +8067,11 @@ impl TsfTextService_Impl {
                 protected_prefix,
             );
             if let Some(promotion) = persistent_exact_promotion {
-                mirror_candidate_promotion(&mut batch, promotion, true);
+                mirror_candidate_promotion(
+                    &mut batch,
+                    promotion,
+                    NativeCandidatePersonalization::PERSISTENT_EXACT,
+                );
             }
             let persistent_anchored_promotion =
                 if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
@@ -8076,7 +8085,11 @@ impl TsfTextService_Impl {
                     None
                 };
             if let Some(promotion) = persistent_anchored_promotion {
-                mirror_candidate_promotion(&mut batch, promotion, true);
+                mirror_candidate_promotion(
+                    &mut batch,
+                    promotion,
+                    NativeCandidatePersonalization::PERSISTENT_ANCHORED,
+                );
             }
             let personal_discovery_promotion = if persistent_exact_promotion.is_none()
                 && persistent_anchored_promotion.is_none()
@@ -8093,7 +8106,11 @@ impl TsfTextService_Impl {
                 None
             };
             if let Some(promotion) = personal_discovery_promotion {
-                mirror_candidate_promotion(&mut batch, promotion, true);
+                mirror_candidate_promotion(
+                    &mut batch,
+                    promotion,
+                    NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
+                );
             }
             let session_anchored_promotion =
                 if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
@@ -8111,7 +8128,11 @@ impl TsfTextService_Impl {
                     None
                 };
             if let Some(promotion) = session_anchored_promotion {
-                mirror_candidate_promotion(&mut batch, promotion, true);
+                mirror_candidate_promotion(
+                    &mut batch,
+                    promotion,
+                    NativeCandidatePersonalization::SESSION_ANCHORED,
+                );
             }
             let session_exact_promotion = session_exact_text.and_then(|_| {
                 selection_memory.promote_texts_after_decision(
@@ -8121,10 +8142,12 @@ impl TsfTextService_Impl {
                 )
             });
             if let Some(promotion) = session_exact_promotion {
-                mirror_candidate_promotion(&mut batch, promotion, true);
+                mirror_candidate_promotion(
+                    &mut batch,
+                    promotion,
+                    NativeCandidatePersonalization::SESSION_EXACT,
+                );
             }
-            let session_promotion = session_exact_promotion.or(session_anchored_promotion);
-            let mut session_changed = session_promotion.is_some_and(|promotion| promotion.changed);
             if automatic_transposition_request.is_none()
                 && let Some(previous) = left_context.as_deref()
             {
@@ -8143,14 +8166,16 @@ impl TsfTextService_Impl {
                         },
                     );
                 if let Some(promotion) = context_promotion {
-                    mirror_candidate_promotion(&mut batch, promotion, promotion.changed);
+                    mirror_candidate_promotion(
+                        &mut batch,
+                        promotion,
+                        if promotion.changed {
+                            NativeCandidatePersonalization::LEFT_CONTEXT
+                        } else {
+                            NativeCandidatePersonalization::NONE
+                        },
+                    );
                 }
-                let context_changed = context_promotion.is_some_and(|promotion| promotion.changed);
-                session_changed |= context_changed;
-            }
-            if session_changed && let Some(provenance) = batch.provenance.get_mut(protected_prefix)
-            {
-                *provenance = NativeCandidateProvenance::new(provenance.source(), true);
             }
         }
         if batch.candidates.len() > limit {
@@ -10351,10 +10376,15 @@ mod tests {
                 source_index: Some(2),
                 changed: true,
             },
-            true,
+            NativeCandidatePersonalization::SESSION_EXACT,
         );
 
         assert_eq!(batch.personalized, [true, false, true]);
+        assert!(
+            batch.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_EXACT)
+        );
     }
 
     #[test]
@@ -15904,6 +15934,11 @@ mod tests {
             Some("雀魂")
         );
         assert_eq!(recalled.personalized.first(), Some(&true));
+        assert!(
+            recalled.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
         drop(second);
 
         fs::remove_dir_all(parent).unwrap();
@@ -15966,6 +16001,11 @@ mod tests {
             .unwrap();
         assert_eq!(discovered.candidates, ["固定", "其他", "雀魂", "雀跃"]);
         assert_eq!(discovered.personalized, [false, false, true, false]);
+        assert!(
+            discovered.provenance[2]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_DISCOVERY)
+        );
 
         let mut short_session = CompositionSession::default();
         short_session.apply(CompositionInput::Letters("qth".to_owned()));
@@ -16056,6 +16096,11 @@ mod tests {
             .unwrap();
         assert_eq!(adopted.candidates, ["固定", "雀魂", "其他", "雀跃"]);
         assert_eq!(adopted.personalized, [false, true, false, false]);
+        assert!(
+            adopted.provenance[1]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
     }
 
     #[test]
@@ -16097,6 +16142,11 @@ mod tests {
             .unwrap();
         assert_eq!(discovered.candidates, ["固定", "其他", "雀魂", "雀跃"]);
         assert_eq!(discovered.personalized, [false, false, true, false]);
+        assert!(
+            discovered.provenance[2]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_DISCOVERY)
+        );
         drop(second);
 
         fs::remove_dir_all(parent).unwrap();
@@ -16771,6 +16821,11 @@ mod tests {
             NativeCandidateSource::SupplementalExact
         );
         assert!(
+            promoted.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_EXACT)
+        );
+        assert!(
             promoted.provenance[1..]
                 .iter()
                 .all(|item| !item.session_promoted())
@@ -16854,6 +16909,11 @@ mod tests {
                 .iter()
                 .all(|item| !item.session_promoted())
         );
+        assert!(
+            inherited.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_ANCHORED)
+        );
 
         let unrelated = service
             .load_candidate_batch(
@@ -16875,6 +16935,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exact.candidates, ["降价", "简单", "讲讲"]);
+        assert!(
+            exact.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
     }
 
     #[test]
@@ -16902,6 +16967,11 @@ mod tests {
             .unwrap();
         assert_eq!(candidates.candidates, ["讲讲", "简单", "降价"]);
         assert_eq!(candidates.personalized, [true, false, false]);
+        assert!(
+            candidates.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_ANCHORED)
+        );
         assert_eq!(
             persistent_provider.exact_calls.load(Ordering::Relaxed),
             1,
@@ -16928,6 +16998,11 @@ mod tests {
             .unwrap();
         assert_eq!(candidates.candidates, ["讲讲", "简单", "降价"]);
         assert_eq!(candidates.personalized, [true, false, false]);
+        assert!(
+            candidates.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_ANCHORED)
+        );
         assert_eq!(
             session_provider.exact_calls.load(Ordering::Relaxed),
             1,
@@ -16960,6 +17035,11 @@ mod tests {
             .unwrap();
         assert_eq!(inherited.candidates, ["讲讲", "简单", "降价"]);
         assert!(inherited.provenance[0].session_promoted());
+        assert!(
+            inherited.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_ANCHORED)
+        );
 
         let enter = service
             .plan_key(
@@ -17197,6 +17277,11 @@ mod tests {
             .unwrap();
         assert_eq!(promoted.candidates, ["乙", "甲", "丙"]);
         assert!(!promoted.provenance[0].session_promoted());
+        assert!(
+            promoted.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
     }
 
     #[test]
@@ -17276,6 +17361,11 @@ mod tests {
             Some("试手")
         );
         assert!(!persistent.provenance[0].session_promoted());
+        assert!(
+            persistent.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
     }
 
     #[test]
@@ -17330,6 +17420,16 @@ mod tests {
         assert_eq!(matching.candidates[0], "把");
         assert!(matching.may_have_more);
         assert!(matching.provenance[0].session_promoted());
+        assert!(
+            matching.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::LEFT_CONTEXT)
+        );
+        assert!(
+            matching.provenance[1]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
 
         service.set_personal_left_context("无关");
         let unrelated = service
@@ -17712,6 +17812,11 @@ mod tests {
             Some("试手")
         );
         assert!(!promoted.provenance[0].session_promoted());
+        assert!(
+            promoted.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
         drop(second);
 
         fs::remove_dir_all(parent).unwrap();
@@ -17987,6 +18092,11 @@ mod tests {
             .unwrap();
         assert_eq!(promoted.candidates, ["乙", "甲", "丙"]);
         assert!(!promoted.provenance[0].session_promoted());
+        assert!(
+            promoted.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
         drop(second);
 
         fs::remove_dir_all(parent).unwrap();
@@ -18466,7 +18576,11 @@ mod tests {
                 candidates: vec!["甲".to_owned(), "乙".to_owned()],
                 provenance: vec![
                     NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
-                    NativeCandidateProvenance::new(NativeCandidateSource::Decoder, true),
+                    NativeCandidateProvenance::with_personalization(
+                        NativeCandidateSource::Decoder,
+                        NativeCandidatePersonalization::PERSISTENT_EXACT
+                            .with(NativeCandidatePersonalization::SESSION_ANCHORED),
+                    ),
                 ],
                 personalized: vec![false, true],
                 protected_prefix_len: 0,
@@ -18495,6 +18609,16 @@ mod tests {
         );
         assert!(!provenance[0].session_promoted());
         assert!(provenance[1].session_promoted());
+        assert!(
+            provenance[1]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        assert!(
+            provenance[1]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_ANCHORED)
+        );
     }
 
     #[test]

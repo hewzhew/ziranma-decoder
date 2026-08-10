@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
-    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateSource,
-    NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope,
-    WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError,
-    WishImportance, WishJournalContext, WishNote, WishReviewStatus, dispatch_wish_command,
-    list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
-    move_wish_to_trash, restore_wish_from_trash, save_wish_note,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
+    WishFeedbackError, WishImportance, WishJournalContext, WishNote, WishReviewStatus,
+    dispatch_wish_command, list_trashed_wish_packages, list_wish_packages, load_wish_note,
+    load_wish_snapshot, move_wish_to_trash, restore_wish_from_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,14 +523,16 @@ fn print_event(event: &NativeFeedbackEvent) {
                 .zip(provenance)
                 .enumerate()
                 .map(|(index, (text, provenance))| {
+                    let personalization =
+                        candidate_personalization_label(provenance.personalization());
                     format!(
                         "{} {text}〔{}{}〕",
                         page_start + index + 1,
                         candidate_source_label(provenance.source()),
-                        if provenance.session_promoted() {
-                            "，个人/会话提升"
+                        if personalization.is_empty() {
+                            String::new()
                         } else {
-                            ""
+                            format!("，{personalization}")
                         }
                     )
                 })
@@ -628,6 +630,27 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
         NativeCandidateSource::Shape => "Tab 找字",
         NativeCandidateSource::FourCharacterCorrection => "四字纠错",
     }
+}
+
+fn candidate_personalization_label(personalization: NativeCandidatePersonalization) -> String {
+    [
+        (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
+        (
+            NativeCandidatePersonalization::PERSISTENT_ANCHORED,
+            "持久尾简",
+        ),
+        (
+            NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
+            "持久发现",
+        ),
+        (NativeCandidatePersonalization::SESSION_EXACT, "会话精确"),
+        (NativeCandidatePersonalization::SESSION_ANCHORED, "会话尾简"),
+        (NativeCandidatePersonalization::LEFT_CONTEXT, "左侧上下文"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, label)| personalization.contains(bit).then_some(label))
+    .collect::<Vec<_>>()
+    .join("+")
 }
 
 fn automatic_transposition_label(decision: &NativeAutomaticTranspositionDecision) -> String {
@@ -887,6 +910,18 @@ mod tests {
         assert_eq!(candidate_depth_label(0, 6, 12, false), "后面已有候选");
         assert_eq!(candidate_depth_label(6, 6, 12, true), "还可继续加载");
         assert_eq!(candidate_depth_label(6, 6, 12, false), "已到底");
+    }
+
+    #[test]
+    fn candidate_personalization_labels_keep_stacked_reasons_visible() {
+        let personalization = NativeCandidatePersonalization::PERSISTENT_EXACT
+            .with(NativeCandidatePersonalization::SESSION_ANCHORED)
+            .with(NativeCandidatePersonalization::LEFT_CONTEXT);
+        assert_eq!(
+            candidate_personalization_label(personalization),
+            "持久精确+会话尾简+左侧上下文"
+        );
+        assert!(candidate_personalization_label(NativeCandidatePersonalization::NONE).is_empty());
     }
 
     #[test]

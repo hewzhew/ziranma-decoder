@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use ziranma_core::{
-    NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
-    NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind,
-    ResearchHalfPairAnalysis, ResearchSceneAnalysis, TranspositionCalibrationLabel,
-    WishCaptureScope, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
-    analyze_runtime_half_pairs, list_wish_packages, repository_root_for_user_tool_executable,
-    research_feedback_enabled, set_research_feedback_enabled,
+    NativeCandidatePersonalization, NativeCandidateProvenance, NativeCandidateSource,
+    NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY,
+    ResearchHabitKind, ResearchHalfPairAnalysis, ResearchSceneAnalysis,
+    TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
+    analyze_linked_research, analyze_runtime_half_pairs, list_wish_packages,
+    repository_root_for_user_tool_executable, research_feedback_enabled,
+    set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -20,6 +21,20 @@ const MAX_REVIEW_BATCHES: usize = 4_096;
 const MAX_REVIEW_ITEMS: usize = 12;
 const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
+const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
+    (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
+    (
+        NativeCandidatePersonalization::PERSISTENT_ANCHORED,
+        "持久尾简",
+    ),
+    (
+        NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
+        "持久发现",
+    ),
+    (NativeCandidatePersonalization::SESSION_EXACT, "会话精确"),
+    (NativeCandidatePersonalization::SESSION_ANCHORED, "会话尾简"),
+    (NativeCandidatePersonalization::LEFT_CONTEXT, "左侧上下文"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
@@ -282,7 +297,7 @@ struct SelectionPattern {
     maximum_rank: usize,
     manual_selections: usize,
     paged_selections: usize,
-    session_promoted_frames: usize,
+    personalization_frames: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
     provenance_observations: usize,
     sources: [usize; 10],
     top_provenance_observations: usize,
@@ -310,7 +325,10 @@ impl SelectionPattern {
         self.paged_selections += usize::from(rank > 6);
         if let Some(provenance) = provenance {
             self.provenance_observations += 1;
-            self.session_promoted_frames += usize::from(provenance.session_promoted());
+            for (index, (bit, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
+                self.personalization_frames[index] +=
+                    usize::from(provenance.personalization().contains(*bit));
+            }
             self.sources[candidate_source_index(provenance.source())] += 1;
         }
     }
@@ -364,7 +382,7 @@ struct FollowupNonTopPressure {
     best_rank_after_first_page: usize,
     improved_rank_identities: usize,
     unimproved_rank_identities: usize,
-    session_promoted_identities: usize,
+    personalization_identities: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
     complete_provenance_identities: usize,
     partial_provenance_identities: usize,
     missing_provenance_identities: usize,
@@ -697,8 +715,8 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "持续非首选证据：观察到会话提升 {}；候选来源完整 {}、部分 {}、缺失 {}；主要来源 {}。",
-            followup.session_promoted_identities,
+            "持续非首选证据：个性化机制 {}；候选来源完整 {}、部分 {}、缺失 {}；主要来源 {}。",
+            render_candidate_personalization_counts(&followup.personalization_identities),
             followup.complete_provenance_identities,
             followup.partial_provenance_identities,
             followup.missing_provenance_identities,
@@ -746,8 +764,9 @@ impl ResearchReview {
             } else {
                 pressure.unimproved_rank_identities += 1;
             }
-            pressure.session_promoted_identities +=
-                usize::from(pattern.session_promoted_frames != 0);
+            for (index, frames) in pattern.personalization_frames.iter().enumerate() {
+                pressure.personalization_identities[index] += usize::from(*frames != 0);
+            }
             match pattern.provenance_observations {
                 0 => pressure.missing_provenance_identities += 1,
                 observations if observations == pattern.selections => {
@@ -957,7 +976,7 @@ impl ResearchReview {
         for ((code, text), pattern) in non_top.into_iter().take(MAX_REVIEW_ITEMS) {
             writeln!(
                 output,
-                "- {code} → “{text}”：非首选 {}/{} 次；名次 {}–{}；显式选择 {} 次；翻页 {} 次；来源 {}；会话提升标记 {} 次。",
+                "- {code} → “{text}”：非首选 {}/{} 次；名次 {}–{}；显式选择 {} 次；翻页 {} 次；来源 {}；个性化机制 {}。",
                 pattern.non_top_selections,
                 pattern.selections,
                 pattern.minimum_rank,
@@ -965,7 +984,7 @@ impl ResearchReview {
                 pattern.manual_selections,
                 pattern.paged_selections,
                 candidate_source_label(pattern.dominant_source()),
-                pattern.session_promoted_frames,
+                render_candidate_personalization_counts(&pattern.personalization_frames),
             )
             .unwrap();
         }
@@ -1362,6 +1381,22 @@ fn render_candidate_source_counts(counts: &[usize; 10]) -> String {
     }
 }
 
+fn render_candidate_personalization_counts(
+    counts: &[usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+) -> String {
+    let rendered = counts
+        .iter()
+        .zip(CANDIDATE_PERSONALIZATION_KINDS)
+        .filter(|(count, _)| **count != 0)
+        .map(|(count, (_, label))| format!("{label} {count}"))
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "未观察到".to_owned()
+    } else {
+        rendered.join("、")
+    }
+}
+
 fn print_status(root: &Path) -> Result<(), Box<dyn Error>> {
     let enabled = research_feedback_enabled(root)?;
     let packages = list_wish_packages(root)?.len();
@@ -1624,7 +1659,11 @@ mod tests {
     fn followup_non_top_pressure_partitions_only_supported_evidence() {
         let alias = NativeCandidateProvenance::new(NativeCandidateSource::ExplicitAlias, false);
         let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
-        let promoted_core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
+        let promoted_core = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT
+                .with(NativeCandidatePersonalization::SESSION_EXACT),
+        );
         let supplemental =
             NativeCandidateProvenance::new(NativeCandidateSource::SupplementalExact, false);
         let mut review = ResearchReview::default();
@@ -1670,6 +1709,9 @@ mod tests {
         let mut dominant_top_sources = [0; 10];
         dominant_top_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 2;
         dominant_top_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
+        let mut personalization_identities = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        personalization_identities[0] = 1;
+        personalization_identities[3] = 1;
         assert_eq!(
             review.followup_non_top_pressure(),
             FollowupNonTopPressure {
@@ -1680,7 +1722,7 @@ mod tests {
                 best_rank_after_first_page: 1,
                 improved_rank_identities: 3,
                 unimproved_rank_identities: 2,
-                session_promoted_identities: 1,
+                personalization_identities,
                 complete_provenance_identities: 3,
                 partial_provenance_identities: 1,
                 missing_provenance_identities: 1,
@@ -1698,6 +1740,7 @@ mod tests {
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("最好第 2 名 2、第 3–6 名 2、第 7 名以后 1"));
         assert!(rendered.contains("候选来源完整 3、部分 1、缺失 1"));
+        assert!(rendered.contains("个性化机制 持久精确 1、会话精确 1"));
         assert!(rendered.contains("主要来源 核心整词 3、补充整词/组合 1"));
         assert!(rendered.contains("首选来源完整 3、部分 1、缺失 1"));
         assert!(rendered.contains("主要首选来源 显式别名 2、核心整词 2"));
@@ -1805,7 +1848,7 @@ mod tests {
             .unwrap();
         assert_eq!(pattern.first_rank, Some(2));
         assert_eq!(pattern.last_rank, Some(1));
-        assert_eq!(pattern.session_promoted_frames, 1);
+        assert_eq!(pattern.personalization_frames[3], 1);
         assert_eq!(pattern.top_provenance_observations, 2);
         assert_eq!(
             pattern.top_sources[candidate_source_index(NativeCandidateSource::CoreExact)],

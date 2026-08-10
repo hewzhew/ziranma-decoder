@@ -25,10 +25,10 @@ use crate::candidate_snapshot::valid_candidate_snapshot_revision;
 use crate::{
     DataProtector, FrozenNativeFeedbackEvent, FrozenNativeFeedbackSnapshot,
     NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
-    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidateProvenance,
-    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
-    NativeTabAssemblyState, TranspositionCalibrationLabel, TranspositionCalibrationObservation,
-    candidate_sha256_hex,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
+    NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
+    NativeSelectionSource, NativeTabAssemblyState, TranspositionCalibrationLabel,
+    TranspositionCalibrationObservation, candidate_sha256_hex,
 };
 
 pub const WISH_SCHEMA_V1: &str = "ziranma-wish-v1";
@@ -41,6 +41,7 @@ pub const WISH_SCHEMA_V7: &str = "ziranma-wish-v7";
 pub const WISH_SCHEMA_V8: &str = "ziranma-wish-v8";
 pub const WISH_SCHEMA_V9: &str = "ziranma-wish-v9";
 pub const WISH_SCHEMA_V10: &str = "ziranma-wish-v10";
+pub const WISH_SCHEMA_V11: &str = "ziranma-wish-v11";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -59,6 +60,7 @@ const WISH_PLAINTEXT_MAGIC_V7: &[u8] = b"ziranma-wish-v7\0";
 const WISH_PLAINTEXT_MAGIC_V8: &[u8] = b"ziranma-wish-v8\0";
 const WISH_PLAINTEXT_MAGIC_V9: &[u8] = b"ziranma-wish-v9\0";
 const WISH_PLAINTEXT_MAGIC_V10: &[u8] = b"ziranma-wish-v10\0";
+const WISH_PLAINTEXT_MAGIC_V11: &[u8] = b"ziranma-wish-v11\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -629,9 +631,13 @@ impl WishSnapshot {
     }
 
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
+        self.render_with_event_version(11)
+    }
+
+    fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V10);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V11);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -674,7 +680,7 @@ impl WishSnapshot {
         put_usize(&mut output, self.events.len())?;
         for event in &self.events {
             put_u32(&mut output, event.milliseconds_before_marker);
-            render_event(&mut output, &event.event)?;
+            render_event(&mut output, &event.event, event_version)?;
         }
         if output.len() > MAX_WISH_PLAINTEXT_BYTES {
             return Err(WishFeedbackError::PlaintextTooLarge);
@@ -687,7 +693,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V10) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V11) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V11)?;
+            11
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V10) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V10)?;
             10
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V9) {
@@ -1518,6 +1527,7 @@ fn unprotect_payload(
 fn render_event(
     output: &mut Vec<u8>,
     event: &NativeFeedbackEvent,
+    version: u8,
 ) -> Result<(), WishFeedbackError> {
     if event.validate_and_measure().is_none() {
         return Err(WishFeedbackError::InvalidSnapshot);
@@ -1551,7 +1561,7 @@ fn render_event(
             tab_assembly,
             may_have_more,
         } => {
-            output.push(9);
+            output.push(if version >= 11 { 12 } else { 9 });
             put_string(output, code)?;
             output.push(view_tag(*view));
             put_usize(output, *page_start)?;
@@ -1562,7 +1572,11 @@ fn render_event(
             put_usize(output, provenance.len())?;
             for provenance in provenance {
                 output.push(candidate_source_tag(provenance.source()));
-                output.push(u8::from(provenance.session_promoted()));
+                output.push(if version >= 11 {
+                    provenance.personalization().bits()
+                } else {
+                    u8::from(provenance.session_promoted())
+                });
             }
             output.push(u8::from(automatic_transposition.is_some()));
             if let Some(decision) = automatic_transposition {
@@ -1694,7 +1708,8 @@ fn parse_event(
         tag if (tag == 6 && version >= 3)
             || (tag == 7 && version >= 4)
             || (tag == 8 && version >= 5)
-            || (tag == 9 && version >= 6) =>
+            || (tag == 9 && version >= 6)
+            || (tag == 12 && version >= 11) =>
         {
             let code = reader.string()?;
             let view = parse_view(reader.byte()?)?;
@@ -1713,12 +1728,17 @@ fn parse_event(
             }
             let mut provenance = Vec::with_capacity(provenance_count);
             for _ in 0..provenance_count {
-                provenance.push(NativeCandidateProvenance::new(
-                    parse_candidate_source(reader.byte()?)?,
-                    reader.boolean()?,
-                ));
+                let source = parse_candidate_source(reader.byte()?)?;
+                let item = if tag == 12 {
+                    let personalization = NativeCandidatePersonalization::from_bits(reader.byte()?)
+                        .ok_or(WishFeedbackError::InvalidSnapshot)?;
+                    NativeCandidateProvenance::with_personalization(source, personalization)
+                } else {
+                    NativeCandidateProvenance::new(source, reader.boolean()?)
+                };
+                provenance.push(item);
             }
-            let automatic_transposition = if tag == 9 {
+            let automatic_transposition = if matches!(tag, 9 | 12) {
                 if reader.boolean()? {
                     let syllable_index = reader.usize()?;
                     let syllable_count = reader.usize()?;
@@ -1779,7 +1799,7 @@ fn parse_event(
             } else {
                 None
             };
-            let (loaded_candidates, tab_assembly) = if tag == 9 {
+            let (loaded_candidates, tab_assembly) = if matches!(tag, 9 | 12) {
                 let loaded_candidates = reader.usize()?;
                 let tab_assembly = if reader.boolean()? {
                     Some(NativeTabAssemblyState::new(
@@ -2314,10 +2334,19 @@ mod tests {
     }
 
     fn render_current_body_with_magic(snapshot: &WishSnapshot, magic: &[u8]) -> Vec<u8> {
-        let current = snapshot.render().unwrap();
+        let event_version = if magic == WISH_PLAINTEXT_MAGIC_V8 {
+            8
+        } else if magic == WISH_PLAINTEXT_MAGIC_V9 {
+            9
+        } else if magic == WISH_PLAINTEXT_MAGIC_V10 {
+            10
+        } else {
+            11
+        };
+        let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V10.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V11.len()..]);
         rendered
     }
 
@@ -2325,7 +2354,7 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V10));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
@@ -2336,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
+    fn v11_round_trips_candidate_runtime_depth_and_multi_syllable_transposition() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "fuem".to_owned(),
@@ -2362,9 +2391,73 @@ mod tests {
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V10));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
+    }
+
+    #[test]
+    fn v11_round_trips_stacked_candidate_personalization() {
+        let mut snapshot = private_snapshot();
+        let personalization = NativeCandidatePersonalization::PERSISTENT_EXACT
+            .with(NativeCandidatePersonalization::SESSION_EXACT)
+            .with(NativeCandidatePersonalization::LEFT_CONTEXT);
+        snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "ab".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: vec!["甲".to_owned()],
+            provenance: vec![NativeCandidateProvenance::with_personalization(
+                NativeCandidateSource::CoreExact,
+                personalization,
+            )],
+            automatic_transposition: None,
+            loaded_candidates: 1,
+            tab_assembly: None,
+            may_have_more: false,
+        };
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert!(parsed == snapshot);
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
+            parsed.events()[0].event()
+        else {
+            panic!("candidate provenance event missing");
+        };
+        assert_eq!(provenance[0].personalization(), personalization);
+    }
+
+    #[test]
+    fn v10_legacy_session_marker_maps_to_exact_session_personalization() {
+        let mut snapshot = private_snapshot();
+        snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "ab".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: vec!["甲".to_owned()],
+            provenance: vec![NativeCandidateProvenance::new(
+                NativeCandidateSource::CoreExact,
+                true,
+            )],
+            automatic_transposition: None,
+            loaded_candidates: 1,
+            tab_assembly: None,
+            may_have_more: false,
+        };
+
+        let legacy = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V10);
+        let parsed = WishSnapshot::parse(&legacy).unwrap();
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
+            parsed.events()[0].event()
+        else {
+            panic!("candidate provenance event missing");
+        };
+        assert_eq!(
+            provenance[0].personalization(),
+            NativeCandidatePersonalization::SESSION_EXACT
+        );
     }
 
     #[test]
@@ -2397,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_round_trips_post_commit_backspace_without_claiming_document_change() {
+    fn v11_round_trips_post_commit_backspace_without_claiming_document_change() {
         let mut snapshot = private_snapshot();
         snapshot.events.push(WishEvent {
             milliseconds_before_marker: 0,
@@ -2406,7 +2499,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V10));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V11));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
@@ -2427,7 +2520,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
+    fn v11_round_trips_tab_assembly_position_strokes_and_loaded_depth() {
         let mut snapshot = private_snapshot();
         snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             code: "hp".to_owned(),
@@ -2449,7 +2542,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_round_trips_exact_runtime_identity() {
+    fn v11_round_trips_exact_runtime_identity() {
         let mut snapshot = private_snapshot();
         snapshot.runtime_identity = Some(
             WishRuntimeIdentity::new(
@@ -2472,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_round_trips_continuous_spans_and_wish_anchors() {
+    fn v11_round_trips_continuous_spans_and_wish_anchors() {
         let mut continuous = private_snapshot();
         continuous.capture_scope = WishCaptureScope::ContinuousJournal;
         continuous.journal_context = Some(WishJournalContext::ContinuousSpan(
@@ -2519,7 +2612,7 @@ mod tests {
         put_usize(&mut legacy, snapshot.events.len()).unwrap();
         for event in &snapshot.events {
             put_u32(&mut legacy, event.milliseconds_before_marker);
-            render_event(&mut legacy, &event.event).unwrap();
+            render_event(&mut legacy, &event.event, 7).unwrap();
         }
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
@@ -2545,7 +2638,7 @@ mod tests {
         put_usize(&mut legacy, snapshot.events.len()).unwrap();
         for event in &snapshot.events {
             put_u32(&mut legacy, event.milliseconds_before_marker);
-            render_event(&mut legacy, &event.event).unwrap();
+            render_event(&mut legacy, &event.event, 6).unwrap();
         }
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
@@ -2797,7 +2890,7 @@ mod tests {
         put_usize(&mut legacy, snapshot.events.len()).unwrap();
         for event in &snapshot.events {
             put_u32(&mut legacy, event.milliseconds_before_marker);
-            render_event(&mut legacy, &event.event).unwrap();
+            render_event(&mut legacy, &event.event, 1).unwrap();
         }
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
@@ -2824,7 +2917,7 @@ mod tests {
         put_usize(&mut legacy, snapshot.events.len()).unwrap();
         for event in &snapshot.events {
             put_u32(&mut legacy, event.milliseconds_before_marker);
-            render_event(&mut legacy, &event.event).unwrap();
+            render_event(&mut legacy, &event.event, 2).unwrap();
         }
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
@@ -2861,10 +2954,49 @@ mod tests {
         bytes
     }
 
+    fn v11_provenance_fixture(personalization_bits: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WISH_PLAINTEXT_MAGIC_V11);
+        bytes.push(WishCaptureScope::RecentWindow.encoded());
+        bytes.push(WishCategory::Other.encoded());
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        bytes.push(0);
+        bytes.push(0);
+        put_u32(&mut bytes, 1_000);
+        bytes.push(1);
+        put_usize(&mut bytes, 1).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_u32(&mut bytes, 0);
+        bytes.push(12);
+        put_string(&mut bytes, "ab").unwrap();
+        bytes.push(view_tag(NativeCandidateView::Ordinary));
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_string(&mut bytes, "甲").unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        bytes.push(candidate_source_tag(NativeCandidateSource::CoreExact));
+        bytes.push(personalization_bits);
+        bytes.push(0);
+        put_usize(&mut bytes, 1).unwrap();
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
     #[test]
     fn v3_rejects_misaligned_or_unknown_candidate_provenance() {
         assert!(WishSnapshot::parse(&v3_provenance_fixture(0, None)).is_err());
         assert!(WishSnapshot::parse(&v3_provenance_fixture(1, Some(255))).is_err());
+    }
+
+    #[test]
+    fn v11_rejects_unknown_candidate_personalization_bits() {
+        assert!(WishSnapshot::parse(&v11_provenance_fixture(1 << 7)).is_err());
+        assert!(WishSnapshot::parse(&v11_provenance_fixture(0)).is_ok());
     }
 
     #[test]

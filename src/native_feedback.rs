@@ -116,16 +116,75 @@ pub enum NativeCandidateSource {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeCandidatePersonalization(u8);
+
+impl NativeCandidatePersonalization {
+    pub const NONE: Self = Self(0);
+    pub const PERSISTENT_EXACT: Self = Self(1 << 0);
+    pub const PERSISTENT_ANCHORED: Self = Self(1 << 1);
+    pub const PERSISTENT_DISCOVERY: Self = Self(1 << 2);
+    pub const SESSION_EXACT: Self = Self(1 << 3);
+    pub const SESSION_ANCHORED: Self = Self(1 << 4);
+    pub const LEFT_CONTEXT: Self = Self(1 << 5);
+    const ALL_BITS: u8 = Self::PERSISTENT_EXACT.0
+        | Self::PERSISTENT_ANCHORED.0
+        | Self::PERSISTENT_DISCOVERY.0
+        | Self::SESSION_EXACT.0
+        | Self::SESSION_ANCHORED.0
+        | Self::LEFT_CONTEXT.0;
+
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        (bits & !Self::ALL_BITS == 0).then_some(Self(bits))
+    }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+
+    pub fn contains(self, reason: Self) -> bool {
+        reason != Self::NONE && self.0 & reason.0 == reason.0
+    }
+
+    pub fn with(self, reason: Self) -> Self {
+        Self(self.0 | reason.0)
+    }
+
+    pub fn session_scoped(self) -> bool {
+        self.contains(Self::SESSION_EXACT)
+            || self.contains(Self::SESSION_ANCHORED)
+            || self.contains(Self::LEFT_CONTEXT)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeCandidateProvenance {
     source: NativeCandidateSource,
-    session_promoted: bool,
+    personalization: NativeCandidatePersonalization,
 }
 
 impl NativeCandidateProvenance {
     pub fn new(source: NativeCandidateSource, session_promoted: bool) -> Self {
         Self {
             source,
-            session_promoted,
+            personalization: if session_promoted {
+                NativeCandidatePersonalization::SESSION_EXACT
+            } else {
+                NativeCandidatePersonalization::NONE
+            },
+        }
+    }
+
+    pub fn with_personalization(
+        source: NativeCandidateSource,
+        personalization: NativeCandidatePersonalization,
+    ) -> Self {
+        Self {
+            source,
+            personalization,
         }
     }
 
@@ -134,7 +193,15 @@ impl NativeCandidateProvenance {
     }
 
     pub fn session_promoted(self) -> bool {
-        self.session_promoted
+        self.personalization.session_scoped()
+    }
+
+    pub fn personalization(self) -> NativeCandidatePersonalization {
+        self.personalization
+    }
+
+    pub fn add_personalization(&mut self, reason: NativeCandidatePersonalization) {
+        self.personalization = self.personalization.with(reason);
     }
 }
 
@@ -1344,6 +1411,22 @@ impl NativeFeedbackSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_personalization_preserves_stacked_causes_and_rejects_unknown_bits() {
+        let personalization = NativeCandidatePersonalization::PERSISTENT_EXACT
+            .with(NativeCandidatePersonalization::SESSION_ANCHORED)
+            .with(NativeCandidatePersonalization::LEFT_CONTEXT);
+        assert!(personalization.contains(NativeCandidatePersonalization::PERSISTENT_EXACT));
+        assert!(personalization.contains(NativeCandidatePersonalization::SESSION_ANCHORED));
+        assert!(personalization.contains(NativeCandidatePersonalization::LEFT_CONTEXT));
+        assert!(personalization.session_scoped());
+        assert_eq!(
+            NativeCandidatePersonalization::from_bits(personalization.bits()),
+            Some(personalization)
+        );
+        assert!(NativeCandidatePersonalization::from_bits(1 << 7).is_none());
+    }
 
     fn page() -> NativeFeedbackEvent {
         NativeFeedbackEvent::CandidatesPresented {
