@@ -543,6 +543,9 @@ struct InitialNonTopEvidence {
     source_pairs: [[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT],
     source_pairs_by_rank: [[[usize; CANDIDATE_SOURCE_KIND_COUNT]; CANDIDATE_SOURCE_KIND_COUNT];
         INITIAL_NON_TOP_RANK_BUCKET_COUNT],
+    source_pairs_by_key_length: [[[usize; CANDIDATE_SOURCE_KIND_COUNT];
+        CANDIDATE_SOURCE_KIND_COUNT];
+        NON_TOP_KEY_LENGTH_BUCKET_COUNT],
     precise_personalization_identities: usize,
     precise_target_missing: usize,
     precise_top_missing: usize,
@@ -1073,6 +1076,12 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
+            "首次非首选来源配对按键长：{}。",
+            render_candidate_source_pairs_by_key_length(&initial),
+        )
+        .unwrap();
+        writeln!(
+            output,
             "首次非首选来源配对（目标→当时首选）：完整 {}/{}；主要配对（最多 6 类）{}。",
             candidate_source_pair_observations(&initial.source_pairs),
             initial.identities,
@@ -1250,6 +1259,8 @@ impl ResearchReview {
                 if let Some(bucket) = pattern.first_rank.and_then(initial_non_top_rank_bucket) {
                     evidence.source_pairs_by_rank[bucket][target_index][top_index] += 1;
                 }
+                evidence.source_pairs_by_key_length[non_top_key_length_bucket(code)]
+                    [target_index][top_index] += 1;
             }
 
             if pattern.first_precise_personalization {
@@ -2165,6 +2176,23 @@ fn render_candidate_source_pairs_with_limit(
     }
 }
 
+fn render_candidate_source_pairs_by_key_length(evidence: &InitialNonTopEvidence) -> String {
+    ["1–2 键", "3–4 键", "5–6 键", "7–8 键", "9 键及以上"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let pairs = &evidence.source_pairs_by_key_length[index];
+            format!(
+                "{label} {}/{}（{}）",
+                candidate_source_pair_observations(pairs),
+                evidence.key_length_buckets[index],
+                render_candidate_source_pairs_with_limit(pairs, 3),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
 fn initial_non_top_rank_bucket(rank: usize) -> Option<usize> {
     match rank {
         2 => Some(0),
@@ -2524,6 +2552,10 @@ mod tests {
             [candidate_source_index(NativeCandidateSource::CoreExact)] = 1;
         source_pairs_by_rank[1][candidate_source_index(NativeCandidateSource::CoreExact)]
             [candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
+        let mut source_pairs_by_key_length = [[[0; CANDIDATE_SOURCE_KIND_COUNT];
+            CANDIDATE_SOURCE_KIND_COUNT];
+            NON_TOP_KEY_LENGTH_BUCKET_COUNT];
+        source_pairs_by_key_length[4] = source_pairs;
         let mut precise_target_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
         precise_target_personalization[0] = 1;
         let mut precise_top_personalization = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
@@ -2542,6 +2574,7 @@ mod tests {
                 top_sources,
                 source_pairs,
                 source_pairs_by_rank,
+                source_pairs_by_key_length,
                 precise_personalization_identities: 4,
                 precise_target_missing: 1,
                 precise_top_missing: 1,
@@ -2562,6 +2595,9 @@ mod tests {
         assert!(rendered.contains(
             "首次非首选键长（不含原码）：1–2 键 0、3–4 键 0、5–6 键 0、7–8 键 0、9 键及以上 7"
         ));
+        assert!(
+            rendered.contains("9 键及以上 4/7（核心整词→核心整词 3、核心整词→公开共识整词 1）")
+        );
         assert!(rendered.contains("核心整词→核心整词 3、核心整词→公开共识整词 1"));
         assert!(rendered.contains("第 2 名 2/2（核心整词→核心整词 1、核心整词→公开共识整词 1）"));
         assert!(rendered.contains("第 3–6 名 2/2（核心整词→核心整词 2）"));
