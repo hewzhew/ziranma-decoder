@@ -9,9 +9,9 @@ use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
     NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
-    ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity,
-    WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs, list_wish_packages,
-    repository_root_for_user_tool_executable, research_feedback_enabled,
+    ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    WishRuntimeIdentity, WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs,
+    list_wish_packages, repository_root_for_user_tool_executable, research_feedback_enabled,
     set_research_feedback_enabled,
 };
 #[cfg(windows)]
@@ -289,12 +289,70 @@ impl PresentedFrame {
 }
 
 #[derive(Clone, Default)]
+struct SelectionObservationLocation {
+    runtime_identity: Option<WishRuntimeIdentity>,
+    stream_id: Option<String>,
+}
+
+impl SelectionObservationLocation {
+    fn from_snapshot(snapshot: &WishSnapshot) -> Self {
+        let stream_id = match snapshot.journal_context() {
+            Some(WishJournalContext::ContinuousSpan(span)) => Some(span.stream_id().to_owned()),
+            _ => None,
+        };
+        Self {
+            runtime_identity: snapshot.runtime_identity().cloned(),
+            stream_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopRegressionBoundary {
+    SameStream,
+    SameRuntimeNewStream,
+    DifferentRuntime,
+    Unknown,
+}
+
+impl TopRegressionBoundary {
+    fn between(
+        previous: &SelectionObservationLocation,
+        current: &SelectionObservationLocation,
+    ) -> Self {
+        if matches!(
+            (&previous.runtime_identity, &current.runtime_identity),
+            (Some(previous), Some(current)) if previous != current
+        ) {
+            return Self::DifferentRuntime;
+        }
+        if matches!(
+            (&previous.stream_id, &current.stream_id),
+            (Some(previous), Some(current)) if previous == current
+        ) {
+            return Self::SameStream;
+        }
+        if matches!(
+            (&previous.runtime_identity, &current.runtime_identity),
+            (Some(previous), Some(current)) if previous == current
+        ) && matches!(
+            (&previous.stream_id, &current.stream_id),
+            (Some(previous), Some(current)) if previous != current
+        ) {
+            return Self::SameRuntimeNewStream;
+        }
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Default)]
 struct SelectionPattern {
     selections: usize,
     non_top_selections: usize,
     first_rank: Option<usize>,
     first_top_selection: Option<usize>,
-    non_top_selections_after_first_top: usize,
+    last_top_location: Option<SelectionObservationLocation>,
+    first_post_top_regression_boundary: Option<TopRegressionBoundary>,
     last_rank: Option<usize>,
     minimum_rank: usize,
     maximum_rank: usize,
@@ -315,14 +373,24 @@ impl SelectionPattern {
         selection: NativeSelectionSource,
         provenance: Option<NativeCandidateProvenance>,
         precise_personalization: bool,
+        location: &SelectionObservationLocation,
     ) {
         self.selections += 1;
         self.non_top_selections += usize::from(rank > 1);
         self.first_rank.get_or_insert(rank);
         if rank == 1 {
             self.first_top_selection.get_or_insert(self.selections);
-        } else if self.first_top_selection.is_some() {
-            self.non_top_selections_after_first_top += 1;
+            self.last_top_location = Some(location.clone());
+        } else if self.first_top_selection.is_some()
+            && self.first_post_top_regression_boundary.is_none()
+        {
+            self.first_post_top_regression_boundary = Some(
+                self.last_top_location
+                    .as_ref()
+                    .map_or(TopRegressionBoundary::Unknown, |previous| {
+                        TopRegressionBoundary::between(previous, location)
+                    }),
+            );
         }
         self.last_rank = Some(rank);
         self.minimum_rank = if self.minimum_rank == 0 {
@@ -391,6 +459,15 @@ struct TopArrivalTrajectory {
     third_or_fourth_selection: usize,
     fifth_or_later_selection: usize,
     later_non_top_identities: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TopRegressionBoundaries {
+    identities: usize,
+    same_stream: usize,
+    same_runtime_new_stream: usize,
+    different_runtime: usize,
+    unknown: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -493,6 +570,7 @@ impl ResearchReview {
             .saturating_add(snapshot.omitted_untimed())
             .saturating_add(snapshot.omitted_by_event_limit());
         let mut frame: Option<PresentedFrame> = None;
+        let observation_location = SelectionObservationLocation::from_snapshot(snapshot);
         for wish_event in snapshot.events() {
             match wish_event.event() {
                 NativeFeedbackEvent::CandidatesPresented {
@@ -578,6 +656,7 @@ impl ResearchReview {
                         *source,
                         provenance,
                         snapshot.supports_precise_candidate_personalization(),
+                        &observation_location,
                     );
                     pattern.observe_global_top_provenance(global_top_provenance);
                     frame = None;
@@ -792,6 +871,17 @@ impl ResearchReview {
             top_arrival.later_non_top_identities,
         )
         .unwrap();
+        let regression = self.top_regression_boundaries();
+        writeln!(
+            output,
+            "首选首次回落边界：身份 {}；同一连续流 {}；同一运行身份的新连续流 {}；不同运行身份 {}；边界未知 {}。",
+            regression.identities,
+            regression.same_stream,
+            regression.same_runtime_new_stream,
+            regression.different_runtime,
+            regression.unknown,
+        )
+        .unwrap();
         let followup = self.followup_non_top_pressure();
         writeln!(
             output,
@@ -850,9 +940,29 @@ impl ResearchReview {
                 _ => {}
             }
             trajectory.later_non_top_identities +=
-                usize::from(pattern.non_top_selections_after_first_top != 0);
+                usize::from(pattern.first_post_top_regression_boundary.is_some());
         }
         trajectory
+    }
+
+    fn top_regression_boundaries(&self) -> TopRegressionBoundaries {
+        let mut boundaries = TopRegressionBoundaries::default();
+        for boundary in self.selections.values().filter_map(|pattern| {
+            (pattern.first_rank.is_some_and(|rank| rank > 1))
+                .then_some(pattern.first_post_top_regression_boundary)
+                .flatten()
+        }) {
+            boundaries.identities += 1;
+            match boundary {
+                TopRegressionBoundary::SameStream => boundaries.same_stream += 1,
+                TopRegressionBoundary::SameRuntimeNewStream => {
+                    boundaries.same_runtime_new_stream += 1;
+                }
+                TopRegressionBoundary::DifferentRuntime => boundaries.different_runtime += 1,
+                TopRegressionBoundary::Unknown => boundaries.unknown += 1,
+            }
+        }
+        boundaries
     }
 
     fn followup_non_top_pressure(&self) -> FollowupNonTopPressure {
@@ -1762,7 +1872,13 @@ mod tests {
                 .entry((code.to_owned(), text.to_owned()))
                 .or_default();
             for rank in ranks {
-                pattern.observe(rank, NativeSelectionSource::Numeric, None, false);
+                pattern.observe(
+                    rank,
+                    NativeSelectionSource::Numeric,
+                    None,
+                    false,
+                    &SelectionObservationLocation::default(),
+                );
             }
         }
 
@@ -1820,7 +1936,13 @@ mod tests {
                 .entry((identity.to_owned(), "private".to_owned()))
                 .or_default();
             for rank in ranks {
-                pattern.observe(rank, NativeSelectionSource::Numeric, None, false);
+                pattern.observe(
+                    rank,
+                    NativeSelectionSource::Numeric,
+                    None,
+                    false,
+                    &SelectionObservationLocation::default(),
+                );
             }
         }
 
@@ -1839,7 +1961,93 @@ mod tests {
         assert!(rendered.contains("第 2 次选择时到达 1"));
         assert!(rendered.contains("第 3–4 次 1"));
         assert!(rendered.contains("第 5 次以后 1"));
+        assert!(rendered.contains("首选首次回落边界：身份 1"));
+        assert!(rendered.contains("边界未知 1"));
         for private_value in ["second", "third", "fifth", "never", "already", "private"] {
+            assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn top_regression_boundaries_partition_stream_runtime_and_legacy_evidence() {
+        fn location(runtime: char, stream: char) -> SelectionObservationLocation {
+            SelectionObservationLocation {
+                runtime_identity: Some(
+                    WishRuntimeIdentity::new(
+                        runtime.to_string().repeat(64),
+                        "research-core-v1".to_owned(),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                stream_id: Some(stream.to_string().repeat(64)),
+            }
+        }
+
+        let runtime_a_stream_1 = location('a', '1');
+        let runtime_a_stream_2 = location('a', '2');
+        let runtime_b_stream_1 = location('b', '1');
+        let unknown = SelectionObservationLocation::default();
+        let mut review = ResearchReview::default();
+        for (identity, observations) in [
+            (
+                "same-stream",
+                vec![
+                    (2, &runtime_a_stream_1),
+                    (1, &runtime_a_stream_1),
+                    (2, &runtime_a_stream_1),
+                ],
+            ),
+            (
+                "new-stream",
+                vec![
+                    (2, &runtime_a_stream_1),
+                    (1, &runtime_a_stream_1),
+                    (2, &runtime_a_stream_2),
+                ],
+            ),
+            (
+                "new-runtime",
+                vec![
+                    (2, &runtime_a_stream_1),
+                    (1, &runtime_a_stream_1),
+                    (2, &runtime_b_stream_1),
+                ],
+            ),
+            ("legacy", vec![(2, &unknown), (1, &unknown), (2, &unknown)]),
+        ] {
+            let pattern = review
+                .selections
+                .entry((identity.to_owned(), "private".to_owned()))
+                .or_default();
+            for (rank, location) in observations {
+                pattern.observe(rank, NativeSelectionSource::Numeric, None, false, location);
+            }
+        }
+
+        assert_eq!(
+            review.top_regression_boundaries(),
+            TopRegressionBoundaries {
+                identities: 4,
+                same_stream: 1,
+                same_runtime_new_stream: 1,
+                different_runtime: 1,
+                unknown: 1,
+            }
+        );
+        let mut rendered = String::new();
+        review.render_selection_pressure(&mut rendered);
+        assert!(rendered.contains("同一连续流 1"));
+        assert!(rendered.contains("同一运行身份的新连续流 1"));
+        assert!(rendered.contains("不同运行身份 1"));
+        assert!(rendered.contains("边界未知 1"));
+        for private_value in [
+            "same-stream",
+            "new-stream",
+            "new-runtime",
+            "legacy",
+            "private",
+        ] {
             assert!(!rendered.contains(private_value));
         }
     }
@@ -1920,7 +2128,13 @@ mod tests {
                 .entry((code.to_owned(), text.to_owned()))
                 .or_default();
             for (rank, provenance) in observations {
-                pattern.observe(rank, NativeSelectionSource::Numeric, provenance, true);
+                pattern.observe(
+                    rank,
+                    NativeSelectionSource::Numeric,
+                    provenance,
+                    true,
+                    &SelectionObservationLocation::default(),
+                );
             }
         }
         for (identity, top_sources) in [
