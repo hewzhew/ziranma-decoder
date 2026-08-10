@@ -43,21 +43,21 @@ mod windows_app {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
-        BS_DEFPUSHBUTTON, BS_OWNERDRAW, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT,
-        CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-        DrawIconEx, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE, ES_READONLY, ES_WANTRETURN, FindWindowW,
-        GWL_STYLE, GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
-        GetWindowTextW, HMENU, IDC_ARROW, IDI_APPLICATION, IDYES, IMAGE_ICON, IsDialogMessageW,
-        LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
-        LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LR_DEFAULTCOLOR,
-        LoadCursorW, LoadIconW, LoadImageW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION,
-        MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
-        RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW,
-        ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
-        WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT,
-        WM_SETFONT, WM_SETREDRAW, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-        WS_EX_COMPOSITED, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-        WS_VSCROLL,
+        BN_CLICKED, BS_DEFPUSHBUTTON, BS_OWNERDRAW, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
+        CBN_SELCHANGE, CW_USEDEFAULT, CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon,
+        DestroyWindow, DispatchMessageW, DrawIconEx, EN_CHANGE, ES_AUTOVSCROLL, ES_LEFT,
+        ES_MULTILINE, ES_READONLY, ES_WANTRETURN, FindWindowW, GWL_STYLE, GetDlgCtrlID, GetDlgItem,
+        GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW,
+        IDI_APPLICATION, IDYES, IMAGE_ICON, IsDialogMessageW, LB_ADDSTRING, LB_GETCURSEL,
+        LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LBN_SELCHANGE, LBS_HASSTRINGS,
+        LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LR_DEFAULTCOLOR, LoadCursorW,
+        LoadIconW, LoadImageW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+        MB_YESNO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
+        SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORLISTBOX,
+        WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
+        WM_SETREDRAW, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_COMPOSITED,
+        WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
     use ziranma_core::{
@@ -173,6 +173,7 @@ mod windows_app {
         visible_indices: Vec<usize>,
         selected: Option<usize>,
         show_context: bool,
+        suppress_filter_notifications: bool,
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -180,6 +181,19 @@ mod windows_app {
         #[default]
         Active,
         Trash,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ManagerCommand {
+        SelectRecord,
+        EditRecord,
+        Refresh,
+        ToggleContext,
+        ApplyFilter,
+        ClearFilter,
+        Navigate(ManagerView),
+        RestoreRecord,
+        MoveRecordToTrash,
     }
 
     impl ManagerView {
@@ -432,20 +446,27 @@ mod windows_app {
                 }
             }
             WM_COMMAND => {
-                match (wparam.0 & 0xffff) as i32 {
-                    MANAGER_LIST_ID => select_from_list(window),
-                    MANAGER_EDIT_ID => open_note_window(window),
-                    MANAGER_REFRESH_ID => force_refresh_records(window, selected_wish_id()),
-                    MANAGER_CONTEXT_ID => toggle_context(window),
-                    MANAGER_SEARCH_ID | MANAGER_STATUS_FILTER_ID | MANAGER_IMPORTANCE_FILTER_ID => {
-                        apply_manager_filter(window, selected_wish_id().as_deref())
+                let id = (wparam.0 & 0xffff) as i32;
+                let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+                match manager_command(id, notification) {
+                    Some(ManagerCommand::SelectRecord) => select_from_list(window),
+                    Some(ManagerCommand::EditRecord) => open_note_window(window),
+                    Some(ManagerCommand::Refresh) => {
+                        force_refresh_records(window, selected_wish_id())
                     }
-                    MANAGER_CLEAR_FILTER_ID => clear_manager_filter(window),
-                    MANAGER_ACTIVE_VIEW_ID => navigate_manager_view(window, ManagerView::Active),
-                    MANAGER_TRASH_VIEW_ID => navigate_manager_view(window, ManagerView::Trash),
-                    MANAGER_RESTORE_ID => restore_selected_record(window),
-                    MANAGER_MOVE_TO_TRASH_ID => move_selected_record_to_trash(window),
-                    _ => {}
+                    Some(ManagerCommand::ToggleContext) => toggle_context(window),
+                    Some(ManagerCommand::ApplyFilter) => {
+                        if !manager_filter_notifications_suppressed() {
+                            apply_manager_filter(window, selected_wish_id().as_deref());
+                        }
+                    }
+                    Some(ManagerCommand::ClearFilter) => clear_manager_filter(window),
+                    Some(ManagerCommand::Navigate(view)) => navigate_manager_view(window, view),
+                    Some(ManagerCommand::RestoreRecord) => restore_selected_record(window),
+                    Some(ManagerCommand::MoveRecordToTrash) => {
+                        move_selected_record_to_trash(window)
+                    }
+                    None => {}
                 }
                 LRESULT(0)
             }
@@ -1531,6 +1552,7 @@ mod windows_app {
                 visible_indices: Vec::new(),
                 selected: None,
                 show_context: false,
+                suppress_filter_notifications: false,
             });
         }
         if empty {
@@ -1969,13 +1991,61 @@ mod windows_app {
     }
 
     fn clear_manager_filter(window: HWND) {
+        if !manager_filter_from_controls(window).is_active() {
+            return;
+        }
+        set_manager_filter_notifications_suppressed(true);
         set_control_text(window, MANAGER_SEARCH_ID, "");
         for id in [MANAGER_STATUS_FILTER_ID, MANAGER_IMPORTANCE_FILTER_ID] {
             if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
                 let _ = unsafe { SendMessageW(control, CB_SETCURSEL, Some(WPARAM(0)), None) };
             }
         }
+        set_manager_filter_notifications_suppressed(false);
         apply_manager_filter(window, selected_wish_id().as_deref());
+    }
+
+    fn set_manager_filter_notifications_suppressed(suppressed: bool) {
+        if let Ok(mut state) = MANAGER_STATE.lock()
+            && let Some(state) = state.as_mut()
+        {
+            state.suppress_filter_notifications = suppressed;
+        }
+    }
+
+    fn manager_filter_notifications_suppressed() -> bool {
+        MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .as_ref()
+                    .map(|state| state.suppress_filter_notifications)
+            })
+            .unwrap_or(false)
+    }
+
+    fn manager_command(id: i32, notification: u32) -> Option<ManagerCommand> {
+        match (id, notification) {
+            (MANAGER_LIST_ID, LBN_SELCHANGE) => Some(ManagerCommand::SelectRecord),
+            (MANAGER_SEARCH_ID, EN_CHANGE)
+            | (MANAGER_STATUS_FILTER_ID | MANAGER_IMPORTANCE_FILTER_ID, CBN_SELCHANGE) => {
+                Some(ManagerCommand::ApplyFilter)
+            }
+            (MANAGER_EDIT_ID, BN_CLICKED) => Some(ManagerCommand::EditRecord),
+            (MANAGER_REFRESH_ID, BN_CLICKED) => Some(ManagerCommand::Refresh),
+            (MANAGER_CONTEXT_ID, BN_CLICKED) => Some(ManagerCommand::ToggleContext),
+            (MANAGER_CLEAR_FILTER_ID, BN_CLICKED) => Some(ManagerCommand::ClearFilter),
+            (MANAGER_ACTIVE_VIEW_ID, BN_CLICKED) => {
+                Some(ManagerCommand::Navigate(ManagerView::Active))
+            }
+            (MANAGER_TRASH_VIEW_ID, BN_CLICKED) => {
+                Some(ManagerCommand::Navigate(ManagerView::Trash))
+            }
+            (MANAGER_RESTORE_ID, BN_CLICKED) => Some(ManagerCommand::RestoreRecord),
+            (MANAGER_MOVE_TO_TRASH_ID, BN_CLICKED) => Some(ManagerCommand::MoveRecordToTrash),
+            _ => None,
+        }
     }
 
     fn manager_record_label(record: &ManagerRecord, now: SystemTime) -> String {
@@ -3349,6 +3419,31 @@ mod windows_app {
             assert_eq!(ManagerView::Trash.list_title(3, 2, true), "筛选结果　2 / 3");
             assert!(ManagerView::Trash.description().contains("暂存"));
             assert!(ManagerView::Trash.description().contains("恢复"));
+        }
+
+        #[test]
+        fn manager_commands_ignore_focus_and_dropdown_notifications() {
+            assert_eq!(
+                manager_command(MANAGER_LIST_ID, LBN_SELCHANGE),
+                Some(ManagerCommand::SelectRecord)
+            );
+            assert_eq!(manager_command(MANAGER_LIST_ID, 4), None);
+            assert_eq!(
+                manager_command(MANAGER_SEARCH_ID, EN_CHANGE),
+                Some(ManagerCommand::ApplyFilter)
+            );
+            assert_eq!(manager_command(MANAGER_SEARCH_ID, 0x0100), None);
+            assert_eq!(
+                manager_command(MANAGER_STATUS_FILTER_ID, CBN_SELCHANGE),
+                Some(ManagerCommand::ApplyFilter)
+            );
+            assert_eq!(manager_command(MANAGER_STATUS_FILTER_ID, 3), None);
+            assert_eq!(manager_command(MANAGER_STATUS_FILTER_ID, 7), None);
+            assert_eq!(
+                manager_command(MANAGER_REFRESH_ID, BN_CLICKED),
+                Some(ManagerCommand::Refresh)
+            );
+            assert_eq!(manager_command(MANAGER_REFRESH_ID, 1), None);
         }
 
         #[test]
