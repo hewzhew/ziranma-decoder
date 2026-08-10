@@ -259,6 +259,7 @@ struct SelectionPattern {
     manual_selections: usize,
     paged_selections: usize,
     session_promoted_frames: usize,
+    provenance_observations: usize,
     sources: [usize; 10],
 }
 
@@ -282,6 +283,7 @@ impl SelectionPattern {
         self.manual_selections += usize::from(selection != NativeSelectionSource::FirstCandidate);
         self.paged_selections += usize::from(rank > 6);
         if let Some(provenance) = provenance {
+            self.provenance_observations += 1;
             self.session_promoted_frames += usize::from(provenance.session_promoted());
             self.sources[candidate_source_index(provenance.source())] += 1;
         }
@@ -309,6 +311,22 @@ struct SelectionPressure {
     first_non_top_later_top_identities: usize,
     followup_first_non_top_never_top_identities: usize,
     first_top_later_non_top_identities: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FollowupNonTopPressure {
+    identities: usize,
+    ambiguous_code_identities: usize,
+    best_rank_two: usize,
+    best_rank_three_to_six: usize,
+    best_rank_after_first_page: usize,
+    improved_rank_identities: usize,
+    unimproved_rank_identities: usize,
+    session_promoted_identities: usize,
+    complete_provenance_identities: usize,
+    partial_provenance_identities: usize,
+    missing_provenance_identities: usize,
+    dominant_sources: [usize; 10],
 }
 
 #[derive(Default)]
@@ -608,6 +626,75 @@ impl ResearchReview {
             self.raw_codes.len(),
         )
         .unwrap();
+        let followup = self.followup_non_top_pressure();
+        writeln!(
+            output,
+            "持续非首选（仅有后续提交且始终未到首选）：身份 {}；同码另有已提交文字 {}；最好第 2 名 {}、第 3–6 名 {}、第 7 名以后 {}；名次曾改善 {}、未改善 {}。",
+            followup.identities,
+            followup.ambiguous_code_identities,
+            followup.best_rank_two,
+            followup.best_rank_three_to_six,
+            followup.best_rank_after_first_page,
+            followup.improved_rank_identities,
+            followup.unimproved_rank_identities,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "持续非首选证据：观察到会话提升 {}；候选来源完整 {}、部分 {}、缺失 {}；主要来源 {}。",
+            followup.session_promoted_identities,
+            followup.complete_provenance_identities,
+            followup.partial_provenance_identities,
+            followup.missing_provenance_identities,
+            render_candidate_source_counts(&followup.dominant_sources),
+        )
+        .unwrap();
+    }
+
+    fn followup_non_top_pressure(&self) -> FollowupNonTopPressure {
+        let mut outputs_by_code: HashMap<&str, usize> = HashMap::new();
+        for code in self.selections.keys().map(|(code, _)| code.as_str()) {
+            *outputs_by_code.entry(code).or_insert(0) += 1;
+        }
+        let mut pressure = FollowupNonTopPressure::default();
+        for ((code, _), pattern) in self.selections.iter().filter(|(_, pattern)| {
+            pattern.selections >= 2
+                && pattern.first_rank.is_some_and(|rank| rank > 1)
+                && pattern.minimum_rank > 1
+        }) {
+            pressure.identities += 1;
+            pressure.ambiguous_code_identities +=
+                usize::from(outputs_by_code.get(code.as_str()).copied().unwrap_or(0) >= 2);
+            match pattern.minimum_rank {
+                2 => pressure.best_rank_two += 1,
+                3..=6 => pressure.best_rank_three_to_six += 1,
+                _ => pressure.best_rank_after_first_page += 1,
+            }
+            if pattern
+                .first_rank
+                .is_some_and(|first_rank| pattern.minimum_rank < first_rank)
+            {
+                pressure.improved_rank_identities += 1;
+            } else {
+                pressure.unimproved_rank_identities += 1;
+            }
+            pressure.session_promoted_identities +=
+                usize::from(pattern.session_promoted_frames != 0);
+            match pattern.provenance_observations {
+                0 => pressure.missing_provenance_identities += 1,
+                observations if observations == pattern.selections => {
+                    pressure.complete_provenance_identities += 1;
+                    pressure.dominant_sources[candidate_source_index(pattern.dominant_source())] +=
+                        1;
+                }
+                _ => {
+                    pressure.partial_provenance_identities += 1;
+                    pressure.dominant_sources[candidate_source_index(pattern.dominant_source())] +=
+                        1;
+                }
+            }
+        }
+        pressure
     }
 
     fn render_aggregate(&self) -> String {
@@ -1167,6 +1254,26 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
     }
 }
 
+fn render_candidate_source_counts(counts: &[usize; 10]) -> String {
+    let rendered = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count != 0)
+        .map(|(index, count)| {
+            format!(
+                "{} {}",
+                candidate_source_label(candidate_source_from_index(index)),
+                count
+            )
+        })
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "暂无".to_owned()
+    } else {
+        rendered.join("、")
+    }
+}
+
 fn print_status(root: &Path) -> Result<(), Box<dyn Error>> {
     let enabled = research_feedback_enabled(root)?;
     let packages = list_wish_packages(root)?.len();
@@ -1375,6 +1482,63 @@ mod tests {
         assert!(rendered.contains("有后续提交 2（其中到过首选 1、仍未到首选 1）"));
         assert!(rendered.contains("首次首选后又出现非首选 1"));
         for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
+            assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn followup_non_top_pressure_partitions_only_supported_evidence() {
+        let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let promoted_core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
+        let supplemental =
+            NativeCandidateProvenance::new(NativeCandidateSource::SupplementalExact, false);
+        let mut review = ResearchReview::default();
+        for (code, text, observations) in [
+            (
+                "same",
+                "alpha",
+                vec![(4, Some(core)), (2, Some(promoted_core))],
+            ),
+            ("same", "beta", vec![(1, Some(core))]),
+            ("cold", "gamma", vec![(3, None), (3, None)]),
+            ("far", "zeta", vec![(8, None), (7, Some(supplemental))]),
+            ("learned", "eta", vec![(2, Some(core)), (1, Some(core))]),
+        ] {
+            let pattern = review
+                .selections
+                .entry((code.to_owned(), text.to_owned()))
+                .or_default();
+            for (rank, provenance) in observations {
+                pattern.observe(rank, NativeSelectionSource::Numeric, provenance);
+            }
+        }
+
+        let mut dominant_sources = [0; 10];
+        dominant_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 1;
+        dominant_sources[candidate_source_index(NativeCandidateSource::SupplementalExact)] = 1;
+        assert_eq!(
+            review.followup_non_top_pressure(),
+            FollowupNonTopPressure {
+                identities: 3,
+                ambiguous_code_identities: 1,
+                best_rank_two: 1,
+                best_rank_three_to_six: 1,
+                best_rank_after_first_page: 1,
+                improved_rank_identities: 2,
+                unimproved_rank_identities: 1,
+                session_promoted_identities: 1,
+                complete_provenance_identities: 1,
+                partial_provenance_identities: 1,
+                missing_provenance_identities: 1,
+                dominant_sources,
+            }
+        );
+        let mut rendered = String::new();
+        review.render_selection_pressure(&mut rendered);
+        assert!(rendered.contains("最好第 2 名 1、第 3–6 名 1、第 7 名以后 1"));
+        assert!(rendered.contains("候选来源完整 1、部分 1、缺失 1"));
+        assert!(rendered.contains("主要来源 核心整词 1、补充整词/组合 1"));
+        for private_value in ["same", "alpha", "cold", "gamma", "far", "zeta"] {
             assert!(!rendered.contains(private_value));
         }
     }
