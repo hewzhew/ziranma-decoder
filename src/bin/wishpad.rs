@@ -154,6 +154,12 @@ mod windows_app {
                 *self = Self::Unloaded;
             }
         }
+
+        fn retry_unavailable(&mut self) {
+            if matches!(self, Self::Unavailable) {
+                *self = Self::Unloaded;
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -201,6 +207,13 @@ mod windows_app {
         Unchanged,
         Select(Option<usize>),
         Rebuild,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ManagerRefreshOutcome {
+        Updated,
+        Unchanged,
+        Failed,
     }
 
     impl ManagerView {
@@ -420,7 +433,7 @@ mod windows_app {
         match message {
             OPEN_MANAGER_MESSAGE => {
                 unsafe { show_manager(window) };
-                force_refresh_records(window, selected_wish_id());
+                let _ = force_refresh_records(window, selected_wish_id());
                 LRESULT(0)
             }
             RECORDS_CHANGED_MESSAGE => {
@@ -459,7 +472,15 @@ mod windows_app {
                     Some(ManagerCommand::SelectRecord) => select_from_list(window),
                     Some(ManagerCommand::EditRecord) => open_note_window(window),
                     Some(ManagerCommand::Refresh) => {
-                        force_refresh_records(window, selected_wish_id())
+                        match force_refresh_records(window, selected_wish_id()) {
+                            ManagerRefreshOutcome::Updated => {
+                                set_manager_status(window, "记录已刷新")
+                            }
+                            ManagerRefreshOutcome::Unchanged => {
+                                set_manager_status(window, "已检查，记录没有变化")
+                            }
+                            ManagerRefreshOutcome::Failed => {}
+                        }
                     }
                     Some(ManagerCommand::ToggleContext) => toggle_context(window),
                     Some(ManagerCommand::ApplyFilter) => {
@@ -1446,17 +1467,21 @@ mod windows_app {
             .unwrap_or_default()
     }
 
-    fn refresh_records(window: HWND, preserve_id: Option<String>) {
-        refresh_records_for_view(window, current_manager_view(), preserve_id);
+    fn refresh_records(window: HWND, preserve_id: Option<String>) -> ManagerRefreshOutcome {
+        refresh_records_for_view(window, current_manager_view(), preserve_id)
     }
 
-    fn force_refresh_records(window: HWND, preserve_id: Option<String>) {
+    fn force_refresh_records(window: HWND, preserve_id: Option<String>) -> ManagerRefreshOutcome {
         clear_cached_manager_view();
-        refresh_records(window, preserve_id);
+        retry_unavailable_manager_snapshots();
+        refresh_records(window, preserve_id)
     }
 
-    fn refresh_records_for_view(window: HWND, view: ManagerView, preserve_id: Option<String>) {
-        apply_manager_view_chrome(window, view);
+    fn refresh_records_for_view(
+        window: HWND,
+        view: ManagerView,
+        preserve_id: Option<String>,
+    ) -> ManagerRefreshOutcome {
         let Some(root) = std::env::current_exe()
             .ok()
             .and_then(|path| wish_root_for_executable(&path))
@@ -1474,7 +1499,7 @@ mod windows_app {
             apply_manager_view_chrome(window, view);
             set_manager_status(window, "无法定位本项目的许愿目录");
             invalidate_manager_window(window);
-            return;
+            return ManagerRefreshOutcome::Failed;
         };
         let packages = match match view {
             ManagerView::Active => list_wish_packages(&root),
@@ -1496,7 +1521,7 @@ mod windows_app {
                 apply_manager_view_chrome(window, view);
                 set_manager_status(window, "暂时无法读取许愿记录");
                 invalidate_manager_window(window);
-                return;
+                return ManagerRefreshOutcome::Failed;
             }
         };
         let (active_count, trash_count) = match view {
@@ -1546,6 +1571,11 @@ mod windows_app {
                 }
             })
             .collect::<Vec<_>>();
+        if update_unchanged_manager_state(&root, view, active_count, trash_count, &records) {
+            apply_manager_view_chrome(window, view);
+            render_selected_record(window);
+            return ManagerRefreshOutcome::Unchanged;
+        }
         let empty = records.is_empty();
         let cached_view = cached_manager_view_for_reload(&root, view);
         if let Ok(mut state) = MANAGER_STATE.lock() {
@@ -1570,6 +1600,39 @@ mod windows_app {
         apply_manager_view_chrome(window, view);
         apply_manager_filter(window, preserve_id.as_deref());
         invalidate_manager_window(window);
+        ManagerRefreshOutcome::Updated
+    }
+
+    fn update_unchanged_manager_state(
+        root: &Path,
+        view: ManagerView,
+        active_count: Option<usize>,
+        trash_count: Option<usize>,
+        refreshed: &[ManagerRecord],
+    ) -> bool {
+        MANAGER_STATE.lock().ok().is_some_and(|mut state| {
+            let Some(state) = state.as_mut() else {
+                return false;
+            };
+            if state.root != root
+                || state.view != view
+                || !manager_records_unchanged(&state.records, refreshed)
+            {
+                return false;
+            }
+            state.active_count = active_count;
+            state.trash_count = trash_count;
+            true
+        })
+    }
+
+    fn manager_records_unchanged(current: &[ManagerRecord], refreshed: &[ManagerRecord]) -> bool {
+        current.len() == refreshed.len()
+            && current.iter().zip(refreshed).all(|(current, refreshed)| {
+                current.info == refreshed.info
+                    && current.note == refreshed.note
+                    && current.note_unavailable == refreshed.note_unavailable
+            })
     }
 
     fn cached_manager_view_for_reload(
@@ -1666,6 +1729,16 @@ mod windows_app {
         }
     }
 
+    fn retry_unavailable_manager_snapshots() {
+        if let Ok(mut state) = MANAGER_STATE.lock()
+            && let Some(state) = state.as_mut()
+        {
+            for record in &mut state.records {
+                record.snapshot.retry_unavailable();
+            }
+        }
+    }
+
     fn apply_manager_view_chrome(window: HWND, view: ManagerView) {
         set_control_text(window, MANAGER_TITLE_ID, view.title());
         set_control_text(window, MANAGER_DESCRIPTION_ID, view.description());
@@ -1728,7 +1801,7 @@ mod windows_app {
             return;
         }
         if !activate_cached_manager_view(window, view) {
-            refresh_records_for_view(window, view, None);
+            let _ = refresh_records_for_view(window, view, None);
         }
     }
 
@@ -1765,7 +1838,7 @@ mod windows_app {
         match move_wish_to_trash(&root, &wish_id) {
             Ok(()) => {
                 clear_cached_manager_view();
-                refresh_records_for_view(window, ManagerView::Active, preserve_id);
+                let _ = refresh_records_for_view(window, ManagerView::Active, preserve_id);
                 if manager_total_record_count() == 0 {
                     set_control_text(window, MANAGER_EMPTY_TITLE_ID, "已放进回收站");
                     set_control_text(
@@ -1833,7 +1906,10 @@ mod windows_app {
         match restore_wish_from_trash(&root, &wish_id, &WindowsUserDataProtector) {
             Ok(()) => {
                 clear_cached_manager_view();
-                refresh_records_for_view(window, ManagerView::Active, Some(wish_id));
+                let _ = refresh_records_for_view(window, ManagerView::Active, Some(wish_id));
+                // The just-departed trash page predates the successful move,
+                // so it must not be offered as a fast path on the next visit.
+                clear_cached_manager_view();
                 set_manager_status(window, "记录已恢复到许愿列表");
             }
             Err(error) => show_note_message(window, restore_error_message(error), true),
@@ -3471,6 +3547,78 @@ mod windows_app {
             failed.discard_loaded();
             assert!(!failed.needs_load());
             assert!(failed.loaded().is_none());
+            failed.retry_unavailable();
+            assert!(failed.needs_load());
+        }
+
+        #[test]
+        fn unchanged_refresh_preserves_snapshot_cache_only_for_the_same_disk_record() {
+            use std::fs;
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+            let directory = std::env::temp_dir().join(format!(
+                "ziranma-wishpad-refresh-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&directory).unwrap();
+            let wish_id = format!("wish-{}", "ab".repeat(32));
+            fs::write(
+                directory.join(format!(
+                    "{wish_id}{}",
+                    ziranma_core::WISH_PACKAGE_FILE_SUFFIX
+                )),
+                b"synthetic-public-test-record",
+            )
+            .unwrap();
+            let info = list_wish_packages(&directory).unwrap().remove(0);
+            fs::remove_dir_all(&directory).unwrap();
+
+            let note = WishNote::with_organization(
+                &wish_id,
+                WishCategory::Display,
+                WishReviewStatus::Inbox,
+                WishImportance::Normal,
+                "公开合成说明",
+            )
+            .unwrap();
+            let current = ManagerRecord {
+                info: info.clone(),
+                note: Some(note.clone()),
+                note_unavailable: false,
+                snapshot: ManagerSnapshotCache::Unloaded,
+            };
+            let mut refreshed = current.clone();
+            refreshed.snapshot = ManagerSnapshotCache::Unavailable;
+            assert!(manager_records_unchanged(
+                std::slice::from_ref(&current),
+                std::slice::from_ref(&refreshed)
+            ));
+
+            refreshed.note = Some(
+                WishNote::with_organization(
+                    &wish_id,
+                    WishCategory::Display,
+                    WishReviewStatus::InProgress,
+                    WishImportance::Normal,
+                    "公开合成说明",
+                )
+                .unwrap(),
+            );
+            assert!(!manager_records_unchanged(
+                std::slice::from_ref(&current),
+                std::slice::from_ref(&refreshed)
+            ));
+
+            refreshed = current.clone();
+            refreshed.note_unavailable = true;
+            assert!(!manager_records_unchanged(&[current], &[refreshed]));
         }
 
         #[test]
