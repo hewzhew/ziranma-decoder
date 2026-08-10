@@ -670,6 +670,12 @@ impl ResearchReview {
             self.batches,
         )
         .unwrap();
+        writeln!(
+            output,
+            "{}",
+            render_current_schema_readiness(&self.source_schema_versions, self.batches)
+        )
+        .unwrap();
     }
 
     fn selection_pressure(&self) -> SelectionPressure {
@@ -1302,6 +1308,41 @@ fn render_slow_key_coverage(
         )
     };
     writeln!(output, "慢按键分段覆盖：{label}").unwrap();
+}
+
+fn render_current_schema_readiness(
+    source_schema_versions: &[usize; WISH_SCHEMA_VERSION_COUNT],
+    total_batches: usize,
+) -> String {
+    let current_batches = source_schema_versions
+        .get(WISH_SCHEMA_VERSION_COUNT.saturating_sub(1))
+        .copied()
+        .unwrap_or(0);
+    if total_batches == 0 {
+        return format!("当前 V{CURRENT_WISH_SCHEMA_VERSION} 采集就绪：无法判断；暂无可分析批次。");
+    }
+    if current_batches == total_batches {
+        return format!(
+            "当前 V{CURRENT_WISH_SCHEMA_VERSION} 采集就绪：已确认；{current_batches}/{total_batches} 批均为当前格式。"
+        );
+    }
+    if current_batches != 0 {
+        return format!(
+            "当前 V{CURRENT_WISH_SCHEMA_VERSION} 采集就绪：部分确认；{current_batches}/{total_batches} 批为当前格式，其余历史批次不会补写。"
+        );
+    }
+    let Some(highest_schema) = source_schema_versions
+        .iter()
+        .rposition(|count| *count != 0)
+        .map(|index| index + 1)
+    else {
+        return format!(
+            "当前 V{CURRENT_WISH_SCHEMA_VERSION} 采集就绪：无法判断；批次数量与格式分布不一致。"
+        );
+    };
+    format!(
+        "当前 V{CURRENT_WISH_SCHEMA_VERSION} 采集就绪：尚未在记录中观察到；这些批次最高为 V{highest_schema}，无法证明全部当前诊断字段均已上线。历史批次不会补写。"
+    )
 }
 
 fn render_code_counts(output: &mut String, title: &str, counts: &HashMap<String, usize>) {
@@ -2040,6 +2081,32 @@ mod tests {
         output.clear();
         render_slow_key_coverage(&mut output, &[21], 4, 4);
         assert!(output.contains("记录中存在分阶段耗时"));
+    }
+
+    #[test]
+    fn current_schema_readiness_distinguishes_absent_legacy_mixed_and_complete_batches() {
+        let empty = [0; WISH_SCHEMA_VERSION_COUNT];
+        assert!(render_current_schema_readiness(&empty, 0).contains("无法判断"));
+
+        let mut legacy = [0; WISH_SCHEMA_VERSION_COUNT];
+        legacy[4] = 3;
+        legacy[7] = 2;
+        let rendered = render_current_schema_readiness(&legacy, 5);
+        assert!(rendered.contains("尚未在记录中观察到"));
+        assert!(rendered.contains("最高为 V8"));
+        assert!(rendered.contains("历史批次不会补写"));
+
+        let mut mixed = legacy;
+        mixed[WISH_SCHEMA_VERSION_COUNT - 1] = 2;
+        let rendered = render_current_schema_readiness(&mixed, 7);
+        assert!(rendered.contains("部分确认"));
+        assert!(rendered.contains("2/7 批为当前格式"));
+
+        let mut current = [0; WISH_SCHEMA_VERSION_COUNT];
+        current[WISH_SCHEMA_VERSION_COUNT - 1] = 4;
+        let rendered = render_current_schema_readiness(&current, 4);
+        assert!(rendered.contains("已确认"));
+        assert!(rendered.contains("4/4 批均为当前格式"));
     }
 
     #[test]
