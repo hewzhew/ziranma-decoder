@@ -293,6 +293,8 @@ struct SelectionPattern {
     selections: usize,
     non_top_selections: usize,
     first_rank: Option<usize>,
+    first_top_selection: Option<usize>,
+    non_top_selections_after_first_top: usize,
     last_rank: Option<usize>,
     minimum_rank: usize,
     maximum_rank: usize,
@@ -317,6 +319,11 @@ impl SelectionPattern {
         self.selections += 1;
         self.non_top_selections += usize::from(rank > 1);
         self.first_rank.get_or_insert(rank);
+        if rank == 1 {
+            self.first_top_selection.get_or_insert(self.selections);
+        } else if self.first_top_selection.is_some() {
+            self.non_top_selections_after_first_top += 1;
+        }
         self.last_rank = Some(rank);
         self.minimum_rank = if self.minimum_rank == 0 {
             rank
@@ -375,6 +382,15 @@ struct SelectionPressure {
     first_non_top_later_top_identities: usize,
     followup_first_non_top_never_top_identities: usize,
     first_top_later_non_top_identities: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TopArrivalTrajectory {
+    identities: usize,
+    second_selection: usize,
+    third_or_fourth_selection: usize,
+    fifth_or_later_selection: usize,
+    later_non_top_identities: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -765,6 +781,17 @@ impl ResearchReview {
             self.raw_codes.len(),
         )
         .unwrap();
+        let top_arrival = self.top_arrival_trajectory();
+        writeln!(
+            output,
+            "首选到达顺序（首次为非首选且后来到过首选）：身份 {}；第 2 次选择时到达 {}；第 3–4 次 {}；第 5 次以后 {}；到达后又出现非首选 {}。",
+            top_arrival.identities,
+            top_arrival.second_selection,
+            top_arrival.third_or_fourth_selection,
+            top_arrival.fifth_or_later_selection,
+            top_arrival.later_non_top_identities,
+        )
+        .unwrap();
         let followup = self.followup_non_top_pressure();
         writeln!(
             output,
@@ -808,6 +835,24 @@ impl ResearchReview {
             render_candidate_source_counts(&followup.dominant_top_sources),
         )
         .unwrap();
+    }
+
+    fn top_arrival_trajectory(&self) -> TopArrivalTrajectory {
+        let mut trajectory = TopArrivalTrajectory::default();
+        for pattern in self.selections.values().filter(|pattern| {
+            pattern.first_rank.is_some_and(|rank| rank > 1) && pattern.first_top_selection.is_some()
+        }) {
+            trajectory.identities += 1;
+            match pattern.first_top_selection {
+                Some(2) => trajectory.second_selection += 1,
+                Some(3..=4) => trajectory.third_or_fourth_selection += 1,
+                Some(5..) => trajectory.fifth_or_later_selection += 1,
+                _ => {}
+            }
+            trajectory.later_non_top_identities +=
+                usize::from(pattern.non_top_selections_after_first_top != 0);
+        }
+        trajectory
     }
 
     fn followup_non_top_pressure(&self) -> FollowupNonTopPressure {
@@ -1753,7 +1798,48 @@ mod tests {
         assert!(rendered.contains("只提交过一次 1"));
         assert!(rendered.contains("有后续提交 2（其中到过首选 1、仍未到首选 1）"));
         assert!(rendered.contains("首次首选后又出现非首选 1"));
+        assert!(rendered.contains("第 2 次选择时到达 1"));
+        assert!(rendered.contains("到达后又出现非首选 1"));
         for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
+            assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn top_arrival_trajectory_uses_observation_order_without_claiming_causality() {
+        let mut review = ResearchReview::default();
+        for (identity, ranks) in [
+            ("second", vec![3, 1]),
+            ("third", vec![2, 2, 1]),
+            ("fifth", vec![4, 3, 2, 2, 1, 3]),
+            ("never", vec![2, 2]),
+            ("already", vec![1, 2]),
+        ] {
+            let pattern = review
+                .selections
+                .entry((identity.to_owned(), "private".to_owned()))
+                .or_default();
+            for rank in ranks {
+                pattern.observe(rank, NativeSelectionSource::Numeric, None, false);
+            }
+        }
+
+        assert_eq!(
+            review.top_arrival_trajectory(),
+            TopArrivalTrajectory {
+                identities: 3,
+                second_selection: 1,
+                third_or_fourth_selection: 1,
+                fifth_or_later_selection: 1,
+                later_non_top_identities: 1,
+            }
+        );
+        let mut rendered = String::new();
+        review.render_selection_pressure(&mut rendered);
+        assert!(rendered.contains("第 2 次选择时到达 1"));
+        assert!(rendered.contains("第 3–4 次 1"));
+        assert!(rendered.contains("第 5 次以后 1"));
+        for private_value in ["second", "third", "fifth", "never", "already", "private"] {
             assert!(!rendered.contains(private_value));
         }
     }
