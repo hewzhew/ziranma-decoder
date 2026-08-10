@@ -50,6 +50,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 11;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -298,6 +299,7 @@ impl WishEvent {
 /// This type deliberately does not implement `Debug`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct WishSnapshot {
+    source_schema_version: u8,
     capture_scope: WishCaptureScope,
     category: WishCategory,
     runtime_identity: Option<WishRuntimeIdentity>,
@@ -353,6 +355,7 @@ impl WishSnapshot {
                 latest_completed_episode_range(snapshot.events())
             };
         let value = Self {
+            source_schema_version: CURRENT_WISH_SCHEMA_VERSION,
             capture_scope,
             category,
             runtime_identity,
@@ -380,6 +383,22 @@ impl WishSnapshot {
 
     pub fn capture_scope(&self) -> WishCaptureScope {
         self.capture_scope
+    }
+
+    pub fn source_schema_version(&self) -> u8 {
+        self.source_schema_version
+    }
+
+    pub fn supports_slow_key_path_timing(&self) -> bool {
+        self.source_schema_version >= 9
+    }
+
+    pub fn supports_post_commit_backspace_routing(&self) -> bool {
+        self.source_schema_version >= 10
+    }
+
+    pub fn supports_precise_candidate_personalization(&self) -> bool {
+        self.source_schema_version >= 11
     }
 
     pub fn category(&self) -> WishCategory {
@@ -573,6 +592,9 @@ impl WishSnapshot {
     }
 
     fn validate(&self) -> Result<(), WishFeedbackError> {
+        if !(1..=CURRENT_WISH_SCHEMA_VERSION).contains(&self.source_schema_version) {
+            return Err(WishFeedbackError::InvalidSnapshot);
+        }
         if let Some(identity) = &self.runtime_identity {
             identity.validate()?;
         }
@@ -631,7 +653,7 @@ impl WishSnapshot {
     }
 
     fn render(&self) -> Result<Vec<u8>, WishFeedbackError> {
-        self.render_with_event_version(11)
+        self.render_with_event_version(CURRENT_WISH_SCHEMA_VERSION)
     }
 
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
@@ -794,6 +816,7 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let snapshot = Self {
+            source_schema_version: version,
             capture_scope,
             category,
             runtime_identity,
@@ -2350,6 +2373,16 @@ mod tests {
         rendered
     }
 
+    fn assert_legacy_snapshot_matches(
+        parsed: &WishSnapshot,
+        current: &WishSnapshot,
+        source_schema_version: u8,
+    ) {
+        let mut expected = current.clone();
+        expected.source_schema_version = source_schema_version;
+        assert!(*parsed == expected);
+    }
+
     #[test]
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
@@ -2360,6 +2393,10 @@ mod tests {
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
+        assert_eq!(parsed.source_schema_version(), 11);
+        assert!(parsed.supports_slow_key_path_timing());
+        assert!(parsed.supports_post_commit_backspace_routing());
+        assert!(parsed.supports_precise_candidate_personalization());
         assert!(parsed == snapshot);
         assert!(WishSnapshot::parse(&rendered[..rendered.len() - 1]).is_err());
     }
@@ -2449,6 +2486,10 @@ mod tests {
 
         let legacy = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V10);
         let parsed = WishSnapshot::parse(&legacy).unwrap();
+        assert_eq!(parsed.source_schema_version(), 10);
+        assert!(parsed.supports_slow_key_path_timing());
+        assert!(parsed.supports_post_commit_backspace_routing());
+        assert!(!parsed.supports_precise_candidate_personalization());
         let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
             parsed.events()[0].event()
         else {
@@ -2477,7 +2518,9 @@ mod tests {
         let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V9);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V9));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
-        assert!(parsed == snapshot);
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 9);
+        assert!(parsed.supports_slow_key_path_timing());
+        assert!(!parsed.supports_post_commit_backspace_routing());
         assert!(matches!(
             parsed.events().last().map(WishEvent::event),
             Some(NativeFeedbackEvent::SlowKeyPathTiming {
@@ -2516,7 +2559,8 @@ mod tests {
         let legacy = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V8);
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
-        assert!(parsed == snapshot);
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 8);
+        assert!(!parsed.supports_slow_key_path_timing());
     }
 
     #[test]
@@ -2643,7 +2687,7 @@ mod tests {
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
         assert!(parsed.runtime_identity().is_none());
-        assert!(parsed == snapshot);
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 6);
     }
 
     #[test]
@@ -2921,7 +2965,7 @@ mod tests {
         }
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
-        assert!(parsed == snapshot);
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 2);
     }
 
     fn v3_provenance_fixture(provenance_count: usize, source_tag: Option<u8>) -> Vec<u8> {

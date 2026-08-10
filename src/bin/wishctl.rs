@@ -351,6 +351,10 @@ fn show(
         category_label(snapshot.category()),
         snapshot.events().len()
     );
+    println!(
+        "反馈格式：{}",
+        wish_schema_version_label(snapshot.source_schema_version())
+    );
     let focus = snapshot.focus_event_range();
     println!(
         "重点片段：第 {}–{} 条；之前为参考上下文，之后为许愿入口",
@@ -440,6 +444,10 @@ fn journal_context_label(context: Option<&WishJournalContext>) -> String {
         ),
         None => "连续位置：旧版未记录".to_owned(),
     }
+}
+
+fn wish_schema_version_label(version: u8) -> String {
+    format!("V{version}")
 }
 
 fn capture_scope_label(scope: WishCaptureScope, lookback_ms: u32) -> String {
@@ -803,6 +811,12 @@ mod tests {
         assert_eq!(review_status_label(WishReviewStatus::Resolved), "已完成");
         assert_eq!(importance_label(WishImportance::Normal), "普通");
         assert_eq!(importance_label(WishImportance::Important), "重要");
+    }
+
+    #[test]
+    fn wish_schema_version_label_exposes_the_loaded_source_format() {
+        assert_eq!(wish_schema_version_label(8), "V8");
+        assert_eq!(wish_schema_version_label(11), "V11");
     }
 
     #[test]

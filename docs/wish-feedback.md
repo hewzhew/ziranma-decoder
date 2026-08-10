@@ -189,6 +189,8 @@ TSF DLL 被加载进记事本、Codex 等宿主，不应在宿主 UI 线程里�
 新反馈包使用 `ziranma-wish-v11`，并兼容读取 `ziranma-wish-v1` 至 `ziranma-wish-v10`，写入 Git 已忽略的
 `.local/tsf-alpha/user-data/wishes/`。先在内存形成完整明文，再由 Windows 当前用户 DPAPI
 保护，最后以“不覆盖既有文件”的原子发布方式保存；临时文件也只能包含密文。
+解析后的内存快照保留来源 schema 版本，供只读分析器区分旧字段缺失与真实零事件；
+重新编码始终使用当前 V11。`wishctl show` 会在单条记录的详情中显示实际来源格式。
 任何解密、原文预览或导出都需要单独命令和明确提示。
 
 ## 必须保持的停止条件

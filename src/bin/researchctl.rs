@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use ziranma_core::{
-    NativeCandidatePersonalization, NativeCandidateProvenance, NativeCandidateSource,
-    NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY,
-    ResearchHabitKind, ResearchHalfPairAnalysis, ResearchSceneAnalysis,
-    TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
-    analyze_linked_research, analyze_runtime_half_pairs, list_wish_packages,
+    CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
+    RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
+    ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishRuntimeIdentity,
+    WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs, list_wish_packages,
     repository_root_for_user_tool_executable, research_feedback_enabled,
     set_research_feedback_enabled,
 };
@@ -21,6 +21,7 @@ const MAX_REVIEW_BATCHES: usize = 4_096;
 const MAX_REVIEW_ITEMS: usize = 12;
 const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
+const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
     (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
     (
@@ -297,6 +298,7 @@ struct SelectionPattern {
     maximum_rank: usize,
     manual_selections: usize,
     paged_selections: usize,
+    precise_personalization_observations: usize,
     personalization_frames: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
     provenance_observations: usize,
     sources: [usize; 10],
@@ -310,6 +312,7 @@ impl SelectionPattern {
         rank: usize,
         selection: NativeSelectionSource,
         provenance: Option<NativeCandidateProvenance>,
+        precise_personalization: bool,
     ) {
         self.selections += 1;
         self.non_top_selections += usize::from(rank > 1);
@@ -323,6 +326,7 @@ impl SelectionPattern {
         self.maximum_rank = self.maximum_rank.max(rank);
         self.manual_selections += usize::from(selection != NativeSelectionSource::FirstCandidate);
         self.paged_selections += usize::from(rank > 6);
+        self.precise_personalization_observations += usize::from(precise_personalization);
         if let Some(provenance) = provenance {
             self.provenance_observations += 1;
             for (index, (bit, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
@@ -383,6 +387,9 @@ struct FollowupNonTopPressure {
     improved_rank_identities: usize,
     unimproved_rank_identities: usize,
     personalization_identities: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    complete_personalization_identities: usize,
+    partial_personalization_identities: usize,
+    legacy_personalization_identities: usize,
     complete_provenance_identities: usize,
     partial_provenance_identities: usize,
     missing_provenance_identities: usize,
@@ -426,6 +433,10 @@ struct ResearchReview {
     slow_key_refresh_ms: Vec<u32>,
     slow_key_planning_ms: Vec<u32>,
     slow_key_edit_session_ms: Vec<u32>,
+    slow_key_timing_capable_batches: usize,
+    post_commit_backspace_capable_batches: usize,
+    precise_personalization_capable_batches: usize,
+    source_schema_versions: [usize; WISH_SCHEMA_VERSION_COUNT],
     transposition_accepted: usize,
     transposition_rejected: usize,
     transposition_unknown: usize,
@@ -442,6 +453,17 @@ impl ResearchReview {
             return Err("持续研究目录中出现了非持续批次".into());
         }
         self.batches += 1;
+        self.slow_key_timing_capable_batches +=
+            usize::from(snapshot.supports_slow_key_path_timing());
+        self.post_commit_backspace_capable_batches +=
+            usize::from(snapshot.supports_post_commit_backspace_routing());
+        self.precise_personalization_capable_batches +=
+            usize::from(snapshot.supports_precise_candidate_personalization());
+        if let Some(count) = self.source_schema_versions.get_mut(usize::from(
+            snapshot.source_schema_version().saturating_sub(1),
+        )) {
+            *count += 1;
+        }
         if let Some(identity) = snapshot.runtime_identity() {
             *self.runtime_batches.entry(identity.clone()).or_insert(0) += 1;
         } else {
@@ -535,7 +557,12 @@ impl ResearchReview {
                         .selections
                         .entry((code.clone(), text.clone()))
                         .or_default();
-                    pattern.observe(*absolute_rank, *source, provenance);
+                    pattern.observe(
+                        *absolute_rank,
+                        *source,
+                        provenance,
+                        snapshot.supports_precise_candidate_personalization(),
+                    );
                     pattern.observe_global_top_provenance(global_top_provenance);
                     frame = None;
                 }
@@ -611,6 +638,38 @@ impl ResearchReview {
                 && first_candidate
                     .is_some_and(|candidate| candidate.source() == NativeCandidateSource::Decoder),
         );
+    }
+
+    fn render_capability_coverage(&self, output: &mut String) {
+        let schemas = self
+            .source_schema_versions
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(index, count)| format!("V{} {}", index + 1, count))
+            .collect::<Vec<_>>()
+            .join("、");
+        writeln!(
+            output,
+            "反馈格式：{}。",
+            if schemas.is_empty() {
+                "暂无"
+            } else {
+                &schemas
+            }
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化原因 {}/{} 批。",
+            self.slow_key_timing_capable_batches,
+            self.batches,
+            self.post_commit_backspace_capable_batches,
+            self.batches,
+            self.precise_personalization_capable_batches,
+            self.batches,
+        )
+        .unwrap();
     }
 
     fn selection_pressure(&self) -> SelectionPressure {
@@ -715,12 +774,20 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "持续非首选证据：个性化机制 {}；候选来源完整 {}、部分 {}、缺失 {}；主要来源 {}。",
-            render_candidate_personalization_counts(&followup.personalization_identities),
+            "持续非首选证据：候选来源完整 {}、部分 {}、缺失 {}；主要来源 {}。",
             followup.complete_provenance_identities,
             followup.partial_provenance_identities,
             followup.missing_provenance_identities,
             render_candidate_source_counts(&followup.dominant_sources),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "持续非首选个性化：精确原因覆盖完整 {}、部分 {}、旧格式 {}；记录到 {}。",
+            followup.complete_personalization_identities,
+            followup.partial_personalization_identities,
+            followup.legacy_personalization_identities,
+            render_candidate_personalization_counts(&followup.personalization_identities),
         )
         .unwrap();
         writeln!(
@@ -766,6 +833,13 @@ impl ResearchReview {
             }
             for (index, frames) in pattern.personalization_frames.iter().enumerate() {
                 pressure.personalization_identities[index] += usize::from(*frames != 0);
+            }
+            match pattern.precise_personalization_observations {
+                0 => pressure.legacy_personalization_identities += 1,
+                observations if observations == pattern.selections => {
+                    pressure.complete_personalization_identities += 1;
+                }
+                _ => pressure.partial_personalization_identities += 1,
             }
             match pattern.provenance_observations {
                 0 => pressure.missing_provenance_identities += 1,
@@ -823,6 +897,7 @@ impl ResearchReview {
             &self.runtime_batches,
             self.unidentified_runtime_batches,
         );
+        self.render_capability_coverage(&mut output);
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；显式选择 {}；无法配对现场 {}。",
@@ -870,7 +945,12 @@ impl ResearchReview {
             "慢按键编辑会话阶段",
             &self.slow_key_edit_session_ms,
         );
-        render_slow_key_coverage(&mut output, &self.slow_key_total_ms);
+        render_slow_key_coverage(
+            &mut output,
+            &self.slow_key_total_ms,
+            self.slow_key_timing_capable_batches,
+            self.batches,
+        );
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -902,6 +982,7 @@ impl ResearchReview {
             &self.runtime_batches,
             self.unidentified_runtime_batches,
         );
+        self.render_capability_coverage(&mut output);
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；显式选择 {}；无法配对现场 {}。",
@@ -948,7 +1029,12 @@ impl ResearchReview {
             "慢按键编辑会话阶段",
             &self.slow_key_edit_session_ms,
         );
-        render_slow_key_coverage(&mut output, &self.slow_key_total_ms);
+        render_slow_key_coverage(
+            &mut output,
+            &self.slow_key_total_ms,
+            self.slow_key_timing_capable_batches,
+            self.batches,
+        );
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -1053,6 +1139,7 @@ impl ResearchReview {
             self.batches, self.complete_batches, self.events, self.omitted_events,
         )
         .unwrap();
+        self.render_capability_coverage(&mut output);
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；取消 {}；原码上屏 {}；提交后紧接退格 {}。",
@@ -1106,7 +1193,12 @@ impl ResearchReview {
             "慢按键总耗时（仅 ≥16 ms）",
             &self.slow_key_total_ms,
         );
-        render_slow_key_coverage(&mut output, &self.slow_key_total_ms);
+        render_slow_key_coverage(
+            &mut output,
+            &self.slow_key_total_ms,
+            self.slow_key_timing_capable_batches,
+            self.batches,
+        );
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -1186,14 +1278,30 @@ fn render_latency(output: &mut String, label: &str, values: &[u32]) {
     }
 }
 
-fn render_slow_key_coverage(output: &mut String, values: &[u32]) {
-    if values.is_empty() {
-        output.push_str(
-            "慢按键分段覆盖：未确认；0 条既可能表示没有 ≥16 ms 按键，也可能表示运行 DLL 尚未采集该字段。\n",
-        );
+fn render_slow_key_coverage(
+    output: &mut String,
+    values: &[u32],
+    capable_batches: usize,
+    total_batches: usize,
+) {
+    let label = if total_batches == 0 {
+        "未确认；没有可分析批次。".to_owned()
+    } else if capable_batches == 0 {
+        format!("未确认；0/{total_batches} 批支持该字段。")
+    } else if values.is_empty() && capable_batches == total_batches {
+        format!("已确认；{capable_batches}/{total_batches} 批均支持该字段，未观察到 ≥16 ms 按键。")
+    } else if values.is_empty() {
+        format!(
+            "部分确认；{capable_batches}/{total_batches} 批支持且未观察到 ≥16 ms 按键，其余批次无法判断。"
+        )
+    } else if capable_batches == total_batches {
+        format!("已确认；{capable_batches}/{total_batches} 批均支持，记录中存在分阶段耗时。")
     } else {
-        output.push_str("慢按键分段覆盖：已确认；记录中存在分阶段耗时。\n");
-    }
+        format!(
+            "部分确认；{capable_batches}/{total_batches} 批支持，记录中存在分阶段耗时，其余批次无法判断。"
+        )
+    };
+    writeln!(output, "慢按键分段覆盖：{label}").unwrap();
 }
 
 fn render_code_counts(output: &mut String, title: &str, counts: &HashMap<String, usize>) {
@@ -1568,7 +1676,7 @@ mod tests {
                 .entry((code.to_owned(), text.to_owned()))
                 .or_default();
             for rank in ranks {
-                pattern.observe(rank, NativeSelectionSource::Numeric, None);
+                pattern.observe(rank, NativeSelectionSource::Numeric, None, false);
             }
         }
 
@@ -1685,7 +1793,7 @@ mod tests {
                 .entry((code.to_owned(), text.to_owned()))
                 .or_default();
             for (rank, provenance) in observations {
-                pattern.observe(rank, NativeSelectionSource::Numeric, provenance);
+                pattern.observe(rank, NativeSelectionSource::Numeric, provenance, true);
             }
         }
         for (identity, top_sources) in [
@@ -1723,6 +1831,9 @@ mod tests {
                 improved_rank_identities: 3,
                 unimproved_rank_identities: 2,
                 personalization_identities,
+                complete_personalization_identities: 5,
+                partial_personalization_identities: 0,
+                legacy_personalization_identities: 0,
                 complete_provenance_identities: 3,
                 partial_provenance_identities: 1,
                 missing_provenance_identities: 1,
@@ -1740,7 +1851,8 @@ mod tests {
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("最好第 2 名 2、第 3–6 名 2、第 7 名以后 1"));
         assert!(rendered.contains("候选来源完整 3、部分 1、缺失 1"));
-        assert!(rendered.contains("个性化机制 持久精确 1、会话精确 1"));
+        assert!(rendered.contains("精确原因覆盖完整 5、部分 0、旧格式 0"));
+        assert!(rendered.contains("记录到 持久精确 1、会话精确 1"));
         assert!(rendered.contains("主要来源 核心整词 3、补充整词/组合 1"));
         assert!(rendered.contains("首选来源完整 3、部分 1、缺失 1"));
         assert!(rendered.contains("主要首选来源 显式别名 2、核心整词 2"));
@@ -1861,7 +1973,9 @@ mod tests {
         assert!(!aggregate.contains("大国"));
         assert!(!aggregate.contains("打过"));
         assert!(!aggregate.contains("需要复查"));
-        assert!(aggregate.contains("慢按键分段覆盖：未确认"));
+        assert!(aggregate.contains("慢按键分段覆盖：已确认"));
+        assert!(aggregate.contains("精确个性化原因 1/1 批"));
+        assert!(aggregate.contains("反馈格式：V11 1"));
         assert!(
             review
                 .render()
@@ -1907,6 +2021,25 @@ mod tests {
             ))
         );
         assert!(research_root_for_executable(Path::new(r"X:\tools\researchctl.exe")).is_none());
+    }
+
+    #[test]
+    fn slow_key_coverage_distinguishes_absent_partial_and_complete_capability() {
+        let mut output = String::new();
+        render_slow_key_coverage(&mut output, &[], 0, 4);
+        assert!(output.contains("未确认；0/4 批支持"));
+
+        output.clear();
+        render_slow_key_coverage(&mut output, &[], 2, 4);
+        assert!(output.contains("部分确认；2/4 批支持且未观察到"));
+
+        output.clear();
+        render_slow_key_coverage(&mut output, &[], 4, 4);
+        assert!(output.contains("已确认；4/4 批均支持"));
+
+        output.clear();
+        render_slow_key_coverage(&mut output, &[21], 4, 4);
+        assert!(output.contains("记录中存在分阶段耗时"));
     }
 
     #[test]
