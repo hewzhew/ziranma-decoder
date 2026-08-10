@@ -11,7 +11,8 @@ use ziranma_core::{
     WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
     WishFeedbackError, WishImportance, WishJournalContext, WishNote, WishReviewStatus,
     dispatch_wish_command, list_trashed_wish_packages, list_wish_packages, load_wish_note,
-    load_wish_snapshot, move_wish_to_trash, restore_wish_from_trash, save_wish_note,
+    load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash,
+    save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -601,9 +602,18 @@ fn print_event(event: &NativeFeedbackEvent) {
             planning_ms,
             edit_session_ms,
             total_ms,
-        } => println!(
-            "慢按键  总计 {total_ms} ms；刷新 {refresh_ms} ms，候选 {planning_ms} ms，编辑 {edit_session_ms} ms"
-        ),
+        } => {
+            let remainder_ms = native_slow_key_remainder_ms(
+                *refresh_ms,
+                *planning_ms,
+                *edit_session_ms,
+                *total_ms,
+            )
+            .unwrap_or_default();
+            println!(
+                "慢按键  总计 {total_ms} ms；刷新 {refresh_ms} ms，候选 {planning_ms} ms，编辑 {edit_session_ms} ms，其余 {remainder_ms} ms"
+            );
+        }
         NativeFeedbackEvent::PostCommitBackspaceRouted => {
             println!("提交后退格  已交给宿主；最终文档结果未观测");
         }

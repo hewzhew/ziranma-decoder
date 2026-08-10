@@ -66,8 +66,9 @@ mod windows_app {
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
         WishPackageInfo, WishReviewStatus, WishSnapshot, list_trashed_wish_packages,
         list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
-        load_wish_snapshot, move_wish_to_trash, repository_root_for_user_tool_executable,
-        restore_wish_from_trash, save_or_replace_wish_note,
+        load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms,
+        repository_root_for_user_tool_executable, restore_wish_from_trash,
+        save_or_replace_wish_note,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -2405,9 +2406,18 @@ mod windows_app {
                 planning_ms,
                 edit_session_ms,
                 total_ms,
-            } => format!(
-                "慢按键　总计 {total_ms} ms；刷新 {refresh_ms} ms，候选 {planning_ms} ms，编辑 {edit_session_ms} ms"
-            ),
+            } => {
+                let remainder_ms = native_slow_key_remainder_ms(
+                    *refresh_ms,
+                    *planning_ms,
+                    *edit_session_ms,
+                    *total_ms,
+                )
+                .unwrap_or_default();
+                format!(
+                    "慢按键　总计 {total_ms} ms；刷新 {refresh_ms} ms，候选 {planning_ms} ms，编辑 {edit_session_ms} ms，其余 {remainder_ms} ms"
+                )
+            }
             NativeFeedbackEvent::PostCommitBackspaceRouted => {
                 "提交后退格　已交给宿主；结果未观测".to_owned()
             }
@@ -3435,6 +3445,15 @@ mod windows_app {
                     code: "abc".to_owned(),
                 }),
                 "原码　abc"
+            );
+            assert_eq!(
+                event_summary(&NativeFeedbackEvent::SlowKeyPathTiming {
+                    refresh_ms: 2,
+                    planning_ms: 9,
+                    edit_session_ms: 5,
+                    total_ms: 18,
+                }),
+                "慢按键　总计 18 ms；刷新 2 ms，候选 9 ms，编辑 5 ms，其余 2 ms"
             );
             assert_eq!(
                 capture_scope_label(WishCaptureScope::RecentEpisodes),

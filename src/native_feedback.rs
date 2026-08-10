@@ -20,6 +20,22 @@ const MAX_FEEDBACK_KEY_PATH_TIMING_MS: u32 = 60_000;
 const MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS: usize = 4;
 const MAX_FEEDBACK_STROKE_PREFIX_BYTES: usize = 8;
 
+/// Returns the part of a slow handled-key duration not covered by the three
+/// explicitly instrumented phases. This includes candidate UI updates,
+/// in-process state/feedback work, and integer-millisecond rounding. Invalid
+/// overlapping phase durations return `None` instead of underflowing.
+pub fn native_slow_key_remainder_ms(
+    refresh_ms: u32,
+    planning_ms: u32,
+    edit_session_ms: u32,
+    total_ms: u32,
+) -> Option<u32> {
+    let measured_ms = refresh_ms
+        .checked_add(planning_ms)?
+        .checked_add(edit_session_ms)?;
+    total_ms.checked_sub(measured_ms)
+}
+
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_EVENTS: usize = 4_096;
 pub const DEFAULT_NATIVE_FEEDBACK_MAX_PRIVATE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS: u64 = 30_000;
@@ -557,15 +573,14 @@ impl NativeFeedbackEvent {
                 planning_ms,
                 edit_session_ms,
                 total_ms,
-            } => refresh_ms
-                .checked_add(*planning_ms)
-                .and_then(|total| total.checked_add(*edit_session_ms))
-                .is_some_and(|measured_phases| {
-                    *total_ms >= MIN_FEEDBACK_SLOW_KEY_PATH_MS
-                        && *total_ms <= MAX_FEEDBACK_KEY_PATH_TIMING_MS
-                        && measured_phases <= *total_ms
-                })
-                .then_some(0),
+            } => {
+                native_slow_key_remainder_ms(*refresh_ms, *planning_ms, *edit_session_ms, *total_ms)
+                    .is_some_and(|_| {
+                        *total_ms >= MIN_FEEDBACK_SLOW_KEY_PATH_MS
+                            && *total_ms <= MAX_FEEDBACK_KEY_PATH_TIMING_MS
+                    })
+                    .then_some(0)
+            }
             Self::PostCommitBackspaceRouted => Some(0),
         }
     }
@@ -1576,6 +1591,7 @@ mod tests {
             total_ms: 18,
         };
         assert_eq!(event.validate_and_measure(), Some(0));
+        assert_eq!(native_slow_key_remainder_ms(2, 9, 5, 18), Some(2));
 
         let too_fast = NativeFeedbackEvent::SlowKeyPathTiming {
             refresh_ms: 2,
@@ -1591,6 +1607,8 @@ mod tests {
             total_ms: 20,
         };
         assert_eq!(overlapping_phases.validate_and_measure(), None);
+        assert_eq!(native_slow_key_remainder_ms(5, 8, 8, 20), None);
+        assert_eq!(native_slow_key_remainder_ms(u32::MAX, 1, 0, u32::MAX), None);
 
         let mut session = NativeFeedbackSession::default();
         start(&mut session, NativeFeedbackLimits::default());

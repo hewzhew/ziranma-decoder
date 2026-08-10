@@ -11,8 +11,8 @@ use ziranma_core::{
     RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
     ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishRuntimeIdentity, WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs,
-    list_wish_packages, repository_root_for_user_tool_executable, research_feedback_enabled,
-    set_research_feedback_enabled,
+    list_wish_packages, native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+    research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -509,6 +509,37 @@ struct TopRegressionEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SlowKeyPhaseDominance {
+    refresh: usize,
+    planning: usize,
+    edit_session: usize,
+    remainder: usize,
+    tied: usize,
+}
+
+impl SlowKeyPhaseDominance {
+    fn observe(&mut self, refresh: u32, planning: u32, edit_session: u32, remainder: u32) {
+        let phases = [refresh, planning, edit_session, remainder];
+        let maximum = phases.into_iter().max().unwrap_or(0);
+        if phases.iter().filter(|value| **value == maximum).count() != 1 {
+            self.tied += 1;
+            return;
+        }
+        match phases.iter().position(|value| *value == maximum) {
+            Some(0) => self.refresh += 1,
+            Some(1) => self.planning += 1,
+            Some(2) => self.edit_session += 1,
+            Some(3) => self.remainder += 1,
+            _ => unreachable!("one of four phases must contain the unique maximum"),
+        }
+    }
+
+    fn samples(self) -> usize {
+        self.refresh + self.planning + self.edit_session + self.remainder + self.tied
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FollowupNonTopPressure {
     identities: usize,
     ambiguous_code_identities: usize,
@@ -564,6 +595,8 @@ struct ResearchReview {
     slow_key_refresh_ms: Vec<u32>,
     slow_key_planning_ms: Vec<u32>,
     slow_key_edit_session_ms: Vec<u32>,
+    slow_key_remainder_ms: Vec<u32>,
+    slow_key_phase_dominance: SlowKeyPhaseDominance,
     slow_key_timing_capable_batches: usize,
     post_commit_backspace_capable_batches: usize,
     precise_personalization_capable_batches: usize,
@@ -725,10 +758,24 @@ impl ResearchReview {
                     edit_session_ms,
                     total_ms,
                 } => {
+                    let remainder_ms = native_slow_key_remainder_ms(
+                        *refresh_ms,
+                        *planning_ms,
+                        *edit_session_ms,
+                        *total_ms,
+                    )
+                    .ok_or("慢按键阶段耗时超过总耗时")?;
                     self.slow_key_total_ms.push(*total_ms);
                     self.slow_key_refresh_ms.push(*refresh_ms);
                     self.slow_key_planning_ms.push(*planning_ms);
                     self.slow_key_edit_session_ms.push(*edit_session_ms);
+                    self.slow_key_remainder_ms.push(remainder_ms);
+                    self.slow_key_phase_dominance.observe(
+                        *refresh_ms,
+                        *planning_ms,
+                        *edit_session_ms,
+                        remainder_ms,
+                    );
                 }
                 NativeFeedbackEvent::PostCommitBackspaceRouted => {
                     self.post_commit_backspaces_routed += 1;
@@ -809,6 +856,25 @@ impl ResearchReview {
             render_current_schema_readiness(&self.source_schema_versions, self.batches)
         )
         .unwrap();
+    }
+
+    fn render_slow_key_diagnostics(&self, output: &mut String) {
+        render_latency(output, "慢按键总耗时（仅 ≥16 ms）", &self.slow_key_total_ms);
+        render_latency(output, "慢按键刷新阶段", &self.slow_key_refresh_ms);
+        render_latency(output, "慢按键候选规划阶段", &self.slow_key_planning_ms);
+        render_latency(output, "慢按键编辑会话阶段", &self.slow_key_edit_session_ms);
+        render_latency(
+            output,
+            "慢按键其余阶段（UI、状态、反馈及计时取整）",
+            &self.slow_key_remainder_ms,
+        );
+        render_slow_key_phase_dominance(output, self.slow_key_phase_dominance);
+        render_slow_key_coverage(
+            output,
+            &self.slow_key_total_ms,
+            self.slow_key_timing_capable_batches,
+            self.batches,
+        );
     }
 
     fn selection_pressure(&self) -> SelectionPressure {
@@ -1214,28 +1280,7 @@ impl ResearchReview {
         .unwrap();
         render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
         render_latency(&mut output, "首次出现", &self.initial_popup_ms);
-        render_latency(
-            &mut output,
-            "慢按键总耗时（仅 ≥16 ms）",
-            &self.slow_key_total_ms,
-        );
-        render_latency(&mut output, "慢按键刷新阶段", &self.slow_key_refresh_ms);
-        render_latency(
-            &mut output,
-            "慢按键候选规划阶段",
-            &self.slow_key_planning_ms,
-        );
-        render_latency(
-            &mut output,
-            "慢按键编辑会话阶段",
-            &self.slow_key_edit_session_ms,
-        );
-        render_slow_key_coverage(
-            &mut output,
-            &self.slow_key_total_ms,
-            self.slow_key_timing_capable_batches,
-            self.batches,
-        );
+        self.render_slow_key_diagnostics(&mut output);
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -1298,28 +1343,7 @@ impl ResearchReview {
         .unwrap();
         render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
         render_latency(&mut output, "首次出现", &self.initial_popup_ms);
-        render_latency(
-            &mut output,
-            "慢按键总耗时（仅 ≥16 ms）",
-            &self.slow_key_total_ms,
-        );
-        render_latency(&mut output, "慢按键刷新阶段", &self.slow_key_refresh_ms);
-        render_latency(
-            &mut output,
-            "慢按键候选规划阶段",
-            &self.slow_key_planning_ms,
-        );
-        render_latency(
-            &mut output,
-            "慢按键编辑会话阶段",
-            &self.slow_key_edit_session_ms,
-        );
-        render_slow_key_coverage(
-            &mut output,
-            &self.slow_key_total_ms,
-            self.slow_key_timing_capable_batches,
-            self.batches,
-        );
+        self.render_slow_key_diagnostics(&mut output);
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -1473,17 +1497,7 @@ impl ResearchReview {
         .unwrap();
         render_latency(&mut output, "候选窗完全显示", &self.popup_ms);
         render_latency(&mut output, "首次出现", &self.initial_popup_ms);
-        render_latency(
-            &mut output,
-            "慢按键总耗时（仅 ≥16 ms）",
-            &self.slow_key_total_ms,
-        );
-        render_slow_key_coverage(
-            &mut output,
-            &self.slow_key_total_ms,
-            self.slow_key_timing_capable_batches,
-            self.batches,
-        );
+        self.render_slow_key_diagnostics(&mut output);
         writeln!(
             output,
             "自动换序标签：采用 {}；未采用 {}；证据不足 {}。",
@@ -1561,6 +1575,19 @@ fn render_latency(output: &mut String, label: &str, values: &[u32]) {
     } else {
         writeln!(output, "{label}：暂无样本。").unwrap();
     }
+}
+
+fn render_slow_key_phase_dominance(output: &mut String, phases: SlowKeyPhaseDominance) {
+    if phases.samples() == 0 {
+        writeln!(output, "慢按键主耗时阶段：暂无样本。").unwrap();
+        return;
+    }
+    writeln!(
+        output,
+        "慢按键主耗时阶段（整数毫秒，并列单列）：刷新 {}；候选规划 {}；编辑会话 {}；其余阶段 {}；并列 {}。",
+        phases.refresh, phases.planning, phases.edit_session, phases.remainder, phases.tied,
+    )
+    .unwrap();
 }
 
 fn render_slow_key_coverage(
@@ -2583,6 +2610,12 @@ mod tests {
                 absolute_rank: 1,
                 visible_rank: 1,
             },
+            NativeFeedbackEvent::SlowKeyPathTiming {
+                refresh_ms: 2,
+                planning_ms: 9,
+                edit_session_ms: 5,
+                total_ms: 18,
+            },
         ];
         for (index, event) in events.into_iter().enumerate() {
             assert_eq!(
@@ -2617,6 +2650,14 @@ mod tests {
 
         assert_eq!(review.candidate_commits, 2);
         assert_eq!(review.non_top_commits, 1);
+        assert_eq!(review.slow_key_remainder_ms, [2]);
+        assert_eq!(
+            review.slow_key_phase_dominance,
+            SlowKeyPhaseDominance {
+                planning: 1,
+                ..SlowKeyPhaseDominance::default()
+            }
+        );
         let pattern = review
             .selections
             .get(&("dago".to_owned(), "打过".to_owned()))
@@ -2637,6 +2678,8 @@ mod tests {
         assert!(!aggregate.contains("打过"));
         assert!(!aggregate.contains("需要复查"));
         assert!(aggregate.contains("慢按键分段覆盖：已确认"));
+        assert!(aggregate.contains("慢按键其余阶段（UI、状态、反馈及计时取整）：1 次"));
+        assert!(aggregate.contains("候选规划 1；编辑会话 0；其余阶段 0；并列 0"));
         assert!(aggregate.contains("精确个性化原因 1/1 批"));
         assert!(aggregate.contains("反馈格式：V11 1"));
         assert!(
@@ -2703,6 +2746,43 @@ mod tests {
         output.clear();
         render_slow_key_coverage(&mut output, &[21], 4, 4);
         assert!(output.contains("记录中存在分阶段耗时"));
+    }
+
+    #[test]
+    fn slow_key_diagnostics_expose_remainder_and_unique_dominant_phases() {
+        let mut dominance = SlowKeyPhaseDominance::default();
+        dominance.observe(12, 2, 1, 1);
+        dominance.observe(2, 12, 1, 1);
+        dominance.observe(2, 1, 12, 1);
+        dominance.observe(2, 1, 1, 12);
+        dominance.observe(5, 5, 1, 1);
+        assert_eq!(
+            dominance,
+            SlowKeyPhaseDominance {
+                refresh: 1,
+                planning: 1,
+                edit_session: 1,
+                remainder: 1,
+                tied: 1,
+            }
+        );
+
+        let review = ResearchReview {
+            batches: 1,
+            slow_key_total_ms: vec![18],
+            slow_key_refresh_ms: vec![2],
+            slow_key_planning_ms: vec![9],
+            slow_key_edit_session_ms: vec![5],
+            slow_key_remainder_ms: vec![2],
+            slow_key_phase_dominance: dominance,
+            slow_key_timing_capable_batches: 1,
+            ..ResearchReview::default()
+        };
+        let mut output = String::new();
+        review.render_slow_key_diagnostics(&mut output);
+        assert!(output.contains("慢按键其余阶段（UI、状态、反馈及计时取整）：1 次"));
+        assert!(output.contains("刷新 1；候选规划 1；编辑会话 1；其余阶段 1；并列 1"));
+        assert!(output.contains("已确认；1/1 批均支持"));
     }
 
     #[test]

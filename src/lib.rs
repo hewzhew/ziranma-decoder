@@ -264,6 +264,7 @@ pub use native_feedback::{
     NativeFeedbackLifecycle, NativeFeedbackLimits, NativeFeedbackRecordResult,
     NativeFeedbackSession, NativeFeedbackStartResult, NativeFeedbackStopReason,
     NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource, NativeTabAssemblyState,
+    native_slow_key_remainder_ms,
 };
 pub use personal_context::{
     MAX_PERSONAL_CONTEXT_CODE_KEYS, MAX_PERSONAL_CONTEXT_ENTRIES,
