@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::candidate_snapshot::{
     FourCharacterCorrectionDecision, InteractiveCandidateQuery, InteractiveCandidateSource,
-    layered_candidate_query_with_consensus_sources, layered_four_character_correction_decision,
+    layered_candidate_query_with_sources, layered_four_character_correction_decision,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -753,7 +753,10 @@ impl SnapshotCandidateProvider {
                 let mut snapshot_query = supplemental
                     .as_ref()
                     .and_then(|(supplemental, config)| {
-                        layered_candidate_query_with_consensus_sources(
+                        // The broader cross-dictionary Top-1 consensus rule
+                        // remains audit-only after losing correct Top-1s on
+                        // its independent public holdout.
+                        layered_candidate_query_with_sources(
                             &self.snapshot,
                             supplemental,
                             code,
@@ -12508,7 +12511,7 @@ mod tests {
     }
 
     #[test]
-    fn supplemental_provider_uses_shared_exact_top_for_cold_order() {
+    fn supplemental_provider_keeps_core_order_until_consensus_gate_passes() {
         const CORE: &str = "text\tpinyin\tfrequency\n\
 大国\tda guo\t1657\n\
 打过\tda guo\t1390\n";
@@ -12544,7 +12547,7 @@ mod tests {
 
         let output =
             provider.candidates_with_provenance("dago", 2, InteractiveCandidateView::Primary);
-        assert_eq!(output.candidates, ["打过", "大国"]);
+        assert_eq!(output.candidates, ["大国", "打过"]);
         assert_eq!(
             output
                 .provenance
@@ -12552,8 +12555,8 @@ mod tests {
                 .map(|item| item.source())
                 .collect::<Vec<_>>(),
             [
-                NativeCandidateSource::PublicConsensusExact,
                 NativeCandidateSource::CoreExact,
+                NativeCandidateSource::CoreExact
             ]
         );
     }

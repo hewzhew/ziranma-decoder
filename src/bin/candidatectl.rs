@@ -108,6 +108,12 @@ enum Options {
         base_payload: PathBuf,
         challenger_payload: PathBuf,
     },
+    ConsensusAudit {
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+    },
     LengthCoverageAudit {
         base_payload: PathBuf,
         challenger_payload: PathBuf,
@@ -338,6 +344,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_payload,
             challenger_payload,
         } => compare_payloads(&base_payload, &challenger_payload)?,
+        Options::ConsensusAudit {
+            core_payload,
+            supplemental_payload,
+            held_out_corpus,
+            frontier_limit,
+        } => audit_public_consensus(
+            &core_payload,
+            &supplemental_payload,
+            &held_out_corpus,
+            frontier_limit,
+        )?,
         Options::LengthCoverageAudit {
             base_payload,
             challenger_payload,
@@ -516,6 +533,7 @@ fn parse_options(
         "merge-public-packages" => parse_merge_public_packages(arguments),
         "diagnose-public-miss" => parse_diagnose_public_miss(arguments),
         "compare" => parse_compare(arguments),
+        "consensus-audit" => parse_consensus_audit(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
@@ -1000,6 +1018,43 @@ fn parse_compare(
     Ok(Options::Compare {
         base_payload: base_payload.ok_or("compare requires --base-payload")?,
         challenger_payload: challenger_payload.ok_or("compare requires --challenger-payload")?,
+    })
+}
+
+fn parse_consensus_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            _ => return Err("unknown consensus-audit argument; value was suppressed".into()),
+        }
+    }
+    let frontier_limit = frontier_limit.ok_or("consensus-audit requires --frontier-limit")?;
+    if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err("consensus-audit --frontier-limit is outside the fixed bound".into());
+    }
+    Ok(Options::ConsensusAudit {
+        core_payload: core_payload.ok_or("consensus-audit requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("consensus-audit requires --supplemental-payload")?,
+        held_out_corpus: held_out_corpus.ok_or("consensus-audit requires --held-out-corpus")?,
+        frontier_limit,
     })
 }
 
@@ -1651,6 +1706,9 @@ fn print_usage() {
     );
     eprintln!("  compare --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv>");
     eprintln!(
+        "  consensus-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <1..50>"
+    );
+    eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
     );
     eprintln!(
@@ -1987,7 +2045,9 @@ fn diagnose_public_miss(
     entries.extend(supplemental_entries);
     let package_whole_word = core_whole_word || supplemental_whole_word;
     let minimum_segments = minimum_exact_public_segments(&entries, target_text, code);
-    let candidates = layered_candidate_texts_with_consensus(
+    // Match the conservative runtime path. The broader consensus reorder is
+    // available only through `consensus-audit` after failing its holdout gate.
+    let candidates = layered_candidate_texts(
         &core.snapshot,
         &supplemental.snapshot,
         code,
@@ -2313,6 +2373,306 @@ fn compare_payloads(
     ))
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicConsensusRankAudit {
+    probes: usize,
+    instances: usize,
+    before_correct_top: usize,
+    before_correct_top_instances: usize,
+    after_correct_top: usize,
+    after_correct_top_instances: usize,
+    order_changes: usize,
+    order_change_instances: usize,
+    top_changes: usize,
+    top_change_instances: usize,
+    correct_top_gained: usize,
+    correct_top_gained_instances: usize,
+    correct_top_lost: usize,
+    correct_top_lost_instances: usize,
+    non_target_top_changes: usize,
+    non_target_top_change_instances: usize,
+    target_movement: WeightedRankMovement,
+}
+
+impl PublicConsensusRankAudit {
+    fn absorb(&mut self, other: Self) {
+        self.probes += other.probes;
+        self.instances += other.instances;
+        self.before_correct_top += other.before_correct_top;
+        self.before_correct_top_instances += other.before_correct_top_instances;
+        self.after_correct_top += other.after_correct_top;
+        self.after_correct_top_instances += other.after_correct_top_instances;
+        self.order_changes += other.order_changes;
+        self.order_change_instances += other.order_change_instances;
+        self.top_changes += other.top_changes;
+        self.top_change_instances += other.top_change_instances;
+        self.correct_top_gained += other.correct_top_gained;
+        self.correct_top_gained_instances += other.correct_top_gained_instances;
+        self.correct_top_lost += other.correct_top_lost;
+        self.correct_top_lost_instances += other.correct_top_lost_instances;
+        self.non_target_top_changes += other.non_target_top_changes;
+        self.non_target_top_change_instances += other.non_target_top_change_instances;
+        self.target_movement.absorb(other.target_movement);
+    }
+
+    fn gate_passed(self) -> bool {
+        self.correct_top_gained != 0
+            && self.correct_top_lost == 0
+            && self.non_target_top_changes == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicConsensusLengthAudit {
+    characters: usize,
+    source_unique_tokens: usize,
+    source_token_instances: usize,
+    matched_unique_tokens: usize,
+    matched_token_instances: usize,
+    ambiguous_unique_tokens: usize,
+    ambiguous_token_instances: usize,
+    ranking: PublicConsensusRankAudit,
+}
+
+fn audit_public_consensus(
+    core_payload: &Path,
+    supplemental_payload: &Path,
+    held_out_corpus: &Path,
+    frontier_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public consensus payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        supplemental_payload,
+        "supplemental public consensus payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public consensus held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let core_sha256 = candidate_sha256_hex(core_text.as_bytes());
+    let supplemental_sha256 = candidate_sha256_hex(supplemental_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if core_sha256 == supplemental_sha256 {
+        return Err("consensus-audit requires two distinct candidate payloads".into());
+    }
+    if held_out_sha256 == core_sha256 || held_out_sha256 == supplemental_sha256 {
+        return Err("consensus-audit requires an independent held-out corpus".into());
+    }
+
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let core = snapshot_from_payload("consensus-audit-core-v1", &core_text)?;
+    let supplemental =
+        snapshot_from_payload("consensus-audit-supplemental-v1", &supplemental_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let ambiguous_surfaces = ambiguous_lexicon_surfaces(&core_entries);
+    let mut lengths = Vec::new();
+    let mut overall = PublicConsensusRankAudit::default();
+    for characters in 1..=4 {
+        let selection = select_public_lexicon_rank_probes(&held_out, &core_entries, characters);
+        let matched_unique_tokens = selection.probes.len();
+        let mut ambiguous_unique_tokens = 0;
+        let mut ambiguous_token_instances = 0;
+        let probes = selection
+            .probes
+            .into_iter()
+            .filter(|probe| {
+                let ambiguous = ambiguous_surfaces.contains(probe.expected_text.as_str());
+                ambiguous_unique_tokens += usize::from(ambiguous);
+                ambiguous_token_instances += probe.instances * usize::from(ambiguous);
+                !ambiguous
+            })
+            .collect::<Vec<_>>();
+        let ranking =
+            compare_public_consensus_ranks(&core, &supplemental, &probes, frontier_limit)?;
+        overall.absorb(ranking);
+        lengths.push(PublicConsensusLengthAudit {
+            characters,
+            source_unique_tokens: selection.source_unique_tokens,
+            source_token_instances: selection.source_token_instances,
+            matched_unique_tokens,
+            matched_token_instances: selection.matched_token_instances,
+            ambiguous_unique_tokens,
+            ambiguous_token_instances,
+            ranking,
+        });
+    }
+
+    let mut output = String::new();
+    writeln!(output, "公开共识排序独立留出审计")?;
+    writeln!(
+        output,
+        "核心词条：{} · SHA-256 {core_sha256}",
+        core_entries.len()
+    )?;
+    writeln!(
+        output,
+        "补充词条：{} · SHA-256 {supplemental_sha256}",
+        supplemental.entry_count()
+    )?;
+    writeln!(
+        output,
+        "独立留出：{} 句，{} 个句法 token · SHA-256 {held_out_sha256}",
+        held_out.stats.sentences, held_out.stats.syntactic_tokens
+    )?;
+    writeln!(
+        output,
+        "候选范围：前 {frontier_limit}；每码最多补 1 个完整词"
+    )?;
+    for length in lengths {
+        writeln!(
+            output,
+            "{} 字：语料词面 {}（实例 {}）；核心匹配 {}（实例 {}）；多音排除 {}（实例 {}）；评测 {}（实例 {}）；正确首选新增 {}、丢失 {}、非目标首选变化 {}",
+            length.characters,
+            length.source_unique_tokens,
+            length.source_token_instances,
+            length.matched_unique_tokens,
+            length.matched_token_instances,
+            length.ambiguous_unique_tokens,
+            length.ambiguous_token_instances,
+            length.ranking.probes,
+            length.ranking.instances,
+            length.ranking.correct_top_gained,
+            length.ranking.correct_top_lost,
+            length.ranking.non_target_top_changes,
+        )?;
+    }
+    writeln!(
+        output,
+        "合计：评测 {}（实例 {}）；校准前正确首选 {}（实例 {}），校准后 {}（实例 {}）",
+        overall.probes,
+        overall.instances,
+        overall.before_correct_top,
+        overall.before_correct_top_instances,
+        overall.after_correct_top,
+        overall.after_correct_top_instances,
+    )?;
+    writeln!(
+        output,
+        "候选顺序变化 {}（实例 {}）；首选变化 {}（实例 {}）；正确首选新增 {}（实例 {}），丢失 {}（实例 {}），非目标首选变化 {}（实例 {}）",
+        overall.order_changes,
+        overall.order_change_instances,
+        overall.top_changes,
+        overall.top_change_instances,
+        overall.correct_top_gained,
+        overall.correct_top_gained_instances,
+        overall.correct_top_lost,
+        overall.correct_top_lost_instances,
+        overall.non_target_top_changes,
+        overall.non_target_top_change_instances,
+    )?;
+    writeln!(
+        output,
+        "目标名次：改善 {}（实例 {}），不变 {}（实例 {}），变差 {}（实例 {}）；新进入范围 {}（实例 {}），掉出范围 {}（实例 {}）",
+        overall.target_movement.improved,
+        overall.target_movement.improved_instances,
+        overall.target_movement.unchanged,
+        overall.target_movement.unchanged_instances,
+        overall.target_movement.worsened,
+        overall.target_movement.worsened_instances,
+        overall.target_movement.newly_visible,
+        overall.target_movement.newly_visible_instances,
+        overall.target_movement.lost_visible,
+        overall.target_movement.lost_visible_instances,
+    )?;
+    writeln!(
+        output,
+        "安全门：{}",
+        if overall.gate_passed() {
+            "通过（至少新增一个正确首选；正确首选零损失；非目标首选零变化）"
+        } else {
+            "未通过（需要至少一个新增正确首选、正确首选零损失且非目标首选零变化）"
+        }
+    )?;
+    output.push_str(
+        "口径：只评测独立公开语料中、核心词典可确认且只有一个规范码的 1～4 字 token；语料不参与规则选择。报告不显示词面，不比较跨词典原始权重，不写文件、不改候选槽位。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn ambiguous_lexicon_surfaces(entries: &[LexiconEntry]) -> HashSet<&str> {
+    let mut first_code = HashMap::<&str, &str>::new();
+    let mut ambiguous = HashSet::new();
+    for entry in entries {
+        match first_code.entry(entry.text.as_str()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(entry.code.as_str());
+            }
+            std::collections::hash_map::Entry::Occupied(slot)
+                if *slot.get() != entry.code.as_str() =>
+            {
+                ambiguous.insert(entry.text.as_str());
+            }
+            _ => {}
+        }
+    }
+    ambiguous
+}
+
+fn compare_public_consensus_ranks(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    probes: &[PublicLexiconRankProbe],
+    frontier_limit: usize,
+) -> Result<PublicConsensusRankAudit, Box<dyn std::error::Error>> {
+    let config = SupplementalCandidateLayerConfig {
+        exact_promotions: 1,
+    };
+    let mut audit = PublicConsensusRankAudit::default();
+    for probe in probes {
+        let before = layered_candidate_texts(
+            core,
+            supplemental,
+            probe.observed.as_str(),
+            frontier_limit,
+            config,
+        )?;
+        let after = layered_candidate_texts_with_consensus(
+            core,
+            supplemental,
+            probe.observed.as_str(),
+            frontier_limit,
+            config,
+        )?;
+        let before_rank = candidate_rank(&before, &probe.expected_text);
+        let after_rank = candidate_rank(&after, &probe.expected_text);
+        let before_correct = before.first() == Some(&probe.expected_text);
+        let after_correct = after.first() == Some(&probe.expected_text);
+        let order_changed = before != after;
+        let top_changed = before.first() != after.first();
+
+        audit.probes += 1;
+        audit.instances += probe.instances;
+        audit.before_correct_top += usize::from(before_correct);
+        audit.before_correct_top_instances += probe.instances * usize::from(before_correct);
+        audit.after_correct_top += usize::from(after_correct);
+        audit.after_correct_top_instances += probe.instances * usize::from(after_correct);
+        audit.order_changes += usize::from(order_changed);
+        audit.order_change_instances += probe.instances * usize::from(order_changed);
+        audit.top_changes += usize::from(top_changed);
+        audit.top_change_instances += probe.instances * usize::from(top_changed);
+        if top_changed && !before_correct && after_correct {
+            audit.correct_top_gained += 1;
+            audit.correct_top_gained_instances += probe.instances;
+        } else if top_changed && before_correct && !after_correct {
+            audit.correct_top_lost += 1;
+            audit.correct_top_lost_instances += probe.instances;
+        } else if top_changed {
+            audit.non_target_top_changes += 1;
+            audit.non_target_top_change_instances += probe.instances;
+        }
+        audit
+            .target_movement
+            .observe(before_rank, after_rank, probe.instances);
+    }
+    Ok(audit)
+}
+
 fn audit_length_coverage(
     base_payload: &Path,
     challenger_payload: &Path,
@@ -2633,6 +2993,19 @@ impl WeightedRankMovement {
                 self.unchanged_instances += instances;
             }
         }
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.improved += other.improved;
+        self.improved_instances += other.improved_instances;
+        self.unchanged += other.unchanged;
+        self.unchanged_instances += other.unchanged_instances;
+        self.worsened += other.worsened;
+        self.worsened_instances += other.worsened_instances;
+        self.newly_visible += other.newly_visible;
+        self.newly_visible_instances += other.newly_visible_instances;
+        self.lost_visible += other.lost_visible;
+        self.lost_visible_instances += other.lost_visible_instances;
     }
 }
 
@@ -6137,7 +6510,8 @@ fn runtime_query(
         .ok_or("candidate runtime root is not configured")?;
     let (mut candidates, supplemental_revision) = match runtime.supplemental() {
         Some(supplemental) => (
-            layered_candidate_texts_with_consensus(
+            // Keep this diagnostic aligned with TSF's gated runtime path.
+            layered_candidate_texts(
                 runtime.core(),
                 supplemental.snapshot(),
                 code,
@@ -6218,7 +6592,7 @@ fn supplement_status(root: &Path) -> Result<String, Box<dyn std::error::Error>> 
             let loaded = load_installed_package(root, package)?;
             validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
             format!(
-                "公开补充词层\n状态：启用\n版本：{}\n每码最多补：{} 个完整词\n冷启动：新增词不越过核心首选；共有词可按补充首选校准\n本次操作：只读\n",
+                "公开补充词层\n状态：启用\n版本：{}\n每码最多补：{} 个完整词\n冷启动：核心已有完整词首选保持不动；共识重排仅供离线审计\n本次操作：只读\n",
                 loaded.snapshot.revision(),
                 state.exact_promotions(),
             )
@@ -6240,7 +6614,7 @@ fn supplement_enable(
     let state = CandidateSupplementalState::enabled(package, exact_promotions)?;
     write_supplemental_state(root, &state)?;
     Ok(format!(
-        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n冷启动：新增词不越过核心首选；共有词可按补充首选校准\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
+        "公开补充词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个完整词\n冷启动：核心已有完整词首选保持不动；共识重排仅供离线审计\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
         loaded.snapshot.revision(),
     ))
 }
@@ -7116,6 +7490,44 @@ mod tests {
                 "length-coverage-audit".to_owned(),
                 "--base-payload".to_owned(),
                 "base.tsv".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn consensus_audit_parser_binds_the_independent_corpus_and_frontier() {
+        assert_eq!(
+            parse_options([
+                "consensus-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "6".to_owned(),
+            ])
+            .unwrap(),
+            Options::ConsensusAudit {
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                frontier_limit: 6,
+            }
+        );
+        assert!(
+            parse_options([
+                "consensus-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "51".to_owned(),
             ])
             .is_err()
         );
@@ -8507,6 +8919,57 @@ mod tests {
     }
 
     #[test]
+    fn consensus_audit_is_held_out_unambiguous_aggregate_only_and_read_only() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲\tjia\t100\n\
+钾\tjia\t90\n\
+吗\tma\t100\n\
+马\tma\t90\n\
+是\tshi\t100\n\
+时\tshi\t90\n\
+事\tshi\t80\n\
+好\thao\t100\n\
+行\txing\t100\n\
+行\thang\t90\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+钾\tjia\t200\n\
+马\tma\t200\n\
+时\tshi\t200\n\
+好\thao\t200\n\
+行\txing\t200\n";
+        const HELD_OUT: &str = "# sent_id = held-out\n\
+1\t钾\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t吗\t_\tPART\t_\t_\t1\tdep\t_\t_\n\
+3\t事\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\
+4\t好\t_\tADJ\t_\t_\t1\tdep\t_\t_\n\
+5\t行\t_\tVERB\t_\t_\t1\tdep\t_\t_\n\n";
+
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let supplemental = root.join("supplemental.tsv");
+        let held_out = root.join("held-out.conllu");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&supplemental, SUPPLEMENTAL).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+
+        let report = audit_public_consensus(&core, &supplemental, &held_out, 4).unwrap();
+        assert!(report.contains("1 字：语料词面 5（实例 5）；核心匹配 5（实例 5）"));
+        assert!(report.contains("多音排除 1（实例 1）；评测 4（实例 4）"));
+        assert!(report.contains("正确首选新增 1、丢失 1、非目标首选变化 1"));
+        assert!(report.contains("校准前正确首选 2（实例 2），校准后 2（实例 2）"));
+        assert!(report.contains("候选顺序变化 3（实例 3）；首选变化 3（实例 3）"));
+        assert!(report.contains("目标名次：改善 1（实例 1），不变 2（实例 2），变差 1（实例 1）"));
+        assert!(report.contains("安全门：未通过"));
+        assert!(report.contains("本次操作：只读"));
+        for private_value in ["甲", "钾", "吗", "马", "是", "时", "事", "好", "行"] {
+            assert!(!report.contains(private_value));
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn layer_audit_is_aggregate_only_bounded_and_read_only() {
         let root = temporary_test_root();
         let core = root.join("core.tsv");
@@ -9011,7 +9474,8 @@ ngram 1=3\n\n\
         );
         let active = supplement_status(&slots).unwrap();
         assert!(active.contains("状态：启用"));
-        assert!(active.contains("共有词可按补充首选校准"));
+        assert!(active.contains("核心已有完整词首选保持不动"));
+        assert!(active.contains("共识重排仅供离线审计"));
 
         stage(&slots, &package_b, &package_b_sha256).unwrap();
         promote(&slots).unwrap();
@@ -9041,6 +9505,55 @@ ngram 1=3\n\n\
                 .unwrap()
                 .contains("写入：0 个文件")
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_query_keeps_core_top_until_consensus_gate_passes() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+大国\tda guo\t1657\n\
+打过\tda guo\t1390\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+打过\tda guo\t9480\n\
+大国\tda guo\t8656\n";
+
+        let root = temporary_test_root();
+        let core_source = root.join("core.tsv");
+        let supplemental_source = root.join("supplemental.tsv");
+        let core_package = root.join("core-package");
+        let supplemental_package = root.join("supplemental-package");
+        let core_slots = root.join("core-slots");
+        let supplemental_slots = root.join("supplemental-slots");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core_source, CORE).unwrap();
+        fs::write(&supplemental_source, SUPPLEMENTAL).unwrap();
+        build_public_package(
+            &core_source,
+            &core_package,
+            "runtime-conservative-core-v1",
+            &test_declaration(CORE),
+        )
+        .unwrap();
+        build_public_package(
+            &supplemental_source,
+            &supplemental_package,
+            "runtime-conservative-supplemental-v1",
+            &test_declaration(SUPPLEMENTAL),
+        )
+        .unwrap();
+        adopt(&core_slots, &core_package, &package_sha256(&core_package)).unwrap();
+        adopt(
+            &supplemental_slots,
+            &supplemental_package,
+            &package_sha256(&supplemental_package),
+        )
+        .unwrap();
+        supplement_enable(&supplemental_slots, 1).unwrap();
+
+        let report = runtime_query(&core_slots, Some(&supplemental_slots), "dago", 2).unwrap();
+        assert!(report.contains("1. 大国\n2. 打过\n"));
+        assert!(!report.contains("1. 打过\n"));
 
         fs::remove_dir_all(root).unwrap();
     }

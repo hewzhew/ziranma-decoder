@@ -632,14 +632,16 @@ pub(crate) fn layered_candidate_texts_with_sources(
         .map(|query| query.candidates)
 }
 
-/// Applies one host-facing cold-order calibration on top of the ordinary
+/// Applies one audit-only cold-order calibration on top of the ordinary
 /// public layer merge.
 ///
 /// Raw frequency scales from unrelated dictionaries remain incomparable. A
 /// supplemental Top-1 may therefore move to the front only when the core
 /// dictionary independently confirms the same text as an exact candidate for
 /// the same complete code. New supplemental-only words keep the conservative
-/// merge order.
+/// merge order. The Windows host does not call this path after the rule lost
+/// correct Top-1s on its independent public holdout; it remains available for
+/// reproducible counterfactual audits.
 pub fn layered_candidate_texts_with_consensus(
     core: &CandidateSnapshot,
     supplemental: &CandidateSnapshot,
