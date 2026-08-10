@@ -220,6 +220,15 @@ pub struct PublicLexiconComparison {
     /// Differing Top-1 codes where the challenger Top-1 is independently
     /// present under the same complete code in the baseline lexicon.
     pub consensus_top_reorder_eligible_codes: usize,
+    /// Reorder-eligible codes whose challenger Top-1 was originally second
+    /// in the baseline's exact full-code order.
+    pub consensus_top_original_rank_two_codes: usize,
+    /// Reorder-eligible codes whose challenger Top-1 was originally between
+    /// third and sixth in the baseline's exact full-code order.
+    pub consensus_top_original_rank_three_to_six_codes: usize,
+    /// Reorder-eligible codes whose challenger Top-1 was originally seventh
+    /// or later in the baseline's exact full-code order.
+    pub consensus_top_original_rank_seven_or_later_codes: usize,
 }
 
 /// Aggregate-only result of applying the bounded supplemental exact-word lane.
@@ -300,9 +309,13 @@ pub fn compare_public_lexicons(
         .collect::<HashSet<_>>();
     let base_top = top_text_by_code(base);
     let challenger_top = top_text_by_code(challenger);
+    let base_exact_texts = exact_texts_by_code(base);
     let mut shared_codes = 0;
     let mut same_top_text_codes = 0;
     let mut consensus_top_reorder_eligible_codes = 0;
+    let mut consensus_top_original_rank_two_codes = 0;
+    let mut consensus_top_original_rank_three_to_six_codes = 0;
+    let mut consensus_top_original_rank_seven_or_later_codes = 0;
     for (code, base_text) in &base_top {
         let Some(challenger_text) = challenger_top.get(code) else {
             continue;
@@ -310,7 +323,22 @@ pub fn compare_public_lexicons(
         shared_codes += 1;
         if base_text == challenger_text {
             same_top_text_codes += 1;
-        } else if base_identities.contains(&(*challenger_text, *code)) {
+        } else if base_identities.contains(&(*challenger_text, *code))
+            && let Some(rank) = base_exact_texts.get(code).and_then(|texts| {
+                texts
+                    .iter()
+                    .position(|text| *text == *challenger_text)
+                    .map(|index| index + 1)
+            })
+        {
+            // A different Top-1 cannot occupy baseline rank one because both
+            // rankings use the same exact full-code ordering below.
+            match rank {
+                2 => consensus_top_original_rank_two_codes += 1,
+                3..=6 => consensus_top_original_rank_three_to_six_codes += 1,
+                7.. => consensus_top_original_rank_seven_or_later_codes += 1,
+                _ => continue,
+            }
             consensus_top_reorder_eligible_codes += 1;
         }
     }
@@ -326,6 +354,9 @@ pub fn compare_public_lexicons(
         same_top_text_codes,
         changed_top_text_codes: shared_codes - same_top_text_codes,
         consensus_top_reorder_eligible_codes,
+        consensus_top_original_rank_two_codes,
+        consensus_top_original_rank_three_to_six_codes,
+        consensus_top_original_rank_seven_or_later_codes,
     }
 }
 
@@ -429,6 +460,7 @@ fn exact_texts_by_code(entries: &[LexiconEntry]) -> HashMap<&str, Vec<&str>> {
                     .1
                     .frequency
                     .cmp(&left.1.frequency)
+                    .then_with(|| left.1.text.cmp(&right.1.text))
                     .then_with(|| left.0.cmp(&right.0))
             });
             let mut seen = HashSet::new();
@@ -1596,7 +1628,52 @@ A词\ta cí\t100\n\
                 same_top_text_codes: 1,
                 changed_top_text_codes: 1,
                 consensus_top_reorder_eligible_codes: 1,
+                consensus_top_original_rank_two_codes: 1,
+                consensus_top_original_rank_three_to_six_codes: 0,
+                consensus_top_original_rank_seven_or_later_codes: 0,
             }
+        );
+    }
+
+    #[test]
+    fn public_comparison_buckets_consensus_target_by_real_exact_rank() {
+        let base = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+甲\tjia\t100\n\
+钾\tjia\t90\n\
+吗\tma\t100\n\
+妈\tma\t90\n\
+马\tma\t80\n\
+是\tshi\t100\n\
+时\tshi\t90\n\
+事\tshi\t80\n\
+市\tshi\t70\n\
+十\tshi\t60\n\
+使\tshi\t50\n\
+世\tshi\t40\n\
+八\tba\t100\n\
+吧\tba\t100\n",
+        )
+        .unwrap();
+        let challenger = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+钾\tjia\t100\n\
+马\tma\t100\n\
+世\tshi\t100\n\
+吧\tba\t100\n",
+        )
+        .unwrap();
+
+        let comparison = compare_public_lexicons(&base, &challenger);
+        assert_eq!(comparison.changed_top_text_codes, 4);
+        assert_eq!(comparison.consensus_top_reorder_eligible_codes, 4);
+        // The equal-frequency `ba` pair verifies the decoder's stable text
+        // tie-break rather than retaining source-row order.
+        assert_eq!(comparison.consensus_top_original_rank_two_codes, 2);
+        assert_eq!(comparison.consensus_top_original_rank_three_to_six_codes, 1);
+        assert_eq!(
+            comparison.consensus_top_original_rank_seven_or_later_codes,
+            1
         );
     }
 

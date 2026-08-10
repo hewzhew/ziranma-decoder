@@ -2296,7 +2296,7 @@ fn compare_payloads(
     let challenger = parse_lexicon_tsv(&challenger_text)?;
     let report = compare_public_lexicons(&base, &challenger);
     Ok(format!(
-        "公开词表对照\n基线词条：{}\n对照词条：{}\n共同词形：{}\n仅基线词形：{}\n仅对照词形：{}\n共同文字与规范码：{}\n共同规范码：{}\n同码首选相同：{}\n同码首选不同：{}\n其中对照首选也被基线同码确认：{}\n本次操作：只读\n",
+        "公开词表对照\n基线词条：{}\n对照词条：{}\n共同词形：{}\n仅基线词形：{}\n仅对照词形：{}\n共同文字与规范码：{}\n共同规范码：{}\n同码首选相同：{}\n同码首选不同：{}\n其中对照首选也被基线同码确认：{}\n  原本第 2 名：{}\n  原本第 3–6 名：{}\n  原本第 7 名以后：{}\n本次操作：只读\n",
         report.base_entries,
         report.challenger_entries,
         report.shared_surface_texts,
@@ -2307,6 +2307,9 @@ fn compare_payloads(
         report.same_top_text_codes,
         report.changed_top_text_codes,
         report.consensus_top_reorder_eligible_codes,
+        report.consensus_top_original_rank_two_codes,
+        report.consensus_top_original_rank_three_to_six_codes,
+        report.consensus_top_original_rank_seven_or_later_codes,
     ))
 }
 
@@ -8483,7 +8486,7 @@ mod tests {
         let base = root.join("base.tsv");
         let challenger = root.join("challenger.tsv");
         fs::create_dir(&root).unwrap();
-        fs::write(&base, "text\tpinyin\tfrequency\n甲\tjia\t10\n").unwrap();
+        fs::write(&base, "text\tpinyin\tfrequency\n甲\tjia\t10\n钾\tjia\t5\n").unwrap();
         fs::write(
             &challenger,
             "text\tpinyin\tfrequency\n甲\tjia\t5\n钾\tjia\t20\n",
@@ -8491,8 +8494,11 @@ mod tests {
         .unwrap();
 
         let report = compare_payloads(&base, &challenger).unwrap();
-        assert!(report.contains("共同词形：1"));
+        assert!(report.contains("共同词形：2"));
         assert!(report.contains("同码首选不同：1"));
+        assert!(report.contains("原本第 2 名：1"));
+        assert!(report.contains("原本第 3–6 名：0"));
+        assert!(report.contains("原本第 7 名以后：0"));
         assert!(report.contains("本次操作：只读"));
         assert!(!report.contains('甲'));
         assert!(!report.contains('钾'));
