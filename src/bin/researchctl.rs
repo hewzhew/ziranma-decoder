@@ -352,7 +352,13 @@ struct SelectionPattern {
     first_rank: Option<usize>,
     first_top_selection: Option<usize>,
     last_top_location: Option<SelectionObservationLocation>,
+    last_top_provenance: Option<NativeCandidateProvenance>,
     first_post_top_regression_boundary: Option<TopRegressionBoundary>,
+    first_regression_prior_top_provenance: Option<NativeCandidateProvenance>,
+    first_regression_target_provenance: Option<NativeCandidateProvenance>,
+    first_regression_global_top_provenance: Option<NativeCandidateProvenance>,
+    first_regression_precise_personalization: bool,
+    awaiting_first_regression_global_top: bool,
     last_rank: Option<usize>,
     minimum_rank: usize,
     maximum_rank: usize,
@@ -375,12 +381,14 @@ impl SelectionPattern {
         precise_personalization: bool,
         location: &SelectionObservationLocation,
     ) {
+        self.awaiting_first_regression_global_top = false;
         self.selections += 1;
         self.non_top_selections += usize::from(rank > 1);
         self.first_rank.get_or_insert(rank);
         if rank == 1 {
             self.first_top_selection.get_or_insert(self.selections);
             self.last_top_location = Some(location.clone());
+            self.last_top_provenance = provenance;
         } else if self.first_top_selection.is_some()
             && self.first_post_top_regression_boundary.is_none()
         {
@@ -391,6 +399,10 @@ impl SelectionPattern {
                         TopRegressionBoundary::between(previous, location)
                     }),
             );
+            self.first_regression_prior_top_provenance = self.last_top_provenance;
+            self.first_regression_target_provenance = provenance;
+            self.first_regression_precise_personalization = precise_personalization;
+            self.awaiting_first_regression_global_top = true;
         }
         self.last_rank = Some(rank);
         self.minimum_rank = if self.minimum_rank == 0 {
@@ -413,6 +425,10 @@ impl SelectionPattern {
     }
 
     fn observe_global_top_provenance(&mut self, provenance: Option<NativeCandidateProvenance>) {
+        if self.awaiting_first_regression_global_top {
+            self.first_regression_global_top_provenance = provenance;
+            self.awaiting_first_regression_global_top = false;
+        }
         if let Some(provenance) = provenance {
             self.top_provenance_observations += 1;
             self.top_sources[candidate_source_index(provenance.source())] += 1;
@@ -468,6 +484,19 @@ struct TopRegressionBoundaries {
     same_runtime_new_stream: usize,
     different_runtime: usize,
     unknown: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TopRegressionEvidence {
+    identities: usize,
+    precise_personalization_identities: usize,
+    marker_retained: usize,
+    marker_lost: usize,
+    marker_gained: usize,
+    marker_absent: usize,
+    marker_unknown: usize,
+    blocker_provenance_observations: usize,
+    blocker_sources: [usize; 10],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -882,6 +911,27 @@ impl ResearchReview {
             regression.unknown,
         )
         .unwrap();
+        let regression_evidence = self.top_regression_evidence();
+        writeln!(
+            output,
+            "首选首次回落个性化：精确原因覆盖 {}/{}；兼容标记前后均有 {}、回落时消失 {}、回落时新出现 {}、前后均无 {}、证据缺失 {}。",
+            regression_evidence.precise_personalization_identities,
+            regression_evidence.identities,
+            regression_evidence.marker_retained,
+            regression_evidence.marker_lost,
+            regression_evidence.marker_gained,
+            regression_evidence.marker_absent,
+            regression_evidence.marker_unknown,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "首选首次回落阻挡：全局首选来源完整 {}/{}；主要来源 {}。",
+            regression_evidence.blocker_provenance_observations,
+            regression_evidence.identities,
+            render_candidate_source_counts(&regression_evidence.blocker_sources),
+        )
+        .unwrap();
         let followup = self.followup_non_top_pressure();
         writeln!(
             output,
@@ -963,6 +1013,38 @@ impl ResearchReview {
             }
         }
         boundaries
+    }
+
+    fn top_regression_evidence(&self) -> TopRegressionEvidence {
+        let mut evidence = TopRegressionEvidence::default();
+        for pattern in self.selections.values().filter(|pattern| {
+            pattern.first_rank.is_some_and(|rank| rank > 1)
+                && pattern.first_post_top_regression_boundary.is_some()
+        }) {
+            evidence.identities += 1;
+            evidence.precise_personalization_identities +=
+                usize::from(pattern.first_regression_precise_personalization);
+            match (
+                pattern.first_regression_prior_top_provenance,
+                pattern.first_regression_target_provenance,
+            ) {
+                (Some(previous), Some(current)) => match (
+                    previous.personalization().is_empty(),
+                    current.personalization().is_empty(),
+                ) {
+                    (false, false) => evidence.marker_retained += 1,
+                    (false, true) => evidence.marker_lost += 1,
+                    (true, false) => evidence.marker_gained += 1,
+                    (true, true) => evidence.marker_absent += 1,
+                },
+                _ => evidence.marker_unknown += 1,
+            }
+            if let Some(blocker) = pattern.first_regression_global_top_provenance {
+                evidence.blocker_provenance_observations += 1;
+                evidence.blocker_sources[candidate_source_index(blocker.source())] += 1;
+            }
+        }
+        evidence
     }
 
     fn followup_non_top_pressure(&self) -> FollowupNonTopPressure {
@@ -2048,6 +2130,114 @@ mod tests {
             "legacy",
             "private",
         ] {
+            assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn top_regression_evidence_separates_marker_changes_and_blocker_sources() {
+        fn observe_case(
+            review: &mut ResearchReview,
+            identity: &str,
+            prior_top: Option<NativeCandidateProvenance>,
+            regressed: Option<NativeCandidateProvenance>,
+            blocker: Option<NativeCandidateProvenance>,
+            precise: bool,
+        ) {
+            let pattern = review
+                .selections
+                .entry((identity.to_owned(), "private".to_owned()))
+                .or_default();
+            let location = SelectionObservationLocation::default();
+            pattern.observe(
+                2,
+                NativeSelectionSource::Numeric,
+                regressed,
+                precise,
+                &location,
+            );
+            pattern.observe_global_top_provenance(blocker);
+            pattern.observe(
+                1,
+                NativeSelectionSource::FirstCandidate,
+                prior_top,
+                precise,
+                &location,
+            );
+            pattern.observe_global_top_provenance(prior_top);
+            pattern.observe(
+                2,
+                NativeSelectionSource::Numeric,
+                regressed,
+                precise,
+                &location,
+            );
+            pattern.observe_global_top_provenance(blocker);
+        }
+
+        let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let marked = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
+        let alias = NativeCandidateProvenance::new(NativeCandidateSource::ExplicitAlias, false);
+        let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let mut review = ResearchReview::default();
+        observe_case(
+            &mut review,
+            "retained",
+            Some(marked),
+            Some(marked),
+            Some(alias),
+            true,
+        );
+        observe_case(
+            &mut review,
+            "lost",
+            Some(marked),
+            Some(plain),
+            Some(alias),
+            false,
+        );
+        observe_case(
+            &mut review,
+            "gained",
+            Some(plain),
+            Some(marked),
+            Some(core),
+            false,
+        );
+        observe_case(
+            &mut review,
+            "absent",
+            Some(plain),
+            Some(plain),
+            Some(core),
+            false,
+        );
+        observe_case(&mut review, "unknown", None, Some(plain), None, false);
+
+        let mut blocker_sources = [0; 10];
+        blocker_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 2;
+        blocker_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
+        assert_eq!(
+            review.top_regression_evidence(),
+            TopRegressionEvidence {
+                identities: 5,
+                precise_personalization_identities: 1,
+                marker_retained: 1,
+                marker_lost: 1,
+                marker_gained: 1,
+                marker_absent: 1,
+                marker_unknown: 1,
+                blocker_provenance_observations: 4,
+                blocker_sources,
+            }
+        );
+        let mut rendered = String::new();
+        review.render_selection_pressure(&mut rendered);
+        assert!(rendered.contains("精确原因覆盖 1/5"));
+        assert!(rendered.contains("回落时消失 1"));
+        assert!(rendered.contains("全局首选来源完整 4/5"));
+        assert!(rendered.contains("显式别名 2、核心整词 2"));
+        for private_value in ["retained", "lost", "gained", "absent", "unknown", "private"] {
             assert!(!rendered.contains(private_value));
         }
     }
