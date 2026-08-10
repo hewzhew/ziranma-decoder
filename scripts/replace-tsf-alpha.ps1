@@ -354,7 +354,12 @@ function Write-UpdateStatus {
         [Parameter(Mandatory = $true)]
         [object]$HostCacheState,
         [Parameter(Mandatory = $true)]
-        [string]$UpdateState
+        [string]$UpdateState,
+        [Parameter(Mandatory = $true)]
+        [Diagnostics.Stopwatch]$TotalStopwatch,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$TimingParts
     )
 
     Write-Host 'TSF Alpha update status'
@@ -392,6 +397,11 @@ function Write-UpdateStatus {
     } else {
         Write-Host 'Next: run update-ime.cmd when convenient; existing hosts need not close first.'
     }
+    Write-Host (
+        'Timing: {0} ms total ({1})' -f
+            $TotalStopwatch.ElapsedMilliseconds,
+            ($TimingParts -join '; ')
+    )
     Write-Host 'This action: read only'
 }
 
@@ -432,11 +442,15 @@ if ($StatusOnly) {
     if ($AdminPhase -or $EnableCurrentUserAfterReplace -or $ForceReregister) {
         throw 'StatusOnly cannot be combined with replacement switches.'
     }
+    $statusStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $releaseValidationStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $sourceDigest = Get-Sha256Hex -Path $sourceDll
     if (-not (Test-Path -LiteralPath $sourceCandidateRoot -PathType Container)) {
         throw 'Release candidate data is missing.'
     }
     Invoke-CandidateCtl -Arguments @('status', '--root', $sourceCandidateRoot) -Quiet
+    $releaseValidationStopwatch.Stop()
+    $installedStateStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $receiptPresent = Test-Path -LiteralPath $receipt -PathType Leaf
     $receiptDigest = Get-InstalledReceiptDigest
     if ($receiptPresent -and $null -eq $receiptDigest) {
@@ -461,7 +475,10 @@ if ($StatusOnly) {
             throw 'Release candidate slots differ from the immutable installed build.'
         }
     }
+    $installedStateStopwatch.Stop()
+    $hostCacheStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $hostCacheState = Get-HostCacheState
+    $hostCacheStopwatch.Stop()
     $updateState = if ($null -eq $receiptDigest) {
         'not installed'
     } elseif ($receiptDigest -eq $sourceDigest) {
@@ -474,7 +491,13 @@ if ($StatusOnly) {
         -InstalledDigest $receiptDigest `
         -CurrentUserState $currentUserState `
         -HostCacheState $hostCacheState `
-        -UpdateState $updateState
+        -UpdateState $updateState `
+        -TotalStopwatch $statusStopwatch `
+        -TimingParts @(
+            "release validation $($releaseValidationStopwatch.ElapsedMilliseconds) ms",
+            "installed state $($installedStateStopwatch.ElapsedMilliseconds) ms",
+            "host scan $($hostCacheStopwatch.ElapsedMilliseconds) ms"
+        )
     exit 0
 }
 

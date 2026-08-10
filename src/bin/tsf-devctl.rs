@@ -3106,6 +3106,18 @@ mod tests {
         let script_contents = fs::read_to_string(script).unwrap();
         assert!(script_contents.contains("This action: read only"));
         assert!(
+            script_contents.contains(
+                "release validation $($releaseValidationStopwatch.ElapsedMilliseconds) ms"
+            )
+        );
+        assert!(
+            script_contents
+                .contains("installed state $($installedStateStopwatch.ElapsedMilliseconds) ms")
+        );
+        assert!(
+            script_contents.contains("host scan $($hostCacheStopwatch.ElapsedMilliseconds) ms")
+        );
+        assert!(
             script_contents.contains("StatusOnly cannot be combined with replacement switches.")
         );
     }
