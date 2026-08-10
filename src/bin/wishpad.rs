@@ -15,6 +15,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_app {
+    use std::collections::HashMap;
     use std::error::Error;
     use std::ffi::c_void;
     use std::path::{Path, PathBuf};
@@ -64,11 +65,12 @@ mod windows_app {
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
         NativeAutomaticTranspositionTier, NativeFeedbackEvent, WindowsUserDataProtector,
         WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
-        WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot,
-        list_trashed_wish_packages, list_wish_packages, load_trashed_wish_note,
+        WishNoteFileVersion, WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus,
+        WishSnapshot, list_trashed_wish_packages, list_wish_packages, load_trashed_wish_note,
         load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot, move_wish_to_trash,
         native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-        restore_wish_from_trash, save_or_replace_wish_note,
+        restore_wish_from_trash, save_or_replace_wish_note, trashed_wish_note_file_version,
+        wish_note_file_version,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -125,6 +127,7 @@ mod windows_app {
     struct ManagerRecord {
         info: WishPackageInfo,
         note: Option<WishNote>,
+        note_version: Option<WishNoteFileVersion>,
         note_unavailable: bool,
         snapshot: ManagerSnapshotCache,
     }
@@ -1538,9 +1541,38 @@ mod windows_app {
                 Some(packages.len()),
             ),
         };
+        let mut reusable_records = reusable_manager_records(&root, view)
+            .into_iter()
+            .map(|record| (record.info.id().to_owned(), record))
+            .collect::<HashMap<_, _>>();
         let records = packages
             .into_iter()
             .map(|info| {
+                let note_version = manager_note_file_version(&root, view, info.id());
+                if let Some(record) = reusable_records.remove(info.id())
+                    && record.info == info
+                    && record.note_version.as_ref() == Some(&note_version)
+                {
+                    return record;
+                }
+                if note_version == WishNoteFileVersion::Missing {
+                    return ManagerRecord {
+                        info,
+                        note: None,
+                        note_version: Some(note_version),
+                        note_unavailable: false,
+                        snapshot: ManagerSnapshotCache::Unloaded,
+                    };
+                }
+                if note_version == WishNoteFileVersion::Unavailable {
+                    return ManagerRecord {
+                        info,
+                        note: None,
+                        note_version: Some(note_version),
+                        note_unavailable: true,
+                        snapshot: ManagerSnapshotCache::Unloaded,
+                    };
+                }
                 let note = match view {
                     ManagerView::Active => {
                         load_wish_note(&root, info.id(), &WindowsUserDataProtector)
@@ -1553,18 +1585,14 @@ mod windows_app {
                     Ok(note) => ManagerRecord {
                         info,
                         note: Some(note),
-                        note_unavailable: false,
-                        snapshot: ManagerSnapshotCache::Unloaded,
-                    },
-                    Err(WishFeedbackError::NoteUnavailable) => ManagerRecord {
-                        info,
-                        note: None,
+                        note_version: Some(note_version),
                         note_unavailable: false,
                         snapshot: ManagerSnapshotCache::Unloaded,
                     },
                     Err(_) => ManagerRecord {
                         info,
                         note: None,
+                        note_version: Some(note_version),
                         note_unavailable: true,
                         snapshot: ManagerSnapshotCache::Unloaded,
                     },
@@ -1631,8 +1659,32 @@ mod windows_app {
             && current.iter().zip(refreshed).all(|(current, refreshed)| {
                 current.info == refreshed.info
                     && current.note == refreshed.note
+                    && current.note_version == refreshed.note_version
                     && current.note_unavailable == refreshed.note_unavailable
             })
+    }
+
+    fn reusable_manager_records(root: &Path, view: ManagerView) -> Vec<ManagerRecord> {
+        MANAGER_STATE
+            .lock()
+            .ok()
+            .and_then(|state| {
+                let state = state.as_ref()?;
+                (state.root == root && state.view == view).then(|| state.records.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn manager_note_file_version(
+        root: &Path,
+        view: ManagerView,
+        wish_id: &str,
+    ) -> WishNoteFileVersion {
+        match view {
+            ManagerView::Active => wish_note_file_version(root, wish_id),
+            ManagerView::Trash => trashed_wish_note_file_version(root, wish_id),
+        }
+        .unwrap_or(WishNoteFileVersion::Unavailable)
     }
 
     fn cached_manager_view_for_reload(
@@ -1735,6 +1787,9 @@ mod windows_app {
         {
             for record in &mut state.records {
                 record.snapshot.retry_unavailable();
+                if record.note_unavailable {
+                    record.note_version = None;
+                }
             }
         }
     }
@@ -3591,6 +3646,7 @@ mod windows_app {
             let current = ManagerRecord {
                 info: info.clone(),
                 note: Some(note.clone()),
+                note_version: Some(WishNoteFileVersion::ProtectedDigest("11".repeat(32))),
                 note_unavailable: false,
                 snapshot: ManagerSnapshotCache::Unloaded,
             };
@@ -3611,6 +3667,13 @@ mod windows_app {
                 )
                 .unwrap(),
             );
+            assert!(!manager_records_unchanged(
+                std::slice::from_ref(&current),
+                std::slice::from_ref(&refreshed)
+            ));
+
+            refreshed = current.clone();
+            refreshed.note_version = Some(WishNoteFileVersion::ProtectedDigest("22".repeat(32)));
             assert!(!manager_records_unchanged(
                 std::slice::from_ref(&current),
                 std::slice::from_ref(&refreshed)

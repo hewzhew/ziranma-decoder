@@ -1200,6 +1200,15 @@ impl WishNote {
     }
 }
 
+/// A content identity for one encrypted wish note without exposing or
+/// decrypting its plaintext.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WishNoteFileVersion {
+    Missing,
+    ProtectedDigest(String),
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WishPackageInfo {
     id: String,
@@ -1477,6 +1486,70 @@ pub fn load_wish_note(
         return Err(WishFeedbackError::InvalidNote);
     }
     Ok(note)
+}
+
+/// Reads only the encrypted note bytes and returns a stable content identity.
+///
+/// The returned digest is over DPAPI-protected bytes, not the private note.
+/// Missing and structurally unavailable sidecars remain distinct so callers
+/// can avoid repeatedly decrypting unchanged notes without hiding recovery.
+pub fn wish_note_file_version(
+    root: &Path,
+    wish_id: &str,
+) -> Result<WishNoteFileVersion, WishFeedbackError> {
+    ensure_root(root)?;
+    wish_note_file_version_in(root, wish_id)
+}
+
+/// Inspects one encrypted note in the recoverable trash without decrypting it.
+pub fn trashed_wish_note_file_version(
+    root: &Path,
+    wish_id: &str,
+) -> Result<WishNoteFileVersion, WishFeedbackError> {
+    ensure_root(root)?;
+    let trash = root.join(WISH_TRASH_DIRECTORY);
+    match fs::symlink_metadata(&trash) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WishNoteFileVersion::Missing);
+        }
+        Err(_) => return Err(WishFeedbackError::InvalidTrash),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(WishFeedbackError::InvalidTrash);
+        }
+        Ok(_) => {}
+    }
+    wish_note_file_version_in(&trash, wish_id)
+}
+
+fn wish_note_file_version_in(
+    directory: &Path,
+    wish_id: &str,
+) -> Result<WishNoteFileVersion, WishFeedbackError> {
+    let path = directory.join(note_filename(wish_id)?);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WishNoteFileVersion::Missing);
+        }
+        Err(_) => return Ok(WishNoteFileVersion::Unavailable),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_WISH_NOTE_BYTES.saturating_add(1024) as u64
+    {
+        return Ok(WishNoteFileVersion::Unavailable);
+    }
+    let Ok(protected) = read_regular_bytes(
+        &path,
+        MAX_WISH_NOTE_BYTES.saturating_add(1024),
+        WishFeedbackError::NoteUnavailable,
+    ) else {
+        return Ok(WishNoteFileVersion::Unavailable);
+    };
+    Ok(WishNoteFileVersion::ProtectedDigest(candidate_sha256_hex(
+        &protected,
+    )))
 }
 
 /// Moves one exact wish and its optional note to a recoverable local trash.
@@ -3360,6 +3433,54 @@ mod tests {
             Err(WishFeedbackError::WishAlreadyExists)
         ));
         assert!(trash_wish.is_file());
+    }
+
+    #[test]
+    fn encrypted_note_versions_detect_changes_without_plaintext() {
+        let root = TemporaryDirectory::new();
+        let receipt = save_wish_snapshot(&root.0, &private_snapshot(), &TestProtector).unwrap();
+        assert_eq!(
+            wish_note_file_version(&root.0, receipt.id()).unwrap(),
+            WishNoteFileVersion::Missing
+        );
+
+        let first = WishNote::new(receipt.id(), WishCategory::Display, "公开合成说明一").unwrap();
+        save_or_replace_wish_note(&root.0, &first, &TestProtector).unwrap();
+        let first_version = wish_note_file_version(&root.0, receipt.id()).unwrap();
+        let WishNoteFileVersion::ProtectedDigest(first_digest) = &first_version else {
+            panic!("saved note must have one protected digest");
+        };
+        assert_eq!(first_digest.len(), 64);
+        assert!(!format!("{first_version:?}").contains(first.text()));
+        assert_eq!(
+            wish_note_file_version(&root.0, receipt.id()).unwrap(),
+            first_version
+        );
+
+        let revised = WishNote::new(receipt.id(), WishCategory::Display, "公开合成说明二").unwrap();
+        save_or_replace_wish_note(&root.0, &revised, &TestProtector).unwrap();
+        let revised_version = wish_note_file_version(&root.0, receipt.id()).unwrap();
+        assert_ne!(revised_version, first_version);
+
+        move_wish_to_trash(&root.0, receipt.id()).unwrap();
+        assert_eq!(
+            wish_note_file_version(&root.0, receipt.id()).unwrap(),
+            WishNoteFileVersion::Missing
+        );
+        assert_eq!(
+            trashed_wish_note_file_version(&root.0, receipt.id()).unwrap(),
+            revised_version
+        );
+
+        let trashed_note = root
+            .0
+            .join(WISH_TRASH_DIRECTORY)
+            .join(note_filename(receipt.id()).unwrap());
+        fs::write(trashed_note, []).unwrap();
+        assert_eq!(
+            trashed_wish_note_file_version(&root.0, receipt.id()).unwrap(),
+            WishNoteFileVersion::Unavailable
+        );
     }
 
     #[test]
