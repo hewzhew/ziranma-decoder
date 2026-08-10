@@ -43,6 +43,7 @@ pub const WISH_SCHEMA_V9: &str = "ziranma-wish-v9";
 pub const WISH_SCHEMA_V10: &str = "ziranma-wish-v10";
 pub const WISH_SCHEMA_V11: &str = "ziranma-wish-v11";
 pub const WISH_SCHEMA_V12: &str = "ziranma-wish-v12";
+pub const WISH_SCHEMA_V13: &str = "ziranma-wish-v13";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -51,7 +52,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 12;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 13;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -64,6 +65,7 @@ const WISH_PLAINTEXT_MAGIC_V9: &[u8] = b"ziranma-wish-v9\0";
 const WISH_PLAINTEXT_MAGIC_V10: &[u8] = b"ziranma-wish-v10\0";
 const WISH_PLAINTEXT_MAGIC_V11: &[u8] = b"ziranma-wish-v11\0";
 const WISH_PLAINTEXT_MAGIC_V12: &[u8] = b"ziranma-wish-v12\0";
+const WISH_PLAINTEXT_MAGIC_V13: &[u8] = b"ziranma-wish-v13\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -116,6 +118,47 @@ pub enum WishEventRole {
     Context,
     Focus,
     Trigger,
+}
+
+/// Public-dictionary cold-order policy used by the capturing host.
+///
+/// This is deliberately separate from [`WishRuntimeIdentity`]: the identity
+/// names immutable code and data artifacts, while a runtime policy may vary
+/// without changing either artifact. V1–V12 snapshots did not record this
+/// distinction and therefore decode as [`Self::Unrecorded`].
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum WishPublicCandidateOrderPolicy {
+    #[default]
+    Unrecorded,
+    ConservativeCoreFirst,
+    ExperimentalCrossDictionaryConsensus,
+}
+
+impl WishPublicCandidateOrderPolicy {
+    fn encoded(self) -> u8 {
+        match self {
+            Self::Unrecorded => 0,
+            Self::ConservativeCoreFirst => 1,
+            Self::ExperimentalCrossDictionaryConsensus => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unrecorded),
+            1 => Some(Self::ConservativeCoreFirst),
+            2 => Some(Self::ExperimentalCrossDictionaryConsensus),
+            _ => None,
+        }
+    }
+
+    pub fn public_consensus_reorder_enabled(self) -> Option<bool> {
+        match self {
+            Self::Unrecorded => None,
+            Self::ConservativeCoreFirst => Some(false),
+            Self::ExperimentalCrossDictionaryConsensus => Some(true),
+        }
+    }
 }
 
 /// One private event loaded from or prepared for a wish package.
@@ -305,6 +348,7 @@ pub struct WishSnapshot {
     capture_scope: WishCaptureScope,
     category: WishCategory,
     runtime_identity: Option<WishRuntimeIdentity>,
+    public_candidate_order_policy: WishPublicCandidateOrderPolicy,
     journal_context: Option<WishJournalContext>,
     focus_event_start: usize,
     focus_event_count: usize,
@@ -350,6 +394,24 @@ impl WishSnapshot {
         runtime_identity: Option<WishRuntimeIdentity>,
         journal_context: Option<WishJournalContext>,
     ) -> Result<Self, WishFeedbackError> {
+        Self::from_frozen_with_context_and_public_order_policy(
+            snapshot,
+            capture_scope,
+            category,
+            runtime_identity,
+            WishPublicCandidateOrderPolicy::Unrecorded,
+            journal_context,
+        )
+    }
+
+    pub fn from_frozen_with_context_and_public_order_policy(
+        snapshot: &FrozenNativeFeedbackSnapshot,
+        capture_scope: WishCaptureScope,
+        category: WishCategory,
+        runtime_identity: Option<WishRuntimeIdentity>,
+        public_candidate_order_policy: WishPublicCandidateOrderPolicy,
+        journal_context: Option<WishJournalContext>,
+    ) -> Result<Self, WishFeedbackError> {
         let (focus_event_start, focus_event_count) =
             if capture_scope == WishCaptureScope::ContinuousJournal {
                 (0, snapshot.events().len())
@@ -361,6 +423,7 @@ impl WishSnapshot {
             capture_scope,
             category,
             runtime_identity,
+            public_candidate_order_policy,
             journal_context,
             focus_event_start,
             focus_event_count,
@@ -407,12 +470,20 @@ impl WishSnapshot {
         self.source_schema_version >= 12
     }
 
+    pub fn supports_public_candidate_order_policy(&self) -> bool {
+        self.source_schema_version >= 13
+    }
+
     pub fn category(&self) -> WishCategory {
         self.category
     }
 
     pub fn runtime_identity(&self) -> Option<&WishRuntimeIdentity> {
         self.runtime_identity.as_ref()
+    }
+
+    pub fn public_candidate_order_policy(&self) -> WishPublicCandidateOrderPolicy {
+        self.public_candidate_order_policy
     }
 
     pub fn journal_context(&self) -> Option<&WishJournalContext> {
@@ -604,6 +675,11 @@ impl WishSnapshot {
         if let Some(identity) = &self.runtime_identity {
             identity.validate()?;
         }
+        if self.source_schema_version < 13
+            && self.public_candidate_order_policy != WishPublicCandidateOrderPolicy::Unrecorded
+        {
+            return Err(WishFeedbackError::InvalidSnapshot);
+        }
         match (&self.capture_scope, &self.journal_context) {
             (
                 WishCaptureScope::ContinuousJournal,
@@ -665,7 +741,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V12);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V13);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -680,6 +756,9 @@ impl WishSnapshot {
             if let Some(revision) = identity.supplemental_candidate_revision() {
                 put_string(&mut output, revision)?;
             }
+        }
+        if event_version >= 13 {
+            output.push(self.public_candidate_order_policy.encoded());
         }
         match &self.journal_context {
             None => output.push(0),
@@ -721,7 +800,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V12) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V13) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V13)?;
+            13
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V12) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V12)?;
             12
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V11) {
@@ -782,6 +864,12 @@ impl WishSnapshot {
         } else {
             None
         };
+        let public_candidate_order_policy = if version >= 13 {
+            WishPublicCandidateOrderPolicy::decode(reader.byte()?)
+                .ok_or(WishFeedbackError::InvalidSnapshot)?
+        } else {
+            WishPublicCandidateOrderPolicy::Unrecorded
+        };
         let journal_context = if version >= 8 {
             match reader.byte()? {
                 0 => None,
@@ -829,6 +917,7 @@ impl WishSnapshot {
             capture_scope,
             category,
             runtime_identity,
+            public_candidate_order_policy,
             journal_context,
             focus_event_start,
             focus_event_count: if version == 1 {
@@ -2384,13 +2473,15 @@ mod tests {
             10
         } else if magic == WISH_PLAINTEXT_MAGIC_V11 {
             11
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V12 {
             12
+        } else {
+            13
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V12.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V13.len()..]);
         rendered
     }
 
@@ -2401,6 +2492,7 @@ mod tests {
     ) {
         let mut expected = current.clone();
         expected.source_schema_version = source_schema_version;
+        expected.public_candidate_order_policy = WishPublicCandidateOrderPolicy::Unrecorded;
         assert!(*parsed == expected);
     }
 
@@ -2408,17 +2500,22 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V13));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 12);
+        assert_eq!(parsed.source_schema_version(), 13);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
         assert!(parsed.supports_public_consensus_candidate_source());
+        assert!(parsed.supports_public_candidate_order_policy());
+        assert_eq!(
+            parsed.public_candidate_order_policy(),
+            WishPublicCandidateOrderPolicy::Unrecorded
+        );
         assert!(parsed == snapshot);
         assert!(WishSnapshot::parse(&rendered[..rendered.len() - 1]).is_err());
     }
@@ -2449,10 +2546,11 @@ mod tests {
             may_have_more: false,
         };
 
-        let rendered = snapshot.render().unwrap();
+        let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V12);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
-        assert!(parsed == snapshot);
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 12);
+        assert!(!parsed.supports_public_candidate_order_policy());
     }
 
     #[test]
@@ -2507,10 +2605,54 @@ mod tests {
             may_have_more: false,
         };
 
-        let rendered = snapshot.render().unwrap();
+        let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V12);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
-        assert!(WishSnapshot::parse(&rendered).unwrap() == snapshot);
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert_legacy_snapshot_matches(&parsed, &snapshot, 12);
         assert!(snapshot.render_with_event_version(11).is_err());
+    }
+
+    #[test]
+    fn v13_round_trips_explicit_public_candidate_order_policy_strictly() {
+        for policy in [
+            WishPublicCandidateOrderPolicy::Unrecorded,
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst,
+            WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus,
+        ] {
+            let mut snapshot = private_snapshot();
+            snapshot.public_candidate_order_policy = policy;
+            let rendered = snapshot.render().unwrap();
+            let parsed = WishSnapshot::parse(&rendered).unwrap();
+            assert_eq!(parsed.public_candidate_order_policy(), policy);
+            assert_eq!(
+                parsed
+                    .public_candidate_order_policy()
+                    .public_consensus_reorder_enabled(),
+                match policy {
+                    WishPublicCandidateOrderPolicy::Unrecorded => None,
+                    WishPublicCandidateOrderPolicy::ConservativeCoreFirst => Some(false),
+                    WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus => {
+                        Some(true)
+                    }
+                }
+            );
+        }
+
+        let mut snapshot = private_snapshot();
+        snapshot.public_candidate_order_policy =
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst;
+        let rendered = snapshot.render().unwrap();
+        let policy_offset = WISH_PLAINTEXT_MAGIC_V13.len() + 1 + 1 + 4 + 4 + 1;
+        assert_eq!(rendered[policy_offset], 1);
+
+        let mut invalid_policy = rendered.clone();
+        invalid_policy[policy_offset] = u8::MAX;
+        assert!(WishSnapshot::parse(&invalid_policy).is_err());
+
+        let mut falsely_downgraded = Vec::new();
+        falsely_downgraded.extend_from_slice(WISH_PLAINTEXT_MAGIC_V12);
+        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V13.len()..]);
+        assert!(WishSnapshot::parse(&falsely_downgraded).is_err());
     }
 
     #[test]
@@ -2589,7 +2731,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V12));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V13));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(

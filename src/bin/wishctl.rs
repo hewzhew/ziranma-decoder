@@ -9,10 +9,10 @@ use ziranma_core::{
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
     NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
     WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
-    WishFeedbackError, WishImportance, WishJournalContext, WishNote, WishReviewStatus,
-    dispatch_wish_command, list_trashed_wish_packages, list_wish_packages, load_wish_note,
-    load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash,
-    save_wish_note,
+    WishFeedbackError, WishImportance, WishJournalContext, WishNote,
+    WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
+    list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
+    move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,6 +385,14 @@ fn show(
     } else {
         println!("运行身份：旧批次未记录");
     }
+    println!(
+        "公开候选冷排序：{}",
+        if snapshot.supports_public_candidate_order_policy() {
+            public_candidate_order_policy_label(snapshot.public_candidate_order_policy())
+        } else {
+            "旧格式未记录，无法判断是否启用跨词典共识"
+        }
+    );
     println!("{}", journal_context_label(snapshot.journal_context()));
     let mut previous_role = None;
     let mut previous_completed_episode = false;
@@ -651,6 +659,18 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
     }
 }
 
+fn public_candidate_order_policy_label(policy: WishPublicCandidateOrderPolicy) -> &'static str {
+    match policy {
+        WishPublicCandidateOrderPolicy::Unrecorded => "当前格式未指定，无法判断",
+        WishPublicCandidateOrderPolicy::ConservativeCoreFirst => {
+            "保守核心优先（未启用跨词典共识重排）"
+        }
+        WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus => {
+            "实验性跨词典共识重排"
+        }
+    }
+}
+
 fn candidate_personalization_label(personalization: NativeCandidatePersonalization) -> String {
     [
         (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
@@ -829,6 +849,7 @@ mod tests {
         assert_eq!(wish_schema_version_label(8), "V8");
         assert_eq!(wish_schema_version_label(11), "V11");
         assert_eq!(wish_schema_version_label(12), "V12");
+        assert_eq!(wish_schema_version_label(13), "V13");
     }
 
     #[test]
@@ -948,6 +969,26 @@ mod tests {
             "持久精确+会话尾简+左侧上下文"
         );
         assert!(candidate_personalization_label(NativeCandidatePersonalization::NONE).is_empty());
+    }
+
+    #[test]
+    fn public_candidate_order_policy_labels_separate_unknown_disabled_and_enabled() {
+        assert!(
+            public_candidate_order_policy_label(WishPublicCandidateOrderPolicy::Unrecorded)
+                .contains("无法判断")
+        );
+        assert!(
+            public_candidate_order_policy_label(
+                WishPublicCandidateOrderPolicy::ConservativeCoreFirst
+            )
+            .contains("未启用跨词典共识重排")
+        );
+        assert_eq!(
+            public_candidate_order_policy_label(
+                WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus
+            ),
+            "实验性跨词典共识重排"
+        );
     }
 
     #[test]

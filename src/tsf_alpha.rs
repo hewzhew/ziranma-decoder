@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use crate::candidate_snapshot::{
     FourCharacterCorrectionDecision, InteractiveCandidateQuery, InteractiveCandidateSource,
-    layered_candidate_query_with_sources, layered_four_character_correction_decision,
+    layered_candidate_query_with_consensus_sources, layered_candidate_query_with_sources,
+    layered_four_character_correction_decision,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -49,13 +50,14 @@ use crate::{
     PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
     WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
     WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
-    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishRuntimeIdentity, WishSnapshot,
-    candidate_sha256_hex, load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
-    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
-    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
-    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
-    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
+    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
+    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_snapshots,
+    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
+    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
+    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
+    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
+    save_personal_ranking_batch, save_personal_ranking_checkpoint,
+    save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -157,6 +159,8 @@ const TSF_PUBLIC_STROKE_SEQUENCES: &str =
 const CANDIDATE_PAGE_SIZE: usize = 6;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
+const TSF_PUBLIC_CANDIDATE_ORDER_POLICY: WishPublicCandidateOrderPolicy =
+    WishPublicCandidateOrderPolicy::ConservativeCoreFirst;
 const AUTOMATIC_TRANSPOSITION_PRIMARY_MAX_GAP_MS: u64 = 48;
 const AUTOMATIC_TRANSPOSITION_SECONDARY_UPPER_GAP_MS: u64 = 64;
 const AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS: u64 = 96;
@@ -753,16 +757,32 @@ impl SnapshotCandidateProvider {
                 let mut snapshot_query = supplemental
                     .as_ref()
                     .and_then(|(supplemental, config)| {
-                        // The broader cross-dictionary Top-1 consensus rule
-                        // remains audit-only after losing correct Top-1s on
-                        // its independent public holdout.
-                        layered_candidate_query_with_sources(
-                            &self.snapshot,
-                            supplemental,
-                            code,
-                            limit,
-                            *config,
-                        )
+                        match TSF_PUBLIC_CANDIDATE_ORDER_POLICY {
+                            WishPublicCandidateOrderPolicy::ConservativeCoreFirst => {
+                                // The broader cross-dictionary Top-1 consensus rule
+                                // remains audit-only after losing correct Top-1s on
+                                // its independent public holdout.
+                                layered_candidate_query_with_sources(
+                                    &self.snapshot,
+                                    supplemental,
+                                    code,
+                                    limit,
+                                    *config,
+                                )
+                            }
+                            WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus => {
+                                layered_candidate_query_with_consensus_sources(
+                                    &self.snapshot,
+                                    supplemental,
+                                    code,
+                                    limit,
+                                    *config,
+                                )
+                            }
+                            WishPublicCandidateOrderPolicy::Unrecorded => {
+                                unreachable!("the TSF public candidate order policy is explicit")
+                            }
+                        }
                         .ok()
                     })
                     .unwrap_or_else(|| {
@@ -5876,11 +5896,12 @@ impl NativeFeedbackLanguageBarState {
         let saved_events = frozen
             .and_then(
                 |(frozen, effective_scope, runtime_identity, journal_context)| {
-                    WishSnapshot::from_frozen_with_context(
+                    WishSnapshot::from_frozen_with_context_and_public_order_policy(
                         &frozen,
                         effective_scope,
                         category,
                         runtime_identity,
+                        TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
                         journal_context,
                     )
                     .ok()
@@ -7610,11 +7631,12 @@ impl ResearchFeedbackJournal {
                     .map(|frozen| (frozen, journal_context))
             })
             .and_then(|(frozen, journal_context)| {
-                WishSnapshot::from_frozen_with_context(
+                WishSnapshot::from_frozen_with_context_and_public_order_policy(
                     &frozen,
                     WishCaptureScope::ContinuousJournal,
                     WishCategory::Other,
                     runtime_identity,
+                    TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
                     Some(journal_context),
                 )
                 .ok()
@@ -12512,6 +12534,10 @@ mod tests {
 
     #[test]
     fn supplemental_provider_keeps_core_order_until_consensus_gate_passes() {
+        assert_eq!(
+            TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst
+        );
         const CORE: &str = "text\tpinyin\tfrequency\n\
 大国\tda guo\t1657\n\
 打过\tda guo\t1390\n";
@@ -14195,6 +14221,16 @@ mod tests {
             identity.supplemental_candidate_revision(),
             Some("research-supplement-v2")
         );
+        assert_eq!(
+            snapshot.public_candidate_order_policy(),
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst
+        );
+        assert_eq!(
+            snapshot
+                .public_candidate_order_policy()
+                .public_consensus_reorder_enabled(),
+            Some(false)
+        );
 
         runtime.record_at(
             NativeFeedbackContext::Eligible,
@@ -14581,6 +14617,10 @@ mod tests {
         let loaded =
             crate::load_wish_snapshot(&root, packages[0].id(), &WindowsUserDataProtector).unwrap();
         assert_eq!(loaded.events().len(), 1);
+        assert_eq!(
+            loaded.public_candidate_order_policy(),
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst
+        );
         assert!(
             state
                 .menu()

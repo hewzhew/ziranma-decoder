@@ -10,9 +10,10 @@ use ziranma_core::{
     NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
     ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
-    WishRuntimeIdentity, WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs,
-    list_wish_packages, native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-    research_feedback_enabled, set_research_feedback_enabled,
+    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
+    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
+    repository_root_for_user_tool_executable, research_feedback_enabled,
+    set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -23,6 +24,7 @@ const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
 const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
 const CANDIDATE_SOURCE_KIND_COUNT: usize = 11;
+const PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT: usize = 3;
 const INITIAL_NON_TOP_RANK_BUCKET_COUNT: usize = 3;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
     (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
@@ -645,6 +647,8 @@ struct ResearchReview {
     post_commit_backspace_capable_batches: usize,
     precise_personalization_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
+    public_candidate_order_policy_capable_batches: usize,
+    public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
     source_schema_versions: [usize; WISH_SCHEMA_VERSION_COUNT],
     transposition_accepted: usize,
     transposition_rejected: usize,
@@ -670,6 +674,10 @@ impl ResearchReview {
             usize::from(snapshot.supports_precise_candidate_personalization());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
+        self.public_candidate_order_policy_capable_batches +=
+            usize::from(snapshot.supports_public_candidate_order_policy());
+        self.public_candidate_order_policies
+            [public_candidate_order_policy_index(snapshot.public_candidate_order_policy())] += 1;
         if let Some(count) = self.source_schema_versions.get_mut(usize::from(
             snapshot.source_schema_version().saturating_sub(1),
         )) {
@@ -888,7 +896,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化原因 {}/{} 批；公开共识来源 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化原因 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -897,6 +905,22 @@ impl ResearchReview {
             self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "公开候选冷排序策略：V13 字段 {}/{} 批；保守核心优先 {}，实验跨词典共识 {}，旧格式或未记录 {}。",
+            self.public_candidate_order_policy_capable_batches,
+            self.batches,
+            self.public_candidate_order_policies[public_candidate_order_policy_index(
+                WishPublicCandidateOrderPolicy::ConservativeCoreFirst,
+            )],
+            self.public_candidate_order_policies[public_candidate_order_policy_index(
+                WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus,
+            )],
+            self.public_candidate_order_policies[public_candidate_order_policy_index(
+                WishPublicCandidateOrderPolicy::Unrecorded,
+            )],
         )
         .unwrap();
         writeln!(
@@ -1967,6 +1991,14 @@ fn candidate_source_index(source: NativeCandidateSource) -> usize {
         NativeCandidateSource::Shape => 8,
         NativeCandidateSource::FourCharacterCorrection => 9,
         NativeCandidateSource::PublicConsensusExact => 10,
+    }
+}
+
+fn public_candidate_order_policy_index(policy: WishPublicCandidateOrderPolicy) -> usize {
+    match policy {
+        WishPublicCandidateOrderPolicy::Unrecorded => 0,
+        WishPublicCandidateOrderPolicy::ConservativeCoreFirst => 1,
+        WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus => 2,
     }
 }
 
@@ -3053,7 +3085,7 @@ mod tests {
                 16,
             )
             .unwrap();
-        let snapshot = WishSnapshot::from_frozen_with_runtime_identity(
+        let snapshot = WishSnapshot::from_frozen_with_context_and_public_order_policy(
             &frozen,
             WishCaptureScope::ContinuousJournal,
             ziranma_core::WishCategory::Other,
@@ -3061,6 +3093,8 @@ mod tests {
                 WishRuntimeIdentity::new("ab".repeat(32), "research-core-v1".to_owned(), None)
                     .unwrap(),
             ),
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst,
+            None,
         )
         .unwrap();
         let mut review = ResearchReview::default();
@@ -3099,15 +3133,18 @@ mod tests {
         assert!(aggregate.contains("慢按键其余阶段（UI、状态、反馈及计时取整）：1 次"));
         assert!(aggregate.contains("候选规划 1；编辑会话 0；其余阶段 0；并列 0"));
         assert!(aggregate.contains("精确个性化原因 1/1 批"));
-        assert!(aggregate.contains("反馈格式：V12 1"));
-        assert!(aggregate.contains("公开共识来源 1/1 批"));
+        assert!(aggregate.contains("反馈格式：V13 1"));
+        assert!(aggregate.contains("公开共识来源字段 1/1 批"));
+        assert!(aggregate.contains(
+            "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"
+        ));
         assert!(
             review
                 .render()
                 .contains("DLL abababababab…；核心 research-core-v1")
         );
 
-        let newer = WishSnapshot::from_frozen_with_runtime_identity(
+        let newer = WishSnapshot::from_frozen_with_context_and_public_order_policy(
             &frozen,
             WishCaptureScope::ContinuousJournal,
             ziranma_core::WishCategory::Other,
@@ -3115,6 +3152,8 @@ mod tests {
                 WishRuntimeIdentity::new("cd".repeat(32), "research-core-v2".to_owned(), None)
                     .unwrap(),
             ),
+            WishPublicCandidateOrderPolicy::ConservativeCoreFirst,
+            None,
         )
         .unwrap();
         let snapshots = [snapshot, newer];
