@@ -239,9 +239,33 @@ struct PresentedFrame {
     view: NativeCandidateView,
     page_start: usize,
     provenance: Vec<NativeCandidateProvenance>,
+    global_top_provenance: Option<NativeCandidateProvenance>,
 }
 
 impl PresentedFrame {
+    fn next(
+        code: &str,
+        view: NativeCandidateView,
+        page_start: usize,
+        provenance: Vec<NativeCandidateProvenance>,
+        previous: Option<&Self>,
+    ) -> Self {
+        let global_top_provenance = if page_start == 0 {
+            provenance.first().copied()
+        } else {
+            previous
+                .filter(|frame| frame.code == code && frame.view == view)
+                .and_then(|frame| frame.global_top_provenance)
+        };
+        Self {
+            code: code.to_owned(),
+            view,
+            page_start,
+            provenance,
+            global_top_provenance,
+        }
+    }
+
     fn provenance_for_rank(&self, absolute_rank: usize) -> Option<NativeCandidateProvenance> {
         let index = absolute_rank.checked_sub(self.page_start.saturating_add(1))?;
         self.provenance.get(index).copied()
@@ -261,6 +285,8 @@ struct SelectionPattern {
     session_promoted_frames: usize,
     provenance_observations: usize,
     sources: [usize; 10],
+    top_provenance_observations: usize,
+    top_sources: [usize; 10],
 }
 
 impl SelectionPattern {
@@ -289,8 +315,24 @@ impl SelectionPattern {
         }
     }
 
+    fn observe_global_top_provenance(&mut self, provenance: Option<NativeCandidateProvenance>) {
+        if let Some(provenance) = provenance {
+            self.top_provenance_observations += 1;
+            self.top_sources[candidate_source_index(provenance.source())] += 1;
+        }
+    }
+
     fn dominant_source(&self) -> NativeCandidateSource {
         self.sources
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, count)| (**count, std::cmp::Reverse(*index)))
+            .map(|(index, _)| candidate_source_from_index(index))
+            .unwrap_or(NativeCandidateSource::Unknown)
+    }
+
+    fn dominant_top_source(&self) -> NativeCandidateSource {
+        self.top_sources
             .iter()
             .enumerate()
             .max_by_key(|(index, count)| (**count, std::cmp::Reverse(*index)))
@@ -327,6 +369,13 @@ struct FollowupNonTopPressure {
     partial_provenance_identities: usize,
     missing_provenance_identities: usize,
     dominant_sources: [usize; 10],
+    complete_top_provenance_identities: usize,
+    partial_top_provenance_identities: usize,
+    missing_top_provenance_identities: usize,
+    all_observed_top_alias_identities: usize,
+    some_observed_top_alias_identities: usize,
+    no_observed_top_alias_identities: usize,
+    dominant_top_sources: [usize; 10],
 }
 
 #[derive(Default)]
@@ -404,12 +453,13 @@ impl ResearchReview {
                         false,
                     );
                     self.observe_code_shape(code, None);
-                    frame = Some(PresentedFrame {
-                        code: code.clone(),
-                        view: *view,
-                        page_start: *page_start,
-                        provenance: Vec::new(),
-                    });
+                    frame = Some(PresentedFrame::next(
+                        code,
+                        *view,
+                        *page_start,
+                        Vec::new(),
+                        frame.as_ref(),
+                    ));
                 }
                 NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                     code,
@@ -429,12 +479,13 @@ impl ResearchReview {
                         tab_assembly.is_some(),
                     );
                     self.observe_code_shape(code, provenance.first().copied());
-                    frame = Some(PresentedFrame {
-                        code: code.clone(),
-                        view: *view,
-                        page_start: *page_start,
-                        provenance: provenance.clone(),
-                    });
+                    frame = Some(PresentedFrame::next(
+                        code,
+                        *view,
+                        *page_start,
+                        provenance.clone(),
+                        frame.as_ref(),
+                    ));
                 }
                 NativeFeedbackEvent::CandidateCommitted {
                     code,
@@ -450,19 +501,24 @@ impl ResearchReview {
                     self.paged_commits += usize::from(*absolute_rank > 6);
                     self.manual_commits +=
                         usize::from(*source != NativeSelectionSource::FirstCandidate);
-                    let provenance = frame
+                    let matching_frame = frame
                         .as_ref()
-                        .filter(|frame| frame.code == *code && frame.view == *view)
-                        .and_then(|frame| frame.provenance_for_rank(*absolute_rank));
+                        .filter(|frame| frame.code == *code && frame.view == *view);
+                    let provenance =
+                        matching_frame.and_then(|frame| frame.provenance_for_rank(*absolute_rank));
+                    let global_top_provenance =
+                        matching_frame.and_then(|frame| frame.global_top_provenance);
                     self.unpaired_commits += usize::from(
                         frame
                             .as_ref()
                             .is_none_or(|frame| frame.code != *code || frame.view != *view),
                     );
-                    self.selections
+                    let pattern = self
+                        .selections
                         .entry((code.clone(), text.clone()))
-                        .or_default()
-                        .observe(*absolute_rank, *source, provenance);
+                        .or_default();
+                    pattern.observe(*absolute_rank, *source, provenance);
+                    pattern.observe_global_top_provenance(global_top_provenance);
                     frame = None;
                 }
                 NativeFeedbackEvent::RawCodeCommitted { code } => {
@@ -649,6 +705,18 @@ impl ResearchReview {
             render_candidate_source_counts(&followup.dominant_sources),
         )
         .unwrap();
+        writeln!(
+            output,
+            "首选阻挡证据：首选来源完整 {}、部分 {}、缺失 {}；已观测首选均为显式别名 {}、部分为显式别名 {}、从未为显式别名 {}；主要首选来源 {}。",
+            followup.complete_top_provenance_identities,
+            followup.partial_top_provenance_identities,
+            followup.missing_top_provenance_identities,
+            followup.all_observed_top_alias_identities,
+            followup.some_observed_top_alias_identities,
+            followup.no_observed_top_alias_identities,
+            render_candidate_source_counts(&followup.dominant_top_sources),
+        )
+        .unwrap();
     }
 
     fn followup_non_top_pressure(&self) -> FollowupNonTopPressure {
@@ -691,6 +759,26 @@ impl ResearchReview {
                     pressure.partial_provenance_identities += 1;
                     pressure.dominant_sources[candidate_source_index(pattern.dominant_source())] +=
                         1;
+                }
+            }
+            match pattern.top_provenance_observations {
+                0 => pressure.missing_top_provenance_identities += 1,
+                observations if observations == pattern.selections => {
+                    pressure.complete_top_provenance_identities += 1;
+                }
+                _ => pressure.partial_top_provenance_identities += 1,
+            }
+            if pattern.top_provenance_observations != 0 {
+                pressure.dominant_top_sources
+                    [candidate_source_index(pattern.dominant_top_source())] += 1;
+                let alias_observations = pattern.top_sources
+                    [candidate_source_index(NativeCandidateSource::ExplicitAlias)];
+                if alias_observations == 0 {
+                    pressure.no_observed_top_alias_identities += 1;
+                } else if alias_observations == pattern.top_provenance_observations {
+                    pressure.all_observed_top_alias_identities += 1;
+                } else {
+                    pressure.some_observed_top_alias_identities += 1;
                 }
             }
         }
@@ -1487,7 +1575,54 @@ mod tests {
     }
 
     #[test]
+    fn presented_frame_carries_global_top_source_only_across_matching_pages() {
+        let alias = NativeCandidateProvenance::new(NativeCandidateSource::ExplicitAlias, false);
+        let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let first = PresentedFrame::next(
+            "code",
+            NativeCandidateView::Ordinary,
+            0,
+            vec![alias, core],
+            None,
+        );
+        assert_eq!(first.global_top_provenance, Some(alias));
+        let second = PresentedFrame::next(
+            "code",
+            NativeCandidateView::Ordinary,
+            6,
+            vec![core],
+            Some(&first),
+        );
+        assert_eq!(second.global_top_provenance, Some(alias));
+        let changed_code = PresentedFrame::next(
+            "other",
+            NativeCandidateView::Ordinary,
+            6,
+            vec![core],
+            Some(&second),
+        );
+        assert_eq!(changed_code.global_top_provenance, None);
+        let changed_view = PresentedFrame::next(
+            "code",
+            NativeCandidateView::Shape,
+            6,
+            vec![core],
+            Some(&second),
+        );
+        assert_eq!(changed_view.global_top_provenance, None);
+        let refreshed_first = PresentedFrame::next(
+            "code",
+            NativeCandidateView::Ordinary,
+            0,
+            vec![core],
+            Some(&second),
+        );
+        assert_eq!(refreshed_first.global_top_provenance, Some(core));
+    }
+
+    #[test]
     fn followup_non_top_pressure_partitions_only_supported_evidence() {
+        let alias = NativeCandidateProvenance::new(NativeCandidateSource::ExplicitAlias, false);
         let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
         let promoted_core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
         let supplemental =
@@ -1502,6 +1637,8 @@ mod tests {
             ("same", "beta", vec![(1, Some(core))]),
             ("cold", "gamma", vec![(3, None), (3, None)]),
             ("far", "zeta", vec![(8, None), (7, Some(supplemental))]),
+            ("partial", "theta", vec![(5, Some(core)), (4, Some(core))]),
+            ("missing", "iota", vec![(2, Some(core)), (2, Some(core))]),
             ("learned", "eta", vec![(2, Some(core)), (1, Some(core))]),
         ] {
             let pattern = review
@@ -1512,33 +1649,61 @@ mod tests {
                 pattern.observe(rank, NativeSelectionSource::Numeric, provenance);
             }
         }
+        for (identity, top_sources) in [
+            (("same", "alpha"), vec![alias, alias]),
+            (("cold", "gamma"), vec![alias, core]),
+            (("far", "zeta"), vec![core, core]),
+            (("partial", "theta"), vec![core]),
+        ] {
+            let pattern = review
+                .selections
+                .get_mut(&(identity.0.to_owned(), identity.1.to_owned()))
+                .unwrap();
+            for source in top_sources {
+                pattern.observe_global_top_provenance(Some(source));
+            }
+        }
 
         let mut dominant_sources = [0; 10];
-        dominant_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 1;
+        dominant_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
         dominant_sources[candidate_source_index(NativeCandidateSource::SupplementalExact)] = 1;
+        let mut dominant_top_sources = [0; 10];
+        dominant_top_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 2;
+        dominant_top_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
         assert_eq!(
             review.followup_non_top_pressure(),
             FollowupNonTopPressure {
-                identities: 3,
+                identities: 5,
                 ambiguous_code_identities: 1,
-                best_rank_two: 1,
-                best_rank_three_to_six: 1,
+                best_rank_two: 2,
+                best_rank_three_to_six: 2,
                 best_rank_after_first_page: 1,
-                improved_rank_identities: 2,
-                unimproved_rank_identities: 1,
+                improved_rank_identities: 3,
+                unimproved_rank_identities: 2,
                 session_promoted_identities: 1,
-                complete_provenance_identities: 1,
+                complete_provenance_identities: 3,
                 partial_provenance_identities: 1,
                 missing_provenance_identities: 1,
                 dominant_sources,
+                complete_top_provenance_identities: 3,
+                partial_top_provenance_identities: 1,
+                missing_top_provenance_identities: 1,
+                all_observed_top_alias_identities: 1,
+                some_observed_top_alias_identities: 1,
+                no_observed_top_alias_identities: 2,
+                dominant_top_sources,
             }
         );
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
-        assert!(rendered.contains("最好第 2 名 1、第 3–6 名 1、第 7 名以后 1"));
-        assert!(rendered.contains("候选来源完整 1、部分 1、缺失 1"));
-        assert!(rendered.contains("主要来源 核心整词 1、补充整词/组合 1"));
-        for private_value in ["same", "alpha", "cold", "gamma", "far", "zeta"] {
+        assert!(rendered.contains("最好第 2 名 2、第 3–6 名 2、第 7 名以后 1"));
+        assert!(rendered.contains("候选来源完整 3、部分 1、缺失 1"));
+        assert!(rendered.contains("主要来源 核心整词 3、补充整词/组合 1"));
+        assert!(rendered.contains("首选来源完整 3、部分 1、缺失 1"));
+        assert!(rendered.contains("主要首选来源 显式别名 2、核心整词 2"));
+        for private_value in [
+            "same", "alpha", "cold", "gamma", "far", "zeta", "partial", "theta", "missing", "iota",
+        ] {
             assert!(!rendered.contains(private_value));
         }
     }
@@ -1641,6 +1806,11 @@ mod tests {
         assert_eq!(pattern.first_rank, Some(2));
         assert_eq!(pattern.last_rank, Some(1));
         assert_eq!(pattern.session_promoted_frames, 1);
+        assert_eq!(pattern.top_provenance_observations, 2);
+        assert_eq!(
+            pattern.top_sources[candidate_source_index(NativeCandidateSource::CoreExact)],
+            2
+        );
         assert!(review.render().contains("首次第 2，最近第 1"));
         let aggregate = review.render_aggregate();
         assert!(aggregate.contains("持续研究摘要（不显示输入原文）"));
