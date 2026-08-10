@@ -17430,6 +17430,23 @@ mod tests {
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
         );
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            candidates,
+            provenance,
+            view,
+            ..
+        } = CandidateDisplay::from_batch(matching.clone(), 0).feedback_event("ab", false)
+        else {
+            panic!("ordinary candidate feedback must preserve provenance");
+        };
+        assert_eq!(view, NativeCandidateView::Ordinary);
+        assert_eq!(candidates.first().map(String::as_str), Some("把"));
+        assert!(
+            provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::LEFT_CONTEXT),
+            "the exact context cause must survive the candidate-display feedback boundary"
+        );
 
         service.set_personal_left_context("无关");
         let unrelated = service

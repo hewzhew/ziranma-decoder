@@ -2176,7 +2176,10 @@ mod tests {
         }
 
         let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
-        let marked = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, true);
+        let marked = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::LEFT_CONTEXT,
+        );
         let alias = NativeCandidateProvenance::new(NativeCandidateSource::ExplicitAlias, false);
         let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
         let mut review = ResearchReview::default();
