@@ -353,11 +353,12 @@ struct SelectionPattern {
     first_top_selection: Option<usize>,
     last_top_location: Option<SelectionObservationLocation>,
     last_top_provenance: Option<NativeCandidateProvenance>,
+    last_top_precise_personalization: bool,
     first_post_top_regression_boundary: Option<TopRegressionBoundary>,
     first_regression_prior_top_provenance: Option<NativeCandidateProvenance>,
     first_regression_target_provenance: Option<NativeCandidateProvenance>,
     first_regression_global_top_provenance: Option<NativeCandidateProvenance>,
-    first_regression_precise_personalization: bool,
+    first_regression_precise_personalization_pair: bool,
     awaiting_first_regression_global_top: bool,
     last_rank: Option<usize>,
     minimum_rank: usize,
@@ -389,6 +390,7 @@ impl SelectionPattern {
             self.first_top_selection.get_or_insert(self.selections);
             self.last_top_location = Some(location.clone());
             self.last_top_provenance = provenance;
+            self.last_top_precise_personalization = precise_personalization;
         } else if self.first_top_selection.is_some()
             && self.first_post_top_regression_boundary.is_none()
         {
@@ -401,7 +403,8 @@ impl SelectionPattern {
             );
             self.first_regression_prior_top_provenance = self.last_top_provenance;
             self.first_regression_target_provenance = provenance;
-            self.first_regression_precise_personalization = precise_personalization;
+            self.first_regression_precise_personalization_pair =
+                self.last_top_precise_personalization && precise_personalization;
             self.awaiting_first_regression_global_top = true;
         }
         self.last_rank = Some(rank);
@@ -490,6 +493,12 @@ struct TopRegressionBoundaries {
 struct TopRegressionEvidence {
     identities: usize,
     precise_personalization_identities: usize,
+    precise_personalization_comparable_identities: usize,
+    precise_personalization_unknown_identities: usize,
+    personalization_retained: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    personalization_lost: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    personalization_gained: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    compatibility_identities: usize,
     marker_retained: usize,
     marker_lost: usize,
     marker_gained: usize,
@@ -914,9 +923,22 @@ impl ResearchReview {
         let regression_evidence = self.top_regression_evidence();
         writeln!(
             output,
-            "首选首次回落个性化：精确原因覆盖 {}/{}；兼容标记前后均有 {}、回落时消失 {}、回落时新出现 {}、前后均无 {}、证据缺失 {}。",
+            "首选首次回落精确个性化：V11 前后覆盖 {}/{}；可比较 {}、证据缺失 {}；保留 {}；回落时消失 {}；回落时新出现 {}。",
             regression_evidence.precise_personalization_identities,
             regression_evidence.identities,
+            regression_evidence.precise_personalization_comparable_identities,
+            regression_evidence.precise_personalization_unknown_identities,
+            render_candidate_personalization_counts(
+                &regression_evidence.personalization_retained
+            ),
+            render_candidate_personalization_counts(&regression_evidence.personalization_lost),
+            render_candidate_personalization_counts(&regression_evidence.personalization_gained),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "首选首次回落兼容标记（旧/混合格式）：身份 {}；前后均有 {}、回落时消失 {}、回落时新出现 {}、前后均无 {}、证据缺失 {}。",
+            regression_evidence.compatibility_identities,
             regression_evidence.marker_retained,
             regression_evidence.marker_lost,
             regression_evidence.marker_gained,
@@ -1022,22 +1044,42 @@ impl ResearchReview {
                 && pattern.first_post_top_regression_boundary.is_some()
         }) {
             evidence.identities += 1;
-            evidence.precise_personalization_identities +=
-                usize::from(pattern.first_regression_precise_personalization);
-            match (
+            let transition = (
                 pattern.first_regression_prior_top_provenance,
                 pattern.first_regression_target_provenance,
-            ) {
-                (Some(previous), Some(current)) => match (
-                    previous.personalization().is_empty(),
-                    current.personalization().is_empty(),
-                ) {
-                    (false, false) => evidence.marker_retained += 1,
-                    (false, true) => evidence.marker_lost += 1,
-                    (true, false) => evidence.marker_gained += 1,
-                    (true, true) => evidence.marker_absent += 1,
-                },
-                _ => evidence.marker_unknown += 1,
+            );
+            if pattern.first_regression_precise_personalization_pair {
+                evidence.precise_personalization_identities += 1;
+                if let (Some(previous), Some(current)) = transition {
+                    evidence.precise_personalization_comparable_identities += 1;
+                    for (index, (bit, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
+                        match (
+                            previous.personalization().contains(*bit),
+                            current.personalization().contains(*bit),
+                        ) {
+                            (true, true) => evidence.personalization_retained[index] += 1,
+                            (true, false) => evidence.personalization_lost[index] += 1,
+                            (false, true) => evidence.personalization_gained[index] += 1,
+                            (false, false) => {}
+                        }
+                    }
+                } else {
+                    evidence.precise_personalization_unknown_identities += 1;
+                }
+            } else {
+                evidence.compatibility_identities += 1;
+                match transition {
+                    (Some(previous), Some(current)) => match (
+                        previous.personalization().is_empty(),
+                        current.personalization().is_empty(),
+                    ) {
+                        (false, false) => evidence.marker_retained += 1,
+                        (false, true) => evidence.marker_lost += 1,
+                        (true, false) => evidence.marker_gained += 1,
+                        (true, true) => evidence.marker_absent += 1,
+                    },
+                    _ => evidence.marker_unknown += 1,
+                }
             }
             if let Some(blocker) = pattern.first_regression_global_top_provenance {
                 evidence.blocker_provenance_observations += 1;
@@ -2135,14 +2177,15 @@ mod tests {
     }
 
     #[test]
-    fn top_regression_evidence_separates_marker_changes_and_blocker_sources() {
+    fn top_regression_evidence_separates_precise_reasons_from_compatibility_markers() {
         fn observe_case(
             review: &mut ResearchReview,
             identity: &str,
             prior_top: Option<NativeCandidateProvenance>,
             regressed: Option<NativeCandidateProvenance>,
             blocker: Option<NativeCandidateProvenance>,
-            precise: bool,
+            prior_precise: bool,
+            regressed_precise: bool,
         ) {
             let pattern = review
                 .selections
@@ -2153,7 +2196,7 @@ mod tests {
                 2,
                 NativeSelectionSource::Numeric,
                 regressed,
-                precise,
+                regressed_precise,
                 &location,
             );
             pattern.observe_global_top_provenance(blocker);
@@ -2161,7 +2204,7 @@ mod tests {
                 1,
                 NativeSelectionSource::FirstCandidate,
                 prior_top,
-                precise,
+                prior_precise,
                 &location,
             );
             pattern.observe_global_top_provenance(prior_top);
@@ -2169,7 +2212,7 @@ mod tests {
                 2,
                 NativeSelectionSource::Numeric,
                 regressed,
-                precise,
+                regressed_precise,
                 &location,
             );
             pattern.observe_global_top_provenance(blocker);
@@ -2180,67 +2223,153 @@ mod tests {
             NativeCandidateSource::CoreExact,
             NativeCandidatePersonalization::LEFT_CONTEXT,
         );
+        let precise_prior = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT
+                .with(NativeCandidatePersonalization::LEFT_CONTEXT),
+        );
+        let precise_regressed = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT
+                .with(NativeCandidatePersonalization::SESSION_ANCHORED),
+        );
         let alias = NativeCandidateProvenance::new(NativeCandidateSource::ExplicitAlias, false);
         let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
         let mut review = ResearchReview::default();
         observe_case(
             &mut review,
-            "retained",
-            Some(marked),
-            Some(marked),
+            "precise-stacked",
+            Some(precise_prior),
+            Some(precise_regressed),
             Some(alias),
+            true,
             true,
         );
         observe_case(
             &mut review,
-            "lost",
+            "precise-empty",
+            Some(plain),
+            Some(plain),
+            Some(core),
+            true,
+            true,
+        );
+        observe_case(
+            &mut review,
+            "precise-unknown",
+            None,
+            Some(plain),
+            None,
+            true,
+            true,
+        );
+        observe_case(
+            &mut review,
+            "compatibility-retained",
+            Some(marked),
+            Some(marked),
+            Some(alias),
+            false,
+            false,
+        );
+        observe_case(
+            &mut review,
+            "compatibility-lost",
             Some(marked),
             Some(plain),
             Some(alias),
             false,
+            false,
         );
         observe_case(
             &mut review,
-            "gained",
+            "compatibility-gained",
             Some(plain),
             Some(marked),
             Some(core),
             false,
+            false,
         );
         observe_case(
             &mut review,
-            "absent",
+            "compatibility-absent",
             Some(plain),
             Some(plain),
             Some(core),
             false,
+            false,
         );
-        observe_case(&mut review, "unknown", None, Some(plain), None, false);
+        observe_case(
+            &mut review,
+            "compatibility-unknown",
+            None,
+            Some(plain),
+            None,
+            false,
+            false,
+        );
+        observe_case(
+            &mut review,
+            "mixed-lost",
+            Some(marked),
+            Some(plain),
+            Some(alias),
+            true,
+            false,
+        );
 
         let mut blocker_sources = [0; 10];
-        blocker_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 2;
-        blocker_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 2;
+        blocker_sources[candidate_source_index(NativeCandidateSource::ExplicitAlias)] = 4;
+        blocker_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
+        let mut personalization_retained = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        personalization_retained[0] = 1;
+        let mut personalization_lost = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        personalization_lost[5] = 1;
+        let mut personalization_gained = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        personalization_gained[4] = 1;
         assert_eq!(
             review.top_regression_evidence(),
             TopRegressionEvidence {
-                identities: 5,
-                precise_personalization_identities: 1,
+                identities: 9,
+                precise_personalization_identities: 3,
+                precise_personalization_comparable_identities: 2,
+                precise_personalization_unknown_identities: 1,
+                personalization_retained,
+                personalization_lost,
+                personalization_gained,
+                compatibility_identities: 6,
                 marker_retained: 1,
-                marker_lost: 1,
+                marker_lost: 2,
                 marker_gained: 1,
                 marker_absent: 1,
                 marker_unknown: 1,
-                blocker_provenance_observations: 4,
+                blocker_provenance_observations: 7,
                 blocker_sources,
             }
         );
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
-        assert!(rendered.contains("精确原因覆盖 1/5"));
-        assert!(rendered.contains("回落时消失 1"));
-        assert!(rendered.contains("全局首选来源完整 4/5"));
-        assert!(rendered.contains("显式别名 2、核心整词 2"));
-        for private_value in ["retained", "lost", "gained", "absent", "unknown", "private"] {
+        assert!(rendered.contains("V11 前后覆盖 3/9"));
+        assert!(rendered.contains("可比较 2、证据缺失 1"));
+        assert!(rendered.contains("保留 持久精确 1"));
+        assert!(rendered.contains("回落时消失 左侧上下文 1"));
+        assert!(rendered.contains("回落时新出现 会话尾简 1"));
+        assert!(rendered.contains("旧/混合格式）：身份 6"));
+        assert!(rendered.contains("前后均有 1、回落时消失 2"));
+        assert!(rendered.contains("全局首选来源完整 7/9"));
+        assert!(rendered.contains("显式别名 4、核心整词 3"));
+        for private_value in [
+            "precise-stacked",
+            "precise-empty",
+            "precise-unknown",
+            "compatibility-retained",
+            "compatibility-lost",
+            "compatibility-gained",
+            "compatibility-absent",
+            "compatibility-unknown",
+            "mixed-lost",
+            "private",
+        ] {
             assert!(!rendered.contains(private_value));
         }
     }
