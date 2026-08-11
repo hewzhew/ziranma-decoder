@@ -469,6 +469,22 @@ fn transposition_tier_change_is_bounded(
     )
 }
 
+/// Content-free outcome of the document-adjacency check used while learning
+/// one bounded personal phrase from consecutive single-character commits.
+///
+/// This deliberately exposes neither the committed text nor a document
+/// position or TSF object identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePersonalPhraseAdjacency {
+    KeyboardFallback,
+    FirstAnchor,
+    VerifiedAdjacent,
+    CaretMoved,
+    AnchorTextChanged,
+    ContextChanged,
+    RangeUnavailable,
+}
+
 /// One private event owned only by the active in-memory session.
 ///
 /// `Debug` and serialization are intentionally not implemented because the
@@ -534,6 +550,13 @@ pub enum NativeFeedbackEvent {
     /// commit was returned to the host after personal learning was withdrawn.
     /// This records the routed action, not an unobserved document result.
     PostCommitBackspaceRouted,
+    /// One bounded, content-free document-adjacency decision following a
+    /// successfully committed, eligible personal-phrase component.
+    PersonalPhraseAdjacencyObserved {
+        adjacency: NativePersonalPhraseAdjacency,
+        previous_components: usize,
+        resulting_components: usize,
+    },
 }
 
 impl NativeFeedbackEvent {
@@ -636,6 +659,11 @@ impl NativeFeedbackEvent {
                     .then_some(0)
             }
             Self::PostCommitBackspaceRouted => Some(0),
+            Self::PersonalPhraseAdjacencyObserved {
+                previous_components,
+                resulting_components,
+                ..
+            } => (*previous_components <= 4 && (1..=4).contains(resulting_components)).then_some(0),
         }
     }
 
@@ -646,6 +674,10 @@ impl NativeFeedbackEvent {
                 | Self::RawCodeCommitted { .. }
                 | Self::CompositionCancelled { .. }
         )
+    }
+
+    pub(crate) fn follows_completed_input_episode(&self) -> bool {
+        matches!(self, Self::PersonalPhraseAdjacencyObserved { .. })
     }
 }
 
@@ -1280,6 +1312,7 @@ impl NativeFeedbackSession {
                 NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
                 NativeFeedbackEvent::PostCommitBackspaceRouted => {}
                 NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {}
+                NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
             }
         }
         summary
@@ -1335,6 +1368,7 @@ impl NativeFeedbackSession {
             NativeFeedbackEvent::CandidatePopupTiming { .. }
                 | NativeFeedbackEvent::SlowKeyPathTiming { .. }
                 | NativeFeedbackEvent::PostCommitBackspaceRouted
+                | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
         ) {
             return;
         }
@@ -1474,7 +1508,8 @@ impl NativeFeedbackSession {
             }
             NativeFeedbackEvent::CandidatePopupTiming { .. }
             | NativeFeedbackEvent::SlowKeyPathTiming { .. }
-            | NativeFeedbackEvent::PostCommitBackspaceRouted => {}
+            | NativeFeedbackEvent::PostCommitBackspaceRouted
+            | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
         }
     }
 }
@@ -1654,6 +1689,44 @@ mod tests {
             ),
             NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
         );
+    }
+
+    #[test]
+    fn personal_phrase_adjacency_is_content_free_and_component_bounded() {
+        let event = NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+            adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+            previous_components: 3,
+            resulting_components: 4,
+        };
+        assert_eq!(event.validate_and_measure(), Some(0));
+
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        assert_eq!(
+            record(&mut session, event),
+            NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(session.summary().private_bytes, 0);
+
+        for invalid in [
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::FirstAnchor,
+                previous_components: 5,
+                resulting_components: 1,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::FirstAnchor,
+                previous_components: 0,
+                resulting_components: 0,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                previous_components: 4,
+                resulting_components: 5,
+            },
+        ] {
+            assert_eq!(invalid.validate_and_measure(), None);
+        }
     }
 
     #[test]

@@ -8,11 +8,12 @@ use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
     NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope, WishCategory, WishCommand,
-    WishCommandAckStatus, WishEventRole, WishFeedbackError, WishImportance, WishJournalContext,
-    WishNote, WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
-    list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
-    move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash, save_wish_note,
+    NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource, WishCaptureScope,
+    WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError,
+    WishImportance, WishJournalContext, WishNote, WishPublicCandidateOrderPolicy, WishReviewStatus,
+    dispatch_wish_command, list_trashed_wish_packages, list_wish_packages, load_wish_note,
+    load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash,
+    save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -638,6 +639,28 @@ fn print_event(event: &NativeFeedbackEvent) {
         NativeFeedbackEvent::PostCommitBackspaceRouted => {
             println!("提交后退格  已交给宿主；最终文档结果未观测");
         }
+        NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+            adjacency,
+            previous_components,
+            resulting_components,
+        } => println!(
+            "个人短语邻接  {}；组件 {} → {}",
+            personal_phrase_adjacency_label(*adjacency),
+            previous_components,
+            resulting_components
+        ),
+    }
+}
+
+fn personal_phrase_adjacency_label(adjacency: NativePersonalPhraseAdjacency) -> &'static str {
+    match adjacency {
+        NativePersonalPhraseAdjacency::KeyboardFallback => "键盘连续回退",
+        NativePersonalPhraseAdjacency::FirstAnchor => "首个锚点",
+        NativePersonalPhraseAdjacency::VerifiedAdjacent => "文档已验证相邻",
+        NativePersonalPhraseAdjacency::CaretMoved => "光标已移动",
+        NativePersonalPhraseAdjacency::AnchorTextChanged => "锚点文字或选区已变化",
+        NativePersonalPhraseAdjacency::ContextChanged => "文档上下文已变化",
+        NativePersonalPhraseAdjacency::RangeUnavailable => "范围不可用，保守回退",
     }
 }
 

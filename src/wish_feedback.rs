@@ -27,8 +27,9 @@ use crate::{
     NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
     NativeCandidateProvenance, NativeCandidateSource, NativeCandidateSuppressionAction,
-    NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, NativeTabAssemblyState,
-    TranspositionCalibrationLabel, TranspositionCalibrationObservation, candidate_sha256_hex,
+    NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
+    NativeTabAssemblyState, TranspositionCalibrationLabel, TranspositionCalibrationObservation,
+    candidate_sha256_hex,
 };
 
 pub const WISH_SCHEMA_V1: &str = "ziranma-wish-v1";
@@ -46,6 +47,7 @@ pub const WISH_SCHEMA_V12: &str = "ziranma-wish-v12";
 pub const WISH_SCHEMA_V13: &str = "ziranma-wish-v13";
 pub const WISH_SCHEMA_V14: &str = "ziranma-wish-v14";
 pub const WISH_SCHEMA_V15: &str = "ziranma-wish-v15";
+pub const WISH_SCHEMA_V16: &str = "ziranma-wish-v16";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -54,7 +56,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 15;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 16;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -70,6 +72,7 @@ const WISH_PLAINTEXT_MAGIC_V12: &[u8] = b"ziranma-wish-v12\0";
 const WISH_PLAINTEXT_MAGIC_V13: &[u8] = b"ziranma-wish-v13\0";
 const WISH_PLAINTEXT_MAGIC_V14: &[u8] = b"ziranma-wish-v14\0";
 const WISH_PLAINTEXT_MAGIC_V15: &[u8] = b"ziranma-wish-v15\0";
+const WISH_PLAINTEXT_MAGIC_V16: &[u8] = b"ziranma-wish-v16\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -486,6 +489,10 @@ impl WishSnapshot {
         self.source_schema_version >= 15
     }
 
+    pub fn supports_personal_phrase_adjacency(&self) -> bool {
+        self.source_schema_version >= 16
+    }
+
     pub fn category(&self) -> WishCategory {
         self.category
     }
@@ -668,7 +675,8 @@ impl WishSnapshot {
                 }
                 NativeFeedbackEvent::CandidatePopupTiming { .. }
                 | NativeFeedbackEvent::SlowKeyPathTiming { .. }
-                | NativeFeedbackEvent::PostCommitBackspaceRouted => {}
+                | NativeFeedbackEvent::PostCommitBackspaceRouted
+                | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
             }
         }
         if let Some(previous) = pending {
@@ -754,7 +762,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V15);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V16);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -813,7 +821,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V15) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V16) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V16)?;
+            16
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V15) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V15)?;
             15
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V14) {
@@ -971,11 +982,23 @@ fn latest_completed_episode_range(events: &[FrozenNativeFeedbackEvent]) -> (usiz
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    let Some(end) = terminals.last().map(|index| index.saturating_add(1)) else {
+    let Some(terminal_end) = terminals.last().map(|index| index.saturating_add(1)) else {
         return (0, events.len());
     };
+    let end = terminal_end.saturating_add(
+        events[terminal_end..]
+            .iter()
+            .take_while(|event| event.event().follows_completed_input_episode())
+            .count(),
+    );
     let start = if terminals.len() >= 2 {
-        terminals[terminals.len() - 2].saturating_add(1)
+        let previous_terminal_end = terminals[terminals.len() - 2].saturating_add(1);
+        previous_terminal_end.saturating_add(
+            events[previous_terminal_end..]
+                .iter()
+                .take_while(|event| event.event().follows_completed_input_episode())
+                .count(),
+        )
     } else {
         0
     };
@@ -1881,6 +1904,19 @@ fn render_event(
             put_u32(output, *total_ms);
         }
         NativeFeedbackEvent::PostCommitBackspaceRouted => output.push(11),
+        NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+            adjacency,
+            previous_components,
+            resulting_components,
+        } => {
+            if version < 16 {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            output.push(14);
+            output.push(personal_phrase_adjacency_tag(*adjacency));
+            put_usize(output, *previous_components)?;
+            put_usize(output, *resulting_components)?;
+        }
     }
     Ok(())
 }
@@ -1941,6 +1977,11 @@ fn parse_event(
             code: reader.string()?,
             text: reader.string()?,
             action: parse_candidate_suppression_action(reader.byte()?)?,
+        },
+        14 if version >= 16 => NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+            adjacency: parse_personal_phrase_adjacency(reader.byte()?)?,
+            previous_components: reader.usize()?,
+            resulting_components: reader.usize()?,
         },
         tag if (tag == 6 && version >= 3)
             || (tag == 7 && version >= 4)
@@ -2111,6 +2152,33 @@ fn parse_candidate_suppression_action(
     match value {
         1 => Ok(NativeCandidateSuppressionAction::Suppress),
         2 => Ok(NativeCandidateSuppressionAction::Restore),
+        _ => Err(WishFeedbackError::InvalidSnapshot),
+    }
+}
+
+fn personal_phrase_adjacency_tag(value: NativePersonalPhraseAdjacency) -> u8 {
+    match value {
+        NativePersonalPhraseAdjacency::KeyboardFallback => 1,
+        NativePersonalPhraseAdjacency::FirstAnchor => 2,
+        NativePersonalPhraseAdjacency::VerifiedAdjacent => 3,
+        NativePersonalPhraseAdjacency::CaretMoved => 4,
+        NativePersonalPhraseAdjacency::AnchorTextChanged => 5,
+        NativePersonalPhraseAdjacency::ContextChanged => 6,
+        NativePersonalPhraseAdjacency::RangeUnavailable => 7,
+    }
+}
+
+fn parse_personal_phrase_adjacency(
+    value: u8,
+) -> Result<NativePersonalPhraseAdjacency, WishFeedbackError> {
+    match value {
+        1 => Ok(NativePersonalPhraseAdjacency::KeyboardFallback),
+        2 => Ok(NativePersonalPhraseAdjacency::FirstAnchor),
+        3 => Ok(NativePersonalPhraseAdjacency::VerifiedAdjacent),
+        4 => Ok(NativePersonalPhraseAdjacency::CaretMoved),
+        5 => Ok(NativePersonalPhraseAdjacency::AnchorTextChanged),
+        6 => Ok(NativePersonalPhraseAdjacency::ContextChanged),
+        7 => Ok(NativePersonalPhraseAdjacency::RangeUnavailable),
         _ => Err(WishFeedbackError::InvalidSnapshot),
     }
 }
@@ -2618,13 +2686,15 @@ mod tests {
             13
         } else if magic == WISH_PLAINTEXT_MAGIC_V14 {
             14
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V15 {
             15
+        } else {
+            16
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V15.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V16.len()..]);
         rendered
     }
 
@@ -2643,13 +2713,13 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V15));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 15);
+        assert_eq!(parsed.source_schema_version(), 16);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
@@ -2657,6 +2727,7 @@ mod tests {
         assert!(parsed.supports_public_candidate_order_policy());
         assert!(parsed.supports_precise_candidate_ranking_personalization());
         assert!(parsed.supports_candidate_suppression_actions());
+        assert!(parsed.supports_personal_phrase_adjacency());
         assert_eq!(
             parsed.public_candidate_order_policy(),
             WishPublicCandidateOrderPolicy::Unrecorded
@@ -2809,7 +2880,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V15));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_candidate_suppression_actions());
         assert!(matches!(
@@ -2825,6 +2896,97 @@ mod tests {
         let mut unknown_action = rendered;
         *unknown_action.last_mut().unwrap() = u8::MAX;
         assert!(WishSnapshot::parse(&unknown_action).is_err());
+    }
+
+    #[test]
+    fn v16_round_trips_bounded_personal_phrase_adjacency_strictly() {
+        let adjacencies = [
+            NativePersonalPhraseAdjacency::KeyboardFallback,
+            NativePersonalPhraseAdjacency::FirstAnchor,
+            NativePersonalPhraseAdjacency::VerifiedAdjacent,
+            NativePersonalPhraseAdjacency::CaretMoved,
+            NativePersonalPhraseAdjacency::AnchorTextChanged,
+            NativePersonalPhraseAdjacency::ContextChanged,
+            NativePersonalPhraseAdjacency::RangeUnavailable,
+        ];
+        for adjacency in adjacencies {
+            let mut snapshot = private_snapshot();
+            snapshot.events.push(WishEvent {
+                milliseconds_before_marker: 0,
+                event: NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                    adjacency,
+                    previous_components: 3,
+                    resulting_components: 4,
+                },
+            });
+            snapshot.source_events += 1;
+
+            let rendered = snapshot.render().unwrap();
+            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
+            let parsed = WishSnapshot::parse(&rendered).unwrap();
+            assert!(parsed.supports_personal_phrase_adjacency());
+            assert!(matches!(
+                parsed.events().last().map(WishEvent::event),
+                Some(NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                    adjacency: parsed_adjacency,
+                    previous_components: 3,
+                    resulting_components: 4,
+                }) if *parsed_adjacency == adjacency
+            ));
+            assert!(snapshot.render_with_event_version(15).is_err());
+        }
+
+        let mut snapshot = private_snapshot();
+        snapshot.events.push(WishEvent {
+            milliseconds_before_marker: 0,
+            event: NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                previous_components: 1,
+                resulting_components: 2,
+            },
+        });
+        snapshot.source_events += 1;
+        let rendered = snapshot.render().unwrap();
+        let adjacency_offset = rendered.len() - 9;
+
+        let mut falsely_downgraded = Vec::with_capacity(rendered.len());
+        falsely_downgraded.extend_from_slice(WISH_PLAINTEXT_MAGIC_V15);
+        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V16.len()..]);
+        assert!(WishSnapshot::parse(&falsely_downgraded).is_err());
+
+        let mut unknown_adjacency = rendered.clone();
+        unknown_adjacency[adjacency_offset] = u8::MAX;
+        assert!(WishSnapshot::parse(&unknown_adjacency).is_err());
+
+        let mut excessive_previous = rendered.clone();
+        excessive_previous[rendered.len() - 8..rendered.len() - 4]
+            .copy_from_slice(&5_u32.to_le_bytes());
+        assert!(WishSnapshot::parse(&excessive_previous).is_err());
+
+        let mut excessive_result = rendered;
+        let result_offset = excessive_result.len() - 4;
+        excessive_result[result_offset..].copy_from_slice(&5_u32.to_le_bytes());
+        assert!(WishSnapshot::parse(&excessive_result).is_err());
+    }
+
+    #[test]
+    fn v8_through_v15_snapshots_remain_readable_without_v16_events() {
+        let snapshot = private_snapshot();
+        for (magic, version) in [
+            (WISH_PLAINTEXT_MAGIC_V8, 8),
+            (WISH_PLAINTEXT_MAGIC_V9, 9),
+            (WISH_PLAINTEXT_MAGIC_V10, 10),
+            (WISH_PLAINTEXT_MAGIC_V11, 11),
+            (WISH_PLAINTEXT_MAGIC_V12, 12),
+            (WISH_PLAINTEXT_MAGIC_V13, 13),
+            (WISH_PLAINTEXT_MAGIC_V14, 14),
+            (WISH_PLAINTEXT_MAGIC_V15, 15),
+        ] {
+            let rendered = render_current_body_with_magic(&snapshot, magic);
+            let parsed = WishSnapshot::parse(&rendered).unwrap();
+            assert_eq!(parsed.source_schema_version(), version);
+            assert!(!parsed.supports_personal_phrase_adjacency());
+        }
     }
 
     #[test]
@@ -2971,7 +3133,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V15));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
@@ -3292,6 +3454,14 @@ mod tests {
                 10,
             ),
             (
+                NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                    adjacency: NativePersonalPhraseAdjacency::FirstAnchor,
+                    previous_components: 0,
+                    resulting_components: 1,
+                },
+                11,
+            ),
+            (
                 NativeFeedbackEvent::CandidatesPresented {
                     code: "cd".to_owned(),
                     view: NativeCandidateView::Ordinary,
@@ -3306,6 +3476,14 @@ mod tests {
                     code: "cd".to_owned(),
                 },
                 30,
+            ),
+            (
+                NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                    adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                    previous_components: 1,
+                    resulting_components: 2,
+                },
+                31,
             ),
             (
                 NativeFeedbackEvent::CandidatesPresented {
@@ -3335,17 +3513,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(snapshot.focus_event_range(), 1..3);
+        assert_eq!(snapshot.focus_event_range(), 2..5);
         assert_eq!(snapshot.event_role(0), Some(WishEventRole::Context));
-        assert_eq!(snapshot.event_role(1), Some(WishEventRole::Focus));
+        assert_eq!(snapshot.event_role(1), Some(WishEventRole::Context));
         assert_eq!(snapshot.event_role(2), Some(WishEventRole::Focus));
-        assert_eq!(snapshot.event_role(3), Some(WishEventRole::Trigger));
+        assert_eq!(snapshot.event_role(3), Some(WishEventRole::Focus));
+        assert_eq!(snapshot.event_role(4), Some(WishEventRole::Focus));
+        assert_eq!(snapshot.event_role(5), Some(WishEventRole::Trigger));
         assert_eq!(snapshot.category(), WishCategory::Ranking);
         assert_eq!(
             WishSnapshot::parse(&snapshot.render().unwrap())
                 .unwrap()
                 .focus_event_range(),
-            1..3
+            2..5
         );
     }
 

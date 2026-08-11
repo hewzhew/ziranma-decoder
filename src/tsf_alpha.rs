@@ -44,20 +44,21 @@ use crate::{
     NativeFeedbackEvent, NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle,
     NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
     NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
-    NativeSelectionSource, NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH,
-    PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking, PersonalRankingBatch,
-    PersonalRankingSelection, PersonalRankingSnapshot, PersonalRankingSuppressionAction,
-    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
-    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, WISH_ACK_COMPARTMENT_GUID,
-    WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
-    WishCommand, WishCommandAck, WishCommandAckStatus, WishJournalAnchor, WishJournalContext,
-    WishJournalSpan, WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot,
-    candidate_sha256_hex, load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
-    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
-    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
-    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
-    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
+    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeTabAssemblyState,
+    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
+    PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
+    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
+    PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
+    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
+    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
+    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_snapshots,
+    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
+    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
+    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
+    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
+    save_personal_ranking_batch, save_personal_ranking_checkpoint,
+    save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -112,12 +113,13 @@ use windows::Win32::UI::TextServices::{
     ITfThreadMgrEventSink_Impl, ITfUIElement, ITfUIElement_Impl, ITfUIElementMgr, InputScope,
     TF_AE_NONE, TF_ANCHOR_END, TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR,
     TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
-    TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_NO_DEFAULT_COMPOSITION,
-    TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STATUS,
-    TF_LBI_STATUS_DISABLED, TF_LBI_STATUS_HIDDEN, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU,
-    TF_LBI_STYLE_SHOWNINTRAY, TF_LBI_STYLE_TEXTCOLORICON, TF_LBI_TEXT, TF_LBI_TOOLTIP,
-    TF_LBMENUF_CHECKED, TF_LBMENUF_GRAYED, TF_LBMENUF_SEPARATOR, TF_POPF_ALL, TF_SELECTION,
-    TF_SELECTIONSTYLE, TF_TF_MOVESTART, TfLBIClick,
+    TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_GRAVITY_BACKWARD, TF_IAS_NO_DEFAULT_COMPOSITION, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT,
+    TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STATUS_DISABLED, TF_LBI_STATUS_HIDDEN,
+    TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_STYLE_SHOWNINTRAY,
+    TF_LBI_STYLE_TEXTCOLORICON, TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_LBMENUF_CHECKED, TF_LBMENUF_GRAYED,
+    TF_LBMENUF_SEPARATOR, TF_POPF_ALL, TF_SELECTION, TF_SELECTIONSTYLE, TF_TF_MOVESTART,
+    TfLBIClick,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DI_NORMAL,
@@ -2617,6 +2619,196 @@ struct PersonalPhraseComposer {
     components: Vec<PersonalPhraseComponent>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersonalPhraseDocumentAdjacency {
+    KeyboardFallback,
+    NoPreviousAnchor,
+    VerifiedAdjacent,
+    CaretMoved,
+    AnchorTextChanged,
+    ContextChanged,
+    RangeUnavailable,
+}
+
+impl PersonalPhraseDocumentAdjacency {
+    fn allows_continuation(self) -> bool {
+        matches!(
+            self,
+            Self::KeyboardFallback | Self::VerifiedAdjacent | Self::RangeUnavailable
+        )
+    }
+
+    fn feedback_value(self) -> NativePersonalPhraseAdjacency {
+        match self {
+            Self::KeyboardFallback => NativePersonalPhraseAdjacency::KeyboardFallback,
+            Self::NoPreviousAnchor => NativePersonalPhraseAdjacency::FirstAnchor,
+            Self::VerifiedAdjacent => NativePersonalPhraseAdjacency::VerifiedAdjacent,
+            Self::CaretMoved => NativePersonalPhraseAdjacency::CaretMoved,
+            Self::AnchorTextChanged => NativePersonalPhraseAdjacency::AnchorTextChanged,
+            Self::ContextChanged => NativePersonalPhraseAdjacency::ContextChanged,
+            Self::RangeUnavailable => NativePersonalPhraseAdjacency::RangeUnavailable,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PersonalPhraseAdjacencyObservation {
+    adjacency: PersonalPhraseDocumentAdjacency,
+    previous_components: usize,
+    resulting_components: usize,
+}
+
+#[derive(Clone)]
+struct PersonalPhraseDocumentAnchor {
+    context: ITfContext,
+    range: ITfRange,
+    expected_text: String,
+}
+
+#[derive(Clone, Default)]
+struct PersonalPhraseDocumentSnapshot {
+    anchor: Option<PersonalPhraseDocumentAnchor>,
+    range_fallback_pending: bool,
+}
+
+#[derive(Default)]
+struct PersonalPhraseDocumentTracker {
+    anchor: Option<PersonalPhraseDocumentAnchor>,
+    range_fallback_pending: bool,
+    completed_adjacency: Option<PersonalPhraseDocumentAdjacency>,
+    last_consumed_adjacency: Option<PersonalPhraseDocumentAdjacency>,
+}
+
+impl PersonalPhraseDocumentTracker {
+    fn observe_composition_start(
+        &self,
+        context: &ITfContext,
+        range: &ITfRange,
+        ec: u32,
+        selection_replaced: bool,
+    ) -> PersonalPhraseDocumentAdjacency {
+        let Some(anchor) = self.anchor.as_ref() else {
+            if self.range_fallback_pending && selection_replaced {
+                return PersonalPhraseDocumentAdjacency::AnchorTextChanged;
+            }
+            return if self.range_fallback_pending {
+                PersonalPhraseDocumentAdjacency::RangeUnavailable
+            } else {
+                PersonalPhraseDocumentAdjacency::NoPreviousAnchor
+            };
+        };
+        match same_com_identity(&anchor.context, context) {
+            Ok(true) => {}
+            Ok(false) => return PersonalPhraseDocumentAdjacency::ContextChanged,
+            Err(_) => return PersonalPhraseDocumentAdjacency::RangeUnavailable,
+        }
+        if selection_replaced {
+            return PersonalPhraseDocumentAdjacency::AnchorTextChanged;
+        }
+        // SAFETY: both ranges belong to this context and `ec` is the active
+        // synchronous read/write cookie. Neither comparison mutates text.
+        match unsafe { range.CompareStart(ec, &anchor.range, TF_ANCHOR_END) } {
+            Ok(0) => {}
+            Ok(_) => return PersonalPhraseDocumentAdjacency::CaretMoved,
+            Err(_) => return PersonalPhraseDocumentAdjacency::RangeUnavailable,
+        }
+        match range_text_equals(&anchor.range, ec, &anchor.expected_text) {
+            Ok(true) => PersonalPhraseDocumentAdjacency::VerifiedAdjacent,
+            Ok(false) => PersonalPhraseDocumentAdjacency::AnchorTextChanged,
+            Err(_) => PersonalPhraseDocumentAdjacency::RangeUnavailable,
+        }
+    }
+
+    fn complete_personal_commit(
+        &mut self,
+        context: &ITfContext,
+        range: Option<ITfRange>,
+        expected_text: String,
+        adjacency: PersonalPhraseDocumentAdjacency,
+        range_ready: bool,
+    ) {
+        self.completed_adjacency = Some(adjacency);
+        let anchor = if range_ready {
+            range.map(|range| PersonalPhraseDocumentAnchor {
+                context: context.clone(),
+                range,
+                expected_text,
+            })
+        } else {
+            None
+        };
+        self.range_fallback_pending = anchor.is_none();
+        self.anchor = anchor;
+    }
+
+    fn take_completed_adjacency(&mut self) -> Option<PersonalPhraseDocumentAdjacency> {
+        self.completed_adjacency.take()
+    }
+
+    fn snapshot(&self) -> PersonalPhraseDocumentSnapshot {
+        PersonalPhraseDocumentSnapshot {
+            anchor: self.anchor.clone(),
+            range_fallback_pending: self.range_fallback_pending,
+        }
+    }
+
+    fn restore(&mut self, snapshot: PersonalPhraseDocumentSnapshot) {
+        self.anchor = snapshot.anchor;
+        self.range_fallback_pending = snapshot.range_fallback_pending;
+        self.completed_adjacency = None;
+    }
+
+    fn mark_range_fallback_after_commit(&mut self) {
+        self.anchor = None;
+        self.range_fallback_pending = true;
+        self.completed_adjacency = None;
+    }
+
+    fn clear(&mut self) {
+        self.anchor = None;
+        self.range_fallback_pending = false;
+        self.completed_adjacency = None;
+        self.last_consumed_adjacency = None;
+    }
+}
+
+fn range_text_equals(range: &ITfRange, ec: u32, expected: &str) -> Result<bool> {
+    let expected: Vec<u16> = expected.encode_utf16().collect();
+    let mut actual = vec![0_u16; expected.len().saturating_add(1)];
+    let mut fetched = 0;
+    // SAFETY: the clone stays inside this edit session. GetText advances only
+    // the clone and the buffer has one extra unit to detect a longer range.
+    let probe = unsafe { range.Clone() }?;
+    unsafe { probe.GetText(ec, TF_TF_MOVESTART, &mut actual, &mut fetched) }?;
+    let fetched = usize::try_from(fetched).map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+    Ok(fetched == expected.len() && actual[..fetched] == expected)
+}
+
+fn context_selection_replaces_text(context: &ITfContext, ec: u32) -> Result<bool> {
+    // SAFETY: TF_SELECTION is an ABI container whose zeroed interface field is
+    // a valid `None`; GetSelection initializes at most the one requested slot.
+    let mut selection = [unsafe { std::mem::zeroed::<TF_SELECTION>() }];
+    let mut fetched = 0;
+    let result =
+        unsafe { context.GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched) };
+    let replaces = result.and_then(|()| {
+        if fetched != 1 {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        let range = selection[0]
+            .range
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?;
+        // SAFETY: compares the two endpoints of the same context-owned range.
+        unsafe { range.CompareStart(ec, &range, TF_ANCHOR_END) }.map(|ordering| ordering != 0)
+    });
+    // SAFETY: GetSelection returned ownership of the interface in this ABI
+    // slot; release it exactly once, including on validation failure.
+    unsafe { std::mem::ManuallyDrop::drop(&mut selection[0].range) };
+    replaces
+}
+
 struct PendingPersonalPhrase {
     selection: PlannedSelection,
     previous_session_text: Option<String>,
@@ -2628,6 +2820,7 @@ struct PendingPersonalSelection {
     previous_session_text: Option<String>,
     phrase: Option<PendingPersonalPhrase>,
     previous_phrase_components: Vec<PersonalPhraseComponent>,
+    previous_phrase_document: PersonalPhraseDocumentSnapshot,
     previous_left_context: Option<String>,
 }
 
@@ -3141,6 +3334,13 @@ struct ActiveDocumentComposition {
     context: ITfContext,
     composition: ITfComposition,
     range: ITfRange,
+    personal_phrase_adjacency: PersonalPhraseDocumentAdjacency,
+}
+
+struct FinishedDocumentComposition {
+    range: Option<ITfRange>,
+    personal_phrase_adjacency: PersonalPhraseDocumentAdjacency,
+    range_ready: bool,
 }
 
 #[derive(Default)]
@@ -5370,9 +5570,23 @@ fn move_selection_after_range(context: &ITfContext, range: &ITfRange, ec: u32) -
 }
 
 /// Receives host-driven termination without keeping the service state alive.
+struct CompositionSinkShared {
+    document_composition: Weak<RefCell<DocumentCompositionState>>,
+    personal_phrase_composer: Weak<RefCell<PersonalPhraseComposer>>,
+    personal_phrase_document_tracker: Weak<RefCell<PersonalPhraseDocumentTracker>>,
+    logical_composition: Weak<RefCell<CompositionSession>>,
+    candidate_ui: Weak<RefCell<CandidateUiController>>,
+    native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
+    native_feedback_context: SyncWeak<Mutex<NativeFeedbackContextCache>>,
+    native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
+    key_advice_mode: KeyAdviceMode,
+}
+
 #[implement(ITfCompositionSink)]
 struct TsfCompositionSink {
     document_composition: Weak<RefCell<DocumentCompositionState>>,
+    personal_phrase_composer: Weak<RefCell<PersonalPhraseComposer>>,
+    personal_phrase_document_tracker: Weak<RefCell<PersonalPhraseDocumentTracker>>,
     logical_composition: Weak<RefCell<CompositionSession>>,
     candidate_ui: Weak<RefCell<CandidateUiController>>,
     native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
@@ -5382,24 +5596,18 @@ struct TsfCompositionSink {
 }
 
 impl TsfCompositionSink {
-    fn counted(
-        document_composition: Weak<RefCell<DocumentCompositionState>>,
-        logical_composition: Weak<RefCell<CompositionSession>>,
-        candidate_ui: Weak<RefCell<CandidateUiController>>,
-        native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
-        native_feedback_context: SyncWeak<Mutex<NativeFeedbackContextCache>>,
-        native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
-        key_advice_mode: KeyAdviceMode,
-    ) -> Self {
+    fn counted(shared: CompositionSinkShared) -> Self {
         object_created();
         Self {
-            document_composition,
-            logical_composition,
-            candidate_ui,
-            native_feedback,
-            native_feedback_context,
-            native_feedback_language_bar_state,
-            key_advice_mode,
+            document_composition: shared.document_composition,
+            personal_phrase_composer: shared.personal_phrase_composer,
+            personal_phrase_document_tracker: shared.personal_phrase_document_tracker,
+            logical_composition: shared.logical_composition,
+            candidate_ui: shared.candidate_ui,
+            native_feedback: shared.native_feedback,
+            native_feedback_context: shared.native_feedback_context,
+            native_feedback_language_bar_state: shared.native_feedback_language_bar_state,
+            key_advice_mode: shared.key_advice_mode,
         }
     }
 }
@@ -5441,6 +5649,16 @@ impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
         let Some(active) = active else {
             return Ok(());
         };
+        if let Some(composer) = self.personal_phrase_composer.upgrade()
+            && let Ok(mut composer) = composer.try_borrow_mut()
+        {
+            composer.components.clear();
+        }
+        if let Some(tracker) = self.personal_phrase_document_tracker.upgrade()
+            && let Ok(mut tracker) = tracker.try_borrow_mut()
+        {
+            tracker.clear();
+        }
         let feedback_context = self
             .native_feedback
             .upgrade()
@@ -5514,6 +5732,8 @@ impl ITfCompositionSink_Impl for TsfCompositionSink_Impl {
 /// Applies one planned composition change inside a synchronous TSF edit session.
 struct EditSessionShared {
     document_composition: Rc<RefCell<DocumentCompositionState>>,
+    personal_phrase_composer: Rc<RefCell<PersonalPhraseComposer>>,
+    personal_phrase_document_tracker: Rc<RefCell<PersonalPhraseDocumentTracker>>,
     logical_composition: Rc<RefCell<CompositionSession>>,
     telemetry: Arc<Mutex<EditSessionTelemetry>>,
     candidate_ui: Rc<RefCell<CandidateUiController>>,
@@ -5527,6 +5747,7 @@ struct DocumentEditRequest {
     action: PendingDocumentEdit,
     candidate_display: Option<CandidateDisplay>,
     feedback_after_success: Option<NativeFeedbackEvent>,
+    personal_phrase_commit_text: Option<String>,
     mode: EditSessionMode,
     cleanup_target: Option<ITfComposition>,
 }
@@ -5536,11 +5757,14 @@ struct TsfDocumentEditSession {
     context: ITfContext,
     action: PendingDocumentEdit,
     document_composition: Rc<RefCell<DocumentCompositionState>>,
+    personal_phrase_composer: Rc<RefCell<PersonalPhraseComposer>>,
+    personal_phrase_document_tracker: Rc<RefCell<PersonalPhraseDocumentTracker>>,
     logical_composition: Rc<RefCell<CompositionSession>>,
     telemetry: Arc<Mutex<EditSessionTelemetry>>,
     candidate_ui: Rc<RefCell<CandidateUiController>>,
     candidate_display: Option<CandidateDisplay>,
     feedback_after_success: Option<NativeFeedbackEvent>,
+    personal_phrase_commit_text: Option<String>,
     native_feedback: Arc<Mutex<NativeFeedbackRuntime>>,
     native_feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
@@ -5552,23 +5776,30 @@ struct TsfDocumentEditSession {
 impl TsfDocumentEditSession {
     fn counted(
         context: ITfContext,
-        action: PendingDocumentEdit,
+        request: DocumentEditRequest,
         shared: EditSessionShared,
-        candidate_display: Option<CandidateDisplay>,
-        feedback_after_success: Option<NativeFeedbackEvent>,
-        mode: EditSessionMode,
-        cleanup_target: Option<ITfComposition>,
     ) -> Self {
+        let DocumentEditRequest {
+            action,
+            candidate_display,
+            feedback_after_success,
+            personal_phrase_commit_text,
+            mode,
+            cleanup_target,
+        } = request;
         object_created();
         Self {
             context,
             action,
             document_composition: shared.document_composition,
+            personal_phrase_composer: shared.personal_phrase_composer,
+            personal_phrase_document_tracker: shared.personal_phrase_document_tracker,
             logical_composition: shared.logical_composition,
             telemetry: shared.telemetry,
             candidate_ui: shared.candidate_ui,
             candidate_display,
             feedback_after_success,
+            personal_phrase_commit_text,
             native_feedback: shared.native_feedback,
             native_feedback_context: shared.native_feedback_context,
             native_feedback_language_bar_state: shared.native_feedback_language_bar_state,
@@ -5599,19 +5830,40 @@ impl TsfDocumentEditSession {
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let insertion: ITfInsertAtSelection = self.context.cast()?;
         let context_composition: ITfContextComposition = self.context.cast()?;
+        let selection_replaced = context_selection_replaces_text(&self.context, ec);
         // SAFETY: `ec` is the read/write cookie issued for this synchronous
         // session. The returned range owns the newly inserted synthetic text.
         let range =
             unsafe { insertion.InsertTextAtSelection(ec, TF_IAS_NO_DEFAULT_COMPOSITION, &utf16) }?;
-        let sink: ITfCompositionSink = TsfCompositionSink::counted(
-            Rc::downgrade(&self.document_composition),
-            Rc::downgrade(&self.logical_composition),
-            Rc::downgrade(&self.candidate_ui),
-            Arc::downgrade(&self.native_feedback),
-            Arc::downgrade(&self.native_feedback_context),
-            Rc::downgrade(&self.native_feedback_language_bar_state),
-            self.key_advice_mode,
-        )
+        let personal_phrase_adjacency = selection_replaced
+            .ok()
+            .and_then(|selection_replaced| {
+                self.personal_phrase_document_tracker
+                    .try_borrow()
+                    .ok()
+                    .map(|tracker| {
+                        tracker.observe_composition_start(
+                            &self.context,
+                            &range,
+                            ec,
+                            selection_replaced,
+                        )
+                    })
+            })
+            .unwrap_or(PersonalPhraseDocumentAdjacency::RangeUnavailable);
+        let sink: ITfCompositionSink = TsfCompositionSink::counted(CompositionSinkShared {
+            document_composition: Rc::downgrade(&self.document_composition),
+            personal_phrase_composer: Rc::downgrade(&self.personal_phrase_composer),
+            personal_phrase_document_tracker: Rc::downgrade(&self.personal_phrase_document_tracker),
+            logical_composition: Rc::downgrade(&self.logical_composition),
+            candidate_ui: Rc::downgrade(&self.candidate_ui),
+            native_feedback: Arc::downgrade(&self.native_feedback),
+            native_feedback_context: Arc::downgrade(&self.native_feedback_context),
+            native_feedback_language_bar_state: Rc::downgrade(
+                &self.native_feedback_language_bar_state,
+            ),
+            key_advice_mode: self.key_advice_mode,
+        })
         .into();
         // SAFETY: the same write cookie and inserted range remain valid. The
         // weak sink lets host-driven termination clear our active handle.
@@ -5641,6 +5893,7 @@ impl TsfDocumentEditSession {
             context: self.context.clone(),
             composition,
             range,
+            personal_phrase_adjacency,
         });
         state.cleanup_scheduled = false;
         Ok(())
@@ -5668,7 +5921,11 @@ impl TsfDocumentEditSession {
         move_selection_after_range(&self.context, &range, ec)
     }
 
-    fn finish_composition(&self, ec: u32, replacement: &str) -> Result<()> {
+    fn finish_composition(
+        &self,
+        ec: u32,
+        replacement: &str,
+    ) -> Result<FinishedDocumentComposition> {
         let active = {
             let mut state = self
                 .document_composition
@@ -5688,6 +5945,18 @@ impl TsfDocumentEditSession {
             self.restore_active(active)?;
             return Err(error);
         }
+        // Keep an independent clone only for a qualifying personal component:
+        // EndComposition is allowed to change the composition-owned range. A
+        // backward end gravity leaves a later insertion at the committed
+        // boundary outside this anchor. Hosts may reject either operation;
+        // input still succeeds with an explicit keyboard-continuity fallback.
+        let committed_range = self
+            .personal_phrase_commit_text
+            .as_ref()
+            .and_then(|_| unsafe { active.range.Clone() }.ok());
+        let range_ready = committed_range.as_ref().is_some_and(|range| {
+            unsafe { range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD) }.is_ok()
+        });
         if let Err(error) = move_selection_after_range(&self.context, &active.range, ec) {
             self.restore_active(active)?;
             return Err(error);
@@ -5697,7 +5966,11 @@ impl TsfDocumentEditSession {
             self.restore_active(active)?;
             return Err(error);
         }
-        Ok(())
+        Ok(FinishedDocumentComposition {
+            range: committed_range,
+            personal_phrase_adjacency: active.personal_phrase_adjacency,
+            range_ready,
+        })
     }
 
     fn restore_active(&self, active: ActiveDocumentComposition) -> Result<()> {
@@ -5741,6 +6014,7 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
                 NativeFeedbackContext::Unknown
             };
         let mut cleanup_applied = false;
+        let mut finished_commit = None;
         match &self.action {
             PendingDocumentEdit::UpdatePreedit(text) => match self.active_composition()? {
                 Some(active) => self.update_composition(ec, &active, text)?,
@@ -5748,13 +6022,36 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
             },
             PendingDocumentEdit::Cancel if self.mode == EditSessionMode::CleanupAsync => {
                 if self.cleanup_target_is_current()? {
-                    self.finish_composition(ec, "")?;
+                    let _ = self.finish_composition(ec, "")?;
                     cleanup_applied = true;
                 }
             }
-            PendingDocumentEdit::Cancel => self.finish_composition(ec, "")?,
-            PendingDocumentEdit::Commit(text) => self.finish_composition(ec, text)?,
+            PendingDocumentEdit::Cancel => {
+                let _ = self.finish_composition(ec, "")?;
+            }
+            PendingDocumentEdit::Commit(text) => {
+                finished_commit = Some(self.finish_composition(ec, text)?);
+            }
             PendingDocumentEdit::Insert(text) => self.insert_text_at_selection(ec, text)?,
+        }
+        if let Some(finished) = finished_commit {
+            if let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut() {
+                if let Some(text) = self.personal_phrase_commit_text.clone() {
+                    tracker.complete_personal_commit(
+                        &self.context,
+                        finished.range,
+                        text,
+                        finished.personal_phrase_adjacency,
+                        finished.range_ready,
+                    );
+                } else {
+                    tracker.clear();
+                }
+            }
+        } else if !matches!(&self.action, PendingDocumentEdit::UpdatePreedit(_))
+            && let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut()
+        {
+            tracker.clear();
         }
         let feedback_context = if let PendingDocumentEdit::UpdatePreedit(code) = &self.action {
             let context = self
@@ -6908,7 +7205,8 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::CandidateSuppressionChanged { code, .. } => Some(code),
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
-        | NativeFeedbackEvent::PostCommitBackspaceRouted => None,
+        | NativeFeedbackEvent::PostCommitBackspaceRouted
+        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => None,
     }
 }
 
@@ -7630,7 +7928,8 @@ struct TsfTextService {
     candidate_cache: RefCell<CandidateCache>,
     selection_memory: RefCell<SessionSelectionMemory>,
     pending_personal_selection: RefCell<Option<PendingPersonalSelection>>,
-    personal_phrase_composer: RefCell<PersonalPhraseComposer>,
+    personal_phrase_composer: Rc<RefCell<PersonalPhraseComposer>>,
+    personal_phrase_document_tracker: Rc<RefCell<PersonalPhraseDocumentTracker>>,
     personal_context_ranking: RefCell<PersonalContextRanking>,
     personal_left_context: RefCell<Option<String>>,
     personal_ranking: RefCell<PersonalRankingRuntime>,
@@ -8113,7 +8412,10 @@ impl TsfTextService {
             candidate_cache: RefCell::new(CandidateCache::default()),
             selection_memory: RefCell::new(SessionSelectionMemory::default()),
             pending_personal_selection: RefCell::new(None),
-            personal_phrase_composer: RefCell::new(PersonalPhraseComposer::default()),
+            personal_phrase_composer: Rc::new(RefCell::new(PersonalPhraseComposer::default())),
+            personal_phrase_document_tracker: Rc::new(RefCell::new(
+                PersonalPhraseDocumentTracker::default(),
+            )),
             personal_context_ranking: RefCell::new(PersonalContextRanking::default()),
             personal_left_context: RefCell::new(None),
             personal_ranking: RefCell::new(PersonalRankingRuntime::new_with_roots_and_persistence(
@@ -8510,10 +8812,36 @@ impl TsfTextService_Impl {
         );
     }
 
-    fn clear_personal_phrase_composer(&self) {
+    fn clear_personal_phrase_components(&self) {
         if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
             composer.components.clear();
         }
+    }
+
+    fn clear_personal_phrase_composer(&self) {
+        self.clear_personal_phrase_components();
+        if let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut() {
+            tracker.clear();
+        }
+    }
+
+    fn personal_phrase_document_snapshot(&self) -> PersonalPhraseDocumentSnapshot {
+        self.personal_phrase_document_tracker
+            .try_borrow()
+            .map(|tracker| tracker.snapshot())
+            .unwrap_or_default()
+    }
+
+    fn take_personal_phrase_document_adjacency(&self) -> PersonalPhraseDocumentAdjacency {
+        let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut() else {
+            return PersonalPhraseDocumentAdjacency::RangeUnavailable;
+        };
+        let adjacency = tracker.take_completed_adjacency().unwrap_or_else(|| {
+            tracker.mark_range_fallback_after_commit();
+            PersonalPhraseDocumentAdjacency::KeyboardFallback
+        });
+        tracker.last_consumed_adjacency = Some(adjacency);
+        adjacency
     }
 
     fn clear_personal_left_context(&self) {
@@ -8660,6 +8988,9 @@ impl TsfTextService_Impl {
         if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
             composer.components = pending.previous_phrase_components;
         }
+        if let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut() {
+            tracker.restore(pending.previous_phrase_document);
+        }
         if let Ok(mut context) = self.personal_left_context.try_borrow_mut() {
             *context = pending.previous_left_context;
         }
@@ -8727,6 +9058,31 @@ impl TsfTextService_Impl {
         }
     }
 
+    fn record_personal_phrase_adjacency_observed(
+        &self,
+        observation: PersonalPhraseAdjacencyObservation,
+    ) {
+        let Ok(mut feedback) = self.native_feedback.lock() else {
+            return;
+        };
+        if !feedback.is_accepting() {
+            return;
+        }
+        let result = feedback.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: observation.adjacency.feedback_value(),
+                previous_components: observation.previous_components,
+                resulting_components: observation.resulting_components,
+            },
+            native_feedback_monotonic_ms(),
+        );
+        drop(feedback);
+        if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
+            self.native_feedback_language_bar_state.notify();
+        }
+    }
+
     #[cfg(test)]
     fn remember_selection_after_success(&self, selection: PlannedSelection) {
         let learning_context = self
@@ -8750,12 +9106,31 @@ impl TsfTextService_Impl {
         );
     }
 
+    #[cfg(test)]
     fn remember_selection_after_success_in_context_with_overrule(
         &self,
         selection: PlannedSelection,
         learning_context: NativeFeedbackContext,
         overruled_text: Option<String>,
     ) {
+        let previous_phrase_document = self.personal_phrase_document_snapshot();
+        let _ = self.remember_selection_after_success_in_context_with_overrule_and_document(
+            selection,
+            learning_context,
+            overruled_text,
+            PersonalPhraseDocumentAdjacency::KeyboardFallback,
+            previous_phrase_document,
+        );
+    }
+
+    fn remember_selection_after_success_in_context_with_overrule_and_document(
+        &self,
+        selection: PlannedSelection,
+        learning_context: NativeFeedbackContext,
+        overruled_text: Option<String>,
+        document_adjacency: PersonalPhraseDocumentAdjacency,
+        previous_phrase_document: PersonalPhraseDocumentSnapshot,
+    ) -> Option<PersonalPhraseAdjacencyObservation> {
         // A second successful selection is an explicit boundary for the
         // preceding transaction, even if an unusual host skipped the key that
         // began the new composition.
@@ -8782,6 +9157,15 @@ impl TsfTextService_Impl {
             memory.remember_text(&selection.code, &selection.text);
         }
         let component = self.personal_phrase_component(&selection, learning_context);
+        let component_is_eligible = component.is_some();
+        let observed_previous_components = self
+            .personal_phrase_composer
+            .try_borrow()
+            .ok()
+            .map_or(0, |composer| composer.components.len());
+        if !document_adjacency.allows_continuation() {
+            self.clear_personal_phrase_components();
+        }
         let previous_phrase_components = self
             .personal_phrase_composer
             .try_borrow()
@@ -8800,6 +9184,12 @@ impl TsfTextService_Impl {
             Some(component) => (vec![component], None),
             None => (Vec::new(), None),
         };
+        let resulting_components = next_phrase_components.len();
+        if next_phrase_components.is_empty()
+            && let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut()
+        {
+            tracker.clear();
+        }
         if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
             composer.components = next_phrase_components;
         }
@@ -8826,9 +9216,15 @@ impl TsfTextService_Impl {
                 previous_session_text,
                 phrase,
                 previous_phrase_components,
+                previous_phrase_document,
                 previous_left_context,
             });
         }
+        component_is_eligible.then_some(PersonalPhraseAdjacencyObservation {
+            adjacency: document_adjacency,
+            previous_components: observed_previous_components.min(MAX_PERSONAL_PHRASE_COMPONENTS),
+            resulting_components,
+        })
     }
 
     fn has_active_logical_composition(&self) -> Result<bool> {
@@ -8945,18 +9341,14 @@ impl TsfTextService_Impl {
         client_id: u32,
         request: DocumentEditRequest,
     ) -> Result<()> {
-        let DocumentEditRequest {
-            action,
-            candidate_display,
-            feedback_after_success,
-            mode,
-            cleanup_target,
-        } = request;
+        let mode = request.mode;
         let edit_session: ITfEditSession = TsfDocumentEditSession::counted(
             context.clone(),
-            action,
+            request,
             EditSessionShared {
                 document_composition: Rc::clone(&self.document_composition),
+                personal_phrase_composer: Rc::clone(&self.personal_phrase_composer),
+                personal_phrase_document_tracker: Rc::clone(&self.personal_phrase_document_tracker),
                 logical_composition: Rc::clone(&self.composition),
                 telemetry: Arc::clone(&self.edit_telemetry),
                 candidate_ui: Rc::clone(&self.candidate_ui),
@@ -8967,10 +9359,6 @@ impl TsfTextService_Impl {
                 ),
                 key_advice_mode: self.key_advice_mode,
             },
-            candidate_display,
-            feedback_after_success,
-            mode,
-            cleanup_target,
         )
         .into();
         let scheduling = match mode {
@@ -9054,6 +9442,7 @@ impl TsfTextService_Impl {
                         })
                     },
                 ),
+                personal_phrase_commit_text: None,
                 mode: EditSessionMode::CleanupAsync,
                 cleanup_target: Some(cleanup_target),
             },
@@ -10181,6 +10570,12 @@ impl TsfTextService_Impl {
             _ => None,
         };
         let ui_only = edit.is_none();
+        let personal_phrase_commit_text = selection_to_remember
+            .as_ref()
+            .map(|selection| selection.text.clone());
+        let previous_phrase_document = selection_to_remember
+            .as_ref()
+            .map(|_| self.personal_phrase_document_snapshot());
         let mut edit_session_ms = 0;
         if let Some(edit) = edit {
             let edit_started_at = Instant::now();
@@ -10191,6 +10586,7 @@ impl TsfTextService_Impl {
                     action: edit,
                     candidate_display: candidate_display.clone(),
                     feedback_after_success: feedback_after_success.clone(),
+                    personal_phrase_commit_text,
                     mode: EditSessionMode::KeySynchronous,
                     cleanup_target: None,
                 },
@@ -10209,11 +10605,18 @@ impl TsfTextService_Impl {
         *composition = after;
         drop(composition);
         if let Some(selection) = selection_to_remember {
-            self.remember_selection_after_success_in_context_with_overrule(
-                selection,
-                candidate_learning_context,
-                overruled_text_to_remember,
-            );
+            let document_adjacency = self.take_personal_phrase_document_adjacency();
+            let observation = self
+                .remember_selection_after_success_in_context_with_overrule_and_document(
+                    selection,
+                    candidate_learning_context,
+                    overruled_text_to_remember,
+                    document_adjacency,
+                    previous_phrase_document.unwrap_or_default(),
+                );
+            if let Some(observation) = observation {
+                self.record_personal_phrase_adjacency_observed(observation);
+            }
         } else if breaks_personal_phrase {
             self.clear_personal_phrase_composer();
         }
@@ -11768,6 +12171,21 @@ mod tests {
             .collect()
     }
 
+    fn seed_personal_phrase_document_fallback(service: &TsfTextService_Impl) {
+        let mut tracker = service.personal_phrase_document_tracker.borrow_mut();
+        tracker.range_fallback_pending = true;
+        tracker.completed_adjacency = Some(PersonalPhraseDocumentAdjacency::RangeUnavailable);
+        tracker.last_consumed_adjacency = Some(PersonalPhraseDocumentAdjacency::RangeUnavailable);
+    }
+
+    fn assert_personal_phrase_document_tracker_cleared(service: &TsfTextService_Impl) {
+        let tracker = service.personal_phrase_document_tracker.borrow();
+        assert!(tracker.anchor.is_none());
+        assert!(!tracker.range_fallback_pending);
+        assert!(tracker.completed_adjacency.is_none());
+        assert!(tracker.last_consumed_adjacency.is_none());
+    }
+
     struct CodeFamilyCandidateProvider;
 
     impl CandidateProvider for CodeFamilyCandidateProvider {
@@ -12000,6 +12418,91 @@ mod tests {
     struct ContextTextReader {
         context: ITfContext,
         output: Arc<Mutex<Option<String>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestContextSelection {
+        Start,
+        All,
+    }
+
+    #[implement(ITfEditSession)]
+    struct ContextSelectionSetter {
+        context: ITfContext,
+        selection: TestContextSelection,
+    }
+
+    #[implement(ITfEditSession)]
+    struct ContextSuffixDeleter {
+        context: ITfContext,
+    }
+
+    impl ITfEditSession_Impl for ContextSuffixDeleter_Impl {
+        fn DoEditSession(&self, ec: u32) -> Result<()> {
+            // SAFETY: the endpoint belongs to this context and the test edits
+            // only one trailing UTF-16 unit from its synthetic BMP text.
+            let range = unsafe { self.context.GetEnd(ec) }?;
+            let mut shifted = 0;
+            unsafe { range.ShiftStart(ec, -1, &mut shifted, ptr::null()) }?;
+            if shifted != -1 {
+                return Err(lifecycle_error(E_UNEXPECTED));
+            }
+            unsafe { range.SetText(ec, 0, &[]) }?;
+            move_selection_after_range(&self.context, &range, ec)
+        }
+    }
+
+    impl ITfEditSession_Impl for ContextSelectionSetter_Impl {
+        fn DoEditSession(&self, ec: u32) -> Result<()> {
+            // SAFETY: both endpoint ranges belong to this context and `ec`
+            // grants synchronous read/write access for the test callback.
+            let range = unsafe { self.context.GetStart(ec) }?;
+            if matches!(self.selection, TestContextSelection::All) {
+                let end = unsafe { self.context.GetEnd(ec) }?;
+                unsafe { range.ShiftEndToRange(ec, &end, TF_ANCHOR_END) }?;
+            }
+            let mut selection = TF_SELECTION {
+                range: std::mem::ManuallyDrop::new(Some(range)),
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: false.into(),
+                },
+            };
+            let result = unsafe {
+                self.context
+                    .SetSelection(ec, std::slice::from_ref(&selection))
+            };
+            // SAFETY: release the interface field owned by this ABI value once.
+            unsafe { std::mem::ManuallyDrop::drop(&mut selection.range) };
+            result
+        }
+    }
+
+    fn set_context_selection(
+        context: &ITfContext,
+        client_id: u32,
+        selection: TestContextSelection,
+    ) {
+        let edit_session: ITfEditSession = ContextSelectionSetter {
+            context: context.clone(),
+            selection,
+        }
+        .into();
+        let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+        let result = unsafe { context.RequestEditSession(client_id, &edit_session, flags) }
+            .expect("selection edit-session request");
+        result.ok().expect("selection edit session");
+    }
+
+    fn delete_context_suffix(context: &ITfContext, client_id: u32) {
+        let edit_session: ITfEditSession = ContextSuffixDeleter {
+            context: context.clone(),
+        }
+        .into();
+        let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+        let result = unsafe { context.RequestEditSession(client_id, &edit_session, flags) }
+            .expect("suffix deletion edit-session request");
+        result.ok().expect("suffix deletion edit session");
     }
 
     impl ITfEditSession_Impl for ContextTextReader_Impl {
@@ -13601,6 +14104,13 @@ mod tests {
                 .is_accepting(),
             "the optional recorder stays stopped while input-scope classification gates learning"
         );
+        assert_eq!(
+            service_object.native_feedback.lock().unwrap().start_memory(
+                NativeFeedbackAuthorization::explicit_memory_only(),
+                NativeFeedbackLimits::default(),
+            ),
+            NativeFeedbackStartResult::Started
+        );
         let service: ITfTextInputProcessorEx = service_object.to_interface();
         let key_sink: ITfKeyEventSink = service_object.to_interface();
 
@@ -13675,11 +14185,43 @@ mod tests {
         assert_eq!(read_context_text(&context, client_id), "试手");
         assert_eq!(
             service_object
+                .personal_phrase_document_tracker
+                .borrow()
+                .last_consumed_adjacency,
+            Some(PersonalPhraseDocumentAdjacency::VerifiedAdjacent)
+        );
+        assert_eq!(
+            service_object
                 .selection_memory
                 .borrow()
                 .remembered_text("uiub"),
             Some("试手")
         );
+        {
+            let feedback = service_object.native_feedback.lock().unwrap();
+            assert!(feedback.events().windows(2).any(|events| matches!(
+                events,
+                [
+                    NativeFeedbackEvent::CandidateCommitted { code, .. },
+                    NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                        adjacency: NativePersonalPhraseAdjacency::FirstAnchor,
+                        previous_components: 0,
+                        resulting_components: 1,
+                    },
+                ] if code == "ui"
+            )));
+            assert!(feedback.events().windows(2).any(|events| matches!(
+                events,
+                [
+                    NativeFeedbackEvent::CandidateCommitted { code, .. },
+                    NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                        adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                        previous_components: 1,
+                        resulting_components: 2,
+                    },
+                ] if code == "ub"
+            )));
+        }
 
         press(VK_OEM_COMMA.0);
         assert_eq!(read_context_text(&context, client_id), "试手，");
@@ -13691,6 +14233,7 @@ mod tests {
                 .is_empty(),
             "punctuation must confirm the pending phrase and break the adjacency chain"
         );
+        assert_personal_phrase_document_tracker_cleared(&service_object);
 
         for letter in b"uiub" {
             press(VK_A.0 + u16::from(*letter - b'a'));
@@ -13710,6 +14253,313 @@ mod tests {
                 .personal_context_ranking
                 .borrow()
                 .has_evidence("试", "ub")
+        );
+
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+    }
+
+    #[test]
+    fn real_key_callbacks_break_personal_phrase_learning_after_caret_move_or_replacement() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(PersonalPhraseCandidateProvider),
+        )));
+        assert_eq!(
+            service_object.native_feedback.lock().unwrap().start_memory(
+                NativeFeedbackAuthorization::explicit_memory_only(),
+                NativeFeedbackLimits::default(),
+            ),
+            NativeFeedbackStartResult::Started
+        );
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        let press = |target: &ITfContext, vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(target, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(target, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+        };
+        let choose_second = |target: &ITfContext, code: &str| {
+            for letter in code.bytes() {
+                press(target, VK_A.0 + u16::from(letter - b'a'));
+            }
+            press(target, VK_1.0 + 1);
+        };
+
+        choose_second(&context, "ui");
+        assert_eq!(read_context_text(&context, client_id), "试");
+        set_context_selection(&context, client_id, TestContextSelection::Start);
+        choose_second(&context, "ub");
+        assert_eq!(read_context_text(&context, client_id), "手试");
+        assert_eq!(
+            service_object
+                .personal_phrase_document_tracker
+                .borrow()
+                .last_consumed_adjacency,
+            Some(PersonalPhraseDocumentAdjacency::CaretMoved)
+        );
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("uiub"),
+            None,
+            "a caret move must not create an adjacent personal phrase"
+        );
+        assert_eq!(personal_phrase_component_codes(&service_object), ["ub"]);
+
+        let second_document =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("second document creation");
+        let mut second_context = None;
+        let mut second_text_store_cookie = 0;
+        unsafe {
+            second_document.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut second_context,
+                &mut second_text_store_cookie,
+            )
+        }
+        .expect("second synthetic context creation");
+        let second_context = second_context.expect("second context should be returned");
+        unsafe { second_document.Push(&second_context) }.expect("second context push");
+        choose_second(&second_context, "lm");
+        assert_eq!(read_context_text(&second_context, client_id), "练");
+        assert_eq!(
+            service_object
+                .personal_phrase_document_tracker
+                .borrow()
+                .last_consumed_adjacency,
+            Some(PersonalPhraseDocumentAdjacency::ContextChanged)
+        );
+        assert_eq!(personal_phrase_component_codes(&service_object), ["lm"]);
+
+        set_context_selection(&second_context, client_id, TestContextSelection::All);
+        choose_second(&second_context, "xi");
+        assert_eq!(read_context_text(&second_context, client_id), "习");
+        assert_eq!(
+            service_object
+                .personal_phrase_document_tracker
+                .borrow()
+                .last_consumed_adjacency,
+            Some(PersonalPhraseDocumentAdjacency::AnchorTextChanged)
+        );
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("lmxi"),
+            None,
+            "replacing the previous selection must not create an adjacent personal phrase"
+        );
+        assert_eq!(personal_phrase_component_codes(&service_object), ["xi"]);
+
+        {
+            let mut tracker = service_object.personal_phrase_document_tracker.borrow_mut();
+            tracker.anchor = None;
+            tracker.range_fallback_pending = true;
+            tracker.completed_adjacency = None;
+        }
+        set_context_selection(&second_context, client_id, TestContextSelection::All);
+        choose_second(&second_context, "aa");
+        assert_eq!(read_context_text(&second_context, client_id), "啊");
+        assert_eq!(
+            service_object
+                .personal_phrase_document_tracker
+                .borrow()
+                .last_consumed_adjacency,
+            Some(PersonalPhraseDocumentAdjacency::AnchorTextChanged),
+            "an observable replacement must break the chain even after range fallback"
+        );
+        assert_eq!(personal_phrase_component_codes(&service_object), ["aa"]);
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("xiaa"),
+            None
+        );
+        let adjacency_events = service_object
+            .native_feedback
+            .lock()
+            .unwrap()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                    adjacency,
+                    previous_components,
+                    resulting_components,
+                } => Some((*adjacency, *previous_components, *resulting_components)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(adjacency_events.contains(&(NativePersonalPhraseAdjacency::CaretMoved, 1, 1)));
+        assert!(adjacency_events.contains(&(NativePersonalPhraseAdjacency::ContextChanged, 1, 1)));
+        assert!(adjacency_events.contains(&(
+            NativePersonalPhraseAdjacency::AnchorTextChanged,
+            1,
+            1
+        )));
+
+        unsafe { second_document.Pop(TF_POPF_ALL) }.expect("second context pop");
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(context);
+        drop(document_manager);
+        drop(second_context);
+        drop(second_document);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+    }
+
+    #[test]
+    fn real_backspace_retraction_restores_the_previous_document_anchor() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(PersonalPhraseCandidateProvider),
+        )));
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let lparam = LPARAM(0);
+        let press = |vkey: u16| {
+            let key = WPARAM(usize::from(vkey));
+            assert!(
+                unsafe { key_sink.OnTestKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { key_sink.OnKeyDown(&context, key, lparam) }
+                    .unwrap()
+                    .as_bool()
+            );
+        };
+        let choose_second = |code: &str| {
+            for letter in code.bytes() {
+                press(VK_A.0 + u16::from(letter - b'a'));
+            }
+            press(VK_1.0 + 1);
+        };
+
+        for code in ["ui", "ub", "lm"] {
+            choose_second(code);
+        }
+        assert_eq!(read_context_text(&context, client_id), "试手练");
+        assert_eq!(
+            personal_phrase_component_codes(&service_object),
+            ["ui", "ub", "lm"]
+        );
+
+        let backspace = WPARAM(usize::from(VK_BACK.0));
+        assert!(
+            unsafe { key_sink.OnTestKeyDown(&context, backspace, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert!(
+            !unsafe { key_sink.OnKeyDown(&context, backspace, lparam) }
+                .unwrap()
+                .as_bool(),
+            "the host must own deletion after the personal transaction is retracted"
+        );
+        delete_context_suffix(&context, client_id);
+        assert_eq!(read_context_text(&context, client_id), "试手");
+        assert_eq!(
+            personal_phrase_component_codes(&service_object),
+            ["ui", "ub"]
+        );
+
+        choose_second("lm");
+        assert_eq!(read_context_text(&context, client_id), "试手练");
+        assert_eq!(
+            service_object
+                .personal_phrase_document_tracker
+                .borrow()
+                .last_consumed_adjacency,
+            Some(PersonalPhraseDocumentAdjacency::VerifiedAdjacent)
+        );
+        assert_eq!(
+            service_object
+                .selection_memory
+                .borrow()
+                .remembered_text("uiublm"),
+            Some("试手练"),
+            "the replacement third character should extend the restored prefix anchor"
         );
 
         unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
@@ -14466,6 +15316,7 @@ mod tests {
                 .as_bool()
         );
         assert_eq!(service_object.input_mode.get(), InputMode::English);
+        assert_personal_phrase_document_tracker_cleared(&service_object);
         assert!(
             !unsafe { key_sink.OnTestKeyDown(&context, b, lparam) }
                 .unwrap()
@@ -14595,6 +15446,15 @@ mod tests {
         // SAFETY: restore the original focus before the next direct key call.
         unsafe { thread_manager.SetFocus(&document_manager) }.expect("original document focus");
 
+        service_object
+            .personal_phrase_composer
+            .borrow_mut()
+            .components
+            .push(PersonalPhraseComponent {
+                code: "ui".to_owned(),
+                text: "试".to_owned(),
+            });
+        seed_personal_phrase_document_fallback(&service_object);
         assert!(
             unsafe { key_sink.OnKeyDown(&context, c, lparam) }
                 .unwrap()
@@ -14609,6 +15469,15 @@ mod tests {
                 .is_some()
         );
         terminate_composition_from_host(&context);
+        assert!(
+            service_object
+                .personal_phrase_composer
+                .borrow()
+                .components
+                .is_empty(),
+            "host termination must break the pending personal-phrase component chain"
+        );
+        assert_personal_phrase_document_tracker_cleared(&service_object);
         assert_eq!(read_context_text(&context, client_id), "啊");
         assert!(service_object.composition.borrow().phonetic().is_empty());
         assert!(
@@ -14630,9 +15499,11 @@ mod tests {
                 .as_bool()
         );
         assert_eq!(read_context_text(&context, client_id), "啊d");
+        seed_personal_phrase_document_fallback(&service_object);
         // SAFETY: directly exercises the advised key sink's foreground-loss
         // callback with no system registration.
         unsafe { key_sink.OnSetFocus(false) }.expect("foreground loss cleanup");
+        assert_personal_phrase_document_tracker_cleared(&service_object);
         assert!(
             service_object
                 .document_composition
@@ -14665,9 +15536,11 @@ mod tests {
                 .as_bool()
         );
         assert_eq!(read_context_text(&context, client_id), "啊e");
+        seed_personal_phrase_document_fallback(&service_object);
         // SAFETY: deactivation schedules the same bounded cancellation before
         // releasing both event subscriptions.
         unsafe { service.Deactivate() }.expect("active composition deactivation");
+        assert_personal_phrase_document_tracker_cleared(&service_object);
         assert!(
             service_object
                 .document_composition
@@ -19366,6 +20239,55 @@ mod tests {
     }
 
     #[test]
+    fn personal_phrase_range_and_keyboard_fallbacks_preserve_bounded_continuation() {
+        let _guard = test_lock();
+        for adjacency in [
+            PersonalPhraseDocumentAdjacency::KeyboardFallback,
+            PersonalPhraseDocumentAdjacency::RangeUnavailable,
+        ] {
+            let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+                PersonalPhraseCandidateProvider,
+            ))));
+            let first = service
+                .remember_selection_after_success_in_context_with_overrule_and_document(
+                    PlannedSelection {
+                        code: "ui".to_owned(),
+                        text: "试".to_owned(),
+                        retractable_by_immediate_backspace: true,
+                    },
+                    NativeFeedbackContext::Eligible,
+                    None,
+                    PersonalPhraseDocumentAdjacency::NoPreviousAnchor,
+                    PersonalPhraseDocumentSnapshot::default(),
+                )
+                .unwrap();
+            assert_eq!(first.previous_components, 0);
+            assert_eq!(first.resulting_components, 1);
+
+            let second = service
+                .remember_selection_after_success_in_context_with_overrule_and_document(
+                    PlannedSelection {
+                        code: "ub".to_owned(),
+                        text: "手".to_owned(),
+                        retractable_by_immediate_backspace: true,
+                    },
+                    NativeFeedbackContext::Eligible,
+                    None,
+                    adjacency,
+                    PersonalPhraseDocumentSnapshot::default(),
+                )
+                .unwrap();
+            assert_eq!(second.adjacency, adjacency);
+            assert_eq!(second.previous_components, 1);
+            assert_eq!(second.resulting_components, 2);
+            assert_eq!(
+                service.selection_memory.borrow().remembered_text("uiub"),
+                Some("试手")
+            );
+        }
+    }
+
+    #[test]
     fn immediate_backspace_retracts_a_new_personal_phrase_but_keeps_its_first_component() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
@@ -19450,7 +20372,10 @@ mod tests {
             });
         }
 
+        seed_personal_phrase_document_fallback(&service);
+
         service.cleanup_after_focus_loss().unwrap();
+        assert_personal_phrase_document_tracker_cleared(&service);
         assert!(service.pending_personal_selection.borrow().is_none());
         assert!(
             service

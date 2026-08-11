@@ -8,12 +8,13 @@ use std::thread;
 use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
     NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind,
-    ResearchHalfPairAnalysis, ResearchSceneAnalysis, TranspositionCalibrationLabel,
-    WishCaptureScope, WishJournalContext, WishPublicCandidateOrderPolicy, WishRuntimeIdentity,
-    WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs, list_wish_packages,
-    native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-    research_feedback_enabled, set_research_feedback_enabled,
+    NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
+    RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
+    ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
+    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
+    repository_root_for_user_tool_executable, research_feedback_enabled,
+    set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -26,6 +27,7 @@ const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
 const POPUP_LATENCY_TAIL_THRESHOLDS_MS: [u32; 4] = [16, 32, 64, 128];
 const CANDIDATE_SOURCE_KIND_COUNT: usize = 11;
 const PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT: usize = 3;
+const PERSONAL_PHRASE_ADJACENCY_KIND_COUNT: usize = 7;
 const INITIAL_NON_TOP_RANK_BUCKET_COUNT: usize = 3;
 const NON_TOP_KEY_LENGTH_BUCKET_COUNT: usize = 5;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
@@ -711,6 +713,7 @@ struct ResearchReview {
     precise_personalization_capable_batches: usize,
     precise_ranking_personalization_capable_batches: usize,
     candidate_suppression_action_capable_batches: usize,
+    personal_phrase_adjacency_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
     public_candidate_order_policy_capable_batches: usize,
     public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
@@ -720,6 +723,7 @@ struct ResearchReview {
     transposition_unknown: usize,
     candidate_suppression_actions: usize,
     candidate_restore_actions: usize,
+    personal_phrase_adjacencies: [usize; PERSONAL_PHRASE_ADJACENCY_KIND_COUNT],
     runtime_batches: HashMap<WishRuntimeIdentity, usize>,
     unidentified_runtime_batches: usize,
     personalized_top_bypass: PersonalizedTopBypassAudit,
@@ -744,6 +748,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_precise_candidate_ranking_personalization());
         self.candidate_suppression_action_capable_batches +=
             usize::from(snapshot.supports_candidate_suppression_actions());
+        self.personal_phrase_adjacency_capable_batches +=
+            usize::from(snapshot.supports_personal_phrase_adjacency());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
         self.public_candidate_order_policy_capable_batches +=
@@ -928,6 +934,10 @@ impl ResearchReview {
                     self.post_commit_backspaces_routed += 1;
                     frame = None;
                 }
+                NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { adjacency, .. } => {
+                    self.personal_phrase_adjacencies
+                        [personal_phrase_adjacency_index(*adjacency)] += 1;
+                }
             }
         }
         for observation in snapshot.automatic_transposition_observations()? {
@@ -988,7 +998,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -998,6 +1008,8 @@ impl ResearchReview {
             self.precise_ranking_personalization_capable_batches,
             self.batches,
             self.candidate_suppression_action_capable_batches,
+            self.batches,
+            self.personal_phrase_adjacency_capable_batches,
             self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
@@ -1029,6 +1041,28 @@ impl ResearchReview {
             output,
             "{}",
             render_current_schema_readiness(&self.source_schema_versions, self.batches)
+        )
+        .unwrap();
+    }
+
+    fn render_personal_phrase_adjacency(&self, output: &mut String) {
+        let count = |adjacency| {
+            self.personal_phrase_adjacencies[personal_phrase_adjacency_index(adjacency)]
+        };
+        let explicit_breaks = count(NativePersonalPhraseAdjacency::CaretMoved)
+            .saturating_add(count(NativePersonalPhraseAdjacency::AnchorTextChanged))
+            .saturating_add(count(NativePersonalPhraseAdjacency::ContextChanged));
+        writeln!(
+            output,
+            "个人短语文档邻接：首锚点 {}；已验证相邻 {}；明确断链 {}（光标 {}、锚点文字/选区 {}、Context {}）；范围不可用回退 {}；键盘连续回退 {}。",
+            count(NativePersonalPhraseAdjacency::FirstAnchor),
+            count(NativePersonalPhraseAdjacency::VerifiedAdjacent),
+            explicit_breaks,
+            count(NativePersonalPhraseAdjacency::CaretMoved),
+            count(NativePersonalPhraseAdjacency::AnchorTextChanged),
+            count(NativePersonalPhraseAdjacency::ContextChanged),
+            count(NativePersonalPhraseAdjacency::RangeUnavailable),
+            count(NativePersonalPhraseAdjacency::KeyboardFallback),
         )
         .unwrap();
     }
@@ -1608,6 +1642,7 @@ impl ResearchReview {
             self.unidentified_runtime_batches,
         );
         self.render_capability_coverage(&mut output);
+        self.render_personal_phrase_adjacency(&mut output);
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；显式选择 {}；无法配对现场 {}。",
@@ -1672,6 +1707,7 @@ impl ResearchReview {
             self.unidentified_runtime_batches,
         );
         self.render_capability_coverage(&mut output);
+        self.render_personal_phrase_adjacency(&mut output);
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；显式选择 {}；无法配对现场 {}。",
@@ -1808,6 +1844,7 @@ impl ResearchReview {
         )
         .unwrap();
         self.render_capability_coverage(&mut output);
+        self.render_personal_phrase_adjacency(&mut output);
         writeln!(
             output,
             "提交：{}；首选 {}（{:.1}%）；非首选 {}；翻页后 {}；取消 {}；原码上屏 {}；提交后紧接退格 {}。",
@@ -2189,6 +2226,18 @@ fn public_candidate_order_policy_index(policy: WishPublicCandidateOrderPolicy) -
         WishPublicCandidateOrderPolicy::Unrecorded => 0,
         WishPublicCandidateOrderPolicy::ConservativeCoreFirst => 1,
         WishPublicCandidateOrderPolicy::ExperimentalCrossDictionaryConsensus => 2,
+    }
+}
+
+fn personal_phrase_adjacency_index(adjacency: NativePersonalPhraseAdjacency) -> usize {
+    match adjacency {
+        NativePersonalPhraseAdjacency::KeyboardFallback => 0,
+        NativePersonalPhraseAdjacency::FirstAnchor => 1,
+        NativePersonalPhraseAdjacency::VerifiedAdjacent => 2,
+        NativePersonalPhraseAdjacency::CaretMoved => 3,
+        NativePersonalPhraseAdjacency::AnchorTextChanged => 4,
+        NativePersonalPhraseAdjacency::ContextChanged => 5,
+        NativePersonalPhraseAdjacency::RangeUnavailable => 6,
     }
 }
 
@@ -3375,6 +3424,11 @@ mod tests {
                 absolute_rank: 1,
                 visible_rank: 1,
             },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                previous_components: 1,
+                resulting_components: 2,
+            },
             NativeFeedbackEvent::CandidateSuppressionChanged {
                 code: "dago".to_owned(),
                 text: "打过".to_owned(),
@@ -3439,6 +3493,11 @@ mod tests {
         assert_eq!(review.non_top_commits, 1);
         assert_eq!(review.candidate_suppression_actions, 1);
         assert_eq!(review.candidate_restore_actions, 1);
+        assert_eq!(
+            review.personal_phrase_adjacencies
+                [personal_phrase_adjacency_index(NativePersonalPhraseAdjacency::VerifiedAdjacent,)],
+            1
+        );
         assert_eq!(review.popup_first_frame_ms, [7, 65]);
         assert_eq!(review.popup_ms, [20, 130]);
         assert_eq!(review.initial_popup_ms, [20]);
@@ -3480,8 +3539,10 @@ mod tests {
         assert!(aggregate.contains("精确个性化证据 1/1 批"));
         assert!(aggregate.contains("实际个人重排原因 1/1 批"));
         assert!(aggregate.contains("显式遗忘/恢复动作 1/1 批"));
+        assert!(aggregate.contains("个人短语文档邻接 1/1 批"));
+        assert!(aggregate.contains("个人短语文档邻接：首锚点 0；已验证相邻 1；明确断链 0"));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V15 1"));
+        assert!(aggregate.contains("反馈格式：V16 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"

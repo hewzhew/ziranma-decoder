@@ -796,7 +796,8 @@ fn observe_event(
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::PostCommitBackspaceRouted
-        | NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {}
+        | NativeFeedbackEvent::CandidateSuppressionChanged { .. }
+        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
         NativeFeedbackEvent::CandidateCommitted { code, text, .. } => {
             let mut episode = pending
                 .take()
@@ -984,7 +985,8 @@ mod tests {
         FrozenNativeFeedbackSnapshot, NativeAutomaticTranspositionDecision,
         NativeAutomaticTranspositionTier, NativeCandidateProvenance, NativeCandidateSource,
         NativeCandidateView, NativeFeedbackFreezeAuthorization, NativeFeedbackSession,
-        NativeSelectionSource, WishCaptureScope, WishCategory, WishJournalAnchor, WishJournalSpan,
+        NativePersonalPhraseAdjacency, NativeSelectionSource, WishCaptureScope, WishCategory,
+        WishJournalAnchor, WishJournalSpan,
     };
 
     fn snapshot(
@@ -1069,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_batches_join_before_adaptive_scene_segmentation() {
+    fn storage_batches_and_followup_metadata_join_before_adaptive_scene_segmentation() {
         let stream = "12".repeat(32);
         let first = snapshot(
             &stream,
@@ -1083,7 +1085,18 @@ mod tests {
             1,
             2,
             Some(5_000),
-            vec![(100, committed("cc", "丙")), (110, committed("dd", "丁"))],
+            vec![
+                (
+                    99,
+                    NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                        adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                        previous_components: 1,
+                        resulting_components: 2,
+                    },
+                ),
+                (100, committed("cc", "丙")),
+                (110, committed("dd", "丁")),
+            ],
         );
 
         let report = analyze_linked_research(&[first, second], &[]).unwrap();

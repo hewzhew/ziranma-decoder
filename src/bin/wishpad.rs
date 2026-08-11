@@ -64,13 +64,14 @@ mod windows_app {
     use ziranma_core::{
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
         NativeAutomaticTranspositionTier, NativeCandidateSuppressionAction, NativeFeedbackEvent,
-        WindowsUserDataProtector, WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError,
-        WishImportance, WishNote, WishNoteFileVersion, WishPackageInfo,
-        WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot, list_trashed_wish_packages,
-        list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
-        load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms,
-        repository_root_for_user_tool_executable, restore_wish_from_trash,
-        save_or_replace_wish_note, trashed_wish_note_file_version, wish_note_file_version,
+        NativePersonalPhraseAdjacency, WindowsUserDataProtector, WishCaptureScope, WishCategory,
+        WishEventRole, WishFeedbackError, WishImportance, WishNote, WishNoteFileVersion,
+        WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot,
+        list_trashed_wish_packages, list_wish_packages, load_trashed_wish_note,
+        load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot, move_wish_to_trash,
+        native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+        restore_wish_from_trash, save_or_replace_wish_note, trashed_wish_note_file_version,
+        wish_note_file_version,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -2724,6 +2725,28 @@ mod windows_app {
             NativeFeedbackEvent::PostCommitBackspaceRouted => {
                 "提交后退格　已交给宿主；结果未观测".to_owned()
             }
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency,
+                previous_components,
+                resulting_components,
+            } => format!(
+                "个人短语邻接　{}；组件 {} → {}",
+                personal_phrase_adjacency_summary(*adjacency),
+                previous_components,
+                resulting_components
+            ),
+        }
+    }
+
+    fn personal_phrase_adjacency_summary(adjacency: NativePersonalPhraseAdjacency) -> &'static str {
+        match adjacency {
+            NativePersonalPhraseAdjacency::KeyboardFallback => "键盘连续回退",
+            NativePersonalPhraseAdjacency::FirstAnchor => "首个锚点",
+            NativePersonalPhraseAdjacency::VerifiedAdjacent => "文档已验证相邻",
+            NativePersonalPhraseAdjacency::CaretMoved => "光标已移动",
+            NativePersonalPhraseAdjacency::AnchorTextChanged => "锚点文字或选区已变化",
+            NativePersonalPhraseAdjacency::ContextChanged => "文档上下文已变化",
+            NativePersonalPhraseAdjacency::RangeUnavailable => "范围不可用，保守回退",
         }
     }
 
