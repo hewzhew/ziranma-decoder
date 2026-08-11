@@ -181,6 +181,7 @@ impl NativeCandidatePersonalization {
 pub struct NativeCandidateProvenance {
     source: NativeCandidateSource,
     personalization: NativeCandidatePersonalization,
+    ranking_personalization: NativeCandidatePersonalization,
 }
 
 impl NativeCandidateProvenance {
@@ -192,6 +193,7 @@ impl NativeCandidateProvenance {
             } else {
                 NativeCandidatePersonalization::NONE
             },
+            ranking_personalization: NativeCandidatePersonalization::NONE,
         }
     }
 
@@ -202,7 +204,20 @@ impl NativeCandidateProvenance {
         Self {
             source,
             personalization,
+            ranking_personalization: NativeCandidatePersonalization::NONE,
         }
+    }
+
+    pub fn with_personalization_and_ranking(
+        source: NativeCandidateSource,
+        personalization: NativeCandidatePersonalization,
+        ranking_personalization: NativeCandidatePersonalization,
+    ) -> Option<Self> {
+        (ranking_personalization.bits() & !personalization.bits() == 0).then_some(Self {
+            source,
+            personalization,
+            ranking_personalization,
+        })
     }
 
     pub fn source(self) -> NativeCandidateSource {
@@ -217,8 +232,17 @@ impl NativeCandidateProvenance {
         self.personalization
     }
 
+    pub fn ranking_personalization(self) -> NativeCandidatePersonalization {
+        self.ranking_personalization
+    }
+
     pub fn add_personalization(&mut self, reason: NativeCandidatePersonalization) {
         self.personalization = self.personalization.with(reason);
+    }
+
+    pub fn add_ranking_personalization(&mut self, reason: NativeCandidatePersonalization) {
+        self.personalization = self.personalization.with(reason);
+        self.ranking_personalization = self.ranking_personalization.with(reason);
     }
 }
 
@@ -1442,6 +1466,24 @@ mod tests {
             Some(personalization)
         );
         assert!(NativeCandidatePersonalization::from_bits(1 << 7).is_none());
+
+        let ranking = NativeCandidatePersonalization::LEFT_CONTEXT;
+        let provenance = NativeCandidateProvenance::with_personalization_and_ranking(
+            NativeCandidateSource::CoreExact,
+            personalization,
+            ranking,
+        )
+        .unwrap();
+        assert_eq!(provenance.personalization(), personalization);
+        assert_eq!(provenance.ranking_personalization(), ranking);
+        assert!(
+            NativeCandidateProvenance::with_personalization_and_ranking(
+                NativeCandidateSource::CoreExact,
+                NativeCandidatePersonalization::PERSISTENT_EXACT,
+                NativeCandidatePersonalization::LEFT_CONTEXT,
+            )
+            .is_none()
+        );
     }
 
     fn page() -> NativeFeedbackEvent {

@@ -393,13 +393,13 @@ pub use wish_feedback::{
     WISH_NOTE_FILE_SUFFIX, WISH_PACKAGE_FILE_SUFFIX, WISH_SCHEMA_V1, WISH_SCHEMA_V2,
     WISH_SCHEMA_V3, WISH_SCHEMA_V4, WISH_SCHEMA_V5, WISH_SCHEMA_V6, WISH_SCHEMA_V7, WISH_SCHEMA_V8,
     WISH_SCHEMA_V9, WISH_SCHEMA_V10, WISH_SCHEMA_V11, WISH_SCHEMA_V12, WISH_SCHEMA_V13,
-    WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance,
-    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishNote, WishNoteFileVersion,
-    WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus, WishRuntimeIdentity,
-    WishSaveReceipt, WishSnapshot, list_trashed_wish_packages, list_wish_packages,
-    load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot,
-    move_wish_to_trash, restore_wish_from_trash, save_or_replace_wish_note, save_wish_note,
-    save_wish_snapshot, trashed_wish_note_file_version, wish_note_file_version,
+    WISH_SCHEMA_V14, WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError,
+    WishImportance, WishJournalAnchor, WishJournalContext, WishJournalSpan, WishNote,
+    WishNoteFileVersion, WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus,
+    WishRuntimeIdentity, WishSaveReceipt, WishSnapshot, list_trashed_wish_packages,
+    list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
+    load_wish_snapshot, move_wish_to_trash, restore_wish_from_trash, save_or_replace_wish_note,
+    save_wish_note, save_wish_snapshot, trashed_wish_note_file_version, wish_note_file_version,
 };
 
 const BIGRAM_INTERPOLATION_WEIGHT: f64 = 0.65;

@@ -368,6 +368,9 @@ fn mirror_candidate_promotion(
     if !personalization.is_empty() {
         if let Some(provenance) = batch.provenance.get_mut(promotion.index) {
             provenance.add_personalization(personalization);
+            if promotion.changed {
+                provenance.add_ranking_personalization(personalization);
+            }
         }
         if let Some(marker) = batch.personalized.get_mut(promotion.index) {
             *marker = true;
@@ -10414,6 +10417,47 @@ mod tests {
                 .personalization()
                 .contains(NativeCandidatePersonalization::SESSION_EXACT)
         );
+        assert!(
+            batch.provenance[0]
+                .ranking_personalization()
+                .contains(NativeCandidatePersonalization::SESSION_EXACT)
+        );
+    }
+
+    #[test]
+    fn unchanged_public_position_keeps_evidence_separate_from_a_ranking_change() {
+        let mut batch = CandidateBatch {
+            candidates: vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()],
+            provenance: vec![
+                NativeCandidateProvenance::default(),
+                NativeCandidateProvenance::default(),
+                NativeCandidateProvenance::default(),
+            ],
+            personalized: vec![false; 3],
+            protected_prefix_len: 0,
+            automatic_transposition: None,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+        };
+
+        mirror_candidate_promotion(
+            &mut batch,
+            CandidateTextPromotion {
+                index: 0,
+                source_index: Some(0),
+                changed: false,
+            },
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+        );
+
+        assert_eq!(batch.candidates, ["甲", "乙", "丙"]);
+        assert_eq!(batch.personalized, [true, false, false]);
+        assert!(
+            batch.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        assert!(batch.provenance[0].ranking_personalization().is_empty());
     }
 
     #[test]
@@ -10815,6 +10859,11 @@ mod tests {
             [true, false, false],
             "persistent evidence must mark its protected candidate, not the first unprotected slot"
         );
+        assert!(
+            candidates.provenance[0]
+                .ranking_personalization()
+                .is_empty()
+        );
 
         let session = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             ProtectedSelectionCandidateProvider,
@@ -10836,6 +10885,11 @@ mod tests {
             candidates.personalized,
             [true, false, false],
             "session evidence must keep the same marker identity"
+        );
+        assert!(
+            candidates.provenance[0]
+                .ranking_personalization()
+                .is_empty()
         );
     }
 
@@ -17549,9 +17603,18 @@ mod tests {
                 .contains(NativeCandidatePersonalization::LEFT_CONTEXT)
         );
         assert!(
+            matching.provenance[0]
+                .ranking_personalization()
+                .contains(NativeCandidatePersonalization::LEFT_CONTEXT)
+        );
+        assert!(
             matching.provenance[1]
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        assert!(
+            matching.provenance[1].ranking_personalization().is_empty(),
+            "persistent evidence that already matched the public top must not claim the later context reorder"
         );
         let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
             candidates,

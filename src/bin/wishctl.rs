@@ -540,17 +540,21 @@ fn print_event(event: &NativeFeedbackEvent) {
                 .zip(provenance)
                 .enumerate()
                 .map(|(index, (text, provenance))| {
-                    let personalization =
-                        candidate_personalization_label(provenance.personalization());
+                    let evidence = candidate_personalization_label(provenance.personalization());
+                    let ranking =
+                        candidate_personalization_label(provenance.ranking_personalization());
                     format!(
                         "{} {text}〔{}{}〕",
                         page_start + index + 1,
                         candidate_source_label(provenance.source()),
-                        if personalization.is_empty() {
-                            String::new()
-                        } else {
-                            format!("，{personalization}")
-                        }
+                        [
+                            (!evidence.is_empty()).then(|| format!("个人证据 {evidence}")),
+                            (!ranking.is_empty()).then(|| format!("实际重排 {ranking}")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(|label| format!("，{label}"))
+                        .collect::<String>()
                     )
                 })
                 .collect::<Vec<_>>()
@@ -850,6 +854,7 @@ mod tests {
         assert_eq!(wish_schema_version_label(11), "V11");
         assert_eq!(wish_schema_version_label(12), "V12");
         assert_eq!(wish_schema_version_label(13), "V13");
+        assert_eq!(wish_schema_version_label(14), "V14");
     }
 
     #[test]

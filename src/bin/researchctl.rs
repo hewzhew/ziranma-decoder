@@ -562,54 +562,54 @@ struct InitialNonTopEvidence {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PersonalizedTopBypassAudit {
-    precise_non_top_commits: usize,
+    ranking_capable_non_top_commits: usize,
     top_provenance_observations: usize,
-    personalized_top_commits: usize,
-    unpersonalized_top_commits: usize,
-    personalization_reasons: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
-    stacked_personalization_commits: usize,
+    reranked_top_commits: usize,
+    nonreranked_top_commits: usize,
+    ranking_reasons: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    stacked_ranking_commits: usize,
     replacement_provenance_observations: usize,
-    personalized_replacements: usize,
-    unpersonalized_replacements: usize,
+    reranked_replacements: usize,
+    nonreranked_replacements: usize,
 }
 
 impl PersonalizedTopBypassAudit {
     fn observe(
         &mut self,
         rank: usize,
-        precise_personalization: bool,
+        precise_ranking_personalization: bool,
         replacement: Option<NativeCandidateProvenance>,
         global_top: Option<NativeCandidateProvenance>,
     ) {
-        if rank <= 1 || !precise_personalization {
+        if rank <= 1 || !precise_ranking_personalization {
             return;
         }
-        self.precise_non_top_commits += 1;
+        self.ranking_capable_non_top_commits += 1;
         let Some(global_top) = global_top else {
             return;
         };
         self.top_provenance_observations += 1;
-        let personalization = global_top.personalization();
-        if personalization.is_empty() {
-            self.unpersonalized_top_commits += 1;
+        let ranking = global_top.ranking_personalization();
+        if ranking.is_empty() {
+            self.nonreranked_top_commits += 1;
             return;
         }
 
-        self.personalized_top_commits += 1;
+        self.reranked_top_commits += 1;
         let mut reason_count = 0;
         for (index, (reason, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
-            if personalization.contains(*reason) {
-                self.personalization_reasons[index] += 1;
+            if ranking.contains(*reason) {
+                self.ranking_reasons[index] += 1;
                 reason_count += 1;
             }
         }
-        self.stacked_personalization_commits += usize::from(reason_count >= 2);
+        self.stacked_ranking_commits += usize::from(reason_count >= 2);
         if let Some(replacement) = replacement {
             self.replacement_provenance_observations += 1;
-            if replacement.personalization().is_empty() {
-                self.unpersonalized_replacements += 1;
+            if replacement.ranking_personalization().is_empty() {
+                self.nonreranked_replacements += 1;
             } else {
-                self.personalized_replacements += 1;
+                self.reranked_replacements += 1;
             }
         }
     }
@@ -709,6 +709,7 @@ struct ResearchReview {
     slow_key_timing_capable_batches: usize,
     post_commit_backspace_capable_batches: usize,
     precise_personalization_capable_batches: usize,
+    precise_ranking_personalization_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
     public_candidate_order_policy_capable_batches: usize,
     public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
@@ -736,6 +737,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_post_commit_backspace_routing());
         self.precise_personalization_capable_batches +=
             usize::from(snapshot.supports_precise_candidate_personalization());
+        self.precise_ranking_personalization_capable_batches +=
+            usize::from(snapshot.supports_precise_candidate_ranking_personalization());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
         self.public_candidate_order_policy_capable_batches +=
@@ -839,7 +842,7 @@ impl ResearchReview {
                     );
                     self.personalized_top_bypass.observe(
                         *absolute_rank,
-                        snapshot.supports_precise_candidate_personalization(),
+                        snapshot.supports_precise_candidate_ranking_personalization(),
                         provenance,
                         global_top_provenance,
                     );
@@ -969,12 +972,14 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化原因 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
             self.batches,
             self.precise_personalization_capable_batches,
+            self.batches,
+            self.precise_ranking_personalization_capable_batches,
             self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
@@ -1292,28 +1297,28 @@ impl ResearchReview {
         let audit = self.personalized_top_bypass;
         writeln!(
             output,
-            "个人提升首选绕过审计：V11+ 非首选提交 {}；首选原因可比较 {}/{}（带个人原因 {}、未带个人原因 {}、来源缺失 {}）。",
-            audit.precise_non_top_commits,
+            "实际个人重排首选绕过审计：V14+ 非首选提交 {}；首选原因可比较 {}/{}（实际重排首选 {}、未发生个人重排 {}、来源缺失 {}）。",
+            audit.ranking_capable_non_top_commits,
             audit.top_provenance_observations,
-            audit.precise_non_top_commits,
-            audit.personalized_top_commits,
-            audit.unpersonalized_top_commits,
+            audit.ranking_capable_non_top_commits,
+            audit.reranked_top_commits,
+            audit.nonreranked_top_commits,
             audit
-                .precise_non_top_commits
+                .ranking_capable_non_top_commits
                 .saturating_sub(audit.top_provenance_observations),
         )
         .unwrap();
         writeln!(
             output,
-            "被绕过首选的个人原因（可叠加）：{}；多原因叠加 {}。替代候选来源 {}/{}；其中也带个人原因 {}、未带个人原因 {}、来源缺失 {}。",
-            render_candidate_personalization_counts(&audit.personalization_reasons),
-            audit.stacked_personalization_commits,
+            "被绕过首选的实际重排原因（可叠加）：{}；多原因叠加 {}。替代候选重排来源 {}/{}；其中也经个人重排 {}、未经个人重排 {}、来源缺失 {}。",
+            render_candidate_personalization_counts(&audit.ranking_reasons),
+            audit.stacked_ranking_commits,
             audit.replacement_provenance_observations,
-            audit.personalized_top_commits,
-            audit.personalized_replacements,
-            audit.unpersonalized_replacements,
+            audit.reranked_top_commits,
+            audit.reranked_replacements,
+            audit.nonreranked_replacements,
             audit
-                .personalized_top_commits
+                .reranked_top_commits
                 .saturating_sub(audit.replacement_provenance_observations),
         )
         .unwrap();
@@ -2545,24 +2550,31 @@ mod tests {
     }
 
     #[test]
-    fn personalized_top_bypass_audit_requires_precise_reasons_and_keeps_stacks_visible() {
-        let stacked_top = NativeCandidateProvenance::with_personalization(
+    fn reranked_top_bypass_audit_requires_v14_reasons_and_keeps_stacks_visible() {
+        let stacked = NativeCandidatePersonalization::PERSISTENT_EXACT
+            .with(NativeCandidatePersonalization::LEFT_CONTEXT);
+        let stacked_top = NativeCandidateProvenance::with_personalization_and_ranking(
             NativeCandidateSource::CoreExact,
-            NativeCandidatePersonalization::PERSISTENT_EXACT
-                .with(NativeCandidatePersonalization::LEFT_CONTEXT),
-        );
-        let session_top = NativeCandidateProvenance::with_personalization(
+            stacked,
+            stacked,
+        )
+        .unwrap();
+        let session_top = NativeCandidateProvenance::with_personalization_and_ranking(
             NativeCandidateSource::CoreExact,
             NativeCandidatePersonalization::SESSION_EXACT,
-        );
-        let personalized_replacement = NativeCandidateProvenance::with_personalization(
+            NativeCandidatePersonalization::SESSION_EXACT,
+        )
+        .unwrap();
+        let reranked_replacement = NativeCandidateProvenance::with_personalization_and_ranking(
             NativeCandidateSource::SupplementalExact,
             NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
-        );
+            NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
+        )
+        .unwrap();
         let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
         let mut audit = PersonalizedTopBypassAudit::default();
 
-        audit.observe(2, true, Some(personalized_replacement), Some(stacked_top));
+        audit.observe(2, true, Some(reranked_replacement), Some(stacked_top));
         audit.observe(3, true, Some(plain), Some(stacked_top));
         audit.observe(2, true, None, Some(session_top));
         audit.observe(2, true, None, Some(plain));
@@ -2577,15 +2589,15 @@ mod tests {
         assert_eq!(
             audit,
             PersonalizedTopBypassAudit {
-                precise_non_top_commits: 5,
+                ranking_capable_non_top_commits: 5,
                 top_provenance_observations: 4,
-                personalized_top_commits: 3,
-                unpersonalized_top_commits: 1,
-                personalization_reasons: reasons,
-                stacked_personalization_commits: 2,
+                reranked_top_commits: 3,
+                nonreranked_top_commits: 1,
+                ranking_reasons: reasons,
+                stacked_ranking_commits: 2,
                 replacement_provenance_observations: 2,
-                personalized_replacements: 1,
-                unpersonalized_replacements: 1,
+                reranked_replacements: 1,
+                nonreranked_replacements: 1,
             }
         );
 
@@ -2595,12 +2607,13 @@ mod tests {
         };
         let aggregate = review.render_aggregate();
         assert!(aggregate.contains(
-            "V11+ 非首选提交 5；首选原因可比较 4/5（带个人原因 3、未带个人原因 1、来源缺失 1）"
+            "V14+ 非首选提交 5；首选原因可比较 4/5（实际重排首选 3、未发生个人重排 1、来源缺失 1）"
         ));
         assert!(aggregate.contains("持久精确 2、会话精确 1、左侧上下文 2"));
         assert!(aggregate.contains("多原因叠加 2"));
         assert!(
-            aggregate.contains("替代候选来源 2/3；其中也带个人原因 1、未带个人原因 1、来源缺失 1")
+            aggregate
+                .contains("替代候选重排来源 2/3；其中也经个人重排 1、未经个人重排 1、来源缺失 1")
         );
     }
 
@@ -3428,8 +3441,9 @@ mod tests {
         assert!(aggregate.contains("候选更新（完全显示）长尾（固定阈值）：≥16 ms 1（100.00%）"));
         assert!(aggregate.contains("慢按键其余阶段（UI、状态、反馈及计时取整）：1 次"));
         assert!(aggregate.contains("候选规划 1；编辑会话 0；其余阶段 0；并列 0"));
-        assert!(aggregate.contains("精确个性化原因 1/1 批"));
-        assert!(aggregate.contains("反馈格式：V13 1"));
+        assert!(aggregate.contains("精确个性化证据 1/1 批"));
+        assert!(aggregate.contains("实际个人重排原因 1/1 批"));
+        assert!(aggregate.contains("反馈格式：V14 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"
