@@ -59,6 +59,8 @@ pub struct ExactShortPageSession {
     requested_limit: usize,
     primary: Vec<String>,
     candidates: Vec<String>,
+    primary_indices: Vec<Option<usize>>,
+    primary_exhausted: bool,
     second_page_decided: bool,
 }
 
@@ -122,17 +124,19 @@ impl ExactShortPageSession {
             return Err(ExactShortWordCatalogError::UnstablePrimaryPrefix);
         }
 
-        let candidates = if self.second_page_decided {
+        let (candidates, primary_indices) = if self.second_page_decided {
             let mut extended = self.candidates.clone();
-            for candidate in primary {
+            let mut primary_indices = self.primary_indices.clone();
+            for (primary_index, candidate) in primary.iter().enumerate() {
                 if extended.len() == total_limit {
                     break;
                 }
                 if !extended.contains(candidate) {
                     extended.push(candidate.clone());
+                    primary_indices.push(Some(primary_index));
                 }
             }
-            extended
+            (extended, primary_indices)
         } else if total_limit > page_size && primary.len() >= page_size {
             let merged = catalog.preview_candidate_texts_after_page_guarded(
                 primary,
@@ -150,13 +154,16 @@ impl ExactShortPageSession {
                 return Err(ExactShortWordCatalogError::UnstablePrimaryPrefix);
             }
             self.second_page_decided = true;
-            merged
+            let primary_indices = candidate_primary_indices(&merged, primary);
+            (merged, primary_indices)
         } else {
-            primary.to_vec()
+            (primary.to_vec(), (0..primary.len()).map(Some).collect())
         };
 
         self.primary = primary.to_vec();
         self.candidates = candidates;
+        self.primary_indices = primary_indices;
+        self.primary_exhausted = primary.len() < total_limit;
         self.requested_limit = total_limit;
         Ok(&self.candidates)
     }
@@ -171,12 +178,31 @@ impl ExactShortPageSession {
         self.requested_limit = 0;
         self.primary.clear();
         self.candidates.clear();
+        self.primary_indices.clear();
+        self.primary_exhausted = false;
         self.second_page_decided = false;
     }
 
     /// Returns the deepest logical request already represented by this state.
     pub fn requested_limit(&self) -> usize {
         self.requested_limit
+    }
+
+    /// Maps every returned candidate to its primary-layer index.
+    ///
+    /// `None` marks an identity inserted only by the exact-short catalog.
+    /// Indices remain valid for the deepest primary prefix accepted by this
+    /// session because any primary-prefix rewrite is rejected.
+    pub fn primary_indices(&self) -> &[Option<usize>] {
+        &self.primary_indices
+    }
+
+    /// Reports whether a deeper page may still exist after exact insertion.
+    ///
+    /// Exact candidates never turn an exhausted primary result into an
+    /// unknown-depth result, even when they fill the requested display bound.
+    pub fn may_have_more(&self) -> bool {
+        !self.primary_exhausted && self.requested_limit < MAX_CANDIDATE_SNAPSHOT_RANK
     }
 }
 
@@ -540,6 +566,23 @@ fn pack_code(code: &str) -> Option<u32> {
         return None;
     }
     Some(u32::from_be_bytes(bytes))
+}
+
+fn candidate_primary_indices(candidates: &[String], primary: &[String]) -> Vec<Option<usize>> {
+    let mut used = vec![false; primary.len()];
+    candidates
+        .iter()
+        .map(|candidate| {
+            let index = primary
+                .iter()
+                .enumerate()
+                .position(|(index, primary)| !used[index] && primary == candidate);
+            if let Some(index) = index {
+                used[index] = true;
+            }
+            index
+        })
+        .collect()
 }
 
 fn parse_canonical_frequency(value: &str) -> Option<u64> {
@@ -916,6 +959,11 @@ mod tests {
         assert_eq!(session.requested_limit(), 6);
         assert!(!session.second_page_decided);
         assert_eq!(session.candidates, primary[..6]);
+        assert_eq!(
+            session.primary_indices(),
+            &[Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+        assert!(session.may_have_more());
     }
 
     #[test]
@@ -952,11 +1000,67 @@ mod tests {
         assert_eq!(first, primary[..6]);
         assert_eq!(&second[..first.len()], first.as_slice());
         assert_eq!(&second[6..8], ["收束", "手术"]);
+        assert_eq!(
+            session.primary_indices(),
+            &[
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                None,
+                None,
+                Some(6),
+                Some(7),
+                Some(8),
+                Some(9),
+                Some(10),
+                Some(11),
+                Some(12),
+                Some(13),
+                Some(14),
+                Some(15),
+                Some(17),
+                Some(18),
+                Some(19),
+                Some(20),
+                Some(21),
+                Some(22),
+                Some(23),
+                Some(24),
+                Some(25),
+                Some(26),
+                Some(27),
+                Some(28),
+                Some(29),
+                Some(30),
+                Some(31),
+                Some(32),
+                Some(33),
+                Some(34),
+                Some(35),
+                Some(36),
+                Some(37),
+                Some(38),
+                Some(39),
+                Some(40),
+                Some(41),
+                Some(42),
+                Some(43),
+                Some(44),
+                Some(45),
+                Some(46),
+                Some(47),
+                Some(48),
+            ]
+        );
         assert_eq!(&third[..second.len()], second.as_slice());
         assert_eq!(&deepest[..third.len()], third.as_slice());
         assert_eq!(deepest.len(), 50);
         assert_eq!(deepest.iter().collect::<HashSet<_>>().len(), deepest.len());
         assert_eq!(session.requested_limit(), 50);
+        assert!(!session.may_have_more());
 
         let independently_recomputed = catalog
             .preview_candidate_texts_after_page_guarded(&primary[..18], "ubuu", 18, 2, 6)
@@ -975,6 +1079,33 @@ mod tests {
             deepest,
             "shallower navigation reuses the deepest high-water result"
         );
+    }
+
+    #[test]
+    fn page_session_keeps_primary_exhaustion_distinct_from_an_exactly_filled_result() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = (1..=6)
+            .map(|rank| format!("基础{rank}"))
+            .collect::<Vec<_>>();
+        let mut session = ExactShortPageSession::default();
+
+        let candidates = session.extend(&catalog, &primary, "ubuu", 8, 2, 6).unwrap();
+        assert_eq!(candidates.len(), 8);
+        assert_eq!(&candidates[6..], ["收束", "手术"]);
+        assert_eq!(
+            session.primary_indices(),
+            &[
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                None,
+                None
+            ]
+        );
+        assert!(!session.may_have_more());
     }
 
     #[test]

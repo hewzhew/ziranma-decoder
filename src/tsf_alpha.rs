@@ -34,6 +34,7 @@ use crate::{
     CompositionPunctuation, CompositionSession,
     DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
     DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder,
+    ExactShortPageSession, ExactShortWordCatalog, ExactShortWordCatalogError,
     ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot, LoadedPersonalRanking,
     LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
@@ -255,6 +256,12 @@ struct CandidateDataIdentity {
     supplemental_revision: Option<String>,
 }
 
+#[derive(Clone)]
+struct ExactShortCandidateLayer {
+    catalog: Arc<ExactShortWordCatalog>,
+    exact_promotions: usize,
+}
+
 trait CandidateProvider: Send + Sync {
     /// Returns one deterministic, bounded candidate page without learning or
     /// I/O. Implementations should decode once rather than once per rank.
@@ -263,6 +270,15 @@ trait CandidateProvider: Send + Sync {
     /// Immutable public candidate-data revisions used by this provider.
     /// Synthetic providers and legacy tests may leave the identity unknown.
     fn candidate_data_identity(&self) -> Option<CandidateDataIdentity> {
+        None
+    }
+
+    /// Returns an optional authenticated exact-short layer for lazy pages.
+    ///
+    /// Production providers leave this disabled until a separately reviewed
+    /// runtime slot is available. The candidate cache owns all page-state and
+    /// never asks this layer to affect the first visible page.
+    fn exact_short_layer(&self) -> Option<ExactShortCandidateLayer> {
         None
     }
 
@@ -491,6 +507,16 @@ struct CandidateCache {
     automatic_transposition_outcome: AutomaticTranspositionOutcome,
     automatic_transposition_recovered_text: Option<String>,
     automatic_transposition_visible_rank: Option<usize>,
+    exact_short_page_session: ExactShortPageSession,
+    exact_short_layer_state: ExactShortLayerState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExactShortLayerState {
+    #[default]
+    Unseen,
+    Disabled,
+    Enabled,
 }
 
 impl CandidateCache {
@@ -503,6 +529,59 @@ impl CandidateCache {
         view: InteractiveCandidateView,
     ) -> CandidateBatch {
         self.load_with_automatic_transposition(provider, code, requested_limit, view, None)
+    }
+
+    fn candidate_batch(&self, view: InteractiveCandidateView) -> CandidateBatch {
+        CandidateBatch {
+            candidates: self.candidates.clone(),
+            resolved_shape_codes: vec![None; self.candidates.len()],
+            provenance: self.provenance.clone(),
+            personalized: vec![false; self.candidates.len()],
+            protected_prefix_len: self.protected_prefix_len,
+            automatic_transposition: self.automatic_transposition_decision(),
+            may_have_more: !self.exhausted && self.requested_limit < CANDIDATE_LIMIT,
+            view,
+        }
+    }
+
+    fn apply_exact_short_layer(
+        &mut self,
+        layer: &ExactShortCandidateLayer,
+        code: &str,
+        requested_limit: usize,
+        output: &mut CandidateProviderOutput,
+    ) -> std::result::Result<bool, ExactShortWordCatalogError> {
+        let primary_candidates = output.candidates.clone();
+        let primary_provenance = output.provenance.clone();
+        let candidates = self
+            .exact_short_page_session
+            .extend(
+                &layer.catalog,
+                &primary_candidates,
+                code,
+                requested_limit,
+                layer.exact_promotions,
+                CANDIDATE_PAGE_SIZE,
+            )?
+            .to_vec();
+        let primary_indices = self.exact_short_page_session.primary_indices();
+        let mut provenance = Vec::with_capacity(primary_indices.len());
+        for primary_index in primary_indices {
+            provenance.push(match primary_index {
+                Some(index) => *primary_provenance
+                    .get(*index)
+                    .ok_or(ExactShortWordCatalogError::UnstablePrimaryPrefix)?,
+                None => NativeCandidateProvenance::new(
+                    NativeCandidateSource::PublicConsensusExact,
+                    false,
+                ),
+            });
+        }
+        debug_assert_eq!(candidates.len(), provenance.len());
+        output.candidates = candidates;
+        output.provenance = provenance;
+        output.protected_prefix_len = output.protected_prefix_len.min(output.candidates.len());
+        Ok(!self.exact_short_page_session.may_have_more())
     }
 
     fn load_with_automatic_transposition(
@@ -521,6 +600,8 @@ impl CandidateCache {
             self.automatic_transposition_outcome = AutomaticTranspositionOutcome::NotRequested;
             self.automatic_transposition_recovered_text = None;
             self.automatic_transposition_visible_rank = None;
+            self.exact_short_page_session.clear();
+            self.exact_short_layer_state = ExactShortLayerState::Unseen;
         }
         if let Some(request) = requested_transposition
             && self.automatic_transposition_request != Some(request)
@@ -538,10 +619,59 @@ impl CandidateCache {
                 output.provenance =
                     vec![NativeCandidateProvenance::default(); output.candidates.len()];
             }
+            let mut exhausted = output.candidates.len() < requested_limit;
+            let exact_short_eligible = view == InteractiveCandidateView::Primary
+                && requested_limit > CANDIDATE_PAGE_SIZE
+                && code.len() == 4
+                && code.bytes().all(|byte| byte.is_ascii_lowercase());
+            if exact_short_eligible {
+                let preserve_cached_prefix = match self.exact_short_layer_state {
+                    ExactShortLayerState::Unseen => match provider.exact_short_layer() {
+                        Some(layer) => {
+                            match self.apply_exact_short_layer(
+                                &layer,
+                                code,
+                                requested_limit,
+                                &mut output,
+                            ) {
+                                Ok(projected_exhausted) => {
+                                    exhausted = projected_exhausted;
+                                    self.exact_short_layer_state = ExactShortLayerState::Enabled;
+                                }
+                                Err(_) => {
+                                    self.exact_short_page_session.clear();
+                                    self.exact_short_layer_state = ExactShortLayerState::Disabled;
+                                }
+                            }
+                            false
+                        }
+                        None => {
+                            self.exact_short_layer_state = ExactShortLayerState::Disabled;
+                            false
+                        }
+                    },
+                    ExactShortLayerState::Disabled => false,
+                    ExactShortLayerState::Enabled => {
+                        provider.exact_short_layer().is_none_or(|layer| {
+                            self.apply_exact_short_layer(&layer, code, requested_limit, &mut output)
+                                .map(|projected_exhausted| exhausted = projected_exhausted)
+                                .is_err()
+                        })
+                    }
+                };
+                if preserve_cached_prefix && same_query && !self.candidates.is_empty() {
+                    self.exhausted = true;
+                    return self.candidate_batch(view);
+                }
+            } else if requested_limit > CANDIDATE_PAGE_SIZE
+                && self.exact_short_layer_state == ExactShortLayerState::Unseen
+            {
+                self.exact_short_layer_state = ExactShortLayerState::Disabled;
+            }
             self.code.clear();
             self.code.push_str(code);
             self.view = view;
-            self.exhausted = output.candidates.len() < requested_limit;
+            self.exhausted = exhausted;
             self.requested_limit = requested_limit;
             self.candidates = output.candidates;
             self.provenance = output.provenance;
@@ -557,16 +687,7 @@ impl CandidateCache {
         {
             self.apply_automatic_transposition(provider, code, request);
         }
-        CandidateBatch {
-            candidates: self.candidates.clone(),
-            resolved_shape_codes: vec![None; self.candidates.len()],
-            provenance: self.provenance.clone(),
-            personalized: vec![false; self.candidates.len()],
-            protected_prefix_len: self.protected_prefix_len,
-            automatic_transposition: self.automatic_transposition_decision(),
-            may_have_more: !self.exhausted && self.requested_limit < CANDIDATE_LIMIT,
-            view,
-        }
+        self.candidate_batch(view)
     }
 
     fn automatic_transposition_decision(&self) -> Option<NativeAutomaticTranspositionDecision> {
@@ -622,10 +743,11 @@ impl CandidateCache {
         if self.requested_limit == 0
             || self.automatic_transposition_blocked
             || self.protected_prefix_len > 0
-            || self
-                .provenance
-                .iter()
-                .any(|item| native_source_is_explicit_exact(item.source()))
+            || self.provenance.iter().enumerate().any(|(index, item)| {
+                native_source_is_explicit_exact(item.source())
+                    && (item.source() != NativeCandidateSource::PublicConsensusExact
+                        || index < CANDIDATE_PAGE_SIZE)
+            })
         {
             self.automatic_transposition_effective_attempt = Some(request.primary);
             self.automatic_transposition_outcome =
@@ -11988,6 +12110,110 @@ mod tests {
         }
     }
 
+    struct ExactShortPagingCandidateProvider {
+        calls: AtomicUsize,
+        layer_requests: AtomicUsize,
+        layer_enabled: AtomicBool,
+        catalog: Arc<ExactShortWordCatalog>,
+    }
+
+    impl ExactShortPagingCandidateProvider {
+        fn new() -> Self {
+            const EXACT: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t90\n\
+手术\tshou shu\t80\n\
+首数\tshou shu\t70\n";
+            let manifest = CandidatePackageManifest::from_payload(
+                "tsf-exact-short-page-test-v1",
+                false,
+                EXACT,
+            )
+            .unwrap();
+            Self {
+                calls: AtomicUsize::new(0),
+                layer_requests: AtomicUsize::new(0),
+                layer_enabled: AtomicBool::new(true),
+                catalog: Arc::new(ExactShortWordCatalog::load(&manifest, EXACT).unwrap()),
+            }
+        }
+
+        fn primary_candidates(limit: usize) -> Vec<String> {
+            (1..=limit.min(CANDIDATE_LIMIT))
+                .map(|rank| {
+                    if rank == 17 {
+                        "收束".to_owned()
+                    } else {
+                        format!("基础{rank}")
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl CandidateProvider for ExactShortPagingCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if code == "ubuu" && view == InteractiveCandidateView::Primary {
+                Self::primary_candidates(limit)
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn candidates_with_provenance(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> CandidateProviderOutput {
+            let candidates = self.candidates(code, limit, view);
+            CandidateProviderOutput {
+                provenance: vec![
+                    NativeCandidateProvenance::new(
+                        NativeCandidateSource::Decoder,
+                        false
+                    );
+                    candidates.len()
+                ],
+                candidates,
+                protected_prefix_len: 0,
+                automatic_transposition_blocked: false,
+            }
+        }
+
+        fn exact_short_layer(&self) -> Option<ExactShortCandidateLayer> {
+            self.layer_requests.fetch_add(1, Ordering::Relaxed);
+            self.layer_enabled
+                .load(Ordering::Relaxed)
+                .then(|| ExactShortCandidateLayer {
+                    catalog: Arc::clone(&self.catalog),
+                    exact_promotions: 2,
+                })
+        }
+
+        fn automatic_transposition_candidates(
+            &self,
+            code: &str,
+            _pattern: AutomaticTranspositionPattern,
+            limit: usize,
+        ) -> Option<CandidateProviderOutput> {
+            (code == "ubuu" && limit > 0).then(|| CandidateProviderOutput {
+                candidates: vec!["换序恢复".to_owned()],
+                provenance: vec![NativeCandidateProvenance::new(
+                    NativeCandidateSource::TranspositionRecovery,
+                    false,
+                )],
+                protected_prefix_len: 0,
+                automatic_transposition_blocked: false,
+            })
+        }
+    }
+
     struct CountingProtectedPrefixCandidateProvider {
         candidate_calls: AtomicUsize,
         protected_prefix_calls: AtomicUsize,
@@ -21281,6 +21507,309 @@ mod tests {
             InteractiveCandidateView::TranspositionRecovery
         );
         assert_eq!(provider.calls.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn optional_exact_short_layer_freezes_candidate_and_provenance_prefixes() {
+        let provider = ExactShortPagingCandidateProvider::new();
+        let mut cache = CandidateCache::default();
+
+        let first = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            first.candidates,
+            ExactShortPagingCandidateProvider::primary_candidates(6)
+        );
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 0);
+
+        let second = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(&second.candidates[..6], first.candidates.as_slice());
+        assert_eq!(&second.candidates[6..8], ["收束", "手术"]);
+        assert_eq!(
+            second.provenance[6].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        assert_eq!(
+            second.provenance[7].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        assert!(
+            second
+                .provenance
+                .iter()
+                .enumerate()
+                .all(|(index, provenance)| index == 6
+                    || index == 7
+                    || provenance.source() == NativeCandidateSource::Decoder)
+        );
+        assert!(second.personalized.iter().all(|personalized| !personalized));
+        assert!(second.may_have_more);
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 1);
+
+        let third = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 3,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            &third.candidates[..second.candidates.len()],
+            second.candidates.as_slice()
+        );
+        assert_eq!(
+            &third.provenance[..second.provenance.len()],
+            second.provenance.as_slice()
+        );
+        assert!(third.may_have_more);
+
+        let deepest = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_LIMIT,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            &deepest.candidates[..third.candidates.len()],
+            third.candidates.as_slice()
+        );
+        assert_eq!(
+            &deepest.provenance[..third.provenance.len()],
+            third.provenance.as_slice()
+        );
+        assert_eq!(deepest.candidates.len(), CANDIDATE_LIMIT);
+        assert!(!deepest.may_have_more);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn enabled_exact_short_layer_disappearance_preserves_the_last_presented_page() {
+        let provider = ExactShortPagingCandidateProvider::new();
+        let mut cache = CandidateCache::default();
+        cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE,
+            InteractiveCandidateView::Primary,
+        );
+        let second = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+        );
+        provider.layer_enabled.store(false, Ordering::Relaxed);
+
+        let failed_extension = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 3,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            failed_extension.candidates.as_slice(),
+            second.candidates.as_slice()
+        );
+        assert_eq!(
+            failed_extension.provenance.as_slice(),
+            second.provenance.as_slice()
+        );
+        assert!(!failed_extension.may_have_more);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+
+        let repeated = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 3,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(repeated.candidates.as_slice(), second.candidates.as_slice());
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn disabled_exact_short_decision_cannot_appear_mid_composition() {
+        let provider = ExactShortPagingCandidateProvider::new();
+        let mut cache = CandidateCache::default();
+        cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE,
+            InteractiveCandidateView::Primary,
+        );
+        provider.layer_enabled.store(false, Ordering::Relaxed);
+        let second = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            second.candidates,
+            ExactShortPagingCandidateProvider::primary_candidates(12)
+        );
+
+        provider.layer_enabled.store(true, Ordering::Relaxed);
+        let third = cache.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 3,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(
+            third.candidates,
+            ExactShortPagingCandidateProvider::primary_candidates(18)
+        );
+        assert!(
+            third
+                .provenance
+                .iter()
+                .all(|provenance| provenance.source() == NativeCandidateSource::Decoder)
+        );
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn exact_short_pages_remain_aligned_after_session_personalization() {
+        let _guard = test_lock();
+        let provider = Arc::new(ExactShortPagingCandidateProvider::new());
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            provider.clone(),
+        )));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ubuu", "基础3");
+
+        let first = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(first.candidates[0], "基础3");
+        assert!(first.personalized[0]);
+        assert!(
+            first.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_EXACT)
+        );
+
+        let second = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE * 2,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            &second.candidates[..first.candidates.len()],
+            first.candidates.as_slice()
+        );
+        assert_eq!(
+            &second.provenance[..first.provenance.len()],
+            first.provenance.as_slice()
+        );
+        for exact in ["收束", "手术"] {
+            let index = second
+                .candidates
+                .iter()
+                .position(|candidate| candidate == exact)
+                .unwrap();
+            assert_eq!(
+                second.provenance[index].source(),
+                NativeCandidateSource::PublicConsensusExact
+            );
+            assert!(!second.personalized[index]);
+        }
+
+        let third = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE * 3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            &third.candidates[..second.candidates.len()],
+            second.candidates.as_slice()
+        );
+        assert_eq!(
+            &third.provenance[..second.provenance.len()],
+            second.provenance.as_slice()
+        );
+        assert_eq!(
+            &third.personalized[..second.personalized.len()],
+            second.personalized.as_slice()
+        );
+    }
+
+    #[test]
+    fn second_page_exact_words_do_not_retract_first_page_automatic_recovery() {
+        let provider = ExactShortPagingCandidateProvider::new();
+        let mut cache = CandidateCache::default();
+        let request = reversed_single_pair_request(AutomaticTranspositionTier::Primary);
+
+        let first = cache.load_with_automatic_transposition(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE,
+            InteractiveCandidateView::Primary,
+            Some(request),
+        );
+        assert_eq!(first.candidates[0], "换序恢复");
+        assert_eq!(
+            first.provenance[0].source(),
+            NativeCandidateSource::TranspositionRecovery
+        );
+
+        let second = cache.load_with_automatic_transposition(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+            Some(request),
+        );
+        assert_eq!(
+            &second.candidates[..first.candidates.len()],
+            first.candidates.as_slice()
+        );
+        assert_eq!(
+            &second.provenance[..first.provenance.len()],
+            first.provenance.as_slice()
+        );
+        assert!(
+            second
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "收束")
+        );
+        assert!(
+            second
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "手术")
+        );
+        assert_eq!(
+            second
+                .automatic_transposition
+                .as_ref()
+                .map(NativeAutomaticTranspositionDecision::outcome),
+            Some(NativeAutomaticTranspositionOutcome::RecoveryAvailable)
+        );
     }
 
     #[test]
