@@ -69,6 +69,12 @@ pub(crate) struct InteractiveCandidateQuery {
     pub(crate) automatic_transposition_blocked: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactSingleCharacterCandidate {
+    pub(crate) text: String,
+    pub(crate) full_code: String,
+}
+
 /// A conservative, host-independent decision about one likely reversed
 /// double-pinyin pair.
 ///
@@ -366,11 +372,11 @@ impl CandidateSnapshot {
     /// syllable. Every returned character comes from a complete exact two-key
     /// lexicon entry whose first key equals `initial`; abbreviations,
     /// corrections, sentence paths, and unresolved input are excluded.
-    pub fn initial_single_character_texts(
+    pub(crate) fn initial_single_character_candidates(
         &self,
         initial: &str,
         limit: usize,
-    ) -> Result<Vec<String>, KeySequenceError> {
+    ) -> Result<Vec<ExactSingleCharacterCandidate>, KeySequenceError> {
         let initial = KeySequence::new(initial)?;
         let requested_limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
         if initial.as_str().len() != 1 || requested_limit == 0 {
@@ -402,7 +408,10 @@ impl CandidateSnapshot {
         candidates.truncate(requested_limit);
         Ok(candidates
             .into_iter()
-            .map(|candidate| candidate.text)
+            .map(|candidate| ExactSingleCharacterCandidate {
+                text: candidate.text,
+                full_code: candidate.code.as_str().to_owned(),
+            })
             .collect())
     }
 
@@ -1952,20 +1961,45 @@ mod tests {
         let snapshot = load_test_snapshot("initial-slot-v1", lexicon, 5);
 
         assert_eq!(
-            snapshot.initial_single_character_texts("j", 10).unwrap(),
-            ["甲", "丁", "乙"]
+            snapshot
+                .initial_single_character_candidates("j", 10)
+                .unwrap(),
+            [
+                ExactSingleCharacterCandidate {
+                    text: "甲".to_owned(),
+                    full_code: "jv".to_owned(),
+                },
+                ExactSingleCharacterCandidate {
+                    text: "丁".to_owned(),
+                    full_code: "jm".to_owned(),
+                },
+                ExactSingleCharacterCandidate {
+                    text: "乙".to_owned(),
+                    full_code: "ji".to_owned(),
+                },
+            ]
         );
         assert_eq!(
-            snapshot.initial_single_character_texts("j", 2).unwrap(),
+            snapshot
+                .initial_single_character_candidates("j", 2)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.text)
+                .collect::<Vec<_>>(),
             ["甲", "丁"]
         );
         assert_eq!(
-            snapshot.initial_single_character_texts("b", 10).unwrap(),
-            ["丙"]
+            snapshot
+                .initial_single_character_candidates("b", 10)
+                .unwrap(),
+            [ExactSingleCharacterCandidate {
+                text: "丙".to_owned(),
+                full_code: "ba".to_owned(),
+            }]
         );
         assert!(
             snapshot
-                .initial_single_character_texts("jd", 10)
+                .initial_single_character_candidates("jd", 10)
                 .unwrap()
                 .is_empty()
         );

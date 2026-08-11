@@ -82,6 +82,7 @@ pub enum CompositionEffect {
 struct TabAssembly {
     pinyin_segments: Vec<String>,
     selected: Vec<String>,
+    selected_codes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +95,7 @@ pub(crate) enum TabAssemblyStage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TabAssemblySelection {
     Advanced,
-    Complete(String),
+    Complete { text: String, full_code: String },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -391,6 +392,7 @@ impl CompositionSession {
             .map(|assembly| assembly.pinyin_segments.len())
     }
 
+    #[cfg(test)]
     pub(crate) fn tab_assembly_has_trailing_initial(&self) -> bool {
         self.tab_assembly
             .as_ref()
@@ -489,6 +491,7 @@ impl CompositionSession {
                 .map(|pinyin| (*pinyin).to_owned())
                 .collect(),
             selected: Vec::with_capacity(pinyin_segments.len()),
+            selected_codes: Vec::with_capacity(pinyin_segments.len()),
         });
         self.candidate_page_start = 0;
         self.notice = None;
@@ -498,6 +501,7 @@ impl CompositionSession {
     pub(crate) fn accept_tab_assembly_candidate(
         &mut self,
         text: &str,
+        resolved_code: &str,
     ) -> Option<TabAssemblySelection> {
         let mut characters = text.chars();
         let character = characters.next()?;
@@ -506,8 +510,13 @@ impl CompositionSession {
         }
         let text = character.to_string();
         let assembly = self.tab_assembly.as_mut()?;
+        let active_slot = assembly.pinyin_segments.get(assembly.selected.len())?;
+        if !resolved_tab_slot_matches(active_slot, resolved_code) {
+            return None;
+        }
         if assembly.selected.len().saturating_add(1) < assembly.pinyin_segments.len() {
             assembly.selected.push(text);
+            assembly.selected_codes.push(resolved_code.to_owned());
             self.shape_pinyin = assembly
                 .pinyin_segments
                 .get(assembly.selected.len())
@@ -519,8 +528,13 @@ impl CompositionSession {
         } else {
             let mut combined = assembly.selected.concat();
             combined.push(character);
+            let mut full_code = assembly.selected_codes.concat();
+            full_code.push_str(resolved_code);
             self.finish_commit();
-            Some(TabAssemblySelection::Complete(combined))
+            Some(TabAssemblySelection::Complete {
+                text: combined,
+                full_code,
+            })
         }
     }
 
@@ -610,6 +624,7 @@ impl CompositionSession {
                 if self.stroke_prefix.pop().is_none() {
                     let previous_pinyin = self.tab_assembly.as_mut().and_then(|assembly| {
                         assembly.selected.pop()?;
+                        assembly.selected_codes.pop()?;
                         assembly
                             .pinyin_segments
                             .get(assembly.selected.len())
@@ -699,6 +714,16 @@ fn valid_tab_slot(slot: &str, trailing: bool) -> bool {
         && slot.as_bytes().iter().all(u8::is_ascii_lowercase)
 }
 
+fn resolved_tab_slot_matches(slot: &str, resolved_code: &str) -> bool {
+    resolved_code.len() == 2
+        && resolved_code.as_bytes().iter().all(u8::is_ascii_lowercase)
+        && if slot.len() == 1 {
+            resolved_code.starts_with(slot)
+        } else {
+            resolved_code == slot
+        }
+}
+
 fn canonical_shape_letters(letters: &str) -> Option<String> {
     letters
         .bytes()
@@ -758,7 +783,7 @@ mod tests {
         assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::First));
         assert_eq!(session.shape_pinyin(), Some("qt"));
         assert_eq!(
-            session.accept_tab_assembly_candidate("雀"),
+            session.accept_tab_assembly_candidate("雀", "qt"),
             Some(TabAssemblySelection::Advanced)
         );
         assert_eq!(session.phonetic(), "qthp");
@@ -766,8 +791,11 @@ mod tests {
         assert_eq!(session.shape_pinyin(), Some("hp"));
 
         assert_eq!(
-            session.accept_tab_assembly_candidate("魂"),
-            Some(TabAssemblySelection::Complete("雀魂".to_owned()))
+            session.accept_tab_assembly_candidate("魂", "hp"),
+            Some(TabAssemblySelection::Complete {
+                text: "雀魂".to_owned(),
+                full_code: "qthp".to_owned(),
+            })
         );
         assert!(session.phonetic().is_empty());
         assert!(!session.tab_mode());
@@ -780,7 +808,7 @@ mod tests {
         session.apply(CompositionInput::Letters("qthp".to_owned()));
         assert!(session.enter_tab_path(&["qt", "hp"]));
         assert_eq!(
-            session.accept_tab_assembly_candidate("雀"),
+            session.accept_tab_assembly_candidate("雀", "qt"),
             Some(TabAssemblySelection::Advanced)
         );
 
@@ -812,7 +840,7 @@ mod tests {
         assert!(!session.tab_mode());
 
         assert!(session.enter_tab_path(&["qt", "hp"]));
-        assert_eq!(session.accept_tab_assembly_candidate("雀魂"), None);
+        assert_eq!(session.accept_tab_assembly_candidate("雀魂", "qt"), None);
         assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::First));
 
         assert_eq!(
@@ -832,7 +860,7 @@ mod tests {
         assert!(session.tab_assembly_has_trailing_initial());
         assert_eq!(session.shape_pinyin(), Some("jd"));
         assert_eq!(
-            session.accept_tab_assembly_candidate("甲"),
+            session.accept_tab_assembly_candidate("甲", "jd"),
             Some(TabAssemblySelection::Advanced)
         );
         assert_eq!(session.shape_pinyin(), Some("j"));
@@ -849,6 +877,40 @@ mod tests {
     }
 
     #[test]
+    fn tab_assembly_requires_each_selected_character_to_match_its_resolved_code() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("jdj".to_owned()));
+        assert!(session.enter_tab_path(&["jd", "j"]));
+
+        assert_eq!(
+            session.accept_tab_assembly_candidate("甲", "jm"),
+            None,
+            "a complete two-key slot must reject a different exact identity"
+        );
+        assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::First));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("甲", "jd"),
+            Some(TabAssemblySelection::Advanced)
+        );
+
+        for invalid in ["", "j", "am", "Jm", "jmq"] {
+            assert_eq!(
+                session.accept_tab_assembly_candidate("件", invalid),
+                None,
+                "a trailing-initial slot must retain one valid full two-key identity"
+            );
+            assert_eq!(session.tab_assembly_stage(), Some(TabAssemblyStage::Second));
+        }
+        assert_eq!(
+            session.accept_tab_assembly_candidate("件", "jm"),
+            Some(TabAssemblySelection::Complete {
+                text: "甲件".to_owned(),
+                full_code: "jdjm".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn bounded_tab_path_advances_and_rewinds_one_character_at_a_time() {
         let mut session = CompositionSession::default();
         session.apply(CompositionInput::Letters("qthplmxi".to_owned()));
@@ -856,13 +918,13 @@ mod tests {
         assert!(!session.enter_tab_path(&["qt"]));
         assert!(!session.enter_tab_path(&["qt", "hp", "lm", "xi", "ab"]));
 
-        for (text, stage, pinyin, selected) in [
-            ("雀", TabAssemblyStage::Second, "hp", "雀"),
-            ("魂", TabAssemblyStage::Later(3), "lm", "雀魂"),
-            ("练", TabAssemblyStage::Later(4), "xi", "雀魂练"),
+        for (text, code, stage, pinyin, selected) in [
+            ("雀", "qt", TabAssemblyStage::Second, "hp", "雀"),
+            ("魂", "hp", TabAssemblyStage::Later(3), "lm", "雀魂"),
+            ("练", "lm", TabAssemblyStage::Later(4), "xi", "雀魂练"),
         ] {
             assert_eq!(
-                session.accept_tab_assembly_candidate(text),
+                session.accept_tab_assembly_candidate(text, code),
                 Some(TabAssemblySelection::Advanced)
             );
             assert_eq!(session.tab_assembly_stage(), Some(stage));
@@ -884,15 +946,18 @@ mod tests {
             assert_eq!(session.tab_assembly_selected_text().as_deref(), selected);
         }
 
-        for text in ["雀", "魂", "练"] {
+        for (text, code) in [("雀", "qt"), ("魂", "hp"), ("练", "lm")] {
             assert_eq!(
-                session.accept_tab_assembly_candidate(text),
+                session.accept_tab_assembly_candidate(text, code),
                 Some(TabAssemblySelection::Advanced)
             );
         }
         assert_eq!(
-            session.accept_tab_assembly_candidate("习"),
-            Some(TabAssemblySelection::Complete("雀魂练习".to_owned()))
+            session.accept_tab_assembly_candidate("习", "xi"),
+            Some(TabAssemblySelection::Complete {
+                text: "雀魂练习".to_owned(),
+                full_code: "qthplmxi".to_owned(),
+            })
         );
         assert!(session.phonetic().is_empty());
         assert!(!session.tab_mode());
@@ -900,15 +965,18 @@ mod tests {
         let mut three_character = CompositionSession::default();
         three_character.apply(CompositionInput::Letters("qthplm".to_owned()));
         assert!(three_character.enter_tab_path(&["qt", "hp", "lm"]));
-        for text in ["雀", "魂"] {
+        for (text, code) in [("雀", "qt"), ("魂", "hp")] {
             assert_eq!(
-                three_character.accept_tab_assembly_candidate(text),
+                three_character.accept_tab_assembly_candidate(text, code),
                 Some(TabAssemblySelection::Advanced)
             );
         }
         assert_eq!(
-            three_character.accept_tab_assembly_candidate("练"),
-            Some(TabAssemblySelection::Complete("雀魂练".to_owned()))
+            three_character.accept_tab_assembly_candidate("练", "lm"),
+            Some(TabAssemblySelection::Complete {
+                text: "雀魂练".to_owned(),
+                full_code: "qthplm".to_owned(),
+            })
         );
     }
 

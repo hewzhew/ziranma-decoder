@@ -329,9 +329,20 @@ trait CandidateProvider: Send + Sync {
     /// complete exact readings beginning with that trailing initial. The shape
     /// prefix is interpreted as the auditable union of stroke and component
     /// prefixes; ordinary providers may leave this unsupported.
-    fn shape_candidates(&self, _code: &str, _stroke_prefix: &str, _limit: usize) -> Vec<String> {
+    fn shape_candidates(
+        &self,
+        _code: &str,
+        _stroke_prefix: &str,
+        _limit: usize,
+    ) -> Vec<ShapeCandidate> {
         Vec::new()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShapeCandidate {
+    text: String,
+    resolved_code: String,
 }
 
 struct CandidateProviderOutput {
@@ -344,6 +355,7 @@ struct CandidateProviderOutput {
 #[derive(Clone, Default)]
 struct CandidateBatch {
     candidates: Vec<String>,
+    resolved_shape_codes: Vec<Option<String>>,
     provenance: Vec<NativeCandidateProvenance>,
     personalized: Vec<bool>,
     protected_prefix_len: usize,
@@ -367,6 +379,9 @@ fn mirror_candidate_promotion(
     }
     if !promotion.mirror_into(&mut batch.personalized, false, final_len) {
         batch.personalized = vec![false; final_len];
+    }
+    if !promotion.mirror_into(&mut batch.resolved_shape_codes, None, final_len) {
+        batch.resolved_shape_codes = vec![None; final_len];
     }
     if !personalization.is_empty() {
         if let Some(provenance) = batch.provenance.get_mut(promotion.index) {
@@ -464,6 +479,7 @@ impl CandidateCache {
         }
         CandidateBatch {
             candidates: self.candidates.clone(),
+            resolved_shape_codes: vec![None; self.candidates.len()],
             provenance: self.provenance.clone(),
             personalized: vec![false; self.candidates.len()],
             protected_prefix_len: self.protected_prefix_len,
@@ -1214,7 +1230,12 @@ impl CandidateProvider for SnapshotCandidateProvider {
             })
     }
 
-    fn shape_candidates(&self, code: &str, stroke_prefix: &str, limit: usize) -> Vec<String> {
+    fn shape_candidates(
+        &self,
+        code: &str,
+        stroke_prefix: &str,
+        limit: usize,
+    ) -> Vec<ShapeCandidate> {
         if !matches!(code.len(), 1 | 2)
             || limit == 0
             || !stroke_prefix.as_bytes().iter().all(u8::is_ascii_lowercase)
@@ -1226,17 +1247,25 @@ impl CandidateProvider for SnapshotCandidateProvider {
         };
         let candidates = if code.len() == 1 {
             self.snapshot
-                .initial_single_character_texts(code, CANDIDATE_LIMIT)
+                .initial_single_character_candidates(code, CANDIDATE_LIMIT)
                 .unwrap_or_default()
         } else {
             self.snapshot
                 .exact_full_code_texts(code, CANDIDATE_LIMIT)
                 .unwrap_or_default()
+                .into_iter()
+                .map(
+                    |text| crate::candidate_snapshot::ExactSingleCharacterCandidate {
+                        text,
+                        full_code: code.to_owned(),
+                    },
+                )
+                .collect()
         };
         candidates
             .into_iter()
             .filter(|candidate| {
-                let mut characters = candidate.chars();
+                let mut characters = candidate.text.chars();
                 let Some(character) = characters.next() else {
                     return false;
                 };
@@ -1254,6 +1283,10 @@ impl CandidateProvider for SnapshotCandidateProvider {
                                 .iter()
                                 .any(|code| code.starts_with(stroke_prefix))
                     })
+            })
+            .map(|candidate| ShapeCandidate {
+                text: candidate.text,
+                resolved_code: candidate.full_code,
             })
             .take(limit.min(CANDIDATE_LIMIT))
             .collect()
@@ -1483,6 +1516,7 @@ impl CandidateDisplay {
             CandidateBatch {
                 provenance: vec![NativeCandidateProvenance::default(); candidates.len()],
                 personalized: vec![false; candidates.len()],
+                resolved_shape_codes: vec![None; candidates.len()],
                 protected_prefix_len: 0,
                 candidates,
                 automatic_transposition: None,
@@ -1496,6 +1530,7 @@ impl CandidateDisplay {
     fn from_batch(batch: CandidateBatch, requested_page_start: usize) -> Self {
         let CandidateBatch {
             candidates,
+            resolved_shape_codes: _,
             mut provenance,
             mut personalized,
             protected_prefix_len: _,
@@ -2730,6 +2765,7 @@ fn plan_tab_assembly_selection(
     session: &CompositionSession,
     input: &CompositionInput,
     selected_text: Option<String>,
+    selected_resolved_code: Option<String>,
 ) -> Option<PlannedKey> {
     let (source, visible_rank) = match input {
         CompositionInput::Confirm => (NativeSelectionSource::FirstCandidate, 1),
@@ -2737,18 +2773,19 @@ fn plan_tab_assembly_selection(
         _ => return None,
     };
     let selected_text = selected_text.filter(|text| !text.is_empty())?;
+    let selected_resolved_code = selected_resolved_code.filter(|code| !code.is_empty())?;
     let before = session.clone();
-    let may_remember_complete_word = !before.tab_assembly_has_trailing_initial();
     let mut after = before.clone();
-    let selection = after.accept_tab_assembly_candidate(&selected_text)?;
+    let selection = after.accept_tab_assembly_candidate(&selected_text, &selected_resolved_code)?;
     let (edit, selection_to_remember, feedback_after_success) = match selection {
         TabAssemblySelection::Advanced => (None, None, None),
-        TabAssemblySelection::Complete(text) => {
-            let selection = may_remember_complete_word.then(|| PlannedSelection {
+        TabAssemblySelection::Complete { text, full_code } => {
+            debug_assert_eq!(full_code.len(), text.chars().count().saturating_mul(2));
+            let selection = PlannedSelection {
                 code: before.phonetic().to_owned(),
                 text: text.clone(),
                 retractable_by_immediate_backspace: true,
-            });
+            };
             let feedback = NativeFeedbackEvent::CandidateCommitted {
                 code: before.phonetic().to_owned(),
                 text: text.clone(),
@@ -2759,7 +2796,7 @@ fn plan_tab_assembly_selection(
             };
             (
                 Some(PendingDocumentEdit::Commit(text)),
-                selection,
+                Some(selection),
                 Some(feedback),
             )
         }
@@ -8086,13 +8123,22 @@ impl TsfTextService_Impl {
         stroke_prefix: &str,
         limit: usize,
     ) -> CandidateBatch {
-        let candidates = provider.shape_candidates(code, stroke_prefix, limit);
+        let resolved = provider.shape_candidates(code, stroke_prefix, limit);
+        let candidates = resolved
+            .iter()
+            .map(|candidate| candidate.text.clone())
+            .collect::<Vec<_>>();
+        let resolved_shape_codes = resolved
+            .into_iter()
+            .map(|candidate| Some(candidate.resolved_code))
+            .collect::<Vec<_>>();
         CandidateBatch {
             provenance: vec![
                 NativeCandidateProvenance::new(NativeCandidateSource::Shape, false);
                 candidates.len()
             ],
             personalized: vec![false; candidates.len()],
+            resolved_shape_codes,
             protected_prefix_len: 0,
             automatic_transposition: None,
             may_have_more: candidates.len() == limit && limit < CANDIDATE_LIMIT,
@@ -9588,6 +9634,10 @@ impl TsfTextService_Impl {
         let selected_text = selected_absolute_index
             .and_then(|index| existing_batch.candidates.get(index))
             .cloned();
+        let selected_resolved_shape_code = selected_absolute_index
+            .and_then(|index| existing_batch.resolved_shape_codes.get(index))
+            .cloned()
+            .flatten();
         let tab_assembly_selection = session.tab_assembly_mode()
             && matches!(
                 &input,
@@ -9696,7 +9746,12 @@ impl TsfTextService_Impl {
             })
             .flatten();
         let planned = if tab_assembly_selection {
-            plan_tab_assembly_selection(&session, &input, selected_text.clone())
+            plan_tab_assembly_selection(
+                &session,
+                &input,
+                selected_text.clone(),
+                selected_resolved_shape_code,
+            )
         } else {
             plan_session_input(
                 &session,
@@ -10480,6 +10535,7 @@ mod tests {
     fn candidate_promotion_mirrors_existing_personal_markers_by_position() {
         let mut batch = CandidateBatch {
             candidates: vec!["丙".to_owned(), "甲".to_owned(), "乙".to_owned()],
+            resolved_shape_codes: vec![None; 3],
             provenance: vec![
                 NativeCandidateProvenance::default(),
                 NativeCandidateProvenance::default(),
@@ -10519,6 +10575,7 @@ mod tests {
     fn unchanged_public_position_keeps_evidence_separate_from_a_ranking_change() {
         let mut batch = CandidateBatch {
             candidates: vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()],
+            resolved_shape_codes: vec![None; 3],
             provenance: vec![
                 NativeCandidateProvenance::default(),
                 NativeCandidateProvenance::default(),
@@ -11387,29 +11444,41 @@ mod tests {
                 .collect()
         }
 
-        fn shape_candidates(&self, code: &str, prefix: &str, limit: usize) -> Vec<String> {
+        fn shape_candidates(&self, code: &str, prefix: &str, limit: usize) -> Vec<ShapeCandidate> {
             if limit == 0 {
                 return Vec::new();
             }
-            let candidates: &[&str] = match (code, prefix) {
-                ("qt", "") => &["却", "缺", "雀"],
-                ("qt", "s") => &["雀"],
-                ("qt", "x") => &["雀"],
-                ("hp", "") => &["很", "和", "魂"],
-                ("hp", "p") => &["魂"],
-                ("lm", "") => &["连", "脸", "练"],
-                ("lm", "s") => &["练"],
-                ("xi", "") => &["西", "系", "习"],
-                ("xi", "z") => &["习"],
-                ("jd", "") => &["甲"],
-                ("j", "") => &["乙", "件", "今", "经", "就", "见", "进", "仅"],
-                ("j", "h") => &["件"],
+            let candidates: &[(&str, &str)] = match (code, prefix) {
+                ("qt", "") => &[("却", "qt"), ("缺", "qt"), ("雀", "qt")],
+                ("qt", "s") => &[("雀", "qt")],
+                ("qt", "x") => &[("雀", "qt")],
+                ("hp", "") => &[("很", "hp"), ("和", "hp"), ("魂", "hp")],
+                ("hp", "p") => &[("魂", "hp")],
+                ("lm", "") => &[("连", "lm"), ("脸", "lm"), ("练", "lm")],
+                ("lm", "s") => &[("练", "lm")],
+                ("xi", "") => &[("西", "xi"), ("系", "xi"), ("习", "xi")],
+                ("xi", "z") => &[("习", "xi")],
+                ("jd", "") => &[("甲", "jd")],
+                ("j", "") => &[
+                    ("乙", "ji"),
+                    ("件", "jm"),
+                    ("今", "jb"),
+                    ("经", "jk"),
+                    ("就", "jq"),
+                    ("见", "jn"),
+                    ("进", "jv"),
+                    ("仅", "jy"),
+                ],
+                ("j", "h") => &[("件", "jm")],
                 _ => &[],
             };
             candidates
                 .iter()
                 .take(limit)
-                .map(|candidate| (*candidate).to_owned())
+                .map(|(text, resolved_code)| ShapeCandidate {
+                    text: (*text).to_owned(),
+                    resolved_code: (*resolved_code).to_owned(),
+                })
                 .collect()
         }
 
@@ -11420,6 +11489,7 @@ mod tests {
                     | ("hp", "很" | "和" | "魂")
                     | ("lm", "连" | "脸" | "练")
                     | ("xi", "西" | "系" | "习")
+                    | ("jd", "甲")
             )
         }
     }
@@ -11451,7 +11521,7 @@ mod tests {
             usize::from(code == "qth" && view == InteractiveCandidateView::Primary)
         }
 
-        fn shape_candidates(&self, code: &str, prefix: &str, limit: usize) -> Vec<String> {
+        fn shape_candidates(&self, code: &str, prefix: &str, limit: usize) -> Vec<ShapeCandidate> {
             ShapeCandidateProvider.shape_candidates(code, prefix, limit)
         }
 
@@ -11951,9 +12021,37 @@ mod tests {
         );
         let provider = SnapshotCandidateProvider::new(snapshot, None, None);
 
-        assert_eq!(provider.shape_candidates("qt", "", 6), ["却", "缺", "雀"]);
-        assert_eq!(provider.shape_candidates("qt", "s", 6), ["雀"]);
-        assert_eq!(provider.shape_candidates("hp", "", 6), ["魂"]);
+        assert_eq!(
+            provider.shape_candidates("qt", "", 6),
+            [
+                ShapeCandidate {
+                    text: "却".to_owned(),
+                    resolved_code: "qt".to_owned(),
+                },
+                ShapeCandidate {
+                    text: "缺".to_owned(),
+                    resolved_code: "qt".to_owned(),
+                },
+                ShapeCandidate {
+                    text: "雀".to_owned(),
+                    resolved_code: "qt".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            provider.shape_candidates("qt", "s", 6),
+            [ShapeCandidate {
+                text: "雀".to_owned(),
+                resolved_code: "qt".to_owned(),
+            }]
+        );
+        assert_eq!(
+            provider.shape_candidates("hp", "", 6),
+            [ShapeCandidate {
+                text: "魂".to_owned(),
+                resolved_code: "hp".to_owned(),
+            }]
+        );
         assert!(provider.shape_candidates("qthp", "", 6).is_empty());
         assert!(provider.shape_candidates("qt", "a", 6).is_empty());
     }
@@ -15828,7 +15926,7 @@ mod tests {
     }
 
     #[test]
-    fn odd_key_tab_path_uses_a_trailing_initial_slot_without_short_code_learning() {
+    fn odd_key_tab_path_pages_by_verified_identity_and_learns_the_original_short_code() {
         let _guard = test_lock();
         assert_eq!(tab_phonetic_segments("jdj"), Some(vec!["jd", "j"]));
         assert_eq!(tab_phonetic_segments("jdjd"), Some(vec!["jd", "jd"]));
@@ -15915,11 +16013,83 @@ mod tests {
             complete.edit,
             Some(PendingDocumentEdit::Commit(ref text)) if text == "甲件"
         ));
-        assert!(
-            complete.selection_to_remember.is_none(),
-            "an unresolved trailing initial must not train an ordinary short-code preference"
-        );
+        let learned = complete
+            .selection_to_remember
+            .expect("a fully resolved trailing initial should safely learn the assembled word");
+        assert_eq!(learned.code, "jdj");
+        assert_eq!(learned.text, "甲件");
+        assert!(learned.retractable_by_immediate_backspace);
         assert!(!complete.after.tab_mode());
+
+        service
+            .remember_selection_after_success_in_context(learned, NativeFeedbackContext::Eligible);
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("jdj"),
+            Some("甲件")
+        );
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+
+        let recalled = service
+            .load_candidate_batch(
+                &ShapeCandidateProvider,
+                "jdj",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            recalled.candidates.first().map(String::as_str),
+            Some("甲件"),
+            "the original odd input remains the personal recall key"
+        );
+        assert_eq!(recalled.personalized.first(), Some(&true));
+    }
+
+    #[test]
+    fn tab_assembly_refuses_missing_or_inconsistent_candidate_identity() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("jdj".to_owned()));
+        assert!(session.enter_tab_path(&["jd", "j"]));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("甲", "jd"),
+            Some(TabAssemblySelection::Advanced)
+        );
+
+        assert!(
+            plan_tab_assembly_selection(
+                &session,
+                &CompositionInput::Confirm,
+                Some("件".to_owned()),
+                None,
+            )
+            .is_none(),
+            "text without aligned identity must not be committed or learned"
+        );
+        assert!(
+            plan_tab_assembly_selection(
+                &session,
+                &CompositionInput::Confirm,
+                Some("件".to_owned()),
+                Some("am".to_owned()),
+            )
+            .is_none(),
+            "an identity outside the active initial pool must be rejected"
+        );
+        let complete = plan_tab_assembly_selection(
+            &session,
+            &CompositionInput::Confirm,
+            Some("件".to_owned()),
+            Some("jm".to_owned()),
+        )
+        .expect("the aligned full identity should complete the assembly");
+        assert_eq!(
+            complete
+                .selection_to_remember
+                .as_ref()
+                .map(|selection| (selection.code.as_str(), selection.text.as_str())),
+            Some(("jdj", "甲件"))
+        );
     }
 
     #[test]
@@ -16251,13 +16421,14 @@ mod tests {
         session.apply(CompositionInput::Letters("qthp".to_owned()));
         assert!(session.enter_tab_path(&["qt", "hp"]));
         assert_eq!(
-            session.accept_tab_assembly_candidate("雀"),
+            session.accept_tab_assembly_candidate("雀", "qt"),
             Some(TabAssemblySelection::Advanced)
         );
         let complete = plan_tab_assembly_selection(
             &session,
             &CompositionInput::Select(3),
             Some("魂".to_owned()),
+            Some("hp".to_owned()),
         )
         .expect("the second Tab character should complete one word");
         let selection = complete
@@ -16314,13 +16485,14 @@ mod tests {
         session.apply(CompositionInput::Letters("qthp".to_owned()));
         assert!(session.enter_tab_path(&["qt", "hp"]));
         assert_eq!(
-            session.accept_tab_assembly_candidate("雀"),
+            session.accept_tab_assembly_candidate("雀", "qt"),
             Some(TabAssemblySelection::Advanced)
         );
         let complete = plan_tab_assembly_selection(
             &session,
             &CompositionInput::Select(3),
             Some("魂".to_owned()),
+            Some("hp".to_owned()),
         )
         .expect("the explicit Tab path should complete");
         first.remember_selection_after_success_in_context(
@@ -19052,6 +19224,7 @@ mod tests {
         let display = CandidateDisplay::from_batch(
             CandidateBatch {
                 candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                resolved_shape_codes: vec![None; 2],
                 provenance: vec![
                     NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
                     NativeCandidateProvenance::with_personalization(
@@ -19106,6 +19279,7 @@ mod tests {
         let recovery = CandidateDisplay::from_batch(
             CandidateBatch {
                 candidates: ordinary.candidates.clone(),
+                resolved_shape_codes: vec![None; ordinary.candidates.len()],
                 provenance: ordinary.provenance.clone(),
                 personalized: ordinary.personalized.clone(),
                 protected_prefix_len: 0,
@@ -19118,6 +19292,7 @@ mod tests {
         let recovery_one_page = CandidateDisplay::from_batch(
             CandidateBatch {
                 candidates: vec!["换序候选".to_owned()],
+                resolved_shape_codes: vec![None],
                 provenance: vec![NativeCandidateProvenance::new(
                     NativeCandidateSource::TranspositionRecovery,
                     false,
