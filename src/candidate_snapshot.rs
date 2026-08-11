@@ -30,6 +30,7 @@ pub const MAX_CANDIDATE_SNAPSHOT_RANK: usize = 50;
 /// keys are useful precisely when a known-reading character is deeper than the
 /// ordinary candidate pages. The bound still prevents one explicit lookup from
 /// expanding to the snapshot's full entry limit.
+#[cfg(any(windows, test))]
 pub(crate) const MAX_TAB_SHAPE_SOURCE_RANK: usize = 4_096;
 const MAX_CANDIDATE_SNAPSHOT_REVISION_BYTES: usize = 64;
 const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
@@ -62,6 +63,7 @@ pub(crate) enum InteractiveCandidateSource {
     CompleteSentence,
     FinalInitialSentence,
     Decoder,
+    #[cfg(windows)]
     FourCharacterCorrection,
 }
 
@@ -77,6 +79,7 @@ pub(crate) struct InteractiveCandidateQuery {
     pub(crate) automatic_transposition_blocked: bool,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExactSingleCharacterCandidate {
     pub(crate) text: String,
@@ -379,6 +382,7 @@ impl CandidateSnapshot {
     /// Ordinary interactive queries remain capped by
     /// [`MAX_CANDIDATE_SNAPSHOT_RANK`]. This source pool is kept separate so a
     /// later shape prefix can filter before applying the visible rank limit.
+    #[cfg(any(windows, test))]
     pub(crate) fn exact_single_character_candidates(
         &self,
         code: &str,
@@ -413,6 +417,7 @@ impl CandidateSnapshot {
     /// syllable. Every returned character comes from a complete exact two-key
     /// lexicon entry whose first key equals `initial`; abbreviations,
     /// corrections, sentence paths, and unresolved input are excluded.
+    #[cfg(any(windows, test))]
     pub(crate) fn initial_single_character_candidates(
         &self,
         initial: &str,
@@ -571,6 +576,7 @@ impl CandidateSnapshot {
         self.decoder.automatic_transposition_decision(code)
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn automatic_transposition_recovery_after_primary(
         &self,
         code: &str,
@@ -581,6 +587,7 @@ impl CandidateSnapshot {
             .automatic_transposition_recovery_after_primary(code, syllable_index, limit)
     }
 
+    #[cfg(windows)]
     pub(crate) fn automatic_transposition_span_recovery_after_primary(
         &self,
         code: &str,
@@ -1733,6 +1740,7 @@ impl Decoder {
         ))
     }
 
+    #[cfg(any(windows, test))]
     fn automatic_transposition_recovery_after_primary(
         &self,
         code: &str,
@@ -1747,6 +1755,7 @@ impl Decoder {
         )
     }
 
+    #[cfg(any(windows, test))]
     fn automatic_transposition_span_recovery_after_primary(
         &self,
         code: &str,
@@ -1926,7 +1935,9 @@ pub(crate) fn valid_candidate_snapshot_revision(revision: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(not(debug_assertions))]
     use std::hint::black_box;
+    #[cfg(not(debug_assertions))]
     use std::time::Instant;
 
     use super::*;
@@ -3760,13 +3771,10 @@ mod tests {
         ));
     }
 
+    #[cfg(not(debug_assertions))]
     #[test]
     #[ignore = "explicit release-only public transposition hot-path benchmark"]
     fn pinned_public_transposition_probe_reuses_the_primary_gate() {
-        assert!(
-            !cfg!(debug_assertions),
-            "run this benchmark with cargo test --release"
-        );
         let imported = crate::parse_simplified_rime_lexicon(include_str!(
             "../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml"
         ))

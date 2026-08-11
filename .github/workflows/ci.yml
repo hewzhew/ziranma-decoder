@@ -35,20 +35,44 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install stable Rust
+      - name: Activate pinned Rust
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustup component add rustfmt clippy
+          rustc --version --verbose
+          cargo --version
+          cargo clippy --version
 
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      # The decoder, public package tooling, and capsule replay stay portable.
+      # TSF registration and the current-user GUI/DPAPI tools are deliberately
+      # Windows-only and receive their exhaustive target check below.
+      - name: Run Clippy (portable targets)
+        if: runner.os != 'Windows'
+        run: >-
+          cargo clippy --locked --lib
+          --bin ziranma-decoder
+          --bin candidatectl
+          --bin capsule-replay
+          --test decoder
+          --all-features -- -D warnings
 
-      - name: Run tests
-        run: cargo test
+      - name: Run Clippy (all Windows targets)
+        if: runner.os == 'Windows'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests (portable targets)
+        if: runner.os != 'Windows'
+        run: >-
+          cargo test --locked --lib
+          --bin ziranma-decoder
+          --bin candidatectl
+          --bin capsule-replay
+          --test decoder
+
+      - name: Run tests (all Windows targets)
+        if: runner.os == 'Windows'
+        run: cargo test --locked
 
       - name: Run release audit
         if: runner.os == 'Windows'

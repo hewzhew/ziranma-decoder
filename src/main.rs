@@ -56,10 +56,12 @@ use shape_course_cli::{
     parse_shape_course_arguments, parse_shape_course_input, render_shape_course_screen,
     render_shape_course_summary,
 };
+#[cfg(windows)]
+use shape_lab_cli::normalize_shape_lab_input;
 use shape_lab_cli::{
     SHAPE_LAB_USAGE, ShapeLabInput, ShapeLabSession, ShapeLabSessionEffect,
-    normalize_shape_lab_input, parse_shape_lab_arguments, parse_shape_lab_input,
-    render_shape_lab_details, render_shape_lab_screen,
+    parse_shape_lab_arguments, parse_shape_lab_input, render_shape_lab_details,
+    render_shape_lab_screen,
 };
 use typing_lab_cli::{
     TYPING_LAB_CANDIDATE_POOL_DEPTH, TYPING_LAB_USAGE, TypingLabEffect, TypingLabInput,

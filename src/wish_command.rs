@@ -17,6 +17,7 @@ pub enum WishCommand {
 }
 
 impl WishCommand {
+    #[cfg(any(windows, test))]
     fn from_kind(kind: u32) -> Option<Self> {
         match kind {
             1 => Some(Self::Start),
@@ -28,12 +29,14 @@ impl WishCommand {
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WishCommandWord {
     command: WishCommand,
     sequence: u32,
 }
 
+#[cfg(any(windows, test))]
 impl WishCommandWord {
     pub fn next(previous: Option<Self>, command: WishCommand) -> Self {
         let sequence = previous
@@ -269,6 +272,7 @@ mod tests {
     #[test]
     fn command_words_are_bounded_and_round_trip() {
         let first = WishCommandWord::next(None, WishCommand::Start);
+        assert_eq!(first.command(), WishCommand::Start);
         assert_eq!(first.sequence(), 1);
         assert_eq!(WishCommandWord::parse(first.raw()), Some(first));
         let second = WishCommandWord::next(Some(first), WishCommand::SaveRecent);

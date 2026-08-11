@@ -8,14 +8,14 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use crate::{
-    SentenceCandidate,
-    personal_ranking::{CandidateTextPromotion, is_anchored_suffix_abbreviation},
-};
+#[cfg(any(windows, test))]
+use crate::personal_ranking::is_anchored_suffix_abbreviation;
+use crate::{SentenceCandidate, personal_ranking::CandidateTextPromotion};
 
 const MAX_COMPOSITION_KEYS: usize = 64;
 const MAX_SESSION_SELECTIONS: usize = 128;
 const MAX_SESSION_SELECTION_TEXT_CHARACTERS: usize = 128;
+#[cfg(any(windows, test))]
 pub(crate) const MAX_TAB_ASSEMBLY_CHARACTERS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +85,7 @@ struct TabAssembly {
     selected_codes: Vec<String>,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TabAssemblyStage {
     First,
@@ -92,6 +93,7 @@ pub(crate) enum TabAssemblyStage {
     Later(usize),
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TabAssemblySelection {
     Advanced,
@@ -300,6 +302,7 @@ impl SessionSelectionMemory {
         .is_some()
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn promote_anchored_suffix_texts_after_decision(
         &self,
         code: &str,
@@ -334,6 +337,7 @@ impl SessionSelectionMemory {
         })
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn has_anchored_suffix_evidence(
         &self,
         code: &str,
@@ -365,6 +369,7 @@ impl CompositionSession {
         self.tab_assembly.is_some()
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn tab_assembly_stage(&self) -> Option<TabAssemblyStage> {
         self.tab_assembly
             .as_ref()
@@ -375,17 +380,20 @@ impl CompositionSession {
             })
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn tab_assembly_selected_text(&self) -> Option<String> {
         let assembly = self.tab_assembly.as_ref()?;
         (!assembly.selected.is_empty()).then(|| assembly.selected.concat())
     }
 
+    #[cfg(windows)]
     pub(crate) fn tab_assembly_position(&self) -> Option<usize> {
         self.tab_assembly
             .as_ref()
             .map(|assembly| assembly.selected.len().saturating_add(1))
     }
 
+    #[cfg(windows)]
     pub(crate) fn tab_assembly_character_count(&self) -> Option<usize> {
         self.tab_assembly
             .as_ref()
@@ -475,6 +483,7 @@ impl CompositionSession {
         self.notice = None;
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn enter_tab_path(&mut self, pinyin_segments: &[&str]) -> bool {
         if !(2..=MAX_TAB_ASSEMBLY_CHARACTERS).contains(&pinyin_segments.len())
             || !valid_tab_assembly_segments(pinyin_segments)
@@ -498,6 +507,7 @@ impl CompositionSession {
         true
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn accept_tab_assembly_candidate(
         &mut self,
         text: &str,
@@ -699,6 +709,7 @@ impl CompositionSession {
     }
 }
 
+#[cfg(any(windows, test))]
 fn valid_tab_assembly_segments(segments: &[&str]) -> bool {
     let Some((last, complete)) = segments.split_last() else {
         return false;
@@ -709,11 +720,13 @@ fn valid_tab_assembly_segments(segments: &[&str]) -> bool {
         && valid_tab_slot(last, true)
 }
 
+#[cfg(any(windows, test))]
 fn valid_tab_slot(slot: &str, trailing: bool) -> bool {
     (slot.len() == 2 || (trailing && slot.len() == 1))
         && slot.as_bytes().iter().all(u8::is_ascii_lowercase)
 }
 
+#[cfg(any(windows, test))]
 fn resolved_tab_slot_matches(slot: &str, resolved_code: &str) -> bool {
     resolved_code.len() == 2
         && resolved_code.as_bytes().iter().all(u8::is_ascii_lowercase)

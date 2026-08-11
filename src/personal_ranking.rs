@@ -41,6 +41,7 @@ const MAX_PERSONAL_RANKING_TEXT_CHARACTERS: usize = 128;
 // keeps an old preference resistant to one incidental choice without making a
 // later deliberate change require an unbounded number of repetitions.
 const PERSONAL_RANKING_SUPPORT_CAP: u64 = 4;
+#[cfg(any(windows, test))]
 const PERSONAL_ABBREVIATION_DISCOVERY_MIN_SELECTIONS: u64 = 2;
 const PROTECTED_PERSONAL_RANKING_MAGIC: &[u8] = b"ziranma-personal-ranking-dpapi-v1\0";
 const PROTECTED_PERSONAL_RANKING_CHECKPOINT_MAGIC: &[u8] =
@@ -58,6 +59,7 @@ const PROTECTED_PERSONAL_RANKING_SUPPRESSION_ACTION_MAGIC: &[u8] =
 /// syllable in one non-empty suffix with its first key. It therefore accepts
 /// `jdjd -> jdj`, but not arbitrary string prefixes such as `jdjd -> jd`, nor
 /// a leading abbreviation such as `jdjd -> jjd`.
+#[cfg(any(windows, test))]
 pub(crate) fn is_anchored_suffix_abbreviation(full_code: &str, abbreviated_code: &str) -> bool {
     let full = full_code.as_bytes();
     let abbreviated = abbreviated_code.as_bytes();
@@ -101,6 +103,7 @@ pub(crate) struct CandidateTextPromotion {
 }
 
 impl CandidateTextPromotion {
+    #[cfg(any(windows, test))]
     pub(crate) fn mirror_into<T>(
         self,
         parallel: &mut Vec<T>,
@@ -655,6 +658,7 @@ impl PersonalRankingSnapshot {
             .take_while(move |((entry_code, _), _)| entry_code == &code)
     }
 
+    #[cfg(any(windows, test))]
     fn entries_for_anchored_code<'a>(
         &'a self,
         abbreviated_code: &str,
@@ -749,6 +753,7 @@ impl PersonalRankingSnapshot {
         .is_some()
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn promote_anchored_suffix_texts_after_with_suppressions_decision(
         &self,
         code: &str,
@@ -775,6 +780,7 @@ impl PersonalRankingSnapshot {
     /// unprotected ordinary candidate; aliases and other protected prefixes
     /// therefore stay fixed, and one complete-code observation cannot become
     /// the short code's first ordinary choice.
+    #[cfg(any(windows, test))]
     pub(crate) fn promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
         &self,
         code: &str,
@@ -799,6 +805,7 @@ impl PersonalRankingSnapshot {
         }
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn has_anchored_suffix_evidence_with_suppressions(
         &self,
         code: &str,
@@ -844,6 +851,7 @@ impl PersonalRankingSnapshot {
         .map(|promotion| promotion.index)
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn recall_repeated_anchored_suffix_text_after_with_suppressions_decision(
         &self,
         code: &str,
@@ -860,6 +868,7 @@ impl PersonalRankingSnapshot {
         recall_preferred_text_after_first_ordinary_decision(preferred, candidates, protected_prefix)
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn has_repeated_anchored_suffix_evidence_with_suppressions(
         &self,
         code: &str,
@@ -879,6 +888,7 @@ impl PersonalRankingSnapshot {
             })
     }
 
+    #[cfg(any(windows, test))]
     fn preferred_anchored_suffix_text_where<'a>(
         &'a self,
         code: &str,
@@ -904,6 +914,7 @@ impl PersonalRankingSnapshot {
             .map(|((_, text), _)| text.as_str())
     }
 
+    #[cfg(any(windows, test))]
     fn preferred_verified_anchored_suffix_text_where<'a>(
         &'a self,
         code: &str,
@@ -927,6 +938,7 @@ impl PersonalRankingSnapshot {
             .map(|((_, text), _)| text.as_str())
     }
 
+    #[cfg(any(windows, test))]
     fn preferred_repeated_anchored_suffix_text_where<'a>(
         &'a self,
         code: &str,
@@ -990,6 +1002,7 @@ fn promote_preferred_text_decision(
     })
 }
 
+#[cfg(any(windows, test))]
 fn recall_preferred_text_after_first_ordinary_decision(
     preferred: &str,
     candidates: &mut Vec<String>,

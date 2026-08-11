@@ -8162,23 +8162,25 @@ impl ResearchFeedbackJournal {
         .ok()
         .map(WishJournalContext::ContinuousSpan);
         let runtime_identity = self.runtime_identity();
-        let snapshot = journal_context
-            .and_then(|journal_context| {
+        let snapshot = match journal_context {
+            Some(journal_context) => {
                 crate::FrozenNativeFeedbackSnapshot::from_journal_events(marker_ms, &self.events)
                     .ok()
                     .map(|frozen| (frozen, journal_context))
-            })
-            .and_then(|(frozen, journal_context)| {
-                WishSnapshot::from_frozen_with_context_and_public_order_policy(
-                    &frozen,
-                    WishCaptureScope::ContinuousJournal,
-                    WishCategory::Other,
-                    runtime_identity,
-                    TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
-                    Some(journal_context),
-                )
-                .ok()
-            });
+            }
+            None => None,
+        }
+        .and_then(|(frozen, journal_context)| {
+            WishSnapshot::from_frozen_with_context_and_public_order_policy(
+                &frozen,
+                WishCaptureScope::ContinuousJournal,
+                WishCategory::Other,
+                runtime_identity,
+                TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
+                Some(journal_context),
+            )
+            .ok()
+        });
         let accepted = snapshot.is_some_and(|snapshot| match self.persistence.as_ref() {
             Some(persistence) => persistence.enqueue_research(root.to_path_buf(), snapshot),
             None => {

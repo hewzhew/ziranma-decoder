@@ -823,6 +823,7 @@ impl FrozenNativeFeedbackSnapshot {
     /// This constructor performs no I/O and retains no absolute monotonic
     /// timestamp. It is restricted to the crate so only a host that already
     /// owns an explicitly enabled private feedback stream can use it.
+    #[cfg(any(windows, test))]
     pub(crate) fn from_journal_events(
         marker_ms: u64,
         events: &[(u64, NativeFeedbackEvent)],
