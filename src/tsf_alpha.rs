@@ -2610,9 +2610,11 @@ struct PersonalPhraseComponent {
     text: String,
 }
 
+const MAX_PERSONAL_PHRASE_COMPONENTS: usize = 4;
+
 #[derive(Default)]
 struct PersonalPhraseComposer {
-    previous: Option<PersonalPhraseComponent>,
+    components: Vec<PersonalPhraseComponent>,
 }
 
 struct PendingPersonalPhrase {
@@ -2625,7 +2627,7 @@ struct PendingPersonalSelection {
     overruled_text: Option<String>,
     previous_session_text: Option<String>,
     phrase: Option<PendingPersonalPhrase>,
-    previous_phrase_component: Option<PersonalPhraseComponent>,
+    previous_phrase_components: Vec<PersonalPhraseComponent>,
     previous_left_context: Option<String>,
 }
 
@@ -8510,7 +8512,7 @@ impl TsfTextService_Impl {
 
     fn clear_personal_phrase_composer(&self) {
         if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
-            composer.previous = None;
+            composer.components.clear();
         }
     }
 
@@ -8547,11 +8549,17 @@ impl TsfTextService_Impl {
 
     fn pending_personal_phrase(
         &self,
-        previous: &PersonalPhraseComponent,
-        current: &PersonalPhraseComponent,
+        components: &[PersonalPhraseComponent],
     ) -> PendingPersonalPhrase {
-        let code = format!("{}{}", previous.code, current.code);
-        let text = format!("{}{}", previous.text, current.text);
+        debug_assert!((2..=MAX_PERSONAL_PHRASE_COMPONENTS).contains(&components.len()));
+        let code: String = components
+            .iter()
+            .map(|component| component.code.as_str())
+            .collect();
+        let text: String = components
+            .iter()
+            .map(|component| component.text.as_str())
+            .collect();
         let previous_session_text = self
             .selection_memory
             .try_borrow()
@@ -8650,7 +8658,7 @@ impl TsfTextService_Impl {
         }
         self.restore_session_selection_after_pending(&pending);
         if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
-            composer.previous = pending.previous_phrase_component;
+            composer.components = pending.previous_phrase_components;
         }
         if let Ok(mut context) = self.personal_left_context.try_borrow_mut() {
             *context = pending.previous_left_context;
@@ -8774,17 +8782,26 @@ impl TsfTextService_Impl {
             memory.remember_text(&selection.code, &selection.text);
         }
         let component = self.personal_phrase_component(&selection, learning_context);
-        let previous_phrase_component = self
+        let previous_phrase_components = self
             .personal_phrase_composer
             .try_borrow()
             .ok()
-            .and_then(|composer| composer.previous.clone());
-        let phrase = previous_phrase_component
-            .as_ref()
-            .zip(component.as_ref())
-            .map(|(previous, current)| self.pending_personal_phrase(previous, current));
+            .map(|composer| composer.components.clone())
+            .unwrap_or_default();
+        let (next_phrase_components, phrase) = match component {
+            Some(component)
+                if previous_phrase_components.len() < MAX_PERSONAL_PHRASE_COMPONENTS =>
+            {
+                let mut next = previous_phrase_components.clone();
+                next.push(component);
+                let phrase = (next.len() >= 2).then(|| self.pending_personal_phrase(&next));
+                (next, phrase)
+            }
+            Some(component) => (vec![component], None),
+            None => (Vec::new(), None),
+        };
         if let Ok(mut composer) = self.personal_phrase_composer.try_borrow_mut() {
-            composer.previous = component;
+            composer.components = next_phrase_components;
         }
         if let Some(phrase) = phrase.as_ref() {
             let phrase_is_suppressed = self
@@ -8808,7 +8825,7 @@ impl TsfTextService_Impl {
                 overruled_text,
                 previous_session_text,
                 phrase,
-                previous_phrase_component,
+                previous_phrase_components,
                 previous_left_context,
             });
         }
@@ -11696,7 +11713,13 @@ mod tests {
             let candidates: &[&str] = match code {
                 "ui" => &["是", "试"],
                 "ub" => &["受", "手"],
+                "lm" => &["连", "练"],
+                "xi" => &["西", "习"],
+                "aa" => &["阿", "啊"],
                 "uiub" => &["是受", "失手", "是手"],
+                "uiublm" => &["是受连", "失手练", "是手连"],
+                "uiublmxi" => &["是受联系", "失手练习", "是手联系"],
+                "uiul" | "uiubl" | "uiulx" | "uiublx" | "uiublmx" => &["固定", "普通", "其他"],
                 _ => &[],
             };
             candidates
@@ -11707,8 +11730,42 @@ mod tests {
         }
 
         fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
-            matches!((code, text), ("ui", "试") | ("ub", "手"))
+            matches!(
+                (code, text),
+                ("ui", "试") | ("ub", "手") | ("lm", "练") | ("xi", "习") | ("aa", "啊")
+            )
         }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            usize::from(
+                view == InteractiveCandidateView::Primary
+                    && matches!(code, "uiul" | "uiubl" | "uiulx" | "uiublx" | "uiublmx"),
+            )
+        }
+    }
+
+    fn remember_verified_personal_character(service: &TsfTextService_Impl, code: &str, text: &str) {
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: code.to_owned(),
+                text: text.to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+    }
+
+    fn personal_phrase_component_codes(service: &TsfTextService_Impl) -> Vec<String> {
+        let composer = service.personal_phrase_composer.borrow();
+        composer
+            .components
+            .iter()
+            .map(|component| component.code.clone())
+            .collect()
     }
 
     struct CodeFamilyCandidateProvider;
@@ -13598,8 +13655,8 @@ mod tests {
             service_object
                 .personal_phrase_composer
                 .borrow()
-                .previous
-                .as_ref()
+                .components
+                .first()
                 .is_some_and(|component| component.code == "ui" && component.text == "试")
         );
 
@@ -13609,8 +13666,8 @@ mod tests {
             service_object
                 .personal_phrase_composer
                 .borrow()
-                .previous
-                .as_ref()
+                .components
+                .first()
                 .is_some_and(|component| component.code == "ui" && component.text == "试")
         );
         press(VK_A.0 + u16::from(b'b' - b'a'));
@@ -13624,11 +13681,22 @@ mod tests {
             Some("试手")
         );
 
+        press(VK_OEM_COMMA.0);
+        assert_eq!(read_context_text(&context, client_id), "试手，");
+        assert!(
+            service_object
+                .personal_phrase_composer
+                .borrow()
+                .components
+                .is_empty(),
+            "punctuation must confirm the pending phrase and break the adjacency chain"
+        );
+
         for letter in b"uiub" {
             press(VK_A.0 + u16::from(*letter - b'a'));
         }
         press(VK_SPACE.0);
-        assert_eq!(read_context_text(&context, client_id), "试手试手");
+        assert_eq!(read_context_text(&context, client_id), "试手，试手");
         assert_eq!(
             service_object
                 .personal_ranking
@@ -18447,7 +18515,11 @@ mod tests {
         assert_eq!(confirmed.candidates, ["丙词", "甲词", "乙词"]);
         assert!(confirmed.personalized[0]);
         assert!(
-            service.personal_phrase_composer.borrow().previous.is_none(),
+            service
+                .personal_phrase_composer
+                .borrow()
+                .components
+                .is_empty(),
             "multi-character exact selections must not enter the adjacent-character phrase lane"
         );
 
@@ -18625,6 +18697,353 @@ mod tests {
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
         );
+    }
+
+    #[test]
+    fn adjacent_verified_characters_extend_through_two_three_and_four_character_phrases() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        remember_verified_personal_character(&service, "ui", "试");
+        assert_eq!(personal_phrase_component_codes(&service), ["ui"]);
+        remember_verified_personal_character(&service, "ub", "手");
+        assert_eq!(personal_phrase_component_codes(&service), ["ui", "ub"]);
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("uiub"),
+            Some("试手")
+        );
+
+        remember_verified_personal_character(&service, "lm", "练");
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            Some("试手"),
+            "the two-character prefix must be confirmed before extending it"
+        );
+        assert_eq!(
+            personal_phrase_component_codes(&service),
+            ["ui", "ub", "lm"]
+        );
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("uiublm"),
+            Some("试手练")
+        );
+
+        remember_verified_personal_character(&service, "xi", "习");
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiublm"),
+            Some("试手练"),
+            "the three-character prefix must be confirmed before extending it"
+        );
+        assert_eq!(
+            personal_phrase_component_codes(&service),
+            ["ui", "ub", "lm", "xi"]
+        );
+        assert_eq!(
+            service
+                .selection_memory
+                .borrow()
+                .remembered_text("uiublmxi"),
+            Some("试手练习")
+        );
+        assert!(service.confirm_pending_personal_selection());
+
+        service.selection_memory.borrow_mut().clear();
+        let persistent = service
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiublmxi",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            persistent.candidates.first().map(String::as_str),
+            Some("试手练习")
+        );
+        assert!(
+            persistent.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+    }
+
+    #[test]
+    fn immediate_backspace_restores_the_prefix_chain_for_three_and_four_character_phrases() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        for (code, text) in [("ui", "试"), ("ub", "手"), ("lm", "练")] {
+            remember_verified_personal_character(&service, code, text);
+        }
+        assert!(service.retract_pending_personal_selection());
+        assert_eq!(personal_phrase_component_codes(&service), ["ui", "ub"]);
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("uiublm"),
+            None
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiub"),
+            Some("试手"),
+            "retracting the third character must not retract the confirmed two-character prefix"
+        );
+
+        remember_verified_personal_character(&service, "lm", "练");
+        remember_verified_personal_character(&service, "xi", "习");
+        assert!(service.retract_pending_personal_selection());
+        assert_eq!(
+            personal_phrase_component_codes(&service),
+            ["ui", "ub", "lm"]
+        );
+        assert_eq!(
+            service
+                .selection_memory
+                .borrow()
+                .remembered_text("uiublmxi"),
+            None
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiublm"),
+            Some("试手练"),
+            "retracting the fourth character must retain the confirmed three-character prefix"
+        );
+    }
+
+    #[test]
+    fn a_fifth_verified_character_restarts_instead_of_learning_overlapping_phrases() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        for (code, text) in [
+            ("ui", "试"),
+            ("ub", "手"),
+            ("lm", "练"),
+            ("xi", "习"),
+            ("aa", "啊"),
+        ] {
+            remember_verified_personal_character(&service, code, text);
+        }
+
+        assert_eq!(personal_phrase_component_codes(&service), ["aa"]);
+        assert!(
+            service
+                .pending_personal_selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.phrase.is_none())
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("uiublmxi"),
+            Some("试手练习")
+        );
+        assert_eq!(
+            service
+                .selection_memory
+                .borrow()
+                .remembered_text("ublmxiaa"),
+            None,
+            "the fifth character must not create a sliding four-character phrase"
+        );
+        assert_eq!(
+            service
+                .selection_memory
+                .borrow()
+                .remembered_text("uiublmxiaa"),
+            None,
+            "five-character phrase learning is outside the bounded lifecycle"
+        );
+        assert!(service.retract_pending_personal_selection());
+        assert_eq!(
+            personal_phrase_component_codes(&service),
+            ["ui", "ub", "lm", "xi"],
+            "deleting the fifth character restores the bounded prefix that remains in the document"
+        );
+        assert_eq!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .preferred_text("aa"),
+            None,
+            "the retracted fifth character must not leave its own personal evidence"
+        );
+    }
+
+    #[test]
+    fn an_unverified_character_breaks_a_longer_personal_phrase_chain() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        remember_verified_personal_character(&service, "ui", "试");
+        remember_verified_personal_character(&service, "ub", "手");
+        service.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "lm".to_owned(),
+                text: "林".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        assert!(personal_phrase_component_codes(&service).is_empty());
+        assert!(
+            service
+                .pending_personal_selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.phrase.is_none())
+        );
+
+        remember_verified_personal_character(&service, "xi", "习");
+        assert_eq!(personal_phrase_component_codes(&service), ["xi"]);
+        assert_eq!(
+            service
+                .selection_memory
+                .borrow()
+                .remembered_text("uiublmxi"),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_four_character_composition_opens_guarded_tail_discovery_and_respects_suppression() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        for round in 0..2 {
+            for (code, text) in [("ui", "试"), ("ub", "手"), ("lm", "练"), ("xi", "习")] {
+                remember_verified_personal_character(&service, code, text);
+            }
+            assert!(service.confirm_pending_personal_selection());
+            if round == 0 {
+                let single_use = service
+                    .load_candidate_batch(
+                        &PersonalPhraseCandidateProvider,
+                        "uiulx",
+                        4,
+                        InteractiveCandidateView::Primary,
+                    )
+                    .unwrap();
+                assert!(
+                    !single_use.candidates.iter().any(|text| text == "试手练习"),
+                    "one adjacent composition must not open pool-external short-code discovery"
+                );
+            }
+        }
+        service.selection_memory.borrow_mut().clear();
+
+        for short_code in ["uiulx", "uiublx", "uiublmx"] {
+            let discovered = service
+                .load_candidate_batch(
+                    &PersonalPhraseCandidateProvider,
+                    short_code,
+                    4,
+                    InteractiveCandidateView::Primary,
+                )
+                .unwrap();
+            assert_eq!(discovered.candidates, ["固定", "普通", "试手练习"]);
+            assert!(
+                discovered.provenance[2]
+                    .personalization()
+                    .contains(NativeCandidatePersonalization::PERSISTENT_DISCOVERY)
+            );
+        }
+
+        {
+            let mut ranking = service.personal_ranking.borrow_mut();
+            assert!(ranking.suppressions.suppress("uiulx", "试手练习").unwrap());
+        }
+        let short_suppressed = service
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiulx",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert!(
+            !short_suppressed
+                .candidates
+                .iter()
+                .any(|text| text == "试手练习")
+        );
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .suppressions
+                .restore("uiulx", "试手练习")
+                .unwrap()
+        );
+
+        {
+            let mut ranking = service.personal_ranking.borrow_mut();
+            assert!(
+                ranking
+                    .suppressions
+                    .suppress("uiublmxi", "试手练习")
+                    .unwrap()
+            );
+        }
+        let source_suppressed = service
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiublx",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert!(
+            !source_suppressed
+                .candidates
+                .iter()
+                .any(|text| text == "试手练习")
+        );
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .suppressions
+                .restore("uiublmxi", "试手练习")
+                .unwrap()
+        );
+        let restored = service
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiublx",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(restored.candidates[2], "试手练习");
     }
 
     #[test]
@@ -19005,20 +19424,20 @@ mod tests {
             service
                 .personal_phrase_composer
                 .borrow()
-                .previous
-                .as_ref()
+                .components
+                .first()
                 .is_some_and(|component| component.code == "ui" && component.text == "试")
         );
     }
 
     #[test]
-    fn focus_loss_confirms_a_personal_phrase_and_breaks_the_adjacency_chain() {
+    fn focus_loss_confirms_a_four_character_phrase_and_breaks_the_adjacency_chain() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             PersonalPhraseCandidateProvider,
         ))));
 
-        for (code, text) in [("ui", "试"), ("ub", "手")] {
+        for (code, text) in [("ui", "试"), ("ub", "手"), ("lm", "练"), ("xi", "习")] {
             service
                 .native_feedback_context
                 .lock()
@@ -19033,14 +19452,20 @@ mod tests {
 
         service.cleanup_after_focus_loss().unwrap();
         assert!(service.pending_personal_selection.borrow().is_none());
-        assert!(service.personal_phrase_composer.borrow().previous.is_none());
+        assert!(
+            service
+                .personal_phrase_composer
+                .borrow()
+                .components
+                .is_empty()
+        );
         assert_eq!(
             service
                 .personal_ranking
                 .borrow()
                 .snapshot
-                .preferred_text("uiub"),
-            Some("试手")
+                .preferred_text("uiublmxi"),
+            Some("试手练习")
         );
     }
 
@@ -19095,6 +19520,60 @@ mod tests {
         assert_eq!(
             promoted.candidates.first().map(String::as_str),
             Some("试手")
+        );
+        assert!(!promoted.provenance[0].session_promoted());
+        assert!(
+            promoted.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        drop(second);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn one_confirmed_four_character_personal_phrase_survives_a_new_service() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-long-phrase-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+
+        let first = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+        first
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root.clone())));
+        for (code, text) in [("ui", "试"), ("ub", "手"), ("lm", "练"), ("xi", "习")] {
+            remember_verified_personal_character(&first, code, text);
+        }
+        assert!(first.confirm_pending_personal_selection());
+        assert!(first.personal_ranking.borrow_mut().flush());
+        drop(first);
+
+        let second = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+        second
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root)));
+        let promoted = second
+            .load_candidate_batch(
+                &PersonalPhraseCandidateProvider,
+                "uiublmxi",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            promoted.candidates.first().map(String::as_str),
+            Some("试手练习")
         );
         assert!(!promoted.provenance[0].session_promoted());
         assert!(
