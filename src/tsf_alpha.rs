@@ -50,11 +50,11 @@ use crate::{
     PersonalContextRanking, PersonalRankingBatch, PersonalRankingSelection,
     PersonalRankingSnapshot, PersonalRankingSuppressionAction,
     PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
-    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, WISH_ACK_COMPARTMENT_GUID,
-    WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
-    WishCommand, WishCommandAck, WishCommandAckStatus, WishJournalAnchor, WishJournalContext,
-    WishJournalSpan, WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot,
-    candidate_sha256_hex, load_candidate_runtime_exact_short,
+    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, SupplementalCandidateLayerConfig,
+    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
+    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
+    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_exact_short,
     load_candidate_runtime_exact_short_selection, load_candidate_runtime_snapshots_with_layers,
     load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
     load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
@@ -161,7 +161,9 @@ const TSF_CONVERSATION_OVERLAY: &str =
     include_str!("../data/public/ziranma-conversation-overlay-v1.tsv");
 const TSF_PUBLIC_STROKE_SEQUENCES: &str =
     include_str!("../data/public/conway-stroke-data/sequence-characters.txt");
-const CANDIDATE_PAGE_SIZE: usize = 6;
+/// Fixed visible candidate count on one TSF Alpha page.
+pub const TSF_ALPHA_CANDIDATE_PAGE_SIZE: usize = 6;
+const CANDIDATE_PAGE_SIZE: usize = TSF_ALPHA_CANDIDATE_PAGE_SIZE;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 const SHAPE_CANDIDATE_POOL_CACHE_CAPACITY: usize = MAX_TAB_ASSEMBLY_CHARACTERS;
 const EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY: usize = 128;
@@ -1180,6 +1182,7 @@ struct CandidateProviderBlueprint {
     snapshot: Arc<CandidateSnapshot>,
     supplemental: Option<CandidateRuntimeSupplemental>,
     supplemental_root: Option<PathBuf>,
+    static_supplemental: Option<(Arc<CandidateSnapshot>, SupplementalCandidateLayerConfig)>,
     exact_short: Option<CandidateRuntimeExactShort>,
     exact_short_root: Option<PathBuf>,
     static_exact_short: Option<ExactShortCandidateLayer>,
@@ -1196,6 +1199,9 @@ impl CandidateProviderBlueprint {
             self.exact_short_root.clone(),
             self.alias_root.clone(),
         );
+        if let Some(layer) = self.static_supplemental.clone() {
+            provider.supplemental = PublicSupplementRuntime::static_layer(Some(layer));
+        }
         if let Some(layer) = self.static_exact_short.clone() {
             provider.exact_short = PublicExactShortRuntime::static_layer(Some(layer));
         }
@@ -1215,7 +1221,6 @@ struct PublicSupplementRuntimeState {
 }
 
 impl PublicSupplementRuntime {
-    #[cfg(test)]
     fn static_layer(
         supplemental: Option<(
             Arc<CandidateSnapshot>,
@@ -2233,6 +2238,7 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
                 snapshot,
                 supplemental: None,
                 supplemental_root: None,
+                static_supplemental: None,
                 exact_short: None,
                 exact_short_root: None,
                 static_exact_short: None,
@@ -2269,6 +2275,7 @@ fn candidate_provider_for_roots(
             snapshot: Arc::clone(runtime.core()),
             supplemental: runtime.supplemental().cloned(),
             supplemental_root: supplemental_root.map(Path::to_path_buf),
+            static_supplemental: None,
             exact_short: runtime.exact_short().cloned(),
             exact_short_root: exact_short_root.map(Path::to_path_buf),
             static_exact_short: None,
@@ -2453,17 +2460,22 @@ impl TsfCandidatePreflightReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TsfExactShortPreflightReport {
     core_revision: String,
+    supplemental_revision: Option<String>,
     exact_short_revision: String,
     input_keys: usize,
     committed_characters: usize,
-    first_page_ms: u32,
-    second_page_ms: u32,
-    commit_ms: u32,
+    first_page: Duration,
+    second_page: Duration,
+    commit: Duration,
 }
 
 impl TsfExactShortPreflightReport {
     pub fn core_revision(&self) -> &str {
         &self.core_revision
+    }
+
+    pub fn supplemental_revision(&self) -> Option<&str> {
+        self.supplemental_revision.as_deref()
     }
 
     pub fn exact_short_revision(&self) -> &str {
@@ -2479,18 +2491,33 @@ impl TsfExactShortPreflightReport {
     }
 
     /// Wall time for routing the code and observing its unchanged first page.
+    pub fn first_page_duration(&self) -> Duration {
+        self.first_page
+    }
+
+    /// Millisecond projection retained for compact human-facing reports.
     pub fn first_page_ms(&self) -> u32 {
-        self.first_page_ms
+        duration_milliseconds(self.first_page)
     }
 
     /// Wall time for PageDown to synchronously expose the second page.
+    pub fn second_page_duration(&self) -> Duration {
+        self.second_page
+    }
+
+    /// Millisecond projection retained for compact human-facing reports.
     pub fn second_page_ms(&self) -> u32 {
-        self.second_page_ms
+        duration_milliseconds(self.second_page)
     }
 
     /// Wall time for committing the first candidate on the second page.
+    pub fn commit_duration(&self) -> Duration {
+        self.commit
+    }
+
+    /// Millisecond projection retained for compact human-facing reports.
     pub fn commit_ms(&self) -> u32 {
-        self.commit_ms
+        duration_milliseconds(self.commit)
     }
 }
 
@@ -2578,6 +2605,7 @@ pub fn preflight_candidate_snapshot(
             snapshot,
             supplemental: None,
             supplemental_root: None,
+            static_supplemental: None,
             exact_short: None,
             exact_short_root: None,
             static_exact_short: None,
@@ -2610,18 +2638,47 @@ pub fn preflight_exact_short_candidate_layer(
     probe_code: &str,
     expected_text: &str,
 ) -> std::result::Result<TsfExactShortPreflightReport, TsfCandidatePreflightError> {
+    preflight_exact_short_candidate_layers(
+        core,
+        None,
+        exact_short,
+        exact_promotions,
+        probe_code,
+        expected_text,
+    )
+}
+
+/// Routes a core, optional supplemental, and exact-short stack through TSF.
+///
+/// The supplemental snapshot is immutable for the complete synthetic
+/// composition. No runtime roots or current-user state are opened.
+pub fn preflight_exact_short_candidate_layers(
+    core: Arc<CandidateSnapshot>,
+    supplemental: Option<(Arc<CandidateSnapshot>, SupplementalCandidateLayerConfig)>,
+    exact_short: Arc<ExactShortWordCatalog>,
+    exact_promotions: usize,
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<TsfExactShortPreflightReport, TsfCandidatePreflightError> {
     let committed_characters = validate_candidate_preflight_request(probe_code, expected_text)?;
     if probe_code.len() != 4
         || !(1..=crate::MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions)
+        || supplemental
+            .as_ref()
+            .is_some_and(|(_, config)| config.exact_promotions > MAX_CANDIDATE_SNAPSHOT_RANK)
     {
         return Err(TsfCandidatePreflightError::ExactShortPageMismatch);
     }
     let core_revision = core.revision().to_owned();
+    let supplemental_revision = supplemental
+        .as_ref()
+        .map(|(snapshot, _)| snapshot.revision().to_owned());
     let exact_short_revision = exact_short.revision().to_owned();
     let blueprint = CandidateProviderBlueprint {
         snapshot: core,
         supplemental: None,
         supplemental_root: None,
+        static_supplemental: supplemental,
         exact_short: None,
         exact_short_root: None,
         static_exact_short: Some(ExactShortCandidateLayer {
@@ -2686,12 +2743,13 @@ pub fn preflight_exact_short_candidate_layer(
     let timings = result?;
     Ok(TsfExactShortPreflightReport {
         core_revision,
+        supplemental_revision,
         exact_short_revision,
         input_keys: probe_code.len(),
         committed_characters,
-        first_page_ms: timings.first_page_ms,
-        second_page_ms: timings.second_page_ms,
-        commit_ms: timings.commit_ms,
+        first_page: timings.first_page,
+        second_page: timings.second_page,
+        commit: timings.commit,
     })
 }
 
@@ -2859,9 +2917,9 @@ enum PreflightSelection {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PreflightTimings {
-    first_page_ms: u32,
-    second_page_ms: u32,
-    commit_ms: u32,
+    first_page: Duration,
+    second_page: Duration,
+    commit: Duration,
 }
 
 fn run_candidate_preflight(
@@ -2960,9 +3018,9 @@ fn run_candidate_preflight_with_selection(
     {
         return Err(TsfCandidatePreflightError::PreeditMismatch);
     }
-    let first_page_ms = elapsed_milliseconds(first_page_started_at);
+    let first_page = first_page_started_at.elapsed();
 
-    let second_page_ms = if selection == PreflightSelection::SecondPageFirstCandidate {
+    let second_page = if selection == PreflightSelection::SecondPageFirstCandidate {
         let second_page_started_at = Instant::now();
         let next_page = WPARAM(usize::from(VK_NEXT.0));
         // SAFETY: routes one ordinary candidate-navigation key through the
@@ -2981,9 +3039,9 @@ fn run_candidate_preflight_with_selection(
         {
             return Err(TsfCandidatePreflightError::PreeditMismatch);
         }
-        elapsed_milliseconds(second_page_started_at)
+        second_page_started_at.elapsed()
     } else {
-        0
+        Duration::ZERO
     };
 
     let commit_started_at = Instant::now();
@@ -3003,7 +3061,7 @@ fn run_candidate_preflight_with_selection(
     {
         return Err(TsfCandidatePreflightError::CommitMismatch);
     }
-    let commit_ms = elapsed_milliseconds(commit_started_at);
+    let commit = commit_started_at.elapsed();
 
     document_activation
         .close()
@@ -3021,9 +3079,9 @@ fn run_candidate_preflight_with_selection(
     drop(factory);
     drop(thread_manager);
     Ok(PreflightTimings {
-        first_page_ms,
-        second_page_ms,
-        commit_ms,
+        first_page,
+        second_page,
+        commit,
     })
 }
 
@@ -7802,7 +7860,11 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
 }
 
 fn elapsed_milliseconds(started_at: Instant) -> u32 {
-    started_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+    duration_milliseconds(started_at.elapsed())
+}
+
+fn duration_milliseconds(duration: Duration) -> u32 {
+    duration.as_millis().min(u128::from(u32::MAX)) as u32
 }
 
 fn slow_key_path_timing_event(
@@ -14883,6 +14945,8 @@ mod tests {
 寅寅\tshou shu\t20\n\
 卯卯\tshou shu\t10\n";
         const EXACT: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t100\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n手术\tshou shu\t100\n";
+        const REPLACEMENT_EXACT: &str = "text\tpinyin\tfrequency\n首数\tshou shu\t100\n";
         let core_manifest =
             CandidatePackageManifest::from_payload("tsf-exact-short-core-v1", false, CORE).unwrap();
         let core = Arc::new(core_manifest.load_snapshot(CORE).unwrap());
@@ -14890,6 +14954,13 @@ mod tests {
             CandidatePackageManifest::from_payload("tsf-exact-short-catalog-v1", false, EXACT)
                 .unwrap();
         let exact = Arc::new(ExactShortWordCatalog::load(&exact_manifest, EXACT).unwrap());
+        let supplemental_manifest = CandidatePackageManifest::from_payload(
+            "tsf-exact-short-supplemental-v1",
+            false,
+            SUPPLEMENTAL,
+        )
+        .unwrap();
+        let supplemental = Arc::new(supplemental_manifest.load_snapshot(SUPPLEMENTAL).unwrap());
 
         assert_eq!(
             preflight_exact_short_candidate_layer(
@@ -14903,8 +14974,73 @@ mod tests {
             TsfCandidatePreflightError::ExactShortPageMismatch
         );
 
+        let layered_report = preflight_exact_short_candidate_layers(
+            Arc::clone(&core),
+            Some((
+                Arc::clone(&supplemental),
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )),
+            Arc::clone(&exact),
+            1,
+            "ubuu",
+            "收束",
+        )
+        .unwrap();
+        assert_eq!(
+            layered_report.supplemental_revision(),
+            Some("tsf-exact-short-supplemental-v1")
+        );
+
+        let replacement_manifest = CandidatePackageManifest::from_payload(
+            "tsf-exact-short-replacement-v1",
+            false,
+            REPLACEMENT_EXACT,
+        )
+        .unwrap();
+        let replacement = Arc::new(
+            ExactShortWordCatalog::load(&replacement_manifest, REPLACEMENT_EXACT).unwrap(),
+        );
+        assert_eq!(
+            preflight_exact_short_candidate_layers(
+                Arc::clone(&core),
+                Some((
+                    Arc::clone(&supplemental),
+                    SupplementalCandidateLayerConfig {
+                        exact_promotions: 1,
+                    },
+                )),
+                Arc::clone(&replacement),
+                1,
+                "ubuu",
+                "收束",
+            )
+            .unwrap_err(),
+            TsfCandidatePreflightError::ExactShortPageMismatch
+        );
+        let replacement_report = preflight_exact_short_candidate_layers(
+            Arc::clone(&core),
+            Some((
+                supplemental,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )),
+            replacement,
+            1,
+            "ubuu",
+            "首数",
+        )
+        .unwrap();
+        assert_eq!(
+            replacement_report.exact_short_revision(),
+            "tsf-exact-short-replacement-v1"
+        );
+
         let report = preflight_exact_short_candidate_layer(core, exact, 1, "ubuu", "收束").unwrap();
         assert_eq!(report.core_revision(), "tsf-exact-short-core-v1");
+        assert_eq!(report.supplemental_revision(), None);
         assert_eq!(report.exact_short_revision(), "tsf-exact-short-catalog-v1");
         assert_eq!(report.input_keys(), 4);
         assert_eq!(report.committed_characters(), 2);

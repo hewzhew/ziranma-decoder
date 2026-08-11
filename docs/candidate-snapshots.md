@@ -274,6 +274,28 @@ median 达 95.898 ms，而精确合并 P95 仍只有 0.008 ms；所以 Top-50 �
 全局分页审计，绝不能被每次按键或首帧同步调用。两个约百毫秒解码分布的 median
 相减受运行噪声支配，命令只报告该差值，不再把它误作精确层增量安全门。
 
+启用前的真实 TSF 状态路径可用另一条 release-only、只读命令复现。它认证完整核心、
+可选补充和精确短词包，等距寻找能保持第一页且把公开精确项放在索引 6 的目标；探针
+码与候选正文只在内存中用于合成 Context，不进入报告：
+
+```powershell
+cargo run --release --bin candidatectl -- exact-short-tsf-preflight `
+  --core-package .local/candidate-rime-pinyin-simp-0c6861ef-v1 `
+  --supplemental-package .local/public-audit/wanxiang-fdda7afb/package-top120k-v1 `
+  --supplemental-promotions 1 `
+  --exact-package .local/public-audit/wanxiang-fdda7afb/package-exact-short-consensus-depth2-v1 `
+  --exact-promotions 2 --sample-limit 16 --repetitions 5
+```
+
+固定本机 80 个 release 样本全部保持第一页并由空格提交带
+`PublicConsensusExact` 来源的第二页首项。第一页状态 median 12.013 ms、p95
+15.347 ms；PageDown 增量 median 7.453 ms、p95 9.810 ms；首键至第二页状态
+median 19.615 ms、p95 25.264 ms、max 26.463 ms；提交 p95 0.035 ms。核心、补充、
+精确层认证与索引分别约 88.857、233.781、79.631 ms。命令每个目标先作一次不计时
+预热，工作量上限为 32 码 × 20 次且总计不超过 640 个样本；它不写文件、不生成预检
+凭据、不改变槽位。同步返回只证明候选状态已就绪，不证明候选窗完成绘制，也不包含
+桌面合成、真实应用宿主和运行时换包延迟。
+
 TSF 尚未加载、安装或启用这个包，因此当前日用候选位移严格为零。候选缓存已经
 按 6、12、18……惰性扩页。`ExactShortPageSession` 现在提供一个不落盘的纯候选文字
 边界：第一页不查询精确层，第二页只作一次保护插入决定，后续扩深冻结全部已返回
@@ -292,9 +314,9 @@ TSF 尚未加载、安装或启用这个包，因此当前日用候选位移严�
 一个不发布状态的专用预检 API 会在进入宿主前严格确认第一页为 6 项、目标不在其中、
 并以 `PublicConsensusExact` 来源稳定位于索引 6；随后通过真实系统 Thread Manager、
 合成 Context 和同一按键接收器输入完整码，发送 PageDown，再以空格提交第二页首项。
-正例和目标已在第一页的反例均有 Windows 合成测试。返回报告只含核心/精确 revision、
-输入键数、提交字符数以及首屏、翻页、提交的本机诊断耗时，不含正文。它证明功能
-链路，不代替真实 release 包的重复延迟测量或运行时换包测量；这些门通过前仍不启用。
+正反例、可选补充层和连续精确 revision 替换均有 Windows 合成测试。返回报告只含
+核心/可选补充/精确 revision、输入长度与高分辨率耗时，不含正文。真实 release
+状态路径的重复测量已完成上述第一批固定基线；视觉呈现及运行时换包门通过前仍不启用。
 
 导入器同时聚合报告三字、四字规范码，而不显示词条文字。上述固定切片中，
 536,722 个合格三字码有 26,897 个进入最终切片，635,180 个合格四字码有

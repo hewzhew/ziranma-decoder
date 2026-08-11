@@ -20,8 +20,6 @@ use windows::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows::core::PCWSTR;
 
-#[cfg(windows)]
-use ziranma_core::preflight_candidate_snapshot;
 use ziranma_core::{
     CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE,
     CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_PACKAGES_DIRECTORY,
@@ -58,6 +56,11 @@ use ziranma_core::{
     select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
     supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
+};
+#[cfg(windows)]
+use ziranma_core::{
+    TSF_ALPHA_CANDIDATE_PAGE_SIZE, TsfCandidatePreflightError, preflight_candidate_snapshot,
+    preflight_exact_short_candidate_layers,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
@@ -159,6 +162,15 @@ enum Options {
         supplemental_promotions: usize,
         exact_promotions: usize,
         candidate_limit: usize,
+        sample_limit: usize,
+        repetitions: usize,
+    },
+    ExactShortTsfPreflight {
+        core_package: PathBuf,
+        supplemental_package: Option<PathBuf>,
+        exact_package: PathBuf,
+        supplemental_promotions: Option<usize>,
+        exact_promotions: usize,
         sample_limit: usize,
         repetitions: usize,
     },
@@ -530,6 +542,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_limit,
             repetitions,
         })?,
+        Options::ExactShortTsfPreflight {
+            core_package,
+            supplemental_package,
+            exact_package,
+            supplemental_promotions,
+            exact_promotions,
+            sample_limit,
+            repetitions,
+        } => preflight_exact_short_tsf(ExactShortTsfPreflightRequest {
+            core_package: &core_package,
+            supplemental_package: supplemental_package.as_deref(),
+            exact_package: &exact_package,
+            supplemental_promotions,
+            exact_promotions,
+            sample_limit,
+            repetitions,
+        })?,
         Options::PhraseCoverageAudit {
             source,
             allowlist,
@@ -749,6 +778,7 @@ fn parse_options(
         "short-consensus-audit" => parse_short_consensus_audit(arguments),
         "exact-short-layer-audit" => parse_exact_short_layer_audit(arguments),
         "exact-short-layer-benchmark" => parse_exact_short_layer_benchmark(arguments),
+        "exact-short-tsf-preflight" => parse_exact_short_tsf_preflight(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
@@ -1718,6 +1748,81 @@ fn parse_exact_short_layer_benchmark(
     })
 }
 
+fn parse_exact_short_tsf_preflight(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_package = None;
+    let mut supplemental_package = None;
+    let mut exact_package = None;
+    let mut supplemental_promotions = None;
+    let mut exact_promotions = None;
+    let mut sample_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-package" => set_path(&mut core_package, &mut arguments, "--core-package")?,
+            "--supplemental-package" => set_path(
+                &mut supplemental_package,
+                &mut arguments,
+                "--supplemental-package",
+            )?,
+            "--exact-package" => set_path(&mut exact_package, &mut arguments, "--exact-package")?,
+            "--supplemental-promotions" => set_usize(
+                &mut supplemental_promotions,
+                &mut arguments,
+                "--supplemental-promotions",
+            )?,
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err(
+                    "unknown exact-short-tsf-preflight argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    if supplemental_package.is_some() != supplemental_promotions.is_some() {
+        return Err(
+            "exact-short-tsf-preflight requires supplemental package and promotion bound together"
+                .into(),
+        );
+    }
+    if supplemental_promotions
+        .is_some_and(|promotions| !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&promotions))
+    {
+        return Err(
+            "exact-short-tsf-preflight --supplemental-promotions is outside the fixed bound".into(),
+        );
+    }
+    let exact_promotions =
+        exact_promotions.ok_or("exact-short-tsf-preflight requires --exact-promotions")?;
+    if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+        return Err(
+            "exact-short-tsf-preflight --exact-promotions is outside the fixed bound".into(),
+        );
+    }
+    let sample_limit = sample_limit.ok_or("exact-short-tsf-preflight requires --sample-limit")?;
+    if !(1..=32).contains(&sample_limit) {
+        return Err("exact-short-tsf-preflight --sample-limit must be within 1..32".into());
+    }
+    let repetitions = repetitions.ok_or("exact-short-tsf-preflight requires --repetitions")?;
+    if !(1..=20).contains(&repetitions) || sample_limit.saturating_mul(repetitions) > 640 {
+        return Err("exact-short-tsf-preflight workload exceeds the fixed 640-probe bound".into());
+    }
+    Ok(Options::ExactShortTsfPreflight {
+        core_package: core_package.ok_or("exact-short-tsf-preflight requires --core-package")?,
+        supplemental_package,
+        exact_package: exact_package.ok_or("exact-short-tsf-preflight requires --exact-package")?,
+        supplemental_promotions,
+        exact_promotions,
+        sample_limit,
+        repetitions,
+    })
+}
+
 fn parse_phrase_coverage_audit(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -2548,6 +2653,9 @@ fn print_usage() {
     );
     eprintln!(
         "  exact-short-layer-benchmark --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --exact-package <PUBLIC_PACKAGE_DIR> --frontier-limit <2..25> --supplemental-promotions <0..FRONTIER> --exact-promotions <1..8> --candidate-limit <TWO-PAGES..50> --sample-limit <8..2048> --repetitions <1..100>"
+    );
+    eprintln!(
+        "  exact-short-tsf-preflight --core-package <PUBLIC_PACKAGE_DIR> [--supplemental-package <PUBLIC_PACKAGE_DIR> --supplemental-promotions <1..50>] --exact-package <PUBLIC_PACKAGE_DIR> --exact-promotions <1..8> --sample-limit <1..32> --repetitions <1..20>"
     );
     eprintln!(
         "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
@@ -4443,6 +4551,37 @@ struct ExactShortLayerBenchmarkRequest<'a> {
     repetitions: usize,
 }
 
+struct ExactShortTsfPreflightRequest<'a> {
+    core_package: &'a Path,
+    supplemental_package: Option<&'a Path>,
+    exact_package: &'a Path,
+    supplemental_promotions: Option<usize>,
+    exact_promotions: usize,
+    sample_limit: usize,
+    repetitions: usize,
+}
+
+struct ExactShortTsfLayerIdentity {
+    revision: String,
+    authentication_sha256: String,
+    load_duration: Duration,
+}
+
+struct ExactShortTsfPreflightSummary {
+    core: ExactShortTsfLayerIdentity,
+    supplemental: Option<ExactShortTsfLayerIdentity>,
+    exact: ExactShortTsfLayerIdentity,
+    exact_promotions: usize,
+    requested_probes: usize,
+    inspected_codes: usize,
+    repetitions: usize,
+    first_page: DurationSummary,
+    second_page: DurationSummary,
+    commit: DurationSummary,
+    to_second_page: DurationSummary,
+    complete_path: DurationSummary,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ExactShortTargetDepthAudit {
     first: usize,
@@ -5104,6 +5243,278 @@ fn benchmark_exact_short_layer(
         },
         repetitions = request.repetitions,
     ))
+}
+
+#[cfg(windows)]
+fn preflight_exact_short_tsf(
+    request: ExactShortTsfPreflightRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("exact-short-tsf-preflight must run from a release build".into());
+    }
+
+    let core_started = Instant::now();
+    let core = load_public_package_directory(request.core_package)?;
+    let core_load_duration = core_started.elapsed();
+
+    let supplemental = match request.supplemental_package {
+        Some(path) => {
+            let started = Instant::now();
+            let loaded = load_public_package_directory(path)?;
+            Some((loaded, started.elapsed()))
+        }
+        None => None,
+    };
+
+    let exact_started = Instant::now();
+    let (exact, exact_entries) =
+        load_exact_short_package_directory_with_entries(request.exact_package)?;
+    let exact_load_duration = exact_started.elapsed();
+    if exact_entries.len() != exact.catalog.entry_count() {
+        return Err("exact-short TSF sampling payload changed after authentication".into());
+    }
+    if supplemental
+        .as_ref()
+        .is_some_and(|(loaded, _)| loaded.authentication_sha256 == core.authentication_sha256)
+    {
+        return Err(
+            "exact-short TSF preflight requires distinct core and supplemental data".into(),
+        );
+    }
+
+    let all_codes = evenly_spaced_exact_short_codes(&exact_entries, exact_entries.len());
+    if request.sample_limit > all_codes.len() {
+        return Err("exact-short TSF preflight package exposes too few distinct codes".into());
+    }
+
+    struct Probe {
+        code: String,
+        expected_text: String,
+    }
+
+    let exact_revision = exact.catalog.revision().to_owned();
+    let exact_catalog = Arc::new(exact.catalog);
+    let expected_supplemental_revision = supplemental
+        .as_ref()
+        .map(|(loaded, _)| loaded.snapshot.revision());
+    let supplemental_layer = || {
+        supplemental.as_ref().map(|(loaded, _)| {
+            (
+                Arc::clone(&loaded.snapshot),
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: request
+                        .supplemental_promotions
+                        .expect("the parser binds a supplemental package and cap together"),
+                },
+            )
+        })
+    };
+    let mut probes = Vec::<Probe>::with_capacity(request.sample_limit);
+    let mut inspected = BTreeSet::<usize>::new();
+    let per_anchor_scan = all_codes.len().min(64);
+    for sample_index in 0..request.sample_limit {
+        let anchor = sample_index * all_codes.len() / request.sample_limit;
+        let mut selected = None;
+        for offset in 0..per_anchor_scan {
+            let code_index = (anchor + offset) % all_codes.len();
+            if !inspected.insert(code_index) {
+                continue;
+            }
+            let code = &all_codes[code_index];
+            let targets = exact_catalog
+                .candidate_texts(code, MAX_EXACT_SHORT_WORDS_PER_CODE)?
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for expected_text in targets {
+                match preflight_exact_short_candidate_layers(
+                    Arc::clone(&core.snapshot),
+                    supplemental_layer(),
+                    Arc::clone(&exact_catalog),
+                    request.exact_promotions,
+                    code,
+                    &expected_text,
+                ) {
+                    Ok(report) => {
+                        if report.core_revision() != core.snapshot.revision()
+                            || report.supplemental_revision() != expected_supplemental_revision
+                            || report.exact_short_revision() != exact_revision
+                        {
+                            return Err("exact-short TSF preflight runtime identity changed".into());
+                        }
+                        selected = Some(Probe {
+                            code: code.clone(),
+                            expected_text,
+                        });
+                        break;
+                    }
+                    Err(TsfCandidatePreflightError::ExactShortPageMismatch) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+        probes.push(selected.ok_or(
+            "exact-short TSF preflight found too few page-stable probes within the bounded scan",
+        )?);
+    }
+
+    let sample_count = probes.len().saturating_mul(request.repetitions);
+    let mut first_page_samples = Vec::with_capacity(sample_count);
+    let mut second_page_samples = Vec::with_capacity(sample_count);
+    let mut commit_samples = Vec::with_capacity(sample_count);
+    let mut to_second_page_samples = Vec::with_capacity(sample_count);
+    let mut complete_path_samples = Vec::with_capacity(sample_count);
+    for _ in 0..request.repetitions {
+        for probe in &probes {
+            let report = preflight_exact_short_candidate_layers(
+                Arc::clone(&core.snapshot),
+                supplemental_layer(),
+                Arc::clone(&exact_catalog),
+                request.exact_promotions,
+                &probe.code,
+                &probe.expected_text,
+            )?;
+            if report.core_revision() != core.snapshot.revision()
+                || report.supplemental_revision() != expected_supplemental_revision
+                || report.exact_short_revision() != exact_revision
+            {
+                return Err("exact-short TSF preflight runtime identity changed".into());
+            }
+            first_page_samples.push(report.first_page_duration());
+            second_page_samples.push(report.second_page_duration());
+            commit_samples.push(report.commit_duration());
+            to_second_page_samples
+                .push(report.first_page_duration() + report.second_page_duration());
+            complete_path_samples.push(
+                report.first_page_duration()
+                    + report.second_page_duration()
+                    + report.commit_duration(),
+            );
+        }
+    }
+
+    let summary = ExactShortTsfPreflightSummary {
+        core: ExactShortTsfLayerIdentity {
+            revision: core.snapshot.revision().to_owned(),
+            authentication_sha256: core.authentication_sha256,
+            load_duration: core_load_duration,
+        },
+        supplemental: supplemental.map(|(loaded, load_duration)| ExactShortTsfLayerIdentity {
+            revision: loaded.snapshot.revision().to_owned(),
+            authentication_sha256: loaded.authentication_sha256,
+            load_duration,
+        }),
+        exact: ExactShortTsfLayerIdentity {
+            revision: exact_revision,
+            authentication_sha256: exact.authentication_sha256,
+            load_duration: exact_load_duration,
+        },
+        exact_promotions: request.exact_promotions,
+        requested_probes: probes.len(),
+        inspected_codes: inspected.len(),
+        repetitions: request.repetitions,
+        first_page: summarize_durations(&mut first_page_samples)
+            .ok_or("exact-short TSF preflight produced no first-page samples")?,
+        second_page: summarize_durations(&mut second_page_samples)
+            .ok_or("exact-short TSF preflight produced no second-page samples")?,
+        commit: summarize_durations(&mut commit_samples)
+            .ok_or("exact-short TSF preflight produced no commit samples")?,
+        to_second_page: summarize_durations(&mut to_second_page_samples)
+            .ok_or("exact-short TSF preflight produced no combined page samples")?,
+        complete_path: summarize_durations(&mut complete_path_samples)
+            .ok_or("exact-short TSF preflight produced no complete-path samples")?,
+    };
+    Ok(render_exact_short_tsf_preflight_report(&summary))
+}
+
+#[cfg(not(windows))]
+fn preflight_exact_short_tsf(
+    _request: ExactShortTsfPreflightRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Err("exact-short TSF preflight requires Windows".into())
+}
+
+fn render_exact_short_tsf_preflight_report(summary: &ExactShortTsfPreflightSummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "TSF 精确短词第二页 release 预检").unwrap();
+    writeln!(
+        output,
+        "核心：{} · 认证 SHA-256 {} · 载入 {:.3} ms",
+        summary.core.revision,
+        summary.core.authentication_sha256,
+        duration_ms(summary.core.load_duration),
+    )
+    .unwrap();
+    match summary.supplemental.as_ref() {
+        Some(supplemental) => writeln!(
+            output,
+            "补充：{} · 认证 SHA-256 {} · 载入 {:.3} ms",
+            supplemental.revision,
+            supplemental.authentication_sha256,
+            duration_ms(supplemental.load_duration),
+        )
+        .unwrap(),
+        None => writeln!(output, "补充：未使用").unwrap(),
+    }
+    writeln!(
+        output,
+        "精确层：{} · 认证 SHA-256 {} · 载入 {:.3} ms · 每码最多补 {}",
+        summary.exact.revision,
+        summary.exact.authentication_sha256,
+        duration_ms(summary.exact.load_duration),
+        summary.exact_promotions,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "工作负载：等距锚点 {} 个；有界检查 {} 个码；每码预热 1 次；重复 {}；计时样本 {}；页宽 {}",
+        summary.requested_probes,
+        summary.inspected_codes,
+        summary.repetitions,
+        summary.first_page.samples,
+        TSF_ALPHA_CANDIDATE_PAGE_SIZE,
+    )
+    .unwrap();
+    write_tsf_preflight_duration(&mut output, "输入至第一页状态就绪", summary.first_page);
+    write_tsf_preflight_duration(
+        &mut output,
+        "PageDown 至第二页状态就绪",
+        summary.second_page,
+    );
+    write_tsf_preflight_duration(&mut output, "空格提交第二页首项", summary.commit);
+    write_tsf_preflight_duration(&mut output, "首键至第二页状态就绪", summary.to_second_page);
+    write_tsf_preflight_duration(&mut output, "首键至提交完成", summary.complete_path);
+    writeln!(
+        output,
+        "功能门：全部样本均保持第一页并提交带 PublicConsensusExact 来源的第二页首项"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "性能口径：同机、release、每次新建真实系统 TSF 合成 Context；计时截止同步候选状态，不包含候选窗绘制、桌面合成或实际宿主呈现。只记录分布，尚未授权启用阈值。"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "隐私：报告不含探针码、候选正文或个人数据；本次操作只读，不写槽位、不安装、不启用。"
+    )
+    .unwrap();
+    output
+}
+
+fn write_tsf_preflight_duration(output: &mut String, label: &str, summary: DurationSummary) {
+    writeln!(
+        output,
+        "{label}：median {:.3} ms；p95 {:.3} ms；p99 {:.3} ms；max {:.3} ms",
+        duration_ms(summary.median),
+        duration_ms(summary.p95),
+        duration_ms(summary.p99),
+        duration_ms(summary.maximum),
+    )
+    .unwrap();
 }
 
 fn evenly_spaced_exact_short_codes(entries: &[LexiconEntry], limit: usize) -> Vec<String> {
@@ -11088,6 +11499,144 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn exact_short_tsf_preflight_parser_binds_only_bounded_public_packages() {
+        assert_eq!(
+            parse_options([
+                "exact-short-tsf-preflight".to_owned(),
+                "--core-package".to_owned(),
+                "core-package".to_owned(),
+                "--supplemental-package".to_owned(),
+                "supplemental-package".to_owned(),
+                "--supplemental-promotions".to_owned(),
+                "1".to_owned(),
+                "--exact-package".to_owned(),
+                "exact-package".to_owned(),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+                "--sample-limit".to_owned(),
+                "8".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortTsfPreflight {
+                core_package: PathBuf::from("core-package"),
+                supplemental_package: Some(PathBuf::from("supplemental-package")),
+                exact_package: PathBuf::from("exact-package"),
+                supplemental_promotions: Some(1),
+                exact_promotions: 2,
+                sample_limit: 8,
+                repetitions: 5,
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "exact-short-tsf-preflight".to_owned(),
+                "--core-package".to_owned(),
+                "core-package".to_owned(),
+                "--exact-package".to_owned(),
+                "exact-package".to_owned(),
+                "--exact-promotions".to_owned(),
+                "1".to_owned(),
+                "--sample-limit".to_owned(),
+                "1".to_owned(),
+                "--repetitions".to_owned(),
+                "1".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortTsfPreflight {
+                core_package: PathBuf::from("core-package"),
+                supplemental_package: None,
+                exact_package: PathBuf::from("exact-package"),
+                supplemental_promotions: None,
+                exact_promotions: 1,
+                sample_limit: 1,
+                repetitions: 1,
+            }
+        );
+        assert!(
+            parse_options([
+                "exact-short-tsf-preflight".to_owned(),
+                "--supplemental-package".to_owned(),
+                "supplemental-package".to_owned(),
+            ])
+            .is_err()
+        );
+        for (flag, value) in [
+            ("--supplemental-promotions", "0"),
+            ("--exact-promotions", "9"),
+            ("--sample-limit", "33"),
+            ("--repetitions", "21"),
+        ] {
+            assert!(
+                parse_options([
+                    "exact-short-tsf-preflight".to_owned(),
+                    flag.to_owned(),
+                    value.to_owned(),
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_short_tsf_preflight_debug_guard_runs_before_opening_packages() {
+        let error = preflight_exact_short_tsf(ExactShortTsfPreflightRequest {
+            core_package: Path::new("must-not-be-opened-core"),
+            supplemental_package: None,
+            exact_package: Path::new("must-not-be-opened-exact"),
+            supplemental_promotions: None,
+            exact_promotions: 1,
+            sample_limit: 1,
+            repetitions: 1,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "exact-short-tsf-preflight must run from a release build"
+        );
+    }
+
+    #[test]
+    fn exact_short_tsf_preflight_report_contains_only_aggregate_identity_and_timings() {
+        let duration = DurationSummary {
+            samples: 40,
+            median: Duration::from_micros(1_250),
+            p95: Duration::from_micros(2_500),
+            p99: Duration::from_micros(3_750),
+            maximum: Duration::from_micros(5_000),
+        };
+        let report = render_exact_short_tsf_preflight_report(&ExactShortTsfPreflightSummary {
+            core: ExactShortTsfLayerIdentity {
+                revision: "public-core-v1".to_owned(),
+                authentication_sha256: "a".repeat(64),
+                load_duration: Duration::from_millis(10),
+            },
+            supplemental: None,
+            exact: ExactShortTsfLayerIdentity {
+                revision: "public-exact-v1".to_owned(),
+                authentication_sha256: "b".repeat(64),
+                load_duration: Duration::from_millis(5),
+            },
+            exact_promotions: 2,
+            requested_probes: 8,
+            inspected_codes: 9,
+            repetitions: 5,
+            first_page: duration,
+            second_page: duration,
+            commit: duration,
+            to_second_page: duration,
+            complete_path: duration,
+        });
+        assert!(report.contains("计时样本 40"));
+        assert!(report.contains("median 1.250 ms"));
+        assert!(report.contains("本次操作只读"));
+        assert!(!report.contains("ubuu"));
+        assert!(!report.contains("收束"));
     }
 
     #[test]
