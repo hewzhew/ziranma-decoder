@@ -2105,12 +2105,18 @@ impl ResearchReview {
     ) -> String {
         let mut output = String::new();
         writeln!(output, "最新运行身份（与旧批次分开）").unwrap();
+        let exact_short = if identity.supports_exact_short_candidate_revision() {
+            identity.exact_short_candidate_revision().unwrap_or("无")
+        } else {
+            "旧格式未记录"
+        };
         writeln!(
             output,
-            "DLL {}…；核心 {}；补充 {}。",
+            "DLL {}…；核心 {}；补充 {}；精确短词 {}。",
             &identity.module_sha256()[..12],
             identity.core_candidate_revision(),
             identity.supplemental_candidate_revision().unwrap_or("无"),
+            exact_short,
         )
         .unwrap();
         writeln!(
@@ -2399,12 +2405,18 @@ fn render_runtime_identities(
     )
     .unwrap();
     for (identity, count) in identities.into_iter().take(MAX_REVIEW_ITEMS) {
+        let exact_short = if identity.supports_exact_short_candidate_revision() {
+            identity.exact_short_candidate_revision().unwrap_or("无")
+        } else {
+            "旧格式未记录"
+        };
         writeln!(
             output,
-            "- DLL {}…；核心 {}；补充 {}：{} 批。",
+            "- DLL {}…；核心 {}；补充 {}；精确短词 {}：{} 批。",
             &identity.module_sha256()[..12],
             identity.core_candidate_revision(),
             identity.supplemental_candidate_revision().unwrap_or("无"),
+            exact_short,
             count,
         )
         .unwrap();
@@ -3818,7 +3830,7 @@ mod tests {
         assert!(aggregate.contains("个人短语文档邻接 1/1 批"));
         assert!(aggregate.contains("个人短语文档邻接：首锚点 0；已验证相邻 1；明确断链 0"));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V16 1"));
+        assert!(aggregate.contains("反馈格式：V17 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"

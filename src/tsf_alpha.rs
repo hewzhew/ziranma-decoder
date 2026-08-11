@@ -256,6 +256,7 @@ enum AutomaticTranspositionOutcome {
 struct CandidateDataIdentity {
     core_revision: String,
     supplemental_revision: Option<String>,
+    exact_short_revision: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1376,6 +1377,15 @@ impl PublicExactShortRuntime {
         })
     }
 
+    fn revision(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|state| {
+            state
+                .catalog
+                .as_ref()
+                .map(|catalog| catalog.revision().to_owned())
+        })
+    }
+
     fn refresh(&self) -> bool {
         let Some(root) = self.root.as_deref() else {
             return false;
@@ -1518,6 +1528,7 @@ impl CandidateProvider for SnapshotCandidateProvider {
         Some(CandidateDataIdentity {
             core_revision: self.snapshot.revision().to_owned(),
             supplemental_revision: self.supplemental.revision(),
+            exact_short_revision: self.exact_short.revision(),
         })
     }
 
@@ -8554,10 +8565,11 @@ impl ResearchFeedbackJournal {
 
     fn runtime_identity(&self) -> Option<WishRuntimeIdentity> {
         let candidates = self.candidate_identity.as_ref()?;
-        WishRuntimeIdentity::new(
+        WishRuntimeIdentity::new_with_exact_short(
             self.module_sha256.clone()?,
             candidates.core_revision.clone(),
             candidates.supplemental_revision.clone(),
+            candidates.exact_short_revision.clone(),
         )
         .ok()
     }
@@ -14387,6 +14399,12 @@ mod tests {
             Some(root.clone()),
             None,
         );
+        assert_eq!(
+            provider
+                .candidate_data_identity()
+                .and_then(|identity| identity.exact_short_revision),
+            Some("tsf-exact-first-v1".to_owned())
+        );
 
         let mut first_composition = CandidateCache::default();
         let first_page = first_composition.load(
@@ -14423,6 +14441,12 @@ mod tests {
 
         let mut refresh_at = Instant::now() + CANDIDATE_RUNTIME_REFRESH_INTERVAL;
         assert!(provider.refresh_at_safe_boundary_at(refresh_at));
+        assert_eq!(
+            provider
+                .candidate_data_identity()
+                .and_then(|identity| identity.exact_short_revision),
+            Some("tsf-exact-second-v1".to_owned())
+        );
         let mut after_refresh = CandidateCache::default();
         let refreshed = after_refresh.load(
             &provider,
@@ -16710,6 +16734,7 @@ mod tests {
         runtime.research.candidate_identity = Some(CandidateDataIdentity {
             core_revision: "research-core-v1".to_owned(),
             supplemental_revision: Some("research-supplement-v2".to_owned()),
+            exact_short_revision: Some("research-exact-short-v1".to_owned()),
         });
         runtime.record_at(
             NativeFeedbackContext::Password,
@@ -16766,6 +16791,10 @@ mod tests {
         assert_eq!(
             identity.supplemental_candidate_revision(),
             Some("research-supplement-v2")
+        );
+        assert_eq!(
+            identity.exact_short_candidate_revision(),
+            Some("research-exact-short-v1")
         );
         assert_eq!(
             snapshot.public_candidate_order_policy(),
@@ -16850,6 +16879,7 @@ mod tests {
         runtime.update_candidate_identity(Some(CandidateDataIdentity {
             core_revision: "research-core-v1".to_owned(),
             supplemental_revision: Some("research-supplement-a".to_owned()),
+            exact_short_revision: Some("research-exact-a".to_owned()),
         }));
         runtime.record_at(
             NativeFeedbackContext::Eligible,
@@ -16861,6 +16891,7 @@ mod tests {
         runtime.update_candidate_identity(Some(CandidateDataIdentity {
             core_revision: "research-core-v1".to_owned(),
             supplemental_revision: Some("research-supplement-b".to_owned()),
+            exact_short_revision: Some("research-exact-b".to_owned()),
         }));
         runtime.record_at(
             NativeFeedbackContext::Eligible,
@@ -16894,6 +16925,18 @@ mod tests {
                 .runtime_identity()
                 .and_then(WishRuntimeIdentity::supplemental_candidate_revision),
             Some("research-supplement-b")
+        );
+        assert_eq!(
+            snapshots[0]
+                .runtime_identity()
+                .and_then(WishRuntimeIdentity::exact_short_candidate_revision),
+            Some("research-exact-a")
+        );
+        assert_eq!(
+            snapshots[1]
+                .runtime_identity()
+                .and_then(WishRuntimeIdentity::exact_short_candidate_revision),
+            Some("research-exact-b")
         );
         drop(runtime);
         fs::remove_dir_all(root).unwrap();

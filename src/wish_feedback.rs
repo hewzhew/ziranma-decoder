@@ -48,6 +48,7 @@ pub const WISH_SCHEMA_V13: &str = "ziranma-wish-v13";
 pub const WISH_SCHEMA_V14: &str = "ziranma-wish-v14";
 pub const WISH_SCHEMA_V15: &str = "ziranma-wish-v15";
 pub const WISH_SCHEMA_V16: &str = "ziranma-wish-v16";
+pub const WISH_SCHEMA_V17: &str = "ziranma-wish-v17";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -56,7 +57,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 16;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 17;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -73,6 +74,7 @@ const WISH_PLAINTEXT_MAGIC_V13: &[u8] = b"ziranma-wish-v13\0";
 const WISH_PLAINTEXT_MAGIC_V14: &[u8] = b"ziranma-wish-v14\0";
 const WISH_PLAINTEXT_MAGIC_V15: &[u8] = b"ziranma-wish-v15\0";
 const WISH_PLAINTEXT_MAGIC_V16: &[u8] = b"ziranma-wish-v16\0";
+const WISH_PLAINTEXT_MAGIC_V17: &[u8] = b"ziranma-wish-v17\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -187,6 +189,8 @@ pub struct WishRuntimeIdentity {
     module_sha256: String,
     core_candidate_revision: String,
     supplemental_candidate_revision: Option<String>,
+    exact_short_candidate_revision: Option<String>,
+    exact_short_candidate_revision_recorded: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -297,10 +301,26 @@ impl WishRuntimeIdentity {
         core_candidate_revision: String,
         supplemental_candidate_revision: Option<String>,
     ) -> Result<Self, WishFeedbackError> {
+        Self::new_with_exact_short(
+            module_sha256,
+            core_candidate_revision,
+            supplemental_candidate_revision,
+            None,
+        )
+    }
+
+    pub fn new_with_exact_short(
+        module_sha256: String,
+        core_candidate_revision: String,
+        supplemental_candidate_revision: Option<String>,
+        exact_short_candidate_revision: Option<String>,
+    ) -> Result<Self, WishFeedbackError> {
         let value = Self {
             module_sha256,
             core_candidate_revision,
             supplemental_candidate_revision,
+            exact_short_candidate_revision,
+            exact_short_candidate_revision_recorded: true,
         };
         value.validate()?;
         Ok(value)
@@ -318,6 +338,30 @@ impl WishRuntimeIdentity {
         self.supplemental_candidate_revision.as_deref()
     }
 
+    pub fn exact_short_candidate_revision(&self) -> Option<&str> {
+        self.exact_short_candidate_revision.as_deref()
+    }
+
+    pub fn supports_exact_short_candidate_revision(&self) -> bool {
+        self.exact_short_candidate_revision_recorded
+    }
+
+    fn new_legacy_without_exact_short(
+        module_sha256: String,
+        core_candidate_revision: String,
+        supplemental_candidate_revision: Option<String>,
+    ) -> Result<Self, WishFeedbackError> {
+        let value = Self {
+            module_sha256,
+            core_candidate_revision,
+            supplemental_candidate_revision,
+            exact_short_candidate_revision: None,
+            exact_short_candidate_revision_recorded: false,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     fn validate(&self) -> Result<(), WishFeedbackError> {
         if self.module_sha256.len() != 64
             || !self
@@ -329,6 +373,12 @@ impl WishRuntimeIdentity {
                 .supplemental_candidate_revision
                 .as_deref()
                 .is_some_and(|revision| !valid_candidate_snapshot_revision(revision))
+            || self
+                .exact_short_candidate_revision
+                .as_deref()
+                .is_some_and(|revision| !valid_candidate_snapshot_revision(revision))
+            || (!self.exact_short_candidate_revision_recorded
+                && self.exact_short_candidate_revision.is_some())
         {
             return Err(WishFeedbackError::InvalidSnapshot);
         }
@@ -695,6 +745,10 @@ impl WishSnapshot {
         }
         if let Some(identity) = &self.runtime_identity {
             identity.validate()?;
+            if self.source_schema_version < 17 && identity.supports_exact_short_candidate_revision()
+            {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
         }
         if self.source_schema_version < 13
             && self.public_candidate_order_policy != WishPublicCandidateOrderPolicy::Unrecorded
@@ -762,7 +816,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V16);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V17);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -776,6 +830,17 @@ impl WishSnapshot {
             ));
             if let Some(revision) = identity.supplemental_candidate_revision() {
                 put_string(&mut output, revision)?;
+            }
+            if event_version >= 17 {
+                output.push(u8::from(identity.supports_exact_short_candidate_revision()));
+                if identity.supports_exact_short_candidate_revision() {
+                    output.push(u8::from(
+                        identity.exact_short_candidate_revision().is_some(),
+                    ));
+                    if let Some(revision) = identity.exact_short_candidate_revision() {
+                        put_string(&mut output, revision)?;
+                    }
+                }
             }
         }
         if event_version >= 13 {
@@ -821,7 +886,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V16) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V17) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V17)?;
+            17
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V16) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V16)?;
             16
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V15) {
@@ -882,15 +950,39 @@ impl WishSnapshot {
             (WishCaptureScope::LegacyWindow, WishCategory::Other, 0, 0)
         };
         let runtime_identity = if version >= 7 && reader.boolean()? {
-            Some(WishRuntimeIdentity::new(
-                reader.string()?,
-                reader.string()?,
+            let module_sha256 = reader.string()?;
+            let core_candidate_revision = reader.string()?;
+            let supplemental_candidate_revision = if reader.boolean()? {
+                Some(reader.string()?)
+            } else {
+                None
+            };
+            Some(if version >= 17 {
                 if reader.boolean()? {
-                    Some(reader.string()?)
+                    WishRuntimeIdentity::new_with_exact_short(
+                        module_sha256,
+                        core_candidate_revision,
+                        supplemental_candidate_revision,
+                        if reader.boolean()? {
+                            Some(reader.string()?)
+                        } else {
+                            None
+                        },
+                    )?
                 } else {
-                    None
-                },
-            )?)
+                    WishRuntimeIdentity::new_legacy_without_exact_short(
+                        module_sha256,
+                        core_candidate_revision,
+                        supplemental_candidate_revision,
+                    )?
+                }
+            } else {
+                WishRuntimeIdentity::new_legacy_without_exact_short(
+                    module_sha256,
+                    core_candidate_revision,
+                    supplemental_candidate_revision,
+                )?
+            })
         } else {
             None
         };
@@ -2688,13 +2780,15 @@ mod tests {
             14
         } else if magic == WISH_PLAINTEXT_MAGIC_V15 {
             15
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V16 {
             16
+        } else {
+            17
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V16.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V17.len()..]);
         rendered
     }
 
@@ -2713,13 +2807,13 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V17));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 16);
+        assert_eq!(parsed.source_schema_version(), 17);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
@@ -2880,7 +2974,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V17));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_candidate_suppression_actions());
         assert!(matches!(
@@ -2922,7 +3016,7 @@ mod tests {
             snapshot.source_events += 1;
 
             let rendered = snapshot.render().unwrap();
-            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
+            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V17));
             let parsed = WishSnapshot::parse(&rendered).unwrap();
             assert!(parsed.supports_personal_phrase_adjacency());
             assert!(matches!(
@@ -2951,7 +3045,7 @@ mod tests {
 
         let mut falsely_downgraded = Vec::with_capacity(rendered.len());
         falsely_downgraded.extend_from_slice(WISH_PLAINTEXT_MAGIC_V15);
-        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V16.len()..]);
+        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V17.len()..]);
         assert!(WishSnapshot::parse(&falsely_downgraded).is_err());
 
         let mut unknown_adjacency = rendered.clone();
@@ -3133,7 +3227,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V16));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V17));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
@@ -3177,13 +3271,14 @@ mod tests {
     }
 
     #[test]
-    fn v11_round_trips_exact_runtime_identity() {
+    fn v17_round_trips_all_public_runtime_revisions_and_v16_remains_readable() {
         let mut snapshot = private_snapshot();
         snapshot.runtime_identity = Some(
-            WishRuntimeIdentity::new(
+            WishRuntimeIdentity::new_with_exact_short(
                 "12ab".repeat(16),
                 "rime-core-test-v1".to_owned(),
                 Some("wanxiang-supplement-test-v2".to_owned()),
+                Some("wanxiang-exact-short-test-v1".to_owned()),
             )
             .unwrap(),
         );
@@ -3196,7 +3291,34 @@ mod tests {
             identity.supplemental_candidate_revision(),
             Some("wanxiang-supplement-test-v2")
         );
+        assert_eq!(
+            identity.exact_short_candidate_revision(),
+            Some("wanxiang-exact-short-test-v1")
+        );
+        assert!(identity.supports_exact_short_candidate_revision());
         assert!(parsed == snapshot);
+
+        let legacy = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V16);
+        let legacy = WishSnapshot::parse(&legacy).unwrap();
+        assert_eq!(legacy.source_schema_version(), 16);
+        assert_eq!(
+            legacy
+                .runtime_identity()
+                .and_then(WishRuntimeIdentity::supplemental_candidate_revision),
+            Some("wanxiang-supplement-test-v2")
+        );
+        assert_eq!(
+            legacy
+                .runtime_identity()
+                .and_then(WishRuntimeIdentity::exact_short_candidate_revision),
+            None
+        );
+        assert!(
+            !legacy
+                .runtime_identity()
+                .unwrap()
+                .supports_exact_short_candidate_revision()
+        );
     }
 
     #[test]
@@ -3251,7 +3373,17 @@ mod tests {
         }
 
         let parsed = WishSnapshot::parse(&legacy).unwrap();
-        assert_eq!(parsed.runtime_identity(), Some(&identity));
+        let parsed_identity = parsed.runtime_identity().unwrap();
+        assert_eq!(parsed_identity.module_sha256(), identity.module_sha256());
+        assert_eq!(
+            parsed_identity.core_candidate_revision(),
+            identity.core_candidate_revision()
+        );
+        assert_eq!(
+            parsed_identity.supplemental_candidate_revision(),
+            identity.supplemental_candidate_revision()
+        );
+        assert!(!parsed_identity.supports_exact_short_candidate_revision());
         assert!(parsed.journal_context().is_none());
     }
 

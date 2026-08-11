@@ -377,11 +377,17 @@ fn show(
         }
     );
     if let Some(identity) = snapshot.runtime_identity() {
+        let exact_short = if identity.supports_exact_short_candidate_revision() {
+            identity.exact_short_candidate_revision().unwrap_or("无")
+        } else {
+            "旧格式未记录"
+        };
         println!(
-            "运行身份：DLL {}…；核心 {}；补充 {}",
+            "运行身份：DLL {}…；核心 {}；补充 {}；精确短词 {}",
             &identity.module_sha256()[..12],
             identity.core_candidate_revision(),
             identity.supplemental_candidate_revision().unwrap_or("无"),
+            exact_short,
         );
     } else {
         println!("运行身份：旧批次未记录");
