@@ -78,20 +78,28 @@ mod tests {
 
     #[test]
     fn recognizes_only_cargo_and_immutable_user_tool_layouts() {
+        let repository = PathBuf::from("test-root").join("repo");
         assert_eq!(
             repository_root_for_user_tool_executable(
-                Path::new(r"X:\repo\target\release\wishpad.exe"),
+                &repository
+                    .join("target")
+                    .join("release")
+                    .join("wishpad.exe"),
                 "wishpad"
             ),
-            Some(PathBuf::from(r"X:\repo"))
+            Some(repository.clone())
         );
         let digest = "a".repeat(64);
-        let bundled = PathBuf::from(r"X:\repo\.local\tsf-alpha\user-tools\builds")
+        let bundled = repository
+            .join(".local")
+            .join("tsf-alpha")
+            .join("user-tools")
+            .join("builds")
             .join(&digest)
             .join("wishpad.exe");
         assert_eq!(
             repository_root_for_user_tool_executable(&bundled, "wishpad"),
-            Some(PathBuf::from(r"X:\repo"))
+            Some(repository.clone())
         );
 
         assert!(
@@ -100,7 +108,11 @@ mod tests {
         );
         assert!(
             repository_root_for_user_tool_executable(
-                &PathBuf::from(r"X:\repo\.local\tsf-alpha\user-tools\builds")
+                &repository
+                    .join(".local")
+                    .join("tsf-alpha")
+                    .join("user-tools")
+                    .join("builds")
                     .join("A".repeat(64))
                     .join("wishpad.exe"),
                 "wishpad"
@@ -109,42 +121,63 @@ mod tests {
             "published bundle ids are canonical lowercase SHA-256"
         );
         assert!(
-            repository_root_for_user_tool_executable(Path::new(r"X:\tools\wishpad.exe"), "wishpad")
-                .is_none()
+            repository_root_for_user_tool_executable(
+                &PathBuf::from("test-root").join("tools").join("wishpad.exe"),
+                "wishpad"
+            )
+            .is_none()
         );
         assert_eq!(
             repository_root_for_user_tool_executable(
-                Path::new(r"X:\repo\target\release\ziranma-launcher.exe"),
+                &repository
+                    .join("target")
+                    .join("release")
+                    .join("ziranma-launcher.exe"),
                 "ziranma-launcher"
             ),
-            Some(PathBuf::from(r"X:\repo"))
+            Some(repository)
         );
     }
 
     #[test]
     fn desktop_launcher_recognizes_only_its_fixed_or_build_layouts() {
+        let repository = PathBuf::from("test-root").join("repo");
         assert_eq!(
-            repository_root_for_desktop_launcher_executable(Path::new(
-                r"X:\repo\.local\tsf-alpha\desktop-launcher\ziranma-launcher.exe"
-            )),
-            Some(PathBuf::from(r"X:\repo"))
+            repository_root_for_desktop_launcher_executable(
+                &repository
+                    .join(".local")
+                    .join("tsf-alpha")
+                    .join("desktop-launcher")
+                    .join("ziranma-launcher.exe")
+            ),
+            Some(repository.clone())
         );
         assert_eq!(
-            repository_root_for_desktop_launcher_executable(Path::new(
-                r"X:\repo\target\release\ziranma-launcher.exe"
-            )),
-            Some(PathBuf::from(r"X:\repo"))
+            repository_root_for_desktop_launcher_executable(
+                &repository
+                    .join("target")
+                    .join("release")
+                    .join("ziranma-launcher.exe")
+            ),
+            Some(repository.clone())
         );
         assert!(
-            repository_root_for_desktop_launcher_executable(Path::new(
-                r"X:\repo\.local\desktop-launcher\ziranma-launcher.exe"
-            ))
+            repository_root_for_desktop_launcher_executable(
+                &repository
+                    .join(".local")
+                    .join("desktop-launcher")
+                    .join("ziranma-launcher.exe")
+            )
             .is_none()
         );
         assert!(
-            repository_root_for_desktop_launcher_executable(Path::new(
-                r"X:\repo\.local\tsf-alpha\desktop-launcher\other.exe"
-            ))
+            repository_root_for_desktop_launcher_executable(
+                &repository
+                    .join(".local")
+                    .join("tsf-alpha")
+                    .join("desktop-launcher")
+                    .join("other.exe")
+            )
             .is_none()
         );
     }
