@@ -1547,6 +1547,11 @@ fn current_user_profile_enable_state() -> Result<Option<bool>, Box<dyn std::erro
     }
 }
 
+#[cfg(not(windows))]
+fn current_user_profile_enable_state() -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    Err("current-user TSF profile state is supported only on Windows".into())
+}
+
 #[cfg(windows)]
 fn registration_key_exists(
     root: windows::Win32::System::Registry::HKEY,
