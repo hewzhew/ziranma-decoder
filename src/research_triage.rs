@@ -9,8 +9,8 @@ use std::fmt;
 
 use crate::{
     NativeCandidateProvenance, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
-    native_slow_key_remainder_ms,
+    NativeFeedbackEvent, NativePersonalPhraseAdjacency, WishCaptureScope, WishRuntimeIdentity,
+    WishSnapshot, native_slow_key_remainder_ms,
 };
 
 /// One 60 Hz frame, used as the fixed threshold for visible latency signals.
@@ -31,6 +31,9 @@ pub struct ResearchTriageCapabilityCoverage {
     pub precise_personalization_batches: usize,
     pub precise_ranking_batches: usize,
     pub slow_key_path_batches: usize,
+    pub post_commit_backspace_batches: usize,
+    pub candidate_suppression_action_batches: usize,
+    pub personal_phrase_adjacency_batches: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -94,6 +97,33 @@ impl ResearchRecoverySignals {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResearchPersonalPhraseSignals {
+    pub keyboard_fallbacks: usize,
+    pub first_anchors: usize,
+    pub verified_adjacencies: usize,
+    pub caret_moves: usize,
+    pub anchor_text_changes: usize,
+    pub context_changes: usize,
+    pub range_unavailable: usize,
+}
+
+impl ResearchPersonalPhraseSignals {
+    pub fn observations(self) -> usize {
+        self.keyboard_fallbacks
+            + self.first_anchors
+            + self.verified_adjacencies
+            + self.caret_moves
+            + self.anchor_text_changes
+            + self.context_changes
+            + self.range_unavailable
+    }
+
+    pub fn explicit_breaks(self) -> usize {
+        self.caret_moves + self.anchor_text_changes + self.context_changes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchSlowKeyPhaseSignals {
     pub refresh: usize,
     pub planning: usize,
@@ -144,6 +174,7 @@ pub struct ResearchIssueTriage {
     pub reachability: ResearchCandidateReachabilitySignals,
     pub ranking: ResearchRankingSignals,
     pub recovery: ResearchRecoverySignals,
+    pub personal_phrase: ResearchPersonalPhraseSignals,
     pub latency: ResearchLatencySignals,
 }
 
@@ -251,6 +282,12 @@ fn analyze_research_issue_signals_from<'a>(
             usize::from(snapshot.supports_precise_candidate_ranking_personalization());
         report.capabilities.slow_key_path_batches +=
             usize::from(snapshot.supports_slow_key_path_timing());
+        report.capabilities.post_commit_backspace_batches +=
+            usize::from(snapshot.supports_post_commit_backspace_routing());
+        report.capabilities.candidate_suppression_action_batches +=
+            usize::from(snapshot.supports_candidate_suppression_actions());
+        report.capabilities.personal_phrase_adjacency_batches +=
+            usize::from(snapshot.supports_personal_phrase_adjacency());
         report.coverage.events += snapshot.events().len();
         report.coverage.omitted_events += snapshot
             .omitted_before_window()
@@ -433,7 +470,31 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
             NativeFeedbackEvent::PostCommitBackspaceRouted => {
                 report.recovery.post_commit_backspaces_routed += 1;
             }
-            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { adjacency, .. } => {
+                match adjacency {
+                    NativePersonalPhraseAdjacency::KeyboardFallback => {
+                        report.personal_phrase.keyboard_fallbacks += 1;
+                    }
+                    NativePersonalPhraseAdjacency::FirstAnchor => {
+                        report.personal_phrase.first_anchors += 1;
+                    }
+                    NativePersonalPhraseAdjacency::VerifiedAdjacent => {
+                        report.personal_phrase.verified_adjacencies += 1;
+                    }
+                    NativePersonalPhraseAdjacency::CaretMoved => {
+                        report.personal_phrase.caret_moves += 1;
+                    }
+                    NativePersonalPhraseAdjacency::AnchorTextChanged => {
+                        report.personal_phrase.anchor_text_changes += 1;
+                    }
+                    NativePersonalPhraseAdjacency::ContextChanged => {
+                        report.personal_phrase.context_changes += 1;
+                    }
+                    NativePersonalPhraseAdjacency::RangeUnavailable => {
+                        report.personal_phrase.range_unavailable += 1;
+                    }
+                }
+            }
         }
     }
 }
@@ -569,6 +630,9 @@ mod tests {
         assert_eq!(report.capabilities.precise_personalization_batches, 1);
         assert_eq!(report.capabilities.precise_ranking_batches, 1);
         assert_eq!(report.capabilities.slow_key_path_batches, 1);
+        assert_eq!(report.capabilities.post_commit_backspace_batches, 1);
+        assert_eq!(report.capabilities.candidate_suppression_action_batches, 1);
+        assert_eq!(report.capabilities.personal_phrase_adjacency_batches, 1);
         assert_eq!(report.reachability.non_top_commits, 1);
         assert_eq!(report.ranking.precise_personalization_non_top_commits, 1);
         assert_eq!(report.ranking.personalized_target_non_top_commits, 1);
@@ -854,6 +918,80 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_and_personal_phrase_partitions_close_over_public_synthetic_events() {
+        let events = vec![
+            NativeFeedbackEvent::CandidateSuppressionChanged {
+                code: "aa".to_owned(),
+                text: "甲".to_owned(),
+                action: NativeCandidateSuppressionAction::Suppress,
+            },
+            NativeFeedbackEvent::CandidateSuppressionChanged {
+                code: "aa".to_owned(),
+                text: "甲".to_owned(),
+                action: NativeCandidateSuppressionAction::Restore,
+            },
+            NativeFeedbackEvent::PostCommitBackspaceRouted,
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::KeyboardFallback,
+                previous_components: 0,
+                resulting_components: 1,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::FirstAnchor,
+                previous_components: 0,
+                resulting_components: 1,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
+                previous_components: 1,
+                resulting_components: 2,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::CaretMoved,
+                previous_components: 1,
+                resulting_components: 1,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::AnchorTextChanged,
+                previous_components: 1,
+                resulting_components: 1,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::ContextChanged,
+                previous_components: 1,
+                resulting_components: 1,
+            },
+            NativeFeedbackEvent::PersonalPhraseAdjacencyObserved {
+                adjacency: NativePersonalPhraseAdjacency::RangeUnavailable,
+                previous_components: 1,
+                resulting_components: 1,
+            },
+        ];
+        let timed = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| (u64::try_from(index + 1).unwrap(), event))
+            .collect();
+        let report = analyze_research_issue_signals(&[snapshot(timed)]).unwrap();
+
+        assert_eq!(report.capabilities.post_commit_backspace_batches, 1);
+        assert_eq!(report.capabilities.candidate_suppression_action_batches, 1);
+        assert_eq!(report.capabilities.personal_phrase_adjacency_batches, 1);
+        assert_eq!(report.recovery.post_commit_backspaces_routed, 1);
+        assert_eq!(report.recovery.candidate_suppressions, 1);
+        assert_eq!(report.recovery.candidate_restores, 1);
+        assert_eq!(report.personal_phrase.keyboard_fallbacks, 1);
+        assert_eq!(report.personal_phrase.first_anchors, 1);
+        assert_eq!(report.personal_phrase.verified_adjacencies, 1);
+        assert_eq!(report.personal_phrase.caret_moves, 1);
+        assert_eq!(report.personal_phrase.anchor_text_changes, 1);
+        assert_eq!(report.personal_phrase.context_changes, 1);
+        assert_eq!(report.personal_phrase.range_unavailable, 1);
+        assert_eq!(report.personal_phrase.explicit_breaks(), 3);
+        assert_eq!(report.personal_phrase.observations(), 7);
+    }
+
+    #[test]
     fn ranking_latency_and_capability_denominators_close_over_public_synthetic_events() {
         let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
         let personalized = provenance(
@@ -944,6 +1082,9 @@ mod tests {
         assert_eq!(report.capabilities.precise_personalization_batches, 2);
         assert_eq!(report.capabilities.precise_ranking_batches, 2);
         assert_eq!(report.capabilities.slow_key_path_batches, 2);
+        assert_eq!(report.capabilities.post_commit_backspace_batches, 2);
+        assert_eq!(report.capabilities.candidate_suppression_action_batches, 2);
+        assert_eq!(report.capabilities.personal_phrase_adjacency_batches, 2);
         assert_eq!(report.ranking.precise_personalization_non_top_commits, 3);
         assert_eq!(report.ranking.personalized_target_non_top_commits, 1);
         assert_eq!(report.ranking.unpersonalized_target_non_top_commits, 1);

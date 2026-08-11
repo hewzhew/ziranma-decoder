@@ -322,10 +322,65 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
     };
     writeln!(
         output,
-        "找字与纠错：{shape_lookup_summary}；{transposition_summary}；提交后紧接退格 {}；显式遗忘 {}、恢复 {}。",
+        "找字与纠错：{shape_lookup_summary}；{transposition_summary}。",
+    )
+    .unwrap();
+    let post_commit_backspace_coverage = render_triage_capability(
+        "V10 提交后退格路由字段",
+        triage.capabilities.post_commit_backspace_batches,
+        triage.coverage.batches,
+        "路由事件",
         triage.recovery.post_commit_backspaces_routed,
-        triage.recovery.candidate_suppressions,
-        triage.recovery.candidate_restores,
+    );
+    let suppression_observations =
+        triage.recovery.candidate_suppressions + triage.recovery.candidate_restores;
+    let suppression_coverage = render_triage_capability(
+        "V15 显式遗忘/恢复字段",
+        triage.capabilities.candidate_suppression_action_batches,
+        triage.coverage.batches,
+        "成功落盘动作",
+        suppression_observations,
+    );
+    let suppression_partition = if suppression_observations == 0 {
+        "动作分区暂无有效分母".to_owned()
+    } else {
+        format!(
+            "成功落盘动作中遗忘 {}、恢复 {}（合计 {suppression_observations}/{suppression_observations}）",
+            triage.recovery.candidate_suppressions, triage.recovery.candidate_restores,
+        )
+    };
+    writeln!(
+        output,
+        "学习撤回与遗忘：{post_commit_backspace_coverage}；{suppression_coverage}；{suppression_partition}。提交后退格只表示学习已撤回且按键已交还宿主，不补猜文档结果。",
+    )
+    .unwrap();
+    let personal_phrase_observations = triage.personal_phrase.observations();
+    let personal_phrase_coverage = render_triage_capability(
+        "V16 个人短语邻接字段",
+        triage.capabilities.personal_phrase_adjacency_batches,
+        triage.coverage.batches,
+        "邻接事件",
+        personal_phrase_observations,
+    );
+    let personal_phrase_partition = if personal_phrase_observations == 0 {
+        "邻接分区暂无有效分母".to_owned()
+    } else {
+        format!(
+            "首锚点 {}、已验证相邻 {}、明确断链 {}（光标 {}、锚点文字/选区 {}、Context {}）、范围不可用 {}、键盘连续回退 {}（合计 {}/{personal_phrase_observations}）",
+            triage.personal_phrase.first_anchors,
+            triage.personal_phrase.verified_adjacencies,
+            triage.personal_phrase.explicit_breaks(),
+            triage.personal_phrase.caret_moves,
+            triage.personal_phrase.anchor_text_changes,
+            triage.personal_phrase.context_changes,
+            triage.personal_phrase.range_unavailable,
+            triage.personal_phrase.keyboard_fallbacks,
+            triage.personal_phrase.observations(),
+        )
+    };
+    writeln!(
+        output,
+        "个人短语邻接：{personal_phrase_coverage}；{personal_phrase_partition}。",
     )
     .unwrap();
     let slow_key_coverage = render_triage_capability(
@@ -3935,6 +3990,9 @@ mod tests {
                 precise_personalization_batches: 2,
                 precise_ranking_batches: 2,
                 slow_key_path_batches: 2,
+                post_commit_backspace_batches: 2,
+                candidate_suppression_action_batches: 2,
+                personal_phrase_adjacency_batches: 2,
             },
             reachability: ziranma_core::ResearchCandidateReachabilitySignals {
                 non_top_commits: 2,
@@ -3959,7 +4017,18 @@ mod tests {
                 tab_assisted_commits: 1,
                 transposition_recovery_selected: 1,
                 post_commit_backspaces_routed: 1,
+                candidate_suppressions: 1,
+                candidate_restores: 1,
                 ..ziranma_core::ResearchRecoverySignals::default()
+            },
+            personal_phrase: ziranma_core::ResearchPersonalPhraseSignals {
+                keyboard_fallbacks: 1,
+                first_anchors: 1,
+                verified_adjacencies: 1,
+                caret_moves: 1,
+                anchor_text_changes: 1,
+                context_changes: 1,
+                range_unavailable: 1,
             },
             latency: ziranma_core::ResearchLatencySignals {
                 initial_popup_timings: 2,
@@ -3987,6 +4056,12 @@ mod tests {
         assert!(rendered.contains("首选实际经个人重排但被绕过 1"));
         assert!(rendered.contains("逐字 Tab 辅助 1/1"));
         assert!(rendered.contains("自动换序恢复终局中被选择 1/1"));
+        assert!(rendered.contains("V10 提交后退格路由字段：字段支持（2/2 批）"));
+        assert!(rendered.contains("V15 显式遗忘/恢复字段：字段支持（2/2 批）"));
+        assert!(rendered.contains("成功落盘动作中遗忘 1、恢复 1（合计 2/2）"));
+        assert!(rendered.contains("V16 个人短语邻接字段：字段支持（2/2 批）"));
+        assert!(rendered.contains("首锚点 1、已验证相邻 1、明确断链 3"));
+        assert!(rendered.contains("范围不可用 1、键盘连续回退 1（合计 7/7）"));
         assert!(rendered.contains("首次出现首帧慢样本 1/2"));
         assert!(rendered.contains("慢按键分段字段：字段支持（2/2 批）"));
         assert!(rendered.contains("候选提交可配对 4/5"));
@@ -4053,6 +4128,11 @@ mod tests {
         assert!(rendered.contains("首选重排分区暂无可核对分母"));
         assert!(rendered.contains("未观察到形码提交，逐字 Tab 辅助暂无分母"));
         assert!(rendered.contains("未观察到自动换序恢复终局"));
+        assert!(rendered.contains("V10 提交后退格路由字段：字段不可用（0/2 批支持）"));
+        assert!(rendered.contains("V15 显式遗忘/恢复字段：字段不可用（0/2 批支持）"));
+        assert!(rendered.contains("动作分区暂无有效分母"));
+        assert!(rendered.contains("V16 个人短语邻接字段：字段不可用（0/2 批支持）"));
+        assert!(rendered.contains("邻接分区暂无有效分母"));
         assert!(rendered.contains("首次出现暂无计时样本"));
         assert!(rendered.contains("候选更新暂无计时样本"));
         assert!(rendered.contains("主阶段暂无有效样本"));
