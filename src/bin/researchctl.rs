@@ -9,12 +9,13 @@ use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
     NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
     NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
-    RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
-    ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
+    ResearchHalfPairAnalysis, ResearchIssueTriage, ResearchSceneAnalysis,
+    TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
-    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
-    repository_root_for_user_tool_executable, research_feedback_enabled,
-    set_research_feedback_enabled,
+    analyze_research_issue_signals, analyze_runtime_half_pairs, list_wish_packages,
+    native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+    research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -142,6 +143,7 @@ fn print_summary(root: &Path) -> Result<(), Box<dyn Error>> {
         review.observe(snapshot)?;
     }
     review.available_batches = available_batches;
+    let triage = analyze_research_issue_signals(&snapshots)?;
     let latest_runtime = match latest_runtime_review(&snapshots)? {
         Some((identity, review)) => {
             let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
@@ -149,7 +151,12 @@ fn print_summary(root: &Path) -> Result<(), Box<dyn Error>> {
         }
         None => "最新运行身份：尚无带版本标识的批次。".to_owned(),
     };
-    println!("{}\n\n{}", latest_runtime, review.render_aggregate());
+    println!(
+        "{}\n\n{}\n\n{}",
+        latest_runtime,
+        render_issue_triage(&triage),
+        review.render_aggregate()
+    );
     Ok(())
 }
 
@@ -170,6 +177,7 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
         review.observe(snapshot)?;
     }
     review.available_batches = available_batches;
+    let triage = analyze_research_issue_signals(&snapshots)?;
     let latest_runtime = latest_runtime_review(&snapshots)?;
     let wishes = load_linkable_wishes(root)?;
     let scenes = analyze_linked_research(&snapshots, &wishes)?;
@@ -181,12 +189,80 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
         None => "最新运行身份：尚无带版本标识的批次。".to_owned(),
     };
     println!(
-        "{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}",
         latest_runtime,
+        render_issue_triage(&triage),
         review.render(),
         render_scene_analysis(&scenes)
     );
     Ok(())
+}
+
+fn render_issue_triage(triage: &ResearchIssueTriage) -> String {
+    let mut output = String::new();
+    writeln!(output, "结构化问题线索（可叠加，只陈述观测，不自动判错）").unwrap();
+    writeln!(
+        output,
+        "候选可达性：非首选提交 {}，其中翻页后 {}；候选已到底后原码上屏 {}、取消 {}；仍可加载时原码上屏 {}、取消 {}。",
+        triage.reachability.non_top_commits,
+        triage.reachability.paged_commits,
+        triage.reachability.raw_after_exhausted_frame,
+        triage.reachability.cancellation_after_exhausted_frame,
+        triage.reachability.raw_while_more_available,
+        triage.reachability.cancellation_while_more_available,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "排序与记忆：V11+ 可核对非首选提交 {}，已有个人证据仍非首选 {}、目标来源缺失 {}；V14+ 可核对 {}，实际个人重排首选被绕过 {}、未个人重排 {}、首选来源缺失 {}。",
+        triage.ranking.precise_personalization_non_top_commits,
+        triage.ranking.personalized_target_non_top_commits,
+        triage.ranking.target_provenance_missing,
+        triage.ranking.precise_ranking_non_top_commits,
+        triage.ranking.reranked_top_bypassed_commits,
+        triage.ranking.nonreranked_top_bypassed_commits,
+        triage.ranking.top_provenance_missing,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "找字与纠错：形码提交 {}（逐字 Tab 辅助 {}）；自动换序恢复被选择 {}、出现但未被选择 {}；提交后紧接退格 {}；显式遗忘 {}、恢复 {}。",
+        triage.recovery.shape_lookup_commits,
+        triage.recovery.tab_assisted_commits,
+        triage.recovery.transposition_recovery_selected,
+        triage.recovery.transposition_recovery_not_selected,
+        triage.recovery.post_commit_backspaces_routed,
+        triage.recovery.candidate_suppressions,
+        triage.recovery.candidate_restores,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "性能线索（≥{} ms）：首次出现首帧 {}、首次完全显示 {}、候选更新完全显示 {}；慢按键 {}；唯一主阶段为刷新 {}、规划 {}、编辑会话 {}、其余阶段 {}，并列 {}。",
+        RESEARCH_TRIAGE_VISIBLE_LATENCY_MS,
+        triage.latency.slow_initial_first_frames,
+        triage.latency.slow_initial_fully_visible_frames,
+        triage.latency.slow_updated_fully_visible_frames,
+        triage.latency.slow_key_paths,
+        triage.latency.dominant_phases.refresh,
+        triage.latency.dominant_phases.planning,
+        triage.latency.dominant_phases.edit_session,
+        triage.latency.dominant_phases.remainder,
+        triage.latency.dominant_phases.tied,
+    )
+    .unwrap();
+    write!(
+        output,
+        "证据完整度：候选提交可配对 {}/{}，无法配对 {}；读取批次 {}、事件 {}，来源窗口省略 {}。候选已到底后的原码或取消只是复查线索，不等同于自动确认缺词。",
+        triage.coverage.paired_candidate_commits,
+        triage.coverage.candidate_commits,
+        triage.coverage.unpaired_candidate_commits,
+        triage.coverage.batches,
+        triage.coverage.events,
+        triage.coverage.omitted_events,
+    )
+    .unwrap();
+    output
 }
 
 #[cfg(windows)]
@@ -3695,6 +3771,65 @@ mod tests {
         assert!(rendered.contains("现有批次尚无连续链"));
         assert!(rendered.contains("单次改码不形成手癖结论"));
         for forbidden in ["最佳配置", "下一步建议", "应该采用", "用户打错"] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn issue_triage_renders_overlapping_evidence_without_inventing_a_root_cause() {
+        let triage = ResearchIssueTriage {
+            coverage: ziranma_core::ResearchTriageCoverage {
+                batches: 2,
+                events: 40,
+                omitted_events: 3,
+                candidate_commits: 5,
+                paired_candidate_commits: 4,
+                unpaired_candidate_commits: 1,
+            },
+            reachability: ziranma_core::ResearchCandidateReachabilitySignals {
+                non_top_commits: 2,
+                paged_commits: 1,
+                raw_after_exhausted_frame: 1,
+                cancellation_while_more_available: 1,
+                ..ziranma_core::ResearchCandidateReachabilitySignals::default()
+            },
+            ranking: ziranma_core::ResearchRankingSignals {
+                precise_personalization_non_top_commits: 2,
+                personalized_target_non_top_commits: 1,
+                precise_ranking_non_top_commits: 2,
+                reranked_top_bypassed_commits: 1,
+                nonreranked_top_bypassed_commits: 1,
+                ..ziranma_core::ResearchRankingSignals::default()
+            },
+            recovery: ziranma_core::ResearchRecoverySignals {
+                shape_lookup_commits: 1,
+                tab_assisted_commits: 1,
+                transposition_recovery_selected: 1,
+                post_commit_backspaces_routed: 1,
+                ..ziranma_core::ResearchRecoverySignals::default()
+            },
+            latency: ziranma_core::ResearchLatencySignals {
+                slow_initial_first_frames: 1,
+                slow_key_paths: 2,
+                dominant_phases: ziranma_core::ResearchSlowKeyPhaseSignals {
+                    planning: 1,
+                    tied: 1,
+                    ..ziranma_core::ResearchSlowKeyPhaseSignals::default()
+                },
+                ..ziranma_core::ResearchLatencySignals::default()
+            },
+        };
+
+        let rendered = render_issue_triage(&triage);
+        assert!(rendered.contains("结构化问题线索（可叠加，只陈述观测，不自动判错）"));
+        assert!(rendered.contains("非首选提交 2，其中翻页后 1"));
+        assert!(rendered.contains("已有个人证据仍非首选 1"));
+        assert!(rendered.contains("实际个人重排首选被绕过 1"));
+        assert!(rendered.contains("逐字 Tab 辅助 1"));
+        assert!(rendered.contains("慢按键 2"));
+        assert!(rendered.contains("候选提交可配对 4/5"));
+        assert!(rendered.contains("不等同于自动确认缺词"));
+        for forbidden in ["最佳配置", "下一步建议", "确定缺词", "用户打错"] {
             assert!(!rendered.contains(forbidden));
         }
     }
