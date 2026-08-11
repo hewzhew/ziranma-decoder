@@ -236,57 +236,144 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
     .unwrap();
     writeln!(
         output,
-        "候选可达性：非首选提交 {}，其中翻页后 {}；候选已到底后原码上屏 {}、取消 {}；仍可加载时原码上屏 {}、取消 {}。",
+        "候选可达性：候选提交中的非首选 {}/{}，其中翻页后 {}；原码上屏可配对 {}/{}（候选已到底 {}、仍可加载 {}），无法配对 {}；取消可配对 {}/{}（候选已到底 {}、仍可加载 {}），无法配对 {}。",
         triage.reachability.non_top_commits,
+        triage.coverage.candidate_commits,
         triage.reachability.paged_commits,
+        triage.reachability.paired_raw_commits(),
+        triage.reachability.raw_commits,
         triage.reachability.raw_after_exhausted_frame,
-        triage.reachability.cancellation_after_exhausted_frame,
         triage.reachability.raw_while_more_available,
+        triage.reachability.unpaired_raw_commits(),
+        triage.reachability.paired_cancellations(),
+        triage.reachability.cancellations,
+        triage.reachability.cancellation_after_exhausted_frame,
         triage.reachability.cancellation_while_more_available,
+        triage.reachability.unpaired_cancellations(),
     )
     .unwrap();
-    writeln!(
-        output,
-        "排序与记忆：V11+ 可核对非首选提交 {}，已有个人证据仍非首选 {}、目标来源缺失 {}；V14+ 可核对 {}，实际个人重排首选被绕过 {}、未个人重排 {}、首选来源缺失 {}。",
+    let personalization_coverage = render_triage_capability(
+        "V11 精确个人证据字段",
+        triage.capabilities.precise_personalization_batches,
+        triage.coverage.batches,
+        "可核对的非首选提交",
         triage.ranking.precise_personalization_non_top_commits,
-        triage.ranking.personalized_target_non_top_commits,
-        triage.ranking.target_provenance_missing,
+    );
+    let ranking_coverage = render_triage_capability(
+        "V14 实际个人重排字段",
+        triage.capabilities.precise_ranking_batches,
+        triage.coverage.batches,
+        "可核对的非首选提交",
         triage.ranking.precise_ranking_non_top_commits,
-        triage.ranking.reranked_top_bypassed_commits,
-        triage.ranking.nonreranked_top_bypassed_commits,
-        triage.ranking.top_provenance_missing,
-    )
-    .unwrap();
+    );
+    let target_partition = triage.ranking.personalized_target_non_top_commits
+        + triage.ranking.unpersonalized_target_non_top_commits
+        + triage.ranking.target_provenance_missing;
+    let target_partition_summary = if triage.ranking.precise_personalization_non_top_commits == 0 {
+        "目标分区暂无可核对分母".to_owned()
+    } else {
+        format!(
+            "目标分区为已有个人证据 {}、无个人证据 {}、来源缺失 {}（合计 {}/{}）",
+            triage.ranking.personalized_target_non_top_commits,
+            triage.ranking.unpersonalized_target_non_top_commits,
+            triage.ranking.target_provenance_missing,
+            target_partition,
+            triage.ranking.precise_personalization_non_top_commits,
+        )
+    };
+    let ranking_partition_summary = if triage.ranking.precise_ranking_non_top_commits == 0 {
+        "首选重排分区暂无可核对分母".to_owned()
+    } else {
+        format!(
+            "首选实际经个人重排但被绕过 {}、未经个人重排 {}、首选来源缺失 {}（合计 {}/{}）",
+            triage.ranking.reranked_top_bypassed_commits,
+            triage.ranking.nonreranked_top_bypassed_commits,
+            triage.ranking.top_provenance_missing,
+            triage.ranking.reranked_top_bypassed_commits
+                + triage.ranking.nonreranked_top_bypassed_commits
+                + triage.ranking.top_provenance_missing,
+            triage.ranking.precise_ranking_non_top_commits,
+        )
+    };
     writeln!(
         output,
-        "找字与纠错：形码提交 {}（逐字 Tab 辅助 {}）；自动换序恢复被选择 {}、出现但未被选择 {}；提交后紧接退格 {}；显式遗忘 {}、恢复 {}。",
-        triage.recovery.shape_lookup_commits,
-        triage.recovery.tab_assisted_commits,
-        triage.recovery.transposition_recovery_selected,
-        triage.recovery.transposition_recovery_not_selected,
+        "排序与记忆：{personalization_coverage}；{target_partition_summary}。{ranking_coverage}；{ranking_partition_summary}。",
+    )
+    .unwrap();
+    let shape_lookup_summary = if triage.recovery.shape_lookup_commits == 0 {
+        "未观察到形码提交，逐字 Tab 辅助暂无分母".to_owned()
+    } else {
+        format!(
+            "形码提交中的逐字 Tab 辅助 {}/{}",
+            triage.recovery.tab_assisted_commits, triage.recovery.shape_lookup_commits,
+        )
+    };
+    let recovery_terminals = triage
+        .recovery
+        .transposition_recovery_terminal_observations();
+    let transposition_summary = if recovery_terminals == 0 {
+        "未观察到自动换序恢复终局".to_owned()
+    } else {
+        format!(
+            "自动换序恢复终局中被选择 {}/{recovery_terminals}、未被选择 {}",
+            triage.recovery.transposition_recovery_selected,
+            triage.recovery.transposition_recovery_not_selected,
+        )
+    };
+    writeln!(
+        output,
+        "找字与纠错：{shape_lookup_summary}；{transposition_summary}；提交后紧接退格 {}；显式遗忘 {}、恢复 {}。",
         triage.recovery.post_commit_backspaces_routed,
         triage.recovery.candidate_suppressions,
         triage.recovery.candidate_restores,
     )
     .unwrap();
+    let slow_key_coverage = render_triage_capability(
+        "慢按键分段字段",
+        triage.capabilities.slow_key_path_batches,
+        triage.coverage.batches,
+        "有效慢按键样本",
+        triage.latency.slow_key_paths,
+    );
+    let initial_popup_summary = if triage.latency.initial_popup_timings == 0 {
+        "首次出现暂无计时样本".to_owned()
+    } else {
+        format!(
+            "首次出现首帧慢样本 {1}/{0}、完全显示慢样本 {2}/{0}",
+            triage.latency.initial_popup_timings,
+            triage.latency.slow_initial_first_frames,
+            triage.latency.slow_initial_fully_visible_frames,
+        )
+    };
+    let updated_popup_summary = if triage.latency.updated_popup_timings == 0 {
+        "候选更新暂无计时样本".to_owned()
+    } else {
+        format!(
+            "候选更新完全显示慢样本 {}/{}",
+            triage.latency.slow_updated_fully_visible_frames, triage.latency.updated_popup_timings,
+        )
+    };
+    let slow_key_phase_summary = if triage.latency.slow_key_paths == 0 {
+        "主阶段暂无有效样本".to_owned()
+    } else {
+        format!(
+            "唯一主阶段为刷新 {}、规划 {}、编辑会话 {}、其余阶段 {}，并列 {}",
+            triage.latency.dominant_phases.refresh,
+            triage.latency.dominant_phases.planning,
+            triage.latency.dominant_phases.edit_session,
+            triage.latency.dominant_phases.remainder,
+            triage.latency.dominant_phases.tied,
+        )
+    };
     writeln!(
         output,
-        "性能线索（≥{} ms）：首次出现首帧 {}、首次完全显示 {}、候选更新完全显示 {}；慢按键 {}；唯一主阶段为刷新 {}、规划 {}、编辑会话 {}、其余阶段 {}，并列 {}。",
+        "性能线索（≥{} ms）：{initial_popup_summary}；{updated_popup_summary}。{slow_key_coverage}；{slow_key_phase_summary}。",
         RESEARCH_TRIAGE_VISIBLE_LATENCY_MS,
-        triage.latency.slow_initial_first_frames,
-        triage.latency.slow_initial_fully_visible_frames,
-        triage.latency.slow_updated_fully_visible_frames,
-        triage.latency.slow_key_paths,
-        triage.latency.dominant_phases.refresh,
-        triage.latency.dominant_phases.planning,
-        triage.latency.dominant_phases.edit_session,
-        triage.latency.dominant_phases.remainder,
-        triage.latency.dominant_phases.tied,
     )
     .unwrap();
     write!(
         output,
-        "证据完整度：候选提交可配对 {}/{}，无法配对 {}；读取批次 {}、事件 {}，来源窗口省略 {}。候选已到底后的原码或取消只是复查线索，不等同于自动确认缺词。",
+        "证据完整度：候选提交可配对 {}/{}，无法配对 {}；读取批次 {}、事件 {}，来源窗口省略 {}。字段支持、事件出现和现场成功配对分别陈述；候选已到底后的原码或取消只是复查线索，不等同于自动确认缺词。",
         triage.coverage.paired_candidate_commits,
         triage.coverage.candidate_commits,
         triage.coverage.unpaired_candidate_commits,
@@ -296,6 +383,31 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
     )
     .unwrap();
     output
+}
+
+fn render_triage_capability(
+    label: &str,
+    capable_batches: usize,
+    batches: usize,
+    observation_label: &str,
+    observations: usize,
+) -> String {
+    if batches == 0 {
+        return format!("{label}：暂无批次");
+    }
+    if capable_batches == 0 {
+        return format!("{label}：字段不可用（0/{batches} 批支持）");
+    }
+    let coverage = if capable_batches == batches {
+        format!("字段支持（{capable_batches}/{batches} 批）")
+    } else {
+        format!("部分批次支持（{capable_batches}/{batches} 批）")
+    };
+    if observations == 0 {
+        format!("{label}：{coverage}，但支持批次内未观察到{observation_label}")
+    } else {
+        format!("{label}：{coverage}，已观察到{observation_label} {observations}")
+    }
 }
 
 #[cfg(windows)]
@@ -3819,16 +3931,24 @@ mod tests {
                 paired_candidate_commits: 4,
                 unpaired_candidate_commits: 1,
             },
+            capabilities: ziranma_core::ResearchTriageCapabilityCoverage {
+                precise_personalization_batches: 2,
+                precise_ranking_batches: 2,
+                slow_key_path_batches: 2,
+            },
             reachability: ziranma_core::ResearchCandidateReachabilitySignals {
                 non_top_commits: 2,
                 paged_commits: 1,
+                raw_commits: 2,
                 raw_after_exhausted_frame: 1,
+                cancellations: 2,
                 cancellation_while_more_available: 1,
                 ..ziranma_core::ResearchCandidateReachabilitySignals::default()
             },
             ranking: ziranma_core::ResearchRankingSignals {
                 precise_personalization_non_top_commits: 2,
                 personalized_target_non_top_commits: 1,
+                unpersonalized_target_non_top_commits: 1,
                 precise_ranking_non_top_commits: 2,
                 reranked_top_bypassed_commits: 1,
                 nonreranked_top_bypassed_commits: 1,
@@ -3842,7 +3962,9 @@ mod tests {
                 ..ziranma_core::ResearchRecoverySignals::default()
             },
             latency: ziranma_core::ResearchLatencySignals {
+                initial_popup_timings: 2,
                 slow_initial_first_frames: 1,
+                updated_popup_timings: 1,
                 slow_key_paths: 2,
                 dominant_phases: ziranma_core::ResearchSlowKeyPhaseSignals {
                     planning: 1,
@@ -3857,16 +3979,41 @@ mod tests {
         assert!(
             rendered.contains("公开合成批次的结构化问题线索（可叠加，只陈述观测，不自动判错）")
         );
-        assert!(rendered.contains("非首选提交 2，其中翻页后 1"));
-        assert!(rendered.contains("已有个人证据仍非首选 1"));
-        assert!(rendered.contains("实际个人重排首选被绕过 1"));
-        assert!(rendered.contains("逐字 Tab 辅助 1"));
-        assert!(rendered.contains("慢按键 2"));
+        assert!(rendered.contains("候选提交中的非首选 2/5，其中翻页后 1"));
+        assert!(rendered.contains("原码上屏可配对 1/2"));
+        assert!(rendered.contains("取消可配对 1/2"));
+        assert!(rendered.contains("V11 精确个人证据字段：字段支持（2/2 批）"));
+        assert!(rendered.contains("已有个人证据 1、无个人证据 1、来源缺失 0（合计 2/2）"));
+        assert!(rendered.contains("首选实际经个人重排但被绕过 1"));
+        assert!(rendered.contains("逐字 Tab 辅助 1/1"));
+        assert!(rendered.contains("自动换序恢复终局中被选择 1/1"));
+        assert!(rendered.contains("首次出现首帧慢样本 1/2"));
+        assert!(rendered.contains("慢按键分段字段：字段支持（2/2 批）"));
         assert!(rendered.contains("候选提交可配对 4/5"));
         assert!(rendered.contains("不等同于自动确认缺词"));
         for forbidden in ["最佳配置", "下一步建议", "确定缺词", "用户打错"] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn triage_capability_rendering_separates_no_batches_absent_fields_and_zero_events() {
+        assert_eq!(
+            render_triage_capability("V11 字段", 0, 0, "非首选提交", 0),
+            "V11 字段：暂无批次"
+        );
+        assert_eq!(
+            render_triage_capability("V11 字段", 0, 3, "非首选提交", 0),
+            "V11 字段：字段不可用（0/3 批支持）"
+        );
+        assert_eq!(
+            render_triage_capability("V11 字段", 2, 3, "非首选提交", 0),
+            "V11 字段：部分批次支持（2/3 批），但支持批次内未观察到非首选提交"
+        );
+        assert_eq!(
+            render_triage_capability("V11 字段", 3, 3, "非首选提交", 2),
+            "V11 字段：字段支持（3/3 批），已观察到非首选提交 2"
+        );
     }
 
     #[test]
@@ -3901,6 +4048,14 @@ mod tests {
         assert!(rendered.contains("全部已读取批次的结构化问题线索"));
         assert!(rendered.contains("读取批次 2、事件 30"));
         assert!(rendered.contains("读取批次 5、事件 90"));
+        assert!(rendered.contains("V11 精确个人证据字段：字段不可用（0/2 批支持）"));
+        assert!(rendered.contains("目标分区暂无可核对分母"));
+        assert!(rendered.contains("首选重排分区暂无可核对分母"));
+        assert!(rendered.contains("未观察到形码提交，逐字 Tab 辅助暂无分母"));
+        assert!(rendered.contains("未观察到自动换序恢复终局"));
+        assert!(rendered.contains("首次出现暂无计时样本"));
+        assert!(rendered.contains("候选更新暂无计时样本"));
+        assert!(rendered.contains("主阶段暂无有效样本"));
         assert!(rendered.contains("不能直接判定改善或退化"));
         for forbidden in ["已经改善", "已经退化", "根因是", "应该修改"] {
             assert!(!rendered.contains(forbidden));

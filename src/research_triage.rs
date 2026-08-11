@@ -27,19 +27,48 @@ pub struct ResearchTriageCoverage {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResearchTriageCapabilityCoverage {
+    pub precise_personalization_batches: usize,
+    pub precise_ranking_batches: usize,
+    pub slow_key_path_batches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchCandidateReachabilitySignals {
     pub non_top_commits: usize,
     pub paged_commits: usize,
+    pub raw_commits: usize,
     pub raw_after_exhausted_frame: usize,
     pub raw_while_more_available: usize,
+    pub cancellations: usize,
     pub cancellation_after_exhausted_frame: usize,
     pub cancellation_while_more_available: usize,
+}
+
+impl ResearchCandidateReachabilitySignals {
+    pub fn paired_raw_commits(self) -> usize {
+        self.raw_after_exhausted_frame + self.raw_while_more_available
+    }
+
+    pub fn unpaired_raw_commits(self) -> usize {
+        self.raw_commits.saturating_sub(self.paired_raw_commits())
+    }
+
+    pub fn paired_cancellations(self) -> usize {
+        self.cancellation_after_exhausted_frame + self.cancellation_while_more_available
+    }
+
+    pub fn unpaired_cancellations(self) -> usize {
+        self.cancellations
+            .saturating_sub(self.paired_cancellations())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchRankingSignals {
     pub precise_personalization_non_top_commits: usize,
     pub personalized_target_non_top_commits: usize,
+    pub unpersonalized_target_non_top_commits: usize,
     pub target_provenance_missing: usize,
     pub precise_ranking_non_top_commits: usize,
     pub reranked_top_bypassed_commits: usize,
@@ -56,6 +85,12 @@ pub struct ResearchRecoverySignals {
     pub post_commit_backspaces_routed: usize,
     pub candidate_suppressions: usize,
     pub candidate_restores: usize,
+}
+
+impl ResearchRecoverySignals {
+    pub fn transposition_recovery_terminal_observations(self) -> usize {
+        self.transposition_recovery_selected + self.transposition_recovery_not_selected
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -91,8 +126,10 @@ impl ResearchSlowKeyPhaseSignals {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchLatencySignals {
+    pub initial_popup_timings: usize,
     pub slow_initial_first_frames: usize,
     pub slow_initial_fully_visible_frames: usize,
+    pub updated_popup_timings: usize,
     pub slow_updated_fully_visible_frames: usize,
     pub slow_key_paths: usize,
     pub dominant_phases: ResearchSlowKeyPhaseSignals,
@@ -103,6 +140,7 @@ pub struct ResearchLatencySignals {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchIssueTriage {
     pub coverage: ResearchTriageCoverage,
+    pub capabilities: ResearchTriageCapabilityCoverage,
     pub reachability: ResearchCandidateReachabilitySignals,
     pub ranking: ResearchRankingSignals,
     pub recovery: ResearchRecoverySignals,
@@ -207,6 +245,12 @@ fn analyze_research_issue_signals_from<'a>(
             return Err(ResearchTriageError::NonContinuousSnapshot);
         }
         report.coverage.batches += 1;
+        report.capabilities.precise_personalization_batches +=
+            usize::from(snapshot.supports_precise_candidate_personalization());
+        report.capabilities.precise_ranking_batches +=
+            usize::from(snapshot.supports_precise_candidate_ranking_personalization());
+        report.capabilities.slow_key_path_batches +=
+            usize::from(snapshot.supports_slow_key_path_timing());
         report.coverage.events += snapshot.events().len();
         report.coverage.omitted_events += snapshot
             .omitted_before_window()
@@ -312,6 +356,7 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                 frame = None;
             }
             NativeFeedbackEvent::RawCodeCommitted { code } => {
+                report.reachability.raw_commits += 1;
                 if let Some(matching) = frame.as_ref().filter(|frame| frame.code == *code) {
                     if matching.may_have_more {
                         report.reachability.raw_while_more_available += 1;
@@ -324,6 +369,7 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                 frame = None;
             }
             NativeFeedbackEvent::CompositionCancelled { code, .. } => {
+                report.reachability.cancellations += 1;
                 if let Some(matching) = frame.as_ref().filter(|frame| frame.code == *code) {
                     if matching.may_have_more {
                         report.reachability.cancellation_while_more_available += 1;
@@ -352,11 +398,13 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                 initial_show,
             } => {
                 if *initial_show {
+                    report.latency.initial_popup_timings += 1;
                     report.latency.slow_initial_first_frames +=
                         usize::from(*first_frame_ms >= RESEARCH_TRIAGE_VISIBLE_LATENCY_MS);
                     report.latency.slow_initial_fully_visible_frames +=
                         usize::from(*fully_visible_ms >= RESEARCH_TRIAGE_VISIBLE_LATENCY_MS);
                 } else {
+                    report.latency.updated_popup_timings += 1;
                     report.latency.slow_updated_fully_visible_frames +=
                         usize::from(*fully_visible_ms >= RESEARCH_TRIAGE_VISIBLE_LATENCY_MS);
                 }
@@ -401,8 +449,11 @@ fn observe_non_top_ranking(
         report.ranking.precise_personalization_non_top_commits += 1;
         match frame.provenance_for_rank(absolute_rank) {
             Some(target) => {
-                report.ranking.personalized_target_non_top_commits +=
-                    usize::from(!target.personalization().is_empty());
+                if target.personalization().is_empty() {
+                    report.ranking.unpersonalized_target_non_top_commits += 1;
+                } else {
+                    report.ranking.personalized_target_non_top_commits += 1;
+                }
             }
             None => report.ranking.target_provenance_missing += 1,
         }
@@ -515,9 +566,14 @@ mod tests {
 
         assert_eq!(report.coverage.candidate_commits, 1);
         assert_eq!(report.coverage.paired_candidate_commits, 1);
+        assert_eq!(report.capabilities.precise_personalization_batches, 1);
+        assert_eq!(report.capabilities.precise_ranking_batches, 1);
+        assert_eq!(report.capabilities.slow_key_path_batches, 1);
         assert_eq!(report.reachability.non_top_commits, 1);
         assert_eq!(report.ranking.precise_personalization_non_top_commits, 1);
         assert_eq!(report.ranking.personalized_target_non_top_commits, 1);
+        assert_eq!(report.ranking.unpersonalized_target_non_top_commits, 0);
+        assert_eq!(report.ranking.target_provenance_missing, 0);
         assert_eq!(report.ranking.precise_ranking_non_top_commits, 1);
         assert_eq!(report.ranking.reranked_top_bypassed_commits, 1);
         assert_eq!(report.ranking.nonreranked_top_bypassed_commits, 0);
@@ -644,6 +700,14 @@ mod tests {
             ),
             (
                 60,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 4,
+                    fully_visible_ms: 7,
+                    initial_show: false,
+                },
+            ),
+            (
+                70,
                 NativeFeedbackEvent::SlowKeyPathTiming {
                     refresh_ms: 2,
                     planning_ms: 11,
@@ -651,16 +715,25 @@ mod tests {
                     total_ms: 18,
                 },
             ),
-            (70, NativeFeedbackEvent::PostCommitBackspaceRouted),
+            (80, NativeFeedbackEvent::PostCommitBackspaceRouted),
         ])])
         .unwrap();
 
         assert_eq!(report.recovery.transposition_recovery_selected, 1);
+        assert_eq!(
+            report
+                .recovery
+                .transposition_recovery_terminal_observations(),
+            1
+        );
         assert_eq!(report.recovery.shape_lookup_commits, 1);
         assert_eq!(report.recovery.tab_assisted_commits, 1);
         assert_eq!(report.recovery.post_commit_backspaces_routed, 1);
+        assert_eq!(report.latency.initial_popup_timings, 1);
         assert_eq!(report.latency.slow_initial_first_frames, 1);
         assert_eq!(report.latency.slow_initial_fully_visible_frames, 1);
+        assert_eq!(report.latency.updated_popup_timings, 1);
+        assert_eq!(report.latency.slow_updated_fully_visible_frames, 0);
         assert_eq!(report.latency.slow_key_paths, 1);
         assert_eq!(report.latency.dominant_phases.planning, 1);
         assert_eq!(report.latency.dominant_phases.samples(), 1);
@@ -752,13 +825,140 @@ mod tests {
                 },
             ),
             (50, commit("cc", "丙", NativeCandidateView::Ordinary, 1)),
+            (
+                60,
+                NativeFeedbackEvent::RawCodeCommitted {
+                    code: "dd".to_owned(),
+                },
+            ),
+            (
+                70,
+                NativeFeedbackEvent::CompositionCancelled {
+                    code: "ee".to_owned(),
+                    source: NativeCancellationSource::Escape,
+                },
+            ),
         ])])
         .unwrap();
 
+        assert_eq!(report.reachability.raw_commits, 2);
         assert_eq!(report.reachability.raw_after_exhausted_frame, 1);
+        assert_eq!(report.reachability.paired_raw_commits(), 1);
+        assert_eq!(report.reachability.unpaired_raw_commits(), 1);
+        assert_eq!(report.reachability.cancellations, 2);
         assert_eq!(report.reachability.cancellation_while_more_available, 1);
+        assert_eq!(report.reachability.paired_cancellations(), 1);
+        assert_eq!(report.reachability.unpaired_cancellations(), 1);
         assert_eq!(report.coverage.unpaired_candidate_commits, 1);
         assert_eq!(report.reachability.paged_commits, 0);
+    }
+
+    #[test]
+    fn ranking_latency_and_capability_denominators_close_over_public_synthetic_events() {
+        let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let personalized = provenance(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidatePersonalization::NONE,
+        );
+        let ranking = snapshot(vec![
+            (
+                10,
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code: "aa".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                    provenance: vec![core, personalized],
+                    automatic_transposition: None,
+                    loaded_candidates: 2,
+                    tab_assembly: None,
+                    may_have_more: false,
+                },
+            ),
+            (20, commit("aa", "乙", NativeCandidateView::Ordinary, 2)),
+            (
+                30,
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code: "bb".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["丙".to_owned(), "丁".to_owned()],
+                    provenance: vec![core, core],
+                    automatic_transposition: None,
+                    loaded_candidates: 2,
+                    tab_assembly: None,
+                    may_have_more: false,
+                },
+            ),
+            (40, commit("bb", "丁", NativeCandidateView::Ordinary, 2)),
+            (
+                50,
+                NativeFeedbackEvent::CandidatesPresented {
+                    code: "cc".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["戊".to_owned(), "己".to_owned()],
+                    may_have_more: false,
+                },
+            ),
+            (60, commit("cc", "己", NativeCandidateView::Ordinary, 2)),
+        ]);
+        let latency = snapshot(vec![
+            (
+                10,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 16,
+                    fully_visible_ms: 24,
+                    initial_show: true,
+                },
+            ),
+            (
+                20,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 3,
+                    fully_visible_ms: 7,
+                    initial_show: true,
+                },
+            ),
+            (
+                30,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 2,
+                    fully_visible_ms: 17,
+                    initial_show: false,
+                },
+            ),
+            (
+                40,
+                NativeFeedbackEvent::CandidatePopupTiming {
+                    first_frame_ms: 2,
+                    fully_visible_ms: 5,
+                    initial_show: false,
+                },
+            ),
+        ]);
+        let report = analyze_research_issue_signals(&[ranking, latency]).unwrap();
+
+        assert_eq!(report.coverage.batches, 2);
+        assert_eq!(report.capabilities.precise_personalization_batches, 2);
+        assert_eq!(report.capabilities.precise_ranking_batches, 2);
+        assert_eq!(report.capabilities.slow_key_path_batches, 2);
+        assert_eq!(report.ranking.precise_personalization_non_top_commits, 3);
+        assert_eq!(report.ranking.personalized_target_non_top_commits, 1);
+        assert_eq!(report.ranking.unpersonalized_target_non_top_commits, 1);
+        assert_eq!(report.ranking.target_provenance_missing, 1);
+        assert_eq!(
+            report.ranking.personalized_target_non_top_commits
+                + report.ranking.unpersonalized_target_non_top_commits
+                + report.ranking.target_provenance_missing,
+            report.ranking.precise_personalization_non_top_commits
+        );
+        assert_eq!(report.latency.initial_popup_timings, 2);
+        assert_eq!(report.latency.slow_initial_first_frames, 1);
+        assert_eq!(report.latency.slow_initial_fully_visible_frames, 1);
+        assert_eq!(report.latency.updated_popup_timings, 2);
+        assert_eq!(report.latency.slow_updated_fully_visible_frames, 1);
     }
 
     #[test]
