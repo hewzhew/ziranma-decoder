@@ -2797,6 +2797,96 @@ mod tests {
     }
 
     #[test]
+    fn verified_long_words_need_only_one_observation_in_each_anchored_suffix_view() {
+        let mut snapshot = PersonalRankingSnapshot::default();
+        let suppressions = PersonalRankingSuppressionSnapshot::default();
+        snapshot.record("abcdef", "甲乙丙").unwrap();
+        snapshot.record("abcdefgh", "甲乙丙丁").unwrap();
+
+        for (short_code, source_code, text) in [
+            ("abce", "abcdef", "甲乙丙"),
+            ("abcde", "abcdef", "甲乙丙"),
+            ("abceg", "abcdefgh", "甲乙丙丁"),
+            ("abcdeg", "abcdefgh", "甲乙丙丁"),
+            ("abcdefg", "abcdefgh", "甲乙丙丁"),
+        ] {
+            let mut candidates = vec![
+                "固定".to_owned(),
+                "普通".to_owned(),
+                "其他".to_owned(),
+                "末尾".to_owned(),
+            ];
+            assert_eq!(
+                snapshot
+                    .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                        short_code,
+                        &mut candidates,
+                        1,
+                        &suppressions,
+                        |code, candidate| code == source_code && candidate == text,
+                    ),
+                Some(CandidateTextPromotion {
+                    index: 2,
+                    source_index: None,
+                    changed: true,
+                })
+            );
+            assert_eq!(candidates, ["固定", "普通", text, "其他"]);
+        }
+    }
+
+    #[test]
+    fn verified_short_code_conflicts_choose_the_strongest_allowed_complete_source() {
+        let mut snapshot = PersonalRankingSnapshot::default();
+        snapshot.record("abcdef", "甲乙丙").unwrap();
+        snapshot.record("abcxef", "丁戊己").unwrap();
+        snapshot.record("abcxef", "丁戊己").unwrap();
+        for _ in 0..3 {
+            snapshot.record("abcyef", "伪造词").unwrap();
+        }
+        let ordinary = || vec!["固定".to_owned(), "普通".to_owned(), "其他".to_owned()];
+        let verifier = |code: &str, text: &str| {
+            matches!((code, text), ("abcdef", "甲乙丙") | ("abcxef", "丁戊己"))
+        };
+
+        let mut candidates = ordinary();
+        let mut verification_calls = 0;
+        let promotion = snapshot
+            .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                "abce",
+                &mut candidates,
+                1,
+                &PersonalRankingSuppressionSnapshot::default(),
+                |code, text| {
+                    verification_calls += 1;
+                    verifier(code, text)
+                },
+            );
+        assert_eq!(promotion.map(|promotion| promotion.index), Some(2));
+        assert_eq!(candidates, ["固定", "普通", "丁戊己"]);
+        assert_eq!(
+            verification_calls, 3,
+            "each matching source is checked once"
+        );
+
+        for suppressed_code in ["abcxef", "abce"] {
+            let mut suppressions = PersonalRankingSuppressionSnapshot::default();
+            suppressions.suppress(suppressed_code, "丁戊己").unwrap();
+            let mut fallback = ordinary();
+            let promotion = snapshot
+                .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                    "abce",
+                    &mut fallback,
+                    1,
+                    &suppressions,
+                    verifier,
+                );
+            assert_eq!(promotion.map(|promotion| promotion.index), Some(2));
+            assert_eq!(fallback, ["固定", "普通", "甲乙丙"]);
+        }
+    }
+
+    #[test]
     fn forgetting_one_multi_character_short_code_keeps_its_other_views_available() {
         let mut snapshot = PersonalRankingSnapshot::default();
         for _ in 0..PERSONAL_ABBREVIATION_DISCOVERY_MIN_SELECTIONS {

@@ -159,6 +159,7 @@ const TSF_PUBLIC_STROKE_SEQUENCES: &str =
 const CANDIDATE_PAGE_SIZE: usize = 6;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
 const SHAPE_CANDIDATE_POOL_CACHE_CAPACITY: usize = MAX_TAB_ASSEMBLY_CHARACTERS;
+const EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY: usize = 128;
 const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
 const TSF_PUBLIC_CANDIDATE_ORDER_POLICY: WishPublicCandidateOrderPolicy =
     WishPublicCandidateOrderPolicy::ConservativeCoreFirst;
@@ -366,6 +367,57 @@ impl ShapeCandidatePoolCache {
         }
         self.entries.push_back((code.to_owned(), pool));
         while self.entries.len() > SHAPE_CANDIDATE_POOL_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+}
+
+/// Bounded memory-only memoization for public whole-word verification.
+///
+/// Personal text may be presented to this lookup, so the cache deliberately
+/// has no `Debug` or serialization surface. The supplemental revision is part
+/// of every identity; a safe-boundary data refresh can therefore never reuse
+/// a decision made against a different public snapshot.
+#[derive(Default)]
+struct ExactFullCodeCandidateCache {
+    entries: VecDeque<ExactFullCodeCandidateCacheEntry>,
+}
+
+struct ExactFullCodeCandidateCacheEntry {
+    code: String,
+    text: String,
+    supplemental_revision: Option<String>,
+    exact: bool,
+}
+
+impl ExactFullCodeCandidateCache {
+    fn get(&mut self, code: &str, text: &str, supplemental_revision: Option<&str>) -> Option<bool> {
+        let index = self.entries.iter().position(|entry| {
+            entry.code == code
+                && entry.text == text
+                && entry.supplemental_revision.as_deref() == supplemental_revision
+        })?;
+        let entry = self.entries.remove(index)?;
+        let exact = entry.exact;
+        self.entries.push_back(entry);
+        Some(exact)
+    }
+
+    fn insert(&mut self, code: &str, text: &str, supplemental_revision: Option<&str>, exact: bool) {
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.code == code
+                && entry.text == text
+                && entry.supplemental_revision.as_deref() == supplemental_revision
+        }) {
+            self.entries.remove(index);
+        }
+        self.entries.push_back(ExactFullCodeCandidateCacheEntry {
+            code: code.to_owned(),
+            text: text.to_owned(),
+            supplemental_revision: supplemental_revision.map(str::to_owned),
+            exact,
+        });
+        while self.entries.len() > EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY {
             self.entries.pop_front();
         }
     }
@@ -712,6 +764,7 @@ struct SnapshotCandidateProvider {
     aliases: Option<ExplicitAliasRuntime>,
     refresh_throttle: Mutex<RefreshThrottle>,
     shape_candidate_pools: Mutex<ShapeCandidatePoolCache>,
+    exact_full_code_candidates: Mutex<ExactFullCodeCandidateCache>,
 }
 
 impl SnapshotCandidateProvider {
@@ -730,6 +783,7 @@ impl SnapshotCandidateProvider {
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
+            exact_full_code_candidates: Mutex::new(ExactFullCodeCandidateCache::default()),
         }
     }
 
@@ -745,6 +799,7 @@ impl SnapshotCandidateProvider {
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
+            exact_full_code_candidates: Mutex::new(ExactFullCodeCandidateCache::default()),
         }
     }
 
@@ -1273,7 +1328,16 @@ impl CandidateProvider for SnapshotCandidateProvider {
     }
 
     fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
-        project_overlay_decoder()
+        let supplemental = self.supplemental.current();
+        let supplemental_revision = supplemental
+            .as_ref()
+            .map(|(snapshot, _)| snapshot.revision());
+        if let Ok(mut cache) = self.exact_full_code_candidates.lock()
+            && let Some(exact) = cache.get(code, text, supplemental_revision)
+        {
+            return exact;
+        }
+        let exact = project_overlay_decoder()
             .decode_exact_full_code(code, CANDIDATE_LIMIT)
             .ok()
             .is_some_and(|candidates| candidates.iter().any(|candidate| candidate.text == text))
@@ -1282,12 +1346,16 @@ impl CandidateProvider for SnapshotCandidateProvider {
                 .exact_full_code_texts(code, CANDIDATE_LIMIT)
                 .ok()
                 .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
-            || self.supplemental.current().is_some_and(|(snapshot, _)| {
+            || supplemental.as_ref().is_some_and(|(snapshot, _)| {
                 snapshot
                     .exact_full_code_texts(code, CANDIDATE_LIMIT)
                     .ok()
                     .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
-            })
+            });
+        if let Ok(mut cache) = self.exact_full_code_candidates.lock() {
+            cache.insert(code, text, supplemental_revision, exact);
+        }
+        exact
     }
 
     fn shape_candidates(
@@ -11231,6 +11299,7 @@ mod tests {
             aliases: Some(runtime),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
+            exact_full_code_candidates: Mutex::new(ExactFullCodeCandidateCache::default()),
         };
         let mut candidates = provider.candidates("aa", 2, InteractiveCandidateView::Primary);
         assert_eq!(candidates, ["乙", "啊"]);
@@ -11729,6 +11798,52 @@ mod tests {
         }
     }
 
+    struct LongExactShortDiscoveryCandidateProvider;
+
+    impl CandidateProvider for LongExactShortDiscoveryCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            let candidates: &[&str] = match code {
+                "abcdef" => &["甲乙丙"],
+                "abcdefgh" => &["甲乙丙丁"],
+                "abce" | "abcde" | "abceg" | "abcdeg" | "abcdefg" => {
+                    &["固定", "普通", "其他", "末尾"]
+                }
+                _ => &[],
+            };
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| (*candidate).to_owned())
+                .collect()
+        }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            usize::from(
+                matches!(code, "abce" | "abcde" | "abceg" | "abcdeg" | "abcdefg")
+                    && view == InteractiveCandidateView::Primary,
+            )
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            matches!(
+                (code, text),
+                ("abcdef", "甲乙丙") | ("abcdefgh", "甲乙丙丁")
+            )
+        }
+    }
+
     struct PersonalContextCandidateProvider;
 
     impl CandidateProvider for PersonalContextCandidateProvider {
@@ -12203,6 +12318,89 @@ mod tests {
             cache.get("aa").is_some(),
             "a recent assembly slot remains cached"
         );
+    }
+
+    #[test]
+    fn exact_full_code_cache_is_bounded_lru_and_version_scoped() {
+        let mut cache = ExactFullCodeCandidateCache::default();
+        for index in 0..EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY {
+            cache.insert(
+                &format!("code-{index}"),
+                &format!("public-{index}"),
+                Some("supplement-a"),
+                index.is_multiple_of(2),
+            );
+        }
+        assert_eq!(
+            cache.get("code-0", "public-0", Some("supplement-a")),
+            Some(true)
+        );
+        cache.insert("code-new", "public-new", Some("supplement-a"), false);
+
+        assert_eq!(
+            cache.entries.len(),
+            EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY
+        );
+        assert_eq!(
+            cache.get("code-1", "public-1", Some("supplement-a")),
+            None,
+            "the least-recent identity is evicted"
+        );
+        assert_eq!(
+            cache.get("code-0", "public-0", Some("supplement-a")),
+            Some(true),
+            "a recently read identity remains cached"
+        );
+        assert_eq!(
+            cache.get("code-new", "public-new", Some("supplement-b")),
+            None,
+            "the same code and text cannot cross a public supplement revision"
+        );
+        assert_eq!(
+            cache.get("code-new", "public-new", Some("supplement-a")),
+            Some(false),
+            "negative verification decisions are cached too"
+        );
+    }
+
+    #[test]
+    fn snapshot_provider_memoizes_positive_and_negative_whole_word_verification() {
+        let provider = reversed_adjacent_pair_provider();
+        assert_eq!(
+            provider
+                .exact_full_code_candidates
+                .lock()
+                .unwrap()
+                .entries
+                .len(),
+            0
+        );
+
+        assert!(provider.is_exact_full_code_candidate("ufme", "什么"));
+        assert_eq!(
+            provider
+                .exact_full_code_candidates
+                .lock()
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert!(!provider.is_exact_full_code_candidate("ufme", "公开合成缺席词"));
+        assert_eq!(
+            provider
+                .exact_full_code_candidates
+                .lock()
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+
+        assert!(provider.is_exact_full_code_candidate("ufme", "什么"));
+        let cache = provider.exact_full_code_candidates.lock().unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries.back().map(|entry| entry.exact), Some(true));
     }
 
     #[test]
@@ -17856,6 +18054,151 @@ mod tests {
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
         );
+    }
+
+    #[test]
+    fn verified_long_word_discovery_is_scoped_for_provenance_forget_and_restore() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            LongExactShortDiscoveryCandidateProvider,
+        ))));
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .record("abcdef", "甲乙丙")
+        );
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .record("abcdefgh", "甲乙丙丁")
+        );
+
+        let automatic = service
+            .load_candidate_batch_with_automatic_transposition(
+                &LongExactShortDiscoveryCandidateProvider,
+                "abceg",
+                4,
+                InteractiveCandidateView::Primary,
+                Some(reversed_single_pair_request(
+                    AutomaticTranspositionTier::Primary,
+                )),
+            )
+            .unwrap();
+        assert_eq!(automatic.candidates, ["固定", "普通", "其他", "末尾"]);
+        assert!(
+            automatic
+                .personalized
+                .iter()
+                .all(|personalized| !personalized)
+        );
+
+        for (short_code, text) in [
+            ("abce", "甲乙丙"),
+            ("abcde", "甲乙丙"),
+            ("abceg", "甲乙丙丁"),
+            ("abcdeg", "甲乙丙丁"),
+            ("abcdefg", "甲乙丙丁"),
+        ] {
+            let discovered = service
+                .load_candidate_batch(
+                    &LongExactShortDiscoveryCandidateProvider,
+                    short_code,
+                    4,
+                    InteractiveCandidateView::Primary,
+                )
+                .unwrap();
+            assert_eq!(discovered.candidates, ["固定", "普通", text, "其他"]);
+            assert_eq!(discovered.personalized, [false, false, true, false]);
+            assert!(
+                discovered.provenance[2]
+                    .personalization()
+                    .contains(NativeCandidatePersonalization::PERSISTENT_DISCOVERY)
+            );
+        }
+
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("abceg".to_owned()));
+        *service.composition.borrow_mut() = session;
+        let enter = service
+            .plan_key(
+                WPARAM(usize::from(VK_DELETE.0)),
+                KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .unwrap()
+            .expect("the long-word discovery should enter forget mode");
+        service.apply_candidate_forget_action(
+            enter
+                .candidate_forget_action_after_success
+                .expect("forget entry should carry an action"),
+        );
+        let suppress = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("the third discovered candidate should be forgettable");
+        let action = suppress
+            .candidate_forget_action_after_success
+            .expect("forget selection should carry a suppression");
+        assert!(matches!(
+            &action,
+            PlannedCandidateForgetAction::Suppress {
+                code,
+                text,
+                restore_session: false,
+            } if code == "abceg" && text == "甲乙丙丁"
+        ));
+        service.apply_candidate_forget_action(action);
+
+        let hidden = service
+            .load_candidate_batch(
+                &LongExactShortDiscoveryCandidateProvider,
+                "abceg",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(hidden.candidates, ["固定", "普通", "其他", "末尾"]);
+        let sibling = service
+            .load_candidate_batch(
+                &LongExactShortDiscoveryCandidateProvider,
+                "abcdeg",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(sibling.candidates, ["固定", "普通", "甲乙丙丁", "其他"]);
+        let full = service
+            .load_candidate_batch(
+                &LongExactShortDiscoveryCandidateProvider,
+                "abcdefgh",
+                1,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(full.candidates, ["甲乙丙丁"]);
+
+        let restore = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Backspace should restore only the forgotten short-code view");
+        service.apply_candidate_forget_action(
+            restore
+                .candidate_forget_action_after_success
+                .expect("restore should carry an action"),
+        );
+        let restored = service
+            .load_candidate_batch(
+                &LongExactShortDiscoveryCandidateProvider,
+                "abceg",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(restored.candidates, ["固定", "普通", "甲乙丙丁", "其他"]);
     }
 
     #[test]
