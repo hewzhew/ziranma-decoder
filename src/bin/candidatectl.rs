@@ -37,23 +37,25 @@ use ziranma_core::{
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
     MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
-    PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
-    PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
-    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SentenceCandidate, SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
-    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
-    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
-    candidate_package_authentication_sha256, candidate_package_storage_id,
-    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
-    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH, MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES,
+    MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES, PublicLexiconRankProbe,
+    PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
+    PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
+    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SentenceCandidate, SupplementalCandidateLayerConfig,
+    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
+    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_rime_target,
+    audit_public_supplemental_layer, candidate_package_authentication_sha256,
+    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
+    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
     load_candidate_runtime_snapshots, load_current_candidate_snapshot, parse_lexicon_tsv,
-    parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_rime_lexicon,
-    parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
-    select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_lexicon_rank_probes, select_public_single_character_context_cases,
-    select_public_static_context_cases, select_public_supplemental_composition_cases,
-    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_public_short_word_consensus,
+    parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
+    select_public_bigram_training_sequences, select_public_character_training_texts,
+    select_public_continuous_composition_cases, select_public_lexicon_rank_probes,
+    select_public_single_character_context_cases, select_public_static_context_cases,
+    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 
@@ -131,6 +133,13 @@ enum Options {
         challenger_payload: PathBuf,
         fit_corpus: PathBuf,
         held_out_corpus: PathBuf,
+    },
+    ShortConsensusAudit {
+        source: PathBuf,
+        confirmation: PathBuf,
+        base_payload: PathBuf,
+        per_code_depth: usize,
+        entry_limit: usize,
     },
     PhraseCoverageAudit {
         source: PathBuf,
@@ -416,6 +425,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &fit_corpus,
             &held_out_corpus,
         )?,
+        Options::ShortConsensusAudit {
+            source,
+            confirmation,
+            base_payload,
+            per_code_depth,
+            entry_limit,
+        } => audit_short_word_consensus(
+            &source,
+            &confirmation,
+            &base_payload,
+            per_code_depth,
+            entry_limit,
+        )?,
         Options::PhraseCoverageAudit {
             source,
             allowlist,
@@ -621,6 +643,7 @@ fn parse_options(
         "short-rank-audit" => parse_short_rank_audit(arguments),
         "segment-penalty-audit" => parse_segment_penalty_audit(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
+        "short-consensus-audit" => parse_short_consensus_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
@@ -807,6 +830,7 @@ fn parse_build_rime_slice(
     let mut source_sha256 = None;
     let mut max_entries = None;
     let mut frequency_frontier_entries = None;
+    let mut two_character_coverage_depth = None;
     let mut three_character_coverage_entries = None;
     let mut four_character_coverage_entries = None;
     let mut max_text_characters = None;
@@ -827,6 +851,11 @@ fn parse_build_rime_slice(
                 &mut frequency_frontier_entries,
                 &mut arguments,
                 "--frequency-frontier-entries",
+            )?,
+            "--two-character-coverage-depth" => set_usize(
+                &mut two_character_coverage_depth,
+                &mut arguments,
+                "--two-character-coverage-depth",
             )?,
             "--three-character-coverage-entries" => set_usize(
                 &mut three_character_coverage_entries,
@@ -859,6 +888,7 @@ fn parse_build_rime_slice(
     let config = PublicRimeSliceConfig {
         max_entries,
         frequency_frontier_entries: frequency_frontier_entries.unwrap_or(max_entries),
+        two_character_coverage_depth: two_character_coverage_depth.unwrap_or(1),
         three_character_coverage_entries: three_character_coverage_entries.unwrap_or(0),
         four_character_coverage_entries: four_character_coverage_entries.unwrap_or(0),
         max_text_characters: max_text_characters
@@ -877,6 +907,13 @@ fn parse_build_rime_slice(
     {
         return Err(
             "build-rime-slice --frequency-frontier-entries must be within --max-entries".into(),
+        );
+    }
+    if config.two_character_coverage_depth == 0
+        || config.two_character_coverage_depth > MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH
+    {
+        return Err(
+            "build-rime-slice --two-character-coverage-depth is outside the fixed bound".into(),
         );
     }
     if config
@@ -1250,6 +1287,45 @@ fn parse_length_coverage_audit(
         fit_corpus: fit_corpus.ok_or("length-coverage-audit requires --fit-corpus")?,
         held_out_corpus: held_out_corpus
             .ok_or("length-coverage-audit requires --held-out-corpus")?,
+    })
+}
+
+fn parse_short_consensus_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut confirmation = None;
+    let mut base_payload = None;
+    let mut per_code_depth = None;
+    let mut entry_limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--confirmation" => set_path(&mut confirmation, &mut arguments, "--confirmation")?,
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--per-code-depth" => {
+                set_usize(&mut per_code_depth, &mut arguments, "--per-code-depth")?
+            }
+            "--entry-limit" => set_usize(&mut entry_limit, &mut arguments, "--entry-limit")?,
+            _ => {
+                return Err("unknown short-consensus-audit argument; value was suppressed".into());
+            }
+        }
+    }
+    let per_code_depth = per_code_depth.ok_or("short-consensus-audit requires --per-code-depth")?;
+    if !(1..=MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH).contains(&per_code_depth) {
+        return Err("short-consensus-audit --per-code-depth is outside the fixed bound".into());
+    }
+    let entry_limit = entry_limit.ok_or("short-consensus-audit requires --entry-limit")?;
+    if !(1..=MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES).contains(&entry_limit) {
+        return Err("short-consensus-audit --entry-limit is outside the fixed bound".into());
+    }
+    Ok(Options::ShortConsensusAudit {
+        source: source.ok_or("short-consensus-audit requires --source")?,
+        confirmation: confirmation.ok_or("short-consensus-audit requires --confirmation")?,
+        base_payload: base_payload.ok_or("short-consensus-audit requires --base-payload")?,
+        per_code_depth,
+        entry_limit,
     })
 }
 
@@ -1988,7 +2064,7 @@ fn print_usage() {
         "  build-rime --source <RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --public"
     );
     eprintln!(
-        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] [--three-character-coverage-entries <N>] [--four-character-coverage-entries <N>] --max-text-characters <1..12> --public"
+        "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] [--two-character-coverage-depth <1..8>] [--three-character-coverage-entries <N>] [--four-character-coverage-entries <N>] --max-text-characters <1..12> --public"
     );
     eprintln!(
         "  build-phrase-layer --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --allowlist-id <ID> --allowlist-license <SPDX> --allowlist-url <HTTPS_URL> --allowlist-sha256 <SHA256> --base-id <ID> --base-license <SPDX> --base-url <HTTPS_URL> --base-sha256 <SHA256> --public"
@@ -2011,6 +2087,9 @@ fn print_usage() {
     );
     eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
+    );
+    eprintln!(
+        "  short-consensus-audit --source <TONED_RIME.dict.yaml> --confirmation <PUBLIC_WORDS.txt> --base-payload <LEXICON.tsv> --per-code-depth <1..8> --entry-limit <1..50000>"
     );
     eprintln!(
         "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
@@ -3653,6 +3732,86 @@ fn write_length_coverage_section(
         )
         .unwrap();
     }
+}
+
+fn audit_short_word_consensus(
+    source: &Path,
+    confirmation: &Path,
+    base_payload: &Path,
+    per_code_depth: usize,
+    entry_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        source,
+        "public toned Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let confirmation_text = read_explicit_text(
+        confirmation,
+        "independent public short-word confirmation",
+        MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES,
+    )?;
+    let base_text = read_explicit_text(
+        base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let source_sha256 = candidate_sha256_hex(source_text.as_bytes());
+    let confirmation_sha256 = candidate_sha256_hex(confirmation_text.as_bytes());
+    let base_sha256 = candidate_sha256_hex(base_text.as_bytes());
+    if source_sha256 == confirmation_sha256 || source_sha256 == base_sha256 {
+        return Err("short-consensus-audit requires distinct public materials".into());
+    }
+
+    let base = parse_lexicon_tsv(&base_text)?;
+    let imported = parse_public_short_word_consensus(
+        &source_text,
+        &confirmation_text,
+        &base,
+        per_code_depth,
+        entry_limit,
+    )?;
+    let stats = imported.stats;
+    let mut output = String::new();
+    writeln!(output, "公开双来源短词共识审计")?;
+    writeln!(output, "Rime 来源：SHA-256 {source_sha256}")?;
+    writeln!(output, "独立确认：SHA-256 {confirmation_sha256}")?;
+    writeln!(
+        output,
+        "基础载荷：{} 条 · SHA-256 {base_sha256}",
+        base.len()
+    )?;
+    writeln!(
+        output,
+        "确认来源：{} 行；合格双字词面 {}；重复 {}",
+        stats.confirmation_rows,
+        stats.eligible_confirmation_surfaces,
+        stats.duplicate_confirmation_surfaces,
+    )?;
+    writeln!(
+        output,
+        "Rime 交集：扫描 {} 行；命中 {}；有效 {}；唯一文字/码身份 {}",
+        stats.source_rows,
+        stats.confirmed_source_rows,
+        stats.valid_confirmed_source_rows,
+        stats.confirmed_identities,
+    )?;
+    writeln!(
+        output,
+        "排除基础：已有 {}；新增身份 {}；新增规范码 {}",
+        stats.base_identities, stats.available_new_identities, stats.available_new_codes,
+    )?;
+    writeln!(
+        output,
+        "分层结果：每码最多 {}；内存选中 {}；上限外 {}",
+        stats.per_code_depth, stats.imported_entries, stats.dropped_by_entry_cap,
+    )?;
+    writeln!(
+        output,
+        "口径：第二来源只确认词面存在；读音、规范码和层内顺序只来自 Rime；不比较跨来源频率。"
+    )?;
+    writeln!(output, "本次操作：只读；没有生成、安装或启用候选包")?;
+    Ok(output)
 }
 
 fn audit_phrase_coverage(
@@ -7745,8 +7904,10 @@ fn write_slice_stats(output: &mut String, stats: PublicRimeSliceImportStats) {
     .unwrap();
     writeln!(
         output,
-        "双字码覆盖：合格码 {}，全局前沿已覆盖 {}（{} 行），补充候选 {}，保留 {}，上限外 {}，高频回填 {}",
+        "双字码覆盖：深度 {}，合格码 {}（分层身份 {}），全局前沿已覆盖 {}（{} 行），补充候选 {}，保留 {}，上限外 {}，高频回填 {}",
+        stats.two_character_coverage_depth,
         stats.eligible_two_character_codes,
+        stats.eligible_two_character_depth_entries,
         stats.frequency_frontier_two_character_codes,
         stats.frequency_frontier_selected_rows,
         stats.two_character_coverage_candidates,
@@ -8967,6 +9128,49 @@ mod tests {
     }
 
     #[test]
+    fn short_consensus_parser_bounds_depth_and_output() {
+        assert_eq!(
+            parse_options([
+                "short-consensus-audit".to_owned(),
+                "--source".to_owned(),
+                "source.yaml".to_owned(),
+                "--confirmation".to_owned(),
+                "words.txt".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+                "--per-code-depth".to_owned(),
+                "2".to_owned(),
+                "--entry-limit".to_owned(),
+                "50000".to_owned(),
+            ])
+            .unwrap(),
+            Options::ShortConsensusAudit {
+                source: PathBuf::from("source.yaml"),
+                confirmation: PathBuf::from("words.txt"),
+                base_payload: PathBuf::from("base.tsv"),
+                per_code_depth: 2,
+                entry_limit: 50_000,
+            }
+        );
+        assert!(
+            parse_options([
+                "short-consensus-audit".to_owned(),
+                "--source".to_owned(),
+                "source.yaml".to_owned(),
+                "--confirmation".to_owned(),
+                "words.txt".to_owned(),
+                "--base-payload".to_owned(),
+                "base.tsv".to_owned(),
+                "--per-code-depth".to_owned(),
+                "9".to_owned(),
+                "--entry-limit".to_owned(),
+                "1".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn consensus_audit_parser_binds_the_independent_corpus_and_frontier() {
         assert_eq!(
             parse_options([
@@ -9530,6 +9734,31 @@ mod tests {
     }
 
     #[test]
+    fn short_consensus_report_is_aggregate_read_only_and_does_not_echo_words() {
+        const SOURCE: &str = "---\n...\n公开词\tgōng kāi cí\t30\n收束\tshōu shù\t20\n";
+        const CONFIRMATION: &str = "收束 10 v\n无关 5 n\n";
+        const BASE: &str = "text\tpinyin\tfrequency\n根基\tgen ji\t10\n";
+        let root = temporary_test_root();
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.yaml");
+        let confirmation = root.join("confirmation.txt");
+        let base = root.join("base.tsv");
+        fs::write(&source, SOURCE).unwrap();
+        fs::write(&confirmation, CONFIRMATION).unwrap();
+        fs::write(&base, BASE).unwrap();
+
+        let report = audit_short_word_consensus(&source, &confirmation, &base, 1, 10).unwrap();
+        assert!(report.contains("合格双字词面 2"));
+        assert!(report.contains("新增身份 1；新增规范码 1"));
+        assert!(report.contains("本次操作：只读；没有生成、安装或启用候选包"));
+        assert!(!report.contains("收束"));
+        assert!(!report.contains("根基"));
+        assert_eq!(root.read_dir().unwrap().count(), 3);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn phrase_coverage_report_is_aggregate_only_and_does_not_build_a_package() {
         const SOURCE: &str = "---\n...\n公开短语\tgōng kāi duǎn yǔ\t20\n";
         const ALLOWLIST: &str = "gkdy\t公开短语\n";
@@ -9699,6 +9928,8 @@ mod tests {
                 "100000".to_owned(),
                 "--frequency-frontier-entries".to_owned(),
                 "80000".to_owned(),
+                "--two-character-coverage-depth".to_owned(),
+                "4".to_owned(),
                 "--three-character-coverage-entries".to_owned(),
                 "6000".to_owned(),
                 "--four-character-coverage-entries".to_owned(),
@@ -9711,6 +9942,7 @@ mod tests {
                 config: PublicRimeSliceConfig {
                     max_entries: 100_000,
                     frequency_frontier_entries: 80_000,
+                    two_character_coverage_depth: 4,
                     three_character_coverage_entries: 6_000,
                     four_character_coverage_entries: 4_000,
                     max_text_characters: 8,
@@ -10144,6 +10376,7 @@ mod tests {
             PublicRimeSliceConfig {
                 max_entries: 2,
                 frequency_frontier_entries: 2,
+                two_character_coverage_depth: 1,
                 three_character_coverage_entries: 0,
                 four_character_coverage_entries: 0,
                 max_text_characters: 4,

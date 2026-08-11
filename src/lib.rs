@@ -324,12 +324,14 @@ pub use public_corpus::{
 pub use public_lexicon_slice::{
     MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
     MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
-    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, PublicLexiconComparison,
-    PublicRimePhraseAllowlistImport, PublicRimePhraseAllowlistImportStats, PublicRimeSliceConfig,
-    PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats, PublicRimeTargetAudit,
+    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH,
+    MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES, MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES,
+    PublicLexiconComparison, PublicRimePhraseAllowlistImport, PublicRimePhraseAllowlistImportStats,
+    PublicRimeSliceConfig, PublicRimeSliceError, PublicRimeSliceImport, PublicRimeSliceImportStats,
+    PublicRimeTargetAudit, PublicShortWordConsensusImport, PublicShortWordConsensusImportStats,
     PublicSupplementalLayerAudit, PublicSupplementalLayerAuditError, audit_public_rime_target,
     audit_public_supplemental_layer, compare_public_lexicons, parse_public_rime_phrase_allowlist,
-    parse_public_rime_slice,
+    parse_public_rime_slice, parse_public_short_word_consensus,
 };
 pub use research_analysis::{
     ResearchHabitClue, ResearchHabitKind, ResearchHalfPairAnalysis, ResearchSceneAnalysis,

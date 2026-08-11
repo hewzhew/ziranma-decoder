@@ -172,6 +172,30 @@ cargo run --release --bin candidatectl -- build-rime-slice `
 为 0。最低权重降到 1 是覆盖长尾的预期结果，不表示低频词会跨来源抢占核心
 首选。与日用核心做前七、每码补一个的层审计仍保持共有完整码的核心首选不变。
 
+“一个码已有代表”仍不等于同码深层正常词可查询。离线实验可显式添加
+`--two-character-coverage-depth 2..8`：先保持每码第一个代表，再让更深身份按
+同一来源内部权重占用剩余容量；默认值 1 完全保持上述旧行为。固定万象中每码
+最多 4 项共有 136,586 个双字身份，超过 120k 切片上限，所以这个开关只用于量化
+容量矛盾，不能被当作新的默认包策略。
+
+独立公开词表可进一步只做二值词面确认。下面的只读审计不写包，也不把两份来源
+的数值频率混合；读音和自然码始终来自万象，jieba 只回答“是否也收录这个双字
+词面”，随后排除基础载荷并按完整码限制深度：
+
+```powershell
+target\release\candidatectl.exe short-consensus-audit `
+  --source .local\public-audit\wanxiang-fdda7afb\jichu.dict.yaml `
+  --confirmation .local\research\upstreams\jieba\jieba\dict.txt `
+  --base-payload .local\public-audit\wanxiang-fdda7afb\package-top120k-v1\lexicon.tsv `
+  --per-code-depth 2 `
+  --entry-limit 50000
+```
+
+命令逐字节报告三个输入的 SHA-256，并只输出聚合计数。固定结果为 55,950 个
+基础外双来源确认身份、34,894 个规范码；每码 1 项需 34,894 条，每码 2 项需
+46,832 条。该规模不能塞进基础包到当前快照上限之间的余量；在独立精确层或惰性
+码索引完成前，审计结果不会自动生成、安装或启用候选包。
+
 导入器同时聚合报告三字、四字规范码，而不显示词条文字。上述固定切片中，
 536,722 个合格三字码有 26,897 个进入最终切片，635,180 个合格四字码有
 14,797 个进入最终切片；因此不能把双字“每码补一个”机械扩大到更长词。可选的
