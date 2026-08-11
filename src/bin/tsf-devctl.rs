@@ -3236,6 +3236,19 @@ mod tests {
             let contents = fs::read_to_string(repository.join(wrapper)).unwrap();
             assert!(contents.contains("scripts\\resolve-user-tool.cmd"));
         }
+
+        for (wrapper, tool, label) in [
+            ("alias-ime.cmd", "aliaspad", "launch_aliaspad"),
+            ("wish-ime.cmd", "wishpad", "launch_wishpad"),
+        ] {
+            let contents = fs::read_to_string(repository.join(wrapper)).unwrap();
+            let normalized = contents.replace("\r\n", "\n");
+            assert!(normalized.contains(&format!("if \"%~1\"==\"\" goto {label}")));
+            assert!(normalized.contains(&format!(":{label}\nset \"{tool}=\"")));
+            assert!(normalized.contains(&format!(
+                "for /f \"usebackq delims=\" %%P in (`call \"%resolver%\" {tool}`) do set \"{tool}=%%P\""
+            )));
+        }
     }
 
     #[test]

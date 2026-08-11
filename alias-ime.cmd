@@ -9,20 +9,7 @@ if not exist "%resolver%" (
     exit /b 1
 )
 
-if "%~1"=="" (
-    set "aliaspad="
-    for /f "usebackq delims=" %%P in (`call "%resolver%" aliaspad`) do set "aliaspad=%%P"
-    if not defined aliaspad (
-        echo Candidate pin panel is unavailable. Run refresh-ime.cmd first.
-        exit /b 1
-    )
-    if not exist "%aliaspad%" (
-        echo Candidate pin panel is unavailable. Run refresh-ime.cmd status.
-        exit /b 1
-    )
-    start "" "%aliaspad%"
-    exit /b 0
-)
+if "%~1"=="" goto launch_aliaspad
 
 set "aliasctl="
 for /f "usebackq delims=" %%P in (`call "%resolver%" aliasctl`) do set "aliasctl=%%P"
@@ -37,3 +24,17 @@ if not exist "%aliasctl%" (
 
 "%aliasctl%" %* --root "%alias_root%"
 exit /b %ERRORLEVEL%
+
+:launch_aliaspad
+set "aliaspad="
+for /f "usebackq delims=" %%P in (`call "%resolver%" aliaspad`) do set "aliaspad=%%P"
+if not defined aliaspad (
+    echo Candidate pin panel is unavailable. Run refresh-ime.cmd first.
+    exit /b 1
+)
+if not exist "%aliaspad%" (
+    echo Candidate pin panel is unavailable. Run refresh-ime.cmd status.
+    exit /b 1
+)
+start "" "%aliaspad%"
+exit /b 0
