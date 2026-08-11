@@ -4,14 +4,16 @@
 //! compares bounded commit records with a caller-supplied decoder and returns
 //! aggregate counts only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
 use crate::{
     BIGRAM_INTERPOLATION_WEIGHT, BigramLanguageModel, CandidateSource,
     CharacterBigramLanguageModel, Correction, Decoder, EventCapsuleV1, KeySequence,
-    KeySequenceError, RawKey, SentenceCandidate, TrackerOutput, encode_pinyin_phrase,
+    KeySequenceError, MAX_PERSONAL_CONTEXT_CODE_KEYS, MAX_PERSONAL_CONTEXT_ENTRIES,
+    MAX_PERSONAL_CONTEXT_TEXT_CHARACTERS, PERSONAL_CONTEXT_SEARCH_DEPTH,
+    PERSONAL_CONTEXT_SUPPORT_CAP, RawKey, SentenceCandidate, TrackerOutput, encode_pinyin_phrase,
 };
 
 pub const MAX_REPLAY_CODE_KEYS: usize = 64;
@@ -215,6 +217,10 @@ pub struct PersonalCacheReplayState {
     code_text_counts: HashMap<(String, String), u64>,
     learned_code_text_tokens: u64,
     active_code_text_spans: Vec<PersonalLearnedCodeTextSpan>,
+    left_context_counts: BTreeMap<(String, String, String), ReplayLeftContextEvidence>,
+    left_context_generation: u64,
+    learned_left_context_tokens: u64,
+    active_left_context_spans: Vec<PersonalLearnedLeftContextSpan>,
 }
 
 struct PersonalLearnedSpan {
@@ -236,6 +242,37 @@ struct PersonalLearnedCodeTextSpan {
     text: String,
 }
 
+#[derive(Clone, Default)]
+struct ReplayLeftContextEvidence {
+    selection_generations: Vec<u64>,
+}
+
+impl ReplayLeftContextEvidence {
+    fn selections(&self) -> u64 {
+        u64::try_from(self.selection_generations.len()).unwrap_or(u64::MAX)
+    }
+
+    fn effective_support(&self) -> u64 {
+        self.selections().min(PERSONAL_CONTEXT_SUPPORT_CAP)
+    }
+
+    fn last_selection_generation(&self) -> u64 {
+        self.selection_generations
+            .last()
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+struct PersonalLearnedLeftContextSpan {
+    start: usize,
+    end: usize,
+    previous_text: String,
+    code: String,
+    selected_text: String,
+    generation: u64,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PersonalCacheEditOutcome {
     invalidated_commits: u64,
@@ -243,6 +280,7 @@ struct PersonalCacheEditOutcome {
     invalidated_pair_sequences: u64,
     invalidated_word_pairs: u64,
     invalidated_code_text_tokens: u64,
+    invalidated_left_context_tokens: u64,
     ambiguous_position: bool,
 }
 
@@ -275,6 +313,14 @@ impl PersonalCacheReplayState {
         self.learned_code_text_tokens
     }
 
+    pub fn learned_left_context_types(&self) -> usize {
+        self.left_context_counts.len()
+    }
+
+    pub fn learned_left_context_tokens(&self) -> u64 {
+        self.learned_left_context_tokens
+    }
+
     pub fn fork_for_frozen_evaluation(&self) -> Self {
         Self {
             word_counts: self.word_counts.clone(),
@@ -286,6 +332,10 @@ impl PersonalCacheReplayState {
             code_text_counts: self.code_text_counts.clone(),
             learned_code_text_tokens: self.learned_code_text_tokens,
             active_code_text_spans: Vec::new(),
+            left_context_counts: self.left_context_counts.clone(),
+            left_context_generation: self.left_context_generation,
+            learned_left_context_tokens: self.learned_left_context_tokens,
+            active_left_context_spans: Vec::new(),
         }
     }
 
@@ -293,6 +343,7 @@ impl PersonalCacheReplayState {
         self.active_document_spans.clear();
         self.active_pair_spans.clear();
         self.active_code_text_spans.clear();
+        self.active_left_context_spans.clear();
     }
 
     fn learn_commit(&mut self, start: usize, inserted_chars: usize, words: &[String]) {
@@ -340,6 +391,96 @@ impl PersonalCacheReplayState {
                 code,
                 text,
             });
+    }
+
+    fn learn_left_context(
+        &mut self,
+        start: usize,
+        end: usize,
+        previous_text: String,
+        code: String,
+        selected_text: String,
+    ) -> bool {
+        if !valid_replay_context_text(&previous_text)
+            || !valid_replay_context_code(&code)
+            || !valid_replay_context_text(&selected_text)
+        {
+            return false;
+        }
+        self.left_context_generation = self.left_context_generation.saturating_add(1);
+        let generation = self.left_context_generation;
+        self.left_context_counts
+            .entry((previous_text.clone(), code.clone(), selected_text.clone()))
+            .or_default()
+            .selection_generations
+            .push(generation);
+        self.learned_left_context_tokens = self.learned_left_context_tokens.saturating_add(1);
+        self.active_left_context_spans
+            .push(PersonalLearnedLeftContextSpan {
+                start,
+                end,
+                previous_text,
+                code,
+                selected_text,
+                generation,
+            });
+        while self.left_context_counts.len() > MAX_PERSONAL_CONTEXT_ENTRIES {
+            let oldest = self
+                .left_context_counts
+                .iter()
+                .min_by_key(|(identity, evidence)| {
+                    (evidence.last_selection_generation(), *identity)
+                })
+                .map(|(identity, _)| identity.clone())
+                .expect("an over-capacity replay context table has one oldest entry");
+            if let Some(evicted) = self.left_context_counts.remove(&oldest) {
+                self.learned_left_context_tokens = self
+                    .learned_left_context_tokens
+                    .saturating_sub(evicted.selections());
+            }
+        }
+        true
+    }
+
+    fn left_context_count(&self, previous_text: &str, code: &str, text: &str) -> u64 {
+        self.left_context_counts
+            .get(&(previous_text.to_owned(), code.to_owned(), text.to_owned()))
+            .map(ReplayLeftContextEvidence::selections)
+            .unwrap_or_default()
+    }
+
+    fn preferred_left_context_text<'a>(
+        &'a self,
+        previous_text: &str,
+        code: &str,
+        candidates: impl IntoIterator<Item = &'a str>,
+    ) -> Option<&'a str> {
+        if !valid_replay_context_text(previous_text) || !valid_replay_context_code(code) {
+            return None;
+        }
+        let candidates = candidates.into_iter().collect::<Vec<_>>();
+        let start = (previous_text.to_owned(), code.to_owned(), String::new());
+        self.left_context_counts
+            .range(start..)
+            .take_while(|((entry_previous, entry_code, _), _)| {
+                entry_previous == previous_text && entry_code == code
+            })
+            .filter(|((_, _, text), evidence)| {
+                evidence.effective_support() > 0
+                    && self.code_text_count(code, text) > 0
+                    && candidates.iter().any(|candidate| *candidate == text)
+            })
+            .max_by(|((_, _, left_text), left), ((_, _, right_text), right)| {
+                left.effective_support()
+                    .cmp(&right.effective_support())
+                    .then_with(|| {
+                        left.last_selection_generation()
+                            .cmp(&right.last_selection_generation())
+                    })
+                    .then_with(|| left.selections().cmp(&right.selections()))
+                    .then_with(|| right_text.cmp(left_text))
+            })
+            .map(|((_, _, text), _)| text.as_str())
     }
 
     fn learn_pair_sequence(&mut self, start: usize, end: usize, words: &[String]) -> usize {
@@ -462,6 +603,40 @@ impl PersonalCacheReplayState {
             retained_code_text.push(span);
         }
         self.active_code_text_spans = retained_code_text;
+
+        let mut retained_left_context = Vec::with_capacity(self.active_left_context_spans.len());
+        for mut span in std::mem::take(&mut self.active_left_context_spans) {
+            let overlaps = if deleted_chars > 0 {
+                span.start < edit_end && span.end > start
+            } else {
+                start > span.start && start < span.end
+            };
+            if overlaps {
+                if self.unlearn_left_context(
+                    &span.previous_text,
+                    &span.code,
+                    &span.selected_text,
+                    span.generation,
+                ) {
+                    outcome.invalidated_left_context_tokens =
+                        outcome.invalidated_left_context_tokens.saturating_add(1);
+                }
+                continue;
+            }
+            if span.start >= edit_end {
+                if inserted_chars >= deleted_chars {
+                    let shift = inserted_chars - deleted_chars;
+                    span.start = span.start.saturating_add(shift);
+                    span.end = span.end.saturating_add(shift);
+                } else {
+                    let shift = deleted_chars - inserted_chars;
+                    span.start = span.start.saturating_sub(shift);
+                    span.end = span.end.saturating_sub(shift);
+                }
+            }
+            retained_left_context.push(span);
+        }
+        self.active_left_context_spans = retained_left_context;
         outcome
     }
 
@@ -505,6 +680,45 @@ impl PersonalCacheReplayState {
         }
         self.learned_code_text_tokens = self.learned_code_text_tokens.saturating_sub(1);
     }
+
+    fn unlearn_left_context(
+        &mut self,
+        previous_text: &str,
+        code: &str,
+        selected_text: &str,
+        generation: u64,
+    ) -> bool {
+        let identity = (
+            previous_text.to_owned(),
+            code.to_owned(),
+            selected_text.to_owned(),
+        );
+        let Some(evidence) = self.left_context_counts.get_mut(&identity) else {
+            return false;
+        };
+        let Ok(index) = evidence.selection_generations.binary_search(&generation) else {
+            return false;
+        };
+        evidence.selection_generations.remove(index);
+        let remove = evidence.selection_generations.is_empty();
+        if remove {
+            self.left_context_counts.remove(&identity);
+        }
+        self.learned_left_context_tokens = self.learned_left_context_tokens.saturating_sub(1);
+        true
+    }
+}
+
+fn valid_replay_context_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_PERSONAL_CONTEXT_CODE_KEYS
+        && code.as_bytes().iter().all(u8::is_ascii_lowercase)
+}
+
+fn valid_replay_context_text(text: &str) -> bool {
+    !text.is_empty()
+        && !text.contains('\0')
+        && text.chars().count() <= MAX_PERSONAL_CONTEXT_TEXT_CHARACTERS
 }
 
 impl fmt::Debug for PersonalCacheReplayState {
@@ -521,6 +735,18 @@ impl fmt::Debug for PersonalCacheReplayState {
             .field("learned_code_text_types", &self.learned_code_text_types())
             .field("learned_code_text_tokens", &self.learned_code_text_tokens)
             .field("active_code_text_spans", &self.active_code_text_spans.len())
+            .field(
+                "learned_left_context_types",
+                &self.learned_left_context_types(),
+            )
+            .field(
+                "learned_left_context_tokens",
+                &self.learned_left_context_tokens,
+            )
+            .field(
+                "active_left_context_spans",
+                &self.active_left_context_spans.len(),
+            )
             .finish()
     }
 }
@@ -1020,6 +1246,8 @@ pub struct CapsuleReplayReport {
     pub personal_cache_history_word_pair_types: u64,
     pub personal_cache_history_code_text_tokens: u64,
     pub personal_cache_history_code_text_types: u64,
+    pub personal_cache_history_left_context_tokens: u64,
+    pub personal_cache_history_left_context_types: u64,
     pub personal_cache_learning_commits: u64,
     pub personal_cache_learning_word_tokens: u64,
     pub personal_cache_retained_word_tokens: u64,
@@ -1036,6 +1264,10 @@ pub struct CapsuleReplayReport {
     pub personal_cache_retained_code_text_tokens: u64,
     pub personal_cache_learned_code_text_types: u64,
     pub personal_cache_reversed_code_text_tokens: u64,
+    pub personal_cache_learning_left_context_tokens: u64,
+    pub personal_cache_retained_left_context_tokens: u64,
+    pub personal_cache_learned_left_context_types: u64,
+    pub personal_cache_reversed_left_context_tokens: u64,
     pub personal_cache_revision_events_with_reversal: u64,
     pub personal_cache_revisions_not_reversed: u64,
     pub personal_cache_ambiguous_edits_not_applied: u64,
@@ -1100,6 +1332,24 @@ pub struct CapsuleReplayReport {
     pub personal_pair_reserved_once_target_evidence_windows: u64,
     pub personal_pair_reserved_repeated_active_windows: u64,
     pub personal_pair_reserved_repeated_target_evidence_windows: u64,
+    pub personal_left_context_comparison_commits: u64,
+    pub personal_left_context_public: ReplayStrategyStats,
+    pub personal_left_context_frozen_exact: ReplayStrategyStats,
+    pub personal_left_context_causal_exact: ReplayStrategyStats,
+    pub personal_left_context_frozen_context: ReplayStrategyStats,
+    pub personal_left_context_causal_context: ReplayStrategyStats,
+    pub personal_left_context_frozen_exact_vs_public: RankingReplayComparisonStats,
+    pub personal_left_context_frozen_context_vs_exact: RankingReplayComparisonStats,
+    pub personal_left_context_causal_context_vs_causal_exact: RankingReplayComparisonStats,
+    pub personal_left_context_causal_context_vs_exact: RankingReplayComparisonStats,
+    pub personal_left_context_causal_vs_frozen_context: RankingReplayComparisonStats,
+    pub personal_left_context_target_in_pool_commits: u64,
+    pub personal_left_context_frozen_any_evidence_commits: u64,
+    pub personal_left_context_frozen_target_evidence_commits: u64,
+    pub personal_left_context_frozen_competing_evidence_commits: u64,
+    pub personal_left_context_causal_any_evidence_commits: u64,
+    pub personal_left_context_causal_target_evidence_commits: u64,
+    pub personal_left_context_causal_competing_evidence_commits: u64,
 }
 
 impl CapsuleReplayReport {
@@ -1306,6 +1556,29 @@ impl CapsuleReplayReport {
         Ok(())
     }
 
+    pub fn observe_capsule_with_personal_left_context_comparison(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        let prepared_windows = self.observe_capsule_internal(decoder, None, capsule, false)?;
+        self.observe_personal_left_context_capsule(
+            decoder,
+            frozen_state,
+            causal_state,
+            capsule,
+            max_gap_ms,
+            &prepared_windows,
+        )?;
+        self.update_personal_left_context_state_totals(causal_state);
+        Ok(())
+    }
+
     pub fn observe_capsule_with_personal_pair_comparison(
         &mut self,
         decoder: &Decoder,
@@ -1365,6 +1638,9 @@ impl CapsuleReplayReport {
         self.personal_cache_history_code_text_tokens = state.learned_code_text_tokens();
         self.personal_cache_history_code_text_types =
             u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_history_left_context_tokens = state.learned_left_context_tokens();
+        self.personal_cache_history_left_context_types =
+            u64::try_from(state.learned_left_context_types()).unwrap_or(u64::MAX);
     }
 
     pub fn learn_capsule_for_personal_cache(
@@ -1417,6 +1693,33 @@ impl CapsuleReplayReport {
             u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
         self.personal_cache_retained_code_text_tokens = state.learned_code_text_tokens();
         Ok(())
+    }
+
+    pub fn learn_capsule_for_personal_left_context_comparison(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        let Some(max_gap_ms) = self.window_gap_limit_ms else {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        };
+        self.capsules = self.capsules.saturating_add(1);
+        self.events = self
+            .events
+            .saturating_add(u64::try_from(capsule.events().len()).unwrap_or(u64::MAX));
+        self.learn_personal_left_context_capsule(decoder, state, capsule, max_gap_ms)?;
+        self.update_personal_left_context_state_totals(state);
+        Ok(())
+    }
+
+    fn update_personal_left_context_state_totals(&mut self, state: &PersonalCacheReplayState) {
+        self.personal_cache_retained_code_text_tokens = state.learned_code_text_tokens();
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_left_context_tokens = state.learned_left_context_tokens();
+        self.personal_cache_learned_left_context_types =
+            u64::try_from(state.learned_left_context_types()).unwrap_or(u64::MAX);
     }
 
     fn observe_capsule_with_personal_cache_kind(
@@ -1788,6 +2091,335 @@ impl CapsuleReplayReport {
             run.push(commit);
         }
         self.finish_personal_cache_window(decoder, state, mode, &mut run)
+    }
+
+    fn observe_personal_left_context_capsule(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+        max_gap_ms: u64,
+        prepared_windows: &HashMap<usize, WindowCommit>,
+    ) -> Result<(), KeySequenceError> {
+        causal_state.start_document();
+        let mut run = Vec::<WindowCommit>::new();
+        for (event_index, event) in capsule.events().iter().enumerate() {
+            let TrackerOutput::Commit(record) = &event.output else {
+                self.finish_personal_left_context_run(
+                    decoder,
+                    frozen_state,
+                    causal_state,
+                    &mut run,
+                )?;
+                let TrackerOutput::Revision(revision) = &event.output else {
+                    unreachable!("tracker output has only commit and revision variants");
+                };
+                let outcome = causal_state.apply_document_delta(
+                    revision.change.start,
+                    revision.change.deleted.chars().count(),
+                    revision.change.inserted.chars().count(),
+                    revision.change.position_evidence,
+                );
+                self.observe_personal_cache_edit(outcome, true);
+                continue;
+            };
+            let Some(commit) = prepared_windows.get(&event_index).cloned() else {
+                self.finish_personal_left_context_run(
+                    decoder,
+                    frozen_state,
+                    causal_state,
+                    &mut run,
+                )?;
+                let outcome = causal_state.apply_document_delta(
+                    record.document_change.start,
+                    record.document_change.deleted.chars().count(),
+                    record.document_change.inserted.chars().count(),
+                    record.document_change.position_evidence,
+                );
+                self.observe_personal_cache_edit(outcome, false);
+                continue;
+            };
+            let joins_previous = run.last().is_some_and(|previous| {
+                commit.elapsed_ms.saturating_sub(previous.elapsed_ms) <= max_gap_ms
+                    && commit.document_start == previous.document_end()
+            });
+            if !run.is_empty() && !joins_previous {
+                self.finish_personal_left_context_run(
+                    decoder,
+                    frozen_state,
+                    causal_state,
+                    &mut run,
+                )?;
+            }
+            run.push(commit);
+        }
+        self.finish_personal_left_context_run(decoder, frozen_state, causal_state, &mut run)
+    }
+
+    fn learn_personal_left_context_capsule(
+        &mut self,
+        decoder: &Decoder,
+        state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+        max_gap_ms: u64,
+    ) -> Result<(), KeySequenceError> {
+        state.start_document();
+        let mut run = Vec::<WindowCommit>::new();
+        for event in capsule.events() {
+            let TrackerOutput::Commit(record) = &event.output else {
+                self.finish_personal_left_context_learning(state, &mut run);
+                let TrackerOutput::Revision(revision) = &event.output else {
+                    unreachable!("tracker output has only commit and revision variants");
+                };
+                let outcome = state.apply_document_delta(
+                    revision.change.start,
+                    revision.change.deleted.chars().count(),
+                    revision.change.inserted.chars().count(),
+                    revision.change.position_evidence,
+                );
+                self.observe_personal_cache_edit(outcome, true);
+                continue;
+            };
+            let Some(commit) = prepare_window_commit(decoder, event.elapsed_ms, record)? else {
+                self.finish_personal_left_context_learning(state, &mut run);
+                let outcome = state.apply_document_delta(
+                    record.document_change.start,
+                    record.document_change.deleted.chars().count(),
+                    record.document_change.inserted.chars().count(),
+                    record.document_change.position_evidence,
+                );
+                self.observe_personal_cache_edit(outcome, false);
+                continue;
+            };
+            let joins_previous = run.last().is_some_and(|previous| {
+                commit.elapsed_ms.saturating_sub(previous.elapsed_ms) <= max_gap_ms
+                    && commit.document_start == previous.document_end()
+            });
+            if !run.is_empty() && !joins_previous {
+                self.finish_personal_left_context_learning(state, &mut run);
+            }
+            run.push(commit);
+        }
+        self.finish_personal_left_context_learning(state, &mut run);
+        Ok(())
+    }
+
+    fn finish_personal_left_context_run(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &mut PersonalCacheReplayState,
+        run: &mut Vec<WindowCommit>,
+    ) -> Result<(), KeySequenceError> {
+        let mut previous = None::<WindowCommit>;
+        for commit in run.iter() {
+            if let Some(previous_commit) = previous.as_ref() {
+                self.observe_personal_left_context_commit(
+                    decoder,
+                    frozen_state,
+                    causal_state,
+                    previous_commit,
+                    commit,
+                )?;
+            }
+            self.learn_personal_left_context_commit(causal_state, previous.as_ref(), commit);
+            previous = Some(commit.clone());
+        }
+        run.clear();
+        Ok(())
+    }
+
+    fn finish_personal_left_context_learning(
+        &mut self,
+        state: &mut PersonalCacheReplayState,
+        run: &mut Vec<WindowCommit>,
+    ) {
+        let mut previous = None::<WindowCommit>;
+        for commit in run.iter() {
+            self.learn_personal_left_context_commit(state, previous.as_ref(), commit);
+            previous = Some(commit.clone());
+        }
+        run.clear();
+    }
+
+    fn learn_personal_left_context_commit(
+        &mut self,
+        state: &mut PersonalCacheReplayState,
+        previous: Option<&WindowCommit>,
+        commit: &WindowCommit,
+    ) {
+        let outcome = state.apply_document_delta(
+            commit.document_start,
+            0,
+            commit.document_inserted_chars,
+            crate::DeltaPositionEvidence::UniqueText,
+        );
+        self.observe_personal_cache_edit(outcome, false);
+        state.learn_code_text(
+            commit.document_start,
+            commit.document_end(),
+            commit.observed.clone(),
+            commit.target.clone(),
+        );
+        self.personal_cache_learning_code_text_tokens = self
+            .personal_cache_learning_code_text_tokens
+            .saturating_add(1);
+        if let Some(previous) = previous
+            && state.learn_left_context(
+                previous.document_start,
+                commit.document_end(),
+                previous.target.clone(),
+                commit.observed.clone(),
+                commit.target.clone(),
+            )
+        {
+            self.personal_cache_learning_left_context_tokens = self
+                .personal_cache_learning_left_context_tokens
+                .saturating_add(1);
+        }
+    }
+
+    fn observe_personal_left_context_commit(
+        &mut self,
+        decoder: &Decoder,
+        frozen_state: &PersonalCacheReplayState,
+        causal_state: &PersonalCacheReplayState,
+        previous: &WindowCommit,
+        commit: &WindowCommit,
+    ) -> Result<(), KeySequenceError> {
+        let pool_depth = PERSONAL_CACHE_POOL_DEPTH.max(PERSONAL_CONTEXT_SEARCH_DEPTH);
+        let pool = decoder.decode_sentence(&commit.canonical_full, pool_depth)?;
+        let public_rank = self.personal_left_context_public.observe(
+            &commit.observed,
+            &commit.target,
+            &pool[..pool.len().min(REPLAY_TOP_K)],
+        );
+        let frozen_exact_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            frozen_state,
+            PersonalCacheKind::ExactCodeText,
+            &commit.observed,
+        );
+        let frozen_exact_rank = self.personal_left_context_frozen_exact.observe(
+            &commit.observed,
+            &commit.target,
+            &frozen_exact_candidates[..frozen_exact_candidates.len().min(REPLAY_TOP_K)],
+        );
+        let causal_exact_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            causal_state,
+            PersonalCacheKind::ExactCodeText,
+            &commit.observed,
+        );
+        let causal_exact_rank = self.personal_left_context_causal_exact.observe(
+            &commit.observed,
+            &commit.target,
+            &causal_exact_candidates[..causal_exact_candidates.len().min(REPLAY_TOP_K)],
+        );
+        let frozen_context_candidates = personal_left_context_candidates_from_pool(
+            &pool,
+            frozen_state,
+            frozen_state,
+            &previous.target,
+            &commit.observed,
+        );
+        let frozen_context_rank = self.personal_left_context_frozen_context.observe(
+            &commit.observed,
+            &commit.target,
+            &frozen_context_candidates[..frozen_context_candidates.len().min(REPLAY_TOP_K)],
+        );
+        let causal_context_candidates = personal_left_context_candidates_from_pool(
+            &pool,
+            causal_state,
+            causal_state,
+            &previous.target,
+            &commit.observed,
+        );
+        let causal_context_rank = self.personal_left_context_causal_context.observe(
+            &commit.observed,
+            &commit.target,
+            &causal_context_candidates[..causal_context_candidates.len().min(REPLAY_TOP_K)],
+        );
+
+        self.personal_left_context_comparison_commits = self
+            .personal_left_context_comparison_commits
+            .saturating_add(1);
+        self.personal_left_context_frozen_exact_vs_public
+            .observe(public_rank, frozen_exact_rank);
+        self.personal_left_context_frozen_context_vs_exact
+            .observe(frozen_exact_rank, frozen_context_rank);
+        self.personal_left_context_causal_context_vs_causal_exact
+            .observe(causal_exact_rank, causal_context_rank);
+        self.personal_left_context_causal_context_vs_exact
+            .observe(frozen_exact_rank, causal_context_rank);
+        self.personal_left_context_causal_vs_frozen_context
+            .observe(frozen_context_rank, causal_context_rank);
+
+        let target_index = pool
+            .iter()
+            .position(|candidate| candidate.text == commit.target);
+        if target_index.is_some() {
+            self.personal_left_context_target_in_pool_commits = self
+                .personal_left_context_target_in_pool_commits
+                .saturating_add(1);
+        }
+        let search_pool = &pool[..pool.len().min(PERSONAL_CONTEXT_SEARCH_DEPTH)];
+        let target_in_search_pool = search_pool
+            .iter()
+            .any(|candidate| candidate.text == commit.target);
+        let mut frozen_any = false;
+        let mut frozen_competing = false;
+        let mut causal_any = false;
+        let mut causal_competing = false;
+        for candidate in search_pool {
+            let is_target = candidate.text == commit.target;
+            if frozen_state.left_context_count(&previous.target, &commit.observed, &candidate.text)
+                > 0
+                && frozen_state.code_text_count(&commit.observed, &candidate.text) > 0
+            {
+                frozen_any = true;
+                frozen_competing |= !is_target;
+            }
+            if causal_state.left_context_count(&previous.target, &commit.observed, &candidate.text)
+                > 0
+                && causal_state.code_text_count(&commit.observed, &candidate.text) > 0
+            {
+                causal_any = true;
+                causal_competing |= !is_target;
+            }
+        }
+        self.personal_left_context_frozen_any_evidence_commits = self
+            .personal_left_context_frozen_any_evidence_commits
+            .saturating_add(u64::from(frozen_any));
+        self.personal_left_context_frozen_competing_evidence_commits = self
+            .personal_left_context_frozen_competing_evidence_commits
+            .saturating_add(u64::from(frozen_competing));
+        self.personal_left_context_causal_any_evidence_commits = self
+            .personal_left_context_causal_any_evidence_commits
+            .saturating_add(u64::from(causal_any));
+        self.personal_left_context_causal_competing_evidence_commits = self
+            .personal_left_context_causal_competing_evidence_commits
+            .saturating_add(u64::from(causal_competing));
+        if target_in_search_pool
+            && frozen_state.left_context_count(&previous.target, &commit.observed, &commit.target)
+                > 0
+            && frozen_state.code_text_count(&commit.observed, &commit.target) > 0
+        {
+            self.personal_left_context_frozen_target_evidence_commits = self
+                .personal_left_context_frozen_target_evidence_commits
+                .saturating_add(1);
+        }
+        if target_in_search_pool
+            && causal_state.left_context_count(&previous.target, &commit.observed, &commit.target)
+                > 0
+            && causal_state.code_text_count(&commit.observed, &commit.target) > 0
+        {
+            self.personal_left_context_causal_target_evidence_commits = self
+                .personal_left_context_causal_target_evidence_commits
+                .saturating_add(1);
+        }
+        Ok(())
     }
 
     fn learn_personal_cache_capsule(
@@ -2214,6 +2846,9 @@ impl CapsuleReplayReport {
         self.personal_cache_reversed_code_text_tokens = self
             .personal_cache_reversed_code_text_tokens
             .saturating_add(outcome.invalidated_code_text_tokens);
+        self.personal_cache_reversed_left_context_tokens = self
+            .personal_cache_reversed_left_context_tokens
+            .saturating_add(outcome.invalidated_left_context_tokens);
         if outcome.ambiguous_position {
             self.personal_cache_ambiguous_edits_not_applied = self
                 .personal_cache_ambiguous_edits_not_applied
@@ -2223,6 +2858,7 @@ impl CapsuleReplayReport {
             if outcome.invalidated_commits > 0
                 || outcome.invalidated_pair_sequences > 0
                 || outcome.invalidated_code_text_tokens > 0
+                || outcome.invalidated_left_context_tokens > 0
             {
                 self.personal_cache_revision_events_with_reversal = self
                     .personal_cache_revision_events_with_reversal
@@ -3347,6 +3983,128 @@ impl CapsuleReplayReport {
         .join("\n")
     }
 
+    pub fn personal_left_context_comparison_terminal_report(&self) -> String {
+        let pool_depth = PERSONAL_CACHE_POOL_DEPTH.max(PERSONAL_CONTEXT_SEARCH_DEPTH);
+        [
+            format!(
+                "PERSONAL_LEFT_CONTEXT_COMPARISON \
+                 schema=ziranma-personal-left-context-comparison-v1 contains_text=false \
+                 contains_behavioral_metadata=true writes=false network=false \
+                 candidate_pool_code=canonical target_identity_code=observed \
+                 context_identity=previous_committed_text_and_observed_code_and_selected_text \
+                 selection_rejections=unavailable evaluation_learning=after_scoring \
+                 frozen_evaluation_updates=0 candidate_pool_depth={} context_search_depth={} \
+                 max_context_entries={} context_support_cap={}",
+                pool_depth,
+                PERSONAL_CONTEXT_SEARCH_DEPTH,
+                MAX_PERSONAL_CONTEXT_ENTRIES,
+                PERSONAL_CONTEXT_SUPPORT_CAP
+            ),
+            format!(
+                "HISTORY capsules={} events={} exact_code_text_tokens={} \
+                 exact_code_text_types={} repeated_exact_code_text_tokens={} \
+                 left_context_tokens={} left_context_types={} \
+                 repeated_left_context_tokens={}",
+                self.personal_cache_history_capsules,
+                self.personal_cache_history_events,
+                self.personal_cache_history_code_text_tokens,
+                self.personal_cache_history_code_text_types,
+                self.personal_cache_history_code_text_tokens
+                    .saturating_sub(self.personal_cache_history_code_text_types),
+                self.personal_cache_history_left_context_tokens,
+                self.personal_cache_history_left_context_types,
+                self.personal_cache_history_left_context_tokens
+                    .saturating_sub(self.personal_cache_history_left_context_types)
+            ),
+            format!(
+                "EVALUATION capsules={} events={} gap_ms={} eligible_commits={} \
+                 ineligible_commits={} windows={} comparison_commits={} \
+                 causal_exact_code_text_tokens={} retained_exact_code_text_tokens={} \
+                 exact_code_text_types={} causal_left_context_tokens={} \
+                 retained_left_context_tokens={} left_context_types={} \
+                 reversed_exact_code_text_tokens={} reversed_left_context_tokens={} \
+                 revisions_with_reversal={} revisions_without_reversal={} ambiguous_edits={}",
+                self.capsules,
+                self.events,
+                display_optional(self.window_gap_limit_ms),
+                self.window_eligible_commits,
+                self.window_ineligible_commits,
+                self.continuous_windows,
+                self.personal_left_context_comparison_commits,
+                self.personal_cache_learning_code_text_tokens,
+                self.personal_cache_retained_code_text_tokens,
+                self.personal_cache_learned_code_text_types,
+                self.personal_cache_learning_left_context_tokens,
+                self.personal_cache_retained_left_context_tokens,
+                self.personal_cache_learned_left_context_types,
+                self.personal_cache_reversed_code_text_tokens,
+                self.personal_cache_reversed_left_context_tokens,
+                self.personal_cache_revision_events_with_reversal,
+                self.personal_cache_revisions_not_reversed,
+                self.personal_cache_ambiguous_edits_not_applied
+            ),
+            format!(
+                "LEFT_CONTEXT_EVIDENCE target_in_pool_commits={} \
+                 frozen_any_evidence_commits={} frozen_target_evidence_commits={} \
+                 frozen_competing_evidence_commits={} causal_any_evidence_commits={} \
+                 causal_target_evidence_commits={} causal_competing_evidence_commits={}",
+                self.personal_left_context_target_in_pool_commits,
+                self.personal_left_context_frozen_any_evidence_commits,
+                self.personal_left_context_frozen_target_evidence_commits,
+                self.personal_left_context_frozen_competing_evidence_commits,
+                self.personal_left_context_causal_any_evidence_commits,
+                self.personal_left_context_causal_target_evidence_commits,
+                self.personal_left_context_causal_competing_evidence_commits
+            ),
+            compact_strategy_line(
+                "commit_public",
+                "canonical_pool_observed_identity",
+                &self.personal_left_context_public,
+            ),
+            compact_strategy_line(
+                "commit_personal_exact_frozen",
+                "canonical_pool_observed_identity",
+                &self.personal_left_context_frozen_exact,
+            ),
+            compact_strategy_line(
+                "commit_personal_exact_causal",
+                "canonical_pool_observed_identity",
+                &self.personal_left_context_causal_exact,
+            ),
+            compact_strategy_line(
+                "commit_personal_left_context_frozen",
+                "canonical_pool_observed_identity",
+                &self.personal_left_context_frozen_context,
+            ),
+            compact_strategy_line(
+                "commit_personal_left_context_causal",
+                "canonical_pool_observed_identity",
+                &self.personal_left_context_causal_context,
+            ),
+            compact_ranking_comparison_line(
+                "personal_exact_frozen_vs_public",
+                &self.personal_left_context_frozen_exact_vs_public,
+            ),
+            compact_ranking_comparison_line(
+                "personal_left_context_frozen_vs_exact_frozen",
+                &self.personal_left_context_frozen_context_vs_exact,
+            ),
+            compact_ranking_comparison_line(
+                "personal_left_context_causal_vs_exact_causal",
+                &self.personal_left_context_causal_context_vs_causal_exact,
+            ),
+            compact_ranking_comparison_line(
+                "personal_left_context_causal_vs_exact_frozen",
+                &self.personal_left_context_causal_context_vs_exact,
+            ),
+            compact_ranking_comparison_line(
+                "personal_left_context_causal_vs_frozen",
+                &self.personal_left_context_causal_vs_frozen_context,
+            ),
+        ]
+        .join("\n")
+    }
+
     pub fn compact_terminal_report(&self) -> String {
         let mut lines = vec![
             format!(
@@ -3803,6 +4561,32 @@ fn observe_personal_strategy_from_pool_with_evidence(
         .take(REPLAY_TOP_K)
         .position(|candidate| candidate.text == target)
         .map(|rank| rank + 1);
+    let candidates = personal_ranked_candidates_from_pool_with_evidence(pool, |candidate| {
+        evidence_for(candidate)
+    });
+    let personal = stats.observe(
+        code,
+        target,
+        &candidates[..candidates.len().min(REPLAY_TOP_K)],
+    );
+    PersonalStrategyRanks { unigram, personal }
+}
+
+fn personal_ranked_candidates_from_pool(
+    pool: &[SentenceCandidate],
+    state: &PersonalCacheReplayState,
+    kind: PersonalCacheKind,
+    code: &str,
+) -> Vec<SentenceCandidate> {
+    personal_ranked_candidates_from_pool_with_evidence(pool, |candidate| {
+        personal_cache_evidence(candidate, state, kind, code)
+    })
+}
+
+fn personal_ranked_candidates_from_pool_with_evidence(
+    pool: &[SentenceCandidate],
+    mut evidence_for: impl FnMut(&SentenceCandidate) -> PersonalCacheEvidence,
+) -> Vec<SentenceCandidate> {
     let mut scored = pool
         .iter()
         .cloned()
@@ -3833,13 +4617,45 @@ fn observe_personal_strategy_from_pool_with_evidence(
             })
             .then_with(|| left.0.cmp(&right.0))
     });
-    let candidates = scored
+    scored
         .into_iter()
-        .take(REPLAY_TOP_K)
         .map(|(_, candidate, _)| candidate)
-        .collect::<Vec<_>>();
-    let personal = stats.observe(code, target, &candidates);
-    PersonalStrategyRanks { unigram, personal }
+        .collect()
+}
+
+fn personal_left_context_candidates_from_pool(
+    pool: &[SentenceCandidate],
+    exact_state: &PersonalCacheReplayState,
+    context_state: &PersonalCacheReplayState,
+    previous_text: &str,
+    code: &str,
+) -> Vec<SentenceCandidate> {
+    let mut candidates = personal_ranked_candidates_from_pool(
+        pool,
+        exact_state,
+        PersonalCacheKind::ExactCodeText,
+        code,
+    );
+    let searchable_texts = pool
+        .iter()
+        .take(PERSONAL_CONTEXT_SEARCH_DEPTH)
+        .map(|candidate| candidate.text.as_str());
+    let Some(preferred) =
+        context_state.preferred_left_context_text(previous_text, code, searchable_texts)
+    else {
+        return candidates;
+    };
+    let Some(index) = candidates
+        .iter()
+        .position(|candidate| candidate.text == preferred)
+    else {
+        return candidates;
+    };
+    if index > 0 {
+        let candidate = candidates.remove(index);
+        candidates.insert(0, candidate);
+    }
+    candidates
 }
 
 fn personal_hybrid_evidence(
@@ -4488,6 +5304,16 @@ text\tpinyin\tfrequency
 麻烦\tma fan\t90
 再\tzai\t300
 在\tzai\t100
+";
+
+    const LEFT_CONTEXT_LEXICON: &str = "\
+text\tpinyin\tfrequency
+请\tqing\t500
+好\thao\t500
+吧\tba\t400
+八\tba\t300
+巴\tba\t200
+把\tba\t100
 ";
 
     fn delta(deleted: &str, inserted: &str) -> TextDelta {
@@ -5638,6 +6464,144 @@ text\tpinyin\tfrequency
         assert!(!compact.contains("猫"));
         assert!(!compact.contains("zai"));
         assert!(!compact.contains("mao"));
+    }
+
+    #[test]
+    fn frozen_exact_left_context_adds_signal_beyond_exact_code_text_history() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEFT_CONTEXT_LEXICON).unwrap());
+        let history = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "qy", "qing", "请"),
+            commit_event(200, 1, "ab", "ba", "把"),
+        ])
+        .unwrap();
+        let evaluation = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "qy", "qing", "请"),
+            commit_event(200, 1, "ab", "ba", "把"),
+        ])
+        .unwrap();
+        let mut causal_state = PersonalCacheReplayState::new();
+        let mut history_report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        history_report
+            .learn_capsule_for_personal_left_context_comparison(
+                &decoder,
+                &mut causal_state,
+                &history,
+            )
+            .unwrap();
+        assert_eq!(causal_state.learned_code_text_tokens(), 2);
+        assert_eq!(causal_state.learned_left_context_tokens(), 1);
+        let frozen_state = causal_state.fork_for_frozen_evaluation();
+        let frozen_before = format!("{frozen_state:?}");
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        report.record_personal_cache_history(&history_report, &causal_state);
+
+        report
+            .observe_capsule_with_personal_left_context_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &evaluation,
+            )
+            .unwrap();
+
+        assert_eq!(report.personal_left_context_comparison_commits, 1);
+        assert_eq!(report.personal_left_context_public.hits_at_1, 0);
+        assert_eq!(report.personal_left_context_frozen_exact.hits_at_1, 0);
+        assert_eq!(report.personal_left_context_frozen_context.hits_at_1, 1);
+        assert_eq!(report.personal_left_context_causal_context.hits_at_1, 1);
+        assert_eq!(
+            report
+                .personal_left_context_frozen_context_vs_exact
+                .gained_top_1,
+            1
+        );
+        assert_eq!(report.personal_left_context_frozen_any_evidence_commits, 1);
+        assert_eq!(
+            report.personal_left_context_frozen_target_evidence_commits,
+            1
+        );
+        assert_eq!(
+            report.personal_left_context_frozen_competing_evidence_commits,
+            0
+        );
+        assert_eq!(report.personal_cache_history_code_text_tokens, 2);
+        assert_eq!(report.personal_cache_history_left_context_tokens, 1);
+        assert_eq!(format!("{frozen_state:?}"), frozen_before);
+
+        let compact = report.personal_left_context_comparison_terminal_report();
+        assert!(compact.contains("schema=ziranma-personal-left-context-comparison-v1"));
+        assert!(compact.contains("candidate_pool_code=canonical"));
+        assert!(compact.contains("target_identity_code=observed"));
+        assert!(compact.contains("selection_rejections=unavailable"));
+        assert!(compact.contains("frozen_target_evidence_commits=1"));
+        assert!(compact.contains("context=personal_left_context_frozen_vs_exact_frozen"));
+        assert!(!compact.contains("请"));
+        assert!(!compact.contains("把"));
+        assert!(!compact.contains("qing"));
+    }
+
+    #[test]
+    fn causal_left_context_scores_before_learning_each_current_identity() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEFT_CONTEXT_LEXICON).unwrap());
+        let evaluation = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "qy", "qing", "请"),
+            commit_event(200, 1, "ab", "ba", "把"),
+            commit_event(10_000, 2, "qy", "qing", "请"),
+            commit_event(10_100, 3, "ab", "ba", "把"),
+        ])
+        .unwrap();
+        let frozen_state = PersonalCacheReplayState::new().fork_for_frozen_evaluation();
+        let mut causal_state = PersonalCacheReplayState::new();
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+
+        report
+            .observe_capsule_with_personal_left_context_comparison(
+                &decoder,
+                &frozen_state,
+                &mut causal_state,
+                &evaluation,
+            )
+            .unwrap();
+
+        assert_eq!(report.continuous_windows, 2);
+        assert_eq!(report.personal_left_context_comparison_commits, 2);
+        assert_eq!(report.personal_left_context_frozen_context.hits_at_1, 0);
+        assert_eq!(report.personal_left_context_causal_context.hits_at_1, 1);
+        assert_eq!(
+            report.personal_left_context_causal_target_evidence_commits,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_left_context_causal_context_vs_causal_exact
+                .gained_top_1,
+            1
+        );
+        assert_eq!(report.personal_cache_learning_code_text_tokens, 4);
+        assert_eq!(report.personal_cache_learning_left_context_tokens, 2);
+    }
+
+    #[test]
+    fn overlapping_revision_reverses_exact_and_left_context_replay_evidence() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEFT_CONTEXT_LEXICON).unwrap());
+        let history = EventCapsuleV1::new(vec![
+            commit_event(100, 0, "qy", "qing", "请"),
+            commit_event(200, 1, "ab", "ba", "把"),
+            revision_event(300, 1, "把", ""),
+        ])
+        .unwrap();
+        let mut state = PersonalCacheReplayState::new();
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+
+        report
+            .learn_capsule_for_personal_left_context_comparison(&decoder, &mut state, &history)
+            .unwrap();
+
+        assert_eq!(state.learned_code_text_tokens(), 1);
+        assert_eq!(state.learned_left_context_tokens(), 0);
+        assert_eq!(report.personal_cache_reversed_code_text_tokens, 1);
+        assert_eq!(report.personal_cache_reversed_left_context_tokens, 1);
+        assert_eq!(report.personal_cache_revision_events_with_reversal, 1);
     }
 
     #[test]

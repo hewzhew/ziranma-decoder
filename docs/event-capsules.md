@@ -423,7 +423,7 @@ cargo run --release --bin capsule-replay -- `
 点名的胶囊，因此输出中的 `capsules/events/commits` 只属于未来评测组。
 `--history-input` 只能和两个个人缓存模式之一、
 `--personal-pair-comparison`、`--personal-word-comparison` 或
-`--personal-code-comparison` 使用；
+`--personal-code-comparison`、`--personal-left-context-comparison` 使用；
 历史与评测路径合并
 后仍统一拒绝重复、符号链接、目录扫描和未点名文件。至少必须有一个
 评测 `--input`。
@@ -511,6 +511,32 @@ cargo run --release --bin capsule-replay -- `
 因果与冻结精确身份，不再依赖汇总直方图推断。覆盖行区分目标/竞争候选在
 冻结历史与因果状态中是否已有精确身份，并单列混合路线因词频用满三位上限
 而无法再提升的窗口数；这些仍是脱敏计数。
+
+若要验证在线 TSF 已存在的精确左上下文探针是否相对精确码记忆仍有独立
+价值，使用：
+
+```powershell
+cargo run --release --bin capsule-replay -- `
+  --history-session <旧会话号> `
+  --session <新会话号> `
+  --window-gap-ms 15000 `
+  --personal-left-context-comparison `
+  --compact
+```
+
+该模式逐个相邻合格提交评分，而不是把整段窗口拼成一个身份。解码候选池
+使用提交文字对应的规范码，以保证目标候选与所有路线共享；精确和上下文
+身份使用事件实际记录到的字母码，以复现 TSF 的同码隔离。每个当前提交
+先进入公共、冻结精确、因果精确、冻结上下文和因果上下文五条路线，之后
+才向因果状态学习。左上下文只允许从 Top-12 搜索范围提升已经存在、且有
+同码精确证据的候选；不会造词或借用其他码。确定位置的删除、替换或局部
+重叠会撤销对应单次精确身份和跨两个提交的上下文关系。
+
+报告只输出 token/type/repeated、证据覆盖、竞争证据与逐提交名次配对，
+不输出上一段文字、码或候选。现有胶囊不能证明当时究竟越过了哪个候选，
+所以该模式不推测反证，并显式报告 `selection_rejections=unavailable`。
+冻结路线在评测期不更新；因果路线的上下文净效应必须相对同一时点的因果
+精确控制路线读取，避免把在线精确码学习误归因给上下文。
 
 `--session` 只按固定名称连续展开该会话的加密段，不扫描目录；历史、评测
 展开后仍使用同一重复路径检查。对带加密元数据的段，回放还会核对同一
