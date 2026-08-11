@@ -72,7 +72,8 @@ mod wish_feedback;
 #[cfg(windows)]
 pub use tsf_alpha::{
     TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID, TsfCandidatePreflightError,
-    TsfCandidatePreflightReport, preflight_candidate_snapshot,
+    TsfCandidatePreflightReport, TsfExactShortPreflightReport, preflight_candidate_snapshot,
+    preflight_exact_short_candidate_layer,
 };
 
 pub use abbreviation::{

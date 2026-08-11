@@ -1182,19 +1182,24 @@ struct CandidateProviderBlueprint {
     supplemental_root: Option<PathBuf>,
     exact_short: Option<CandidateRuntimeExactShort>,
     exact_short_root: Option<PathBuf>,
+    static_exact_short: Option<ExactShortCandidateLayer>,
     alias_root: Option<PathBuf>,
 }
 
 impl CandidateProviderBlueprint {
     fn build(&self) -> Arc<dyn CandidateProvider> {
-        Arc::new(SnapshotCandidateProvider::new_with_runtime(
+        let mut provider = SnapshotCandidateProvider::new_with_runtime(
             Arc::clone(&self.snapshot),
             self.supplemental.clone(),
             self.supplemental_root.clone(),
             self.exact_short.clone(),
             self.exact_short_root.clone(),
             self.alias_root.clone(),
-        ))
+        );
+        if let Some(layer) = self.static_exact_short.clone() {
+            provider.exact_short = PublicExactShortRuntime::static_layer(Some(layer));
+        }
+        Arc::new(provider)
     }
 }
 
@@ -1347,6 +1352,20 @@ struct PublicExactShortRuntimeState {
 }
 
 impl PublicExactShortRuntime {
+    fn static_layer(layer: Option<ExactShortCandidateLayer>) -> Self {
+        let (catalog, exact_promotions) = layer
+            .map(|layer| (Some(layer.catalog), Some(layer.exact_promotions)))
+            .unwrap_or_default();
+        Self {
+            root: None,
+            state: Mutex::new(PublicExactShortRuntimeState {
+                package_id: None,
+                catalog,
+                exact_promotions,
+            }),
+        }
+    }
+
     fn managed(root: Option<PathBuf>, exact_short: Option<CandidateRuntimeExactShort>) -> Self {
         let state = match exact_short {
             Some(exact_short) => PublicExactShortRuntimeState {
@@ -2216,6 +2235,7 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
                 supplemental_root: None,
                 exact_short: None,
                 exact_short_root: None,
+                static_exact_short: None,
                 alias_root: None,
             })
         })
@@ -2251,6 +2271,7 @@ fn candidate_provider_for_roots(
             supplemental_root: supplemental_root.map(Path::to_path_buf),
             exact_short: runtime.exact_short().cloned(),
             exact_short_root: exact_short_root.map(Path::to_path_buf),
+            static_exact_short: None,
             alias_root,
         }),
         None => development_candidate_blueprint().map(|mut blueprint| {
@@ -2428,6 +2449,51 @@ impl TsfCandidatePreflightReport {
     }
 }
 
+/// Redacted evidence from a real TSF second-page exact-short preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TsfExactShortPreflightReport {
+    core_revision: String,
+    exact_short_revision: String,
+    input_keys: usize,
+    committed_characters: usize,
+    first_page_ms: u32,
+    second_page_ms: u32,
+    commit_ms: u32,
+}
+
+impl TsfExactShortPreflightReport {
+    pub fn core_revision(&self) -> &str {
+        &self.core_revision
+    }
+
+    pub fn exact_short_revision(&self) -> &str {
+        &self.exact_short_revision
+    }
+
+    pub fn input_keys(&self) -> usize {
+        self.input_keys
+    }
+
+    pub fn committed_characters(&self) -> usize {
+        self.committed_characters
+    }
+
+    /// Wall time for routing the code and observing its unchanged first page.
+    pub fn first_page_ms(&self) -> u32 {
+        self.first_page_ms
+    }
+
+    /// Wall time for PageDown to synchronously expose the second page.
+    pub fn second_page_ms(&self) -> u32 {
+        self.second_page_ms
+    }
+
+    /// Wall time for committing the first candidate on the second page.
+    pub fn commit_ms(&self) -> u32 {
+        self.commit_ms
+    }
+}
+
 /// Sanitized failures from a candidate snapshot's TSF synthetic-host preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TsfCandidatePreflightError {
@@ -2437,6 +2503,8 @@ pub enum TsfCandidatePreflightError {
     InvalidExpectedText,
     /// The snapshot does not rank the supplied expected text first.
     CandidateMismatch,
+    /// The expected exact word is not uniquely exposed as second-page first.
+    ExactShortPageMismatch,
     /// Another synthetic-host operation is already using local COM state.
     HostBusy,
     /// The calling thread could not enter a compatible COM apartment.
@@ -2463,6 +2531,7 @@ impl fmt::Display for TsfCandidatePreflightError {
             Self::InvalidProbeCode => write!(formatter, "TSF 预检按键无效"),
             Self::InvalidExpectedText => write!(formatter, "TSF 预检目标文字无效"),
             Self::CandidateMismatch => write!(formatter, "候选快照与 TSF 预检目标不符"),
+            Self::ExactShortPageMismatch => write!(formatter, "精确短词未稳定出现在第二页首项"),
             Self::HostBusy => write!(formatter, "TSF 合成宿主当前不可用"),
             Self::ComInitialization => write!(formatter, "TSF 预检无法初始化 COM"),
             Self::ThreadManager => write!(formatter, "TSF 预检无法建立线程管理器"),
@@ -2487,16 +2556,7 @@ pub fn preflight_candidate_snapshot(
     probe_code: &str,
     expected_text: &str,
 ) -> std::result::Result<TsfCandidatePreflightReport, TsfCandidatePreflightError> {
-    if probe_code.is_empty()
-        || probe_code.len() > MAX_TSF_PREFLIGHT_CODE_KEYS
-        || !probe_code.bytes().all(|byte| byte.is_ascii_lowercase())
-    {
-        return Err(TsfCandidatePreflightError::InvalidProbeCode);
-    }
-    let committed_characters = expected_text.chars().count();
-    if committed_characters == 0 || committed_characters > MAX_TSF_PREFLIGHT_TEXT_CHARACTERS {
-        return Err(TsfCandidatePreflightError::InvalidExpectedText);
-    }
+    let committed_characters = validate_candidate_preflight_request(probe_code, expected_text)?;
     if snapshot
         .candidate_text(probe_code, 1)
         .map_err(|_| TsfCandidatePreflightError::CandidateMismatch)?
@@ -2513,7 +2573,19 @@ pub fn preflight_candidate_snapshot(
         return Err(TsfCandidatePreflightError::HostBusy);
     }
     let revision = snapshot.revision().to_owned();
-    let result = run_candidate_preflight(snapshot, probe_code, expected_text);
+    let result = run_candidate_preflight(
+        CandidateProviderBlueprint {
+            snapshot,
+            supplemental: None,
+            supplemental_root: None,
+            exact_short: None,
+            exact_short_root: None,
+            static_exact_short: None,
+            alias_root: None,
+        },
+        probe_code,
+        expected_text,
+    );
     if !can_unload_now() {
         return Err(TsfCandidatePreflightError::Cleanup);
     }
@@ -2523,6 +2595,121 @@ pub fn preflight_candidate_snapshot(
         input_keys: probe_code.len(),
         committed_characters,
     })
+}
+
+/// Routes one page-guarded exact-short candidate through a real TSF context.
+///
+/// This does not install or activate a runtime layer. The caller must provide
+/// an already authenticated strict catalog. The expected word must be absent
+/// from the frozen first page and become the first item after one PageDown.
+/// Timings are local diagnostic evidence, not a cross-device benchmark.
+pub fn preflight_exact_short_candidate_layer(
+    core: Arc<CandidateSnapshot>,
+    exact_short: Arc<ExactShortWordCatalog>,
+    exact_promotions: usize,
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<TsfExactShortPreflightReport, TsfCandidatePreflightError> {
+    let committed_characters = validate_candidate_preflight_request(probe_code, expected_text)?;
+    if probe_code.len() != 4
+        || !(1..=crate::MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions)
+    {
+        return Err(TsfCandidatePreflightError::ExactShortPageMismatch);
+    }
+    let core_revision = core.revision().to_owned();
+    let exact_short_revision = exact_short.revision().to_owned();
+    let blueprint = CandidateProviderBlueprint {
+        snapshot: core,
+        supplemental: None,
+        supplemental_root: None,
+        exact_short: None,
+        exact_short_root: None,
+        static_exact_short: Some(ExactShortCandidateLayer {
+            catalog: exact_short,
+            exact_promotions,
+        }),
+        alias_root: None,
+    };
+
+    let provider = blueprint.build();
+    let mut cache = CandidateCache::default();
+    let first = cache.load_with_automatic_transposition(
+        provider.as_ref(),
+        probe_code,
+        CANDIDATE_PAGE_SIZE,
+        InteractiveCandidateView::Primary,
+        None,
+    );
+    let second = cache.load_with_automatic_transposition(
+        provider.as_ref(),
+        probe_code,
+        CANDIDATE_PAGE_SIZE * 2,
+        InteractiveCandidateView::Primary,
+        None,
+    );
+    if first.candidates.len() != CANDIDATE_PAGE_SIZE
+        || first
+            .candidates
+            .iter()
+            .any(|candidate| candidate == expected_text)
+        || second
+            .candidates
+            .get(CANDIDATE_PAGE_SIZE)
+            .map(String::as_str)
+            != Some(expected_text)
+        || second
+            .provenance
+            .get(CANDIDATE_PAGE_SIZE)
+            .copied()
+            .map(NativeCandidateProvenance::source)
+            != Some(NativeCandidateSource::PublicConsensusExact)
+    {
+        return Err(TsfCandidatePreflightError::ExactShortPageMismatch);
+    }
+    drop(provider);
+
+    let _host_guard = SYNTHETIC_HOST_LOCK
+        .lock()
+        .map_err(|_| TsfCandidatePreflightError::HostBusy)?;
+    if !can_unload_now() {
+        return Err(TsfCandidatePreflightError::HostBusy);
+    }
+    let result = run_candidate_preflight_with_selection(
+        blueprint,
+        probe_code,
+        expected_text,
+        PreflightSelection::SecondPageFirstCandidate,
+    );
+    if !can_unload_now() {
+        return Err(TsfCandidatePreflightError::Cleanup);
+    }
+    let timings = result?;
+    Ok(TsfExactShortPreflightReport {
+        core_revision,
+        exact_short_revision,
+        input_keys: probe_code.len(),
+        committed_characters,
+        first_page_ms: timings.first_page_ms,
+        second_page_ms: timings.second_page_ms,
+        commit_ms: timings.commit_ms,
+    })
+}
+
+fn validate_candidate_preflight_request(
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<usize, TsfCandidatePreflightError> {
+    if probe_code.is_empty()
+        || probe_code.len() > MAX_TSF_PREFLIGHT_CODE_KEYS
+        || !probe_code.bytes().all(|byte| byte.is_ascii_lowercase())
+    {
+        return Err(TsfCandidatePreflightError::InvalidProbeCode);
+    }
+    let committed_characters = expected_text.chars().count();
+    if committed_characters == 0 || committed_characters > MAX_TSF_PREFLIGHT_TEXT_CHARACTERS {
+        return Err(TsfCandidatePreflightError::InvalidExpectedText);
+    }
+    Ok(committed_characters)
 }
 
 struct PreflightApartment;
@@ -2664,24 +2851,41 @@ fn read_preflight_context_text(context: &ITfContext, client_id: u32) -> Result<S
         .ok_or_else(|| lifecycle_error(E_UNEXPECTED))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightSelection {
+    FirstCandidate,
+    SecondPageFirstCandidate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PreflightTimings {
+    first_page_ms: u32,
+    second_page_ms: u32,
+    commit_ms: u32,
+}
+
 fn run_candidate_preflight(
-    snapshot: Arc<CandidateSnapshot>,
+    blueprint: CandidateProviderBlueprint,
     probe_code: &str,
     expected_text: &str,
-) -> std::result::Result<(), TsfCandidatePreflightError> {
-    let _apartment = PreflightApartment::enter()?;
-    let factory: IClassFactory = TsfClassFactory::counted_with_options(
-        Ok(CandidateProviderBlueprint {
-            snapshot,
-            supplemental: None,
-            supplemental_root: None,
-            exact_short: None,
-            exact_short_root: None,
-            alias_root: None,
-        }),
-        KeyAdviceMode::SyntheticHost,
+) -> std::result::Result<PreflightTimings, TsfCandidatePreflightError> {
+    run_candidate_preflight_with_selection(
+        blueprint,
+        probe_code,
+        expected_text,
+        PreflightSelection::FirstCandidate,
     )
-    .into();
+}
+
+fn run_candidate_preflight_with_selection(
+    blueprint: CandidateProviderBlueprint,
+    probe_code: &str,
+    expected_text: &str,
+    selection: PreflightSelection,
+) -> std::result::Result<PreflightTimings, TsfCandidatePreflightError> {
+    let _apartment = PreflightApartment::enter()?;
+    let factory: IClassFactory =
+        TsfClassFactory::counted_with_options(Ok(blueprint), KeyAdviceMode::SyntheticHost).into();
     // SAFETY: aggregation is disabled and the local factory implements this interface.
     let service: ITfTextInputProcessorEx = unsafe { factory.CreateInstance(None::<&IUnknown>) }
         .map_err(|_| TsfCandidatePreflightError::ServiceActivation)?;
@@ -2737,6 +2941,7 @@ fn run_candidate_preflight(
         .map_err(|_| TsfCandidatePreflightError::ContextSetup)?;
 
     let lparam = LPARAM(0);
+    let first_page_started_at = Instant::now();
     for byte in probe_code.bytes() {
         let key = WPARAM(usize::from(VK_A.0 + u16::from(byte - b'a')));
         // SAFETY: these virtual-key values contain no pointer data.
@@ -2755,7 +2960,33 @@ fn run_candidate_preflight(
     {
         return Err(TsfCandidatePreflightError::PreeditMismatch);
     }
+    let first_page_ms = elapsed_milliseconds(first_page_started_at);
 
+    let second_page_ms = if selection == PreflightSelection::SecondPageFirstCandidate {
+        let second_page_started_at = Instant::now();
+        let next_page = WPARAM(usize::from(VK_NEXT.0));
+        // SAFETY: routes one ordinary candidate-navigation key through the
+        // same synthetic context without pointer data.
+        let tested = unsafe { key_sink.OnTestKeyDown(&context, next_page, lparam) }
+            .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
+        // SAFETY: routes the same accepted navigation key.
+        let handled = unsafe { key_sink.OnKeyDown(&context, next_page, lparam) }
+            .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
+        if !tested.as_bool() || !handled.as_bool() {
+            return Err(TsfCandidatePreflightError::KeyRouting);
+        }
+        if read_preflight_context_text(&context, client_id)
+            .map_err(|_| TsfCandidatePreflightError::KeyRouting)?
+            != probe_code
+        {
+            return Err(TsfCandidatePreflightError::PreeditMismatch);
+        }
+        elapsed_milliseconds(second_page_started_at)
+    } else {
+        0
+    };
+
+    let commit_started_at = Instant::now();
     let space = WPARAM(usize::from(VK_SPACE.0));
     // SAFETY: routes one ordinary confirmation key through the same context.
     let tested = unsafe { key_sink.OnTestKeyDown(&context, space, lparam) }
@@ -2772,6 +3003,7 @@ fn run_candidate_preflight(
     {
         return Err(TsfCandidatePreflightError::CommitMismatch);
     }
+    let commit_ms = elapsed_milliseconds(commit_started_at);
 
     document_activation
         .close()
@@ -2788,7 +3020,11 @@ fn run_candidate_preflight(
     drop(service);
     drop(factory);
     drop(thread_manager);
-    Ok(())
+    Ok(PreflightTimings {
+        first_page_ms,
+        second_page_ms,
+        commit_ms,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14625,6 +14861,86 @@ mod tests {
         assert_eq!(
             preflight_candidate_snapshot(snapshot, "nihk", "您好").unwrap_err(),
             TsfCandidatePreflightError::CandidateMismatch
+        );
+    }
+
+    #[test]
+    fn exact_short_preflight_commits_second_page_first_through_real_tsf_context() {
+        let _guard = test_state_lock();
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲甲\tshou shu\t140\n\
+乙乙\tshou shu\t130\n\
+丙丙\tshou shu\t120\n\
+丁丁\tshou shu\t110\n\
+戊戊\tshou shu\t100\n\
+己己\tshou shu\t90\n\
+庚庚\tshou shu\t80\n\
+辛辛\tshou shu\t70\n\
+壬壬\tshou shu\t60\n\
+癸癸\tshou shu\t50\n\
+子子\tshou shu\t40\n\
+丑丑\tshou shu\t30\n\
+寅寅\tshou shu\t20\n\
+卯卯\tshou shu\t10\n";
+        const EXACT: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t100\n";
+        let core_manifest =
+            CandidatePackageManifest::from_payload("tsf-exact-short-core-v1", false, CORE).unwrap();
+        let core = Arc::new(core_manifest.load_snapshot(CORE).unwrap());
+        let exact_manifest =
+            CandidatePackageManifest::from_payload("tsf-exact-short-catalog-v1", false, EXACT)
+                .unwrap();
+        let exact = Arc::new(ExactShortWordCatalog::load(&exact_manifest, EXACT).unwrap());
+
+        assert_eq!(
+            preflight_exact_short_candidate_layer(
+                Arc::clone(&core),
+                Arc::clone(&exact),
+                1,
+                "ubuu",
+                "手术",
+            )
+            .unwrap_err(),
+            TsfCandidatePreflightError::ExactShortPageMismatch
+        );
+
+        let report = preflight_exact_short_candidate_layer(core, exact, 1, "ubuu", "收束").unwrap();
+        assert_eq!(report.core_revision(), "tsf-exact-short-core-v1");
+        assert_eq!(report.exact_short_revision(), "tsf-exact-short-catalog-v1");
+        assert_eq!(report.input_keys(), 4);
+        assert_eq!(report.committed_characters(), 2);
+        assert!(!format!("{report:?}").contains("收束"));
+    }
+
+    #[test]
+    fn exact_short_preflight_rejects_a_target_outside_the_guarded_second_page_slot() {
+        let _guard = test_state_lock();
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t200\n\
+甲甲\tshou shu\t100\n\
+乙乙\tshou shu\t90\n\
+丙丙\tshou shu\t80\n\
+丁丁\tshou shu\t70\n\
+戊戊\tshou shu\t60\n\
+己己\tshou shu\t50\n";
+        const EXACT: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t100\n";
+        let core_manifest = CandidatePackageManifest::from_payload(
+            "tsf-exact-short-first-page-core-v1",
+            false,
+            CORE,
+        )
+        .unwrap();
+        let core = Arc::new(core_manifest.load_snapshot(CORE).unwrap());
+        let exact_manifest = CandidatePackageManifest::from_payload(
+            "tsf-exact-short-first-page-catalog-v1",
+            false,
+            EXACT,
+        )
+        .unwrap();
+        let exact = Arc::new(ExactShortWordCatalog::load(&exact_manifest, EXACT).unwrap());
+
+        assert_eq!(
+            preflight_exact_short_candidate_layer(core, exact, 1, "ubuu", "收束").unwrap_err(),
+            TsfCandidatePreflightError::ExactShortPageMismatch
         );
     }
 
