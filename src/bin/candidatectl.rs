@@ -296,6 +296,8 @@ struct PreflightSummary {
     committed_characters: usize,
 }
 
+type PackagePreflight = fn(&LoadedPackage) -> Result<PreflightSummary, Box<dyn std::error::Error>>;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = match parse_options(std::env::args().skip(1))? {
         Options::Help => {
@@ -7631,8 +7633,15 @@ fn supplement_disable(root: &Path) -> Result<String, Box<dyn std::error::Error>>
 }
 
 fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    preflight_with(package, preflight_loaded_package)
+}
+
+fn preflight_with(
+    package: &Path,
+    package_preflight: PackagePreflight,
+) -> Result<String, Box<dyn std::error::Error>> {
     let loaded = load_public_package_directory(package)?;
-    let summary = preflight_loaded_package(&loaded)?;
+    let summary = package_preflight(&loaded)?;
     Ok(render_preflight_report(&summary))
 }
 
@@ -7656,9 +7665,18 @@ fn adopt(
     package: &Path,
     expected_sha256: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    adopt_with_preflight(root, package, expected_sha256, preflight_loaded_package)
+}
+
+fn adopt_with_preflight(
+    root: &Path,
+    package: &Path,
+    expected_sha256: &str,
+    package_preflight: PackagePreflight,
+) -> Result<String, Box<dyn std::error::Error>> {
     let loaded = load_public_package_directory(package)?;
     verify_expected_sha256(&loaded, expected_sha256)?;
-    adopt_loaded(root, loaded)
+    adopt_loaded_with_preflight(root, loaded, package_preflight)
 }
 
 fn stage(
@@ -7666,9 +7684,18 @@ fn stage(
     package: &Path,
     expected_sha256: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    stage_with_preflight(root, package, expected_sha256, preflight_loaded_package)
+}
+
+fn stage_with_preflight(
+    root: &Path,
+    package: &Path,
+    expected_sha256: &str,
+    package_preflight: PackagePreflight,
+) -> Result<String, Box<dyn std::error::Error>> {
     let loaded = load_public_package_directory(package)?;
     verify_expected_sha256(&loaded, expected_sha256)?;
-    stage_loaded(root, loaded)
+    stage_loaded_with_preflight(root, loaded, package_preflight)
 }
 
 fn adopt_signed(
@@ -7692,6 +7719,14 @@ fn stage_signed(
 }
 
 fn adopt_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn std::error::Error>> {
+    adopt_loaded_with_preflight(root, loaded, preflight_loaded_package)
+}
+
+fn adopt_loaded_with_preflight(
+    root: &Path,
+    loaded: LoadedPackage,
+    package_preflight: PackagePreflight,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_some() {
         return Err("current candidate package is already configured".into());
@@ -7700,7 +7735,7 @@ fn adopt_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn st
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
     let installed = load_installed_package(root, &package_id)?;
-    preflight_loaded_package(&installed)?;
+    package_preflight(&installed)?;
     write_preflight_receipt(root, &package_id, &installed.authentication_sha256)?;
     state.adopt(&package_id)?;
     write_slot_state(root, &state)?;
@@ -7711,6 +7746,14 @@ fn adopt_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn st
 }
 
 fn stage_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn std::error::Error>> {
+    stage_loaded_with_preflight(root, loaded, preflight_loaded_package)
+}
+
+fn stage_loaded_with_preflight(
+    root: &Path,
+    loaded: LoadedPackage,
+    package_preflight: PackagePreflight,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut state = read_slot_state(root)?;
     if state.current().is_none() {
         return Err("current candidate package is not configured".into());
@@ -7719,7 +7762,7 @@ fn stage_loaded(root: &Path, loaded: LoadedPackage) -> Result<String, Box<dyn st
     prepare_slot_root(root)?;
     let package_id = install_package(root, &loaded)?;
     let installed = load_installed_package(root, &package_id)?;
-    preflight_loaded_package(&installed)?;
+    package_preflight(&installed)?;
     write_preflight_receipt(root, &package_id, &installed.authentication_sha256)?;
     state.stage(&package_id)?;
     write_slot_state(root, &state)?;
@@ -8400,6 +8443,65 @@ mod tests {
         load_public_package_directory(package)
             .unwrap()
             .authentication_sha256
+    }
+
+    fn portable_test_preflight(
+        loaded: &LoadedPackage,
+    ) -> Result<PreflightSummary, Box<dyn std::error::Error>> {
+        let entries = parse_lexicon_tsv(&loaded.payload_text)
+            .map_err(|_| "candidate package has no usable test preflight probe")?;
+        let probe = entries
+            .first()
+            .ok_or("candidate package has no usable test preflight probe")?;
+        let expected = loaded
+            .snapshot
+            .candidate_text(probe.code.as_str(), 1)?
+            .ok_or("candidate package produced no test preflight candidate")?;
+        Ok(PreflightSummary {
+            revision: loaded.snapshot.revision().to_owned(),
+            input_keys: probe.code.as_str().len(),
+            committed_characters: expected.chars().count(),
+        })
+    }
+
+    fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {
+        preflight_with(package, portable_test_preflight)
+    }
+
+    fn adopt(
+        root: &Path,
+        package: &Path,
+        expected_sha256: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        adopt_with_preflight(root, package, expected_sha256, portable_test_preflight)
+    }
+
+    fn stage(
+        root: &Path,
+        package: &Path,
+        expected_sha256: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        stage_with_preflight(root, package, expected_sha256, portable_test_preflight)
+    }
+
+    fn adopt_signed(
+        root: &Path,
+        package: &Path,
+        signature_path: &Path,
+        trusted_public_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let loaded = load_signature_verified_package(package, signature_path, trusted_public_key)?;
+        adopt_loaded_with_preflight(root, loaded, portable_test_preflight)
+    }
+
+    fn stage_signed(
+        root: &Path,
+        package: &Path,
+        signature_path: &Path,
+        trusted_public_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let loaded = load_signature_verified_package(package, signature_path, trusted_public_key)?;
+        stage_loaded_with_preflight(root, loaded, portable_test_preflight)
     }
 
     fn encode_hex(bytes: &[u8]) -> String {
@@ -9710,6 +9812,27 @@ mod tests {
                 fs::read(package_b.join(filename)).unwrap(),
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tsf_preflight_accepts_a_public_package() {
+        let root = temporary_test_root();
+        let source = root.join("source.tsv");
+        let package = root.join("package");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, LEXICON).unwrap();
+        build_public_package(
+            &source,
+            &package,
+            "windows-tsf-preflight-v1",
+            &test_declaration(LEXICON),
+        )
+        .unwrap();
+
+        assert!(super::preflight(&package).unwrap().contains("结果：通过"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -11079,7 +11202,7 @@ ngram 1=3\n\n\
         adopt(&slots, &package_a, &package_sha256(&package_a)).unwrap();
 
         let before = read_slot_state(&slots).unwrap();
-        let error = stage(&slots, &package_b, &package_sha256(&package_b))
+        let error = super::stage(&slots, &package_b, &package_sha256(&package_b))
             .unwrap_err()
             .to_string();
         assert!(!error.contains('测'));
