@@ -244,19 +244,40 @@ cargo run --release --bin candidatectl -- exact-short-layer-audit `
   --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top120k-v1/lexicon.tsv `
   --exact-package .local/public-audit/wanxiang-fdda7afb/package-exact-short-consensus-depth2-v1 `
   --held-out-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu `
-  --frontier-limit 7 --supplemental-promotions 1
+  --frontier-limit 6 --supplemental-promotions 1
 ```
 
 固定 UD test 留出有 334 个精确层匹配词面（421 次）。机械插在首选后会改变
-113 个第一页，并让 36 个目标名次后移，其中 6 个跨页，故被否决。仅把插入点移到
-第二页开头虽使第一页零变化，仍有 3 个目标跨页，也被否决。分页保护后，补 1 项
+113 个第一页，并让 36 个目标名次后移，其中 4 个跨页，故被否决。仅把插入点移到
+第二页开头虽使第一页零变化，仍有 2 个目标跨页，也被否决。分页保护后，补 1 项
 让 59 个目标新进入前两页，补 2 项让 64 个目标新进入；两者均保持第一页逐项零
 变化、目标零跨页、零掉出 50 项总范围。补 2 项额外挤出 22 个第 50 名附近的旧尾项，
 却多覆盖 5 个公开目标，且没有增加目标跨页，因此它是当前离线胜出配置。尾端位移
 仍单独报告，不等同于正确性结论。
 
-TSF 尚未加载、安装或启用这个包，因此当前日用候选位移严格为零。下一安全门是
-受保护的 depth-2 路径在 release 热查询和真实宿主首帧中的成本；通过前不新增槽位、
+`exact-short-layer-benchmark` 把精确层增量与既有深解码分开计时，并要求显式给出
+候选请求深度。现行 TSF 页宽是 6，翻到第二页会请求前 12 项；对应复现命令为：
+
+```powershell
+cargo run --release --bin candidatectl -- exact-short-layer-benchmark `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top120k-v1/lexicon.tsv `
+  --exact-package .local/public-audit/wanxiang-fdda7afb/package-exact-short-consensus-depth2-v1 `
+  --frontier-limit 6 --supplemental-promotions 1 --exact-promotions 2 `
+  --candidate-limit 12 --sample-limit 128 --repetitions 5
+```
+
+本机 640 个 release 样本中，核心＋补充前 12 项 median 8.276 ms、P95 10.463 ms；
+单独的精确查询与分页保护合并 median 0.003 ms、P95 0.004 ms、P99 0.005 ms。
+精确包认证建索引约 33.990 ms。把同一工作负载故意扩大到前 50 项时，既有深解码
+median 达 95.898 ms，而精确合并 P95 仍只有 0.008 ms；所以 Top-50 只用于离线
+全局分页审计，绝不能被每次按键或首帧同步调用。两个约百毫秒解码分布的 median
+相减受运行噪声支配，命令只报告该差值，不再把它误作精确层增量安全门。
+
+TSF 尚未加载、安装或启用这个包，因此当前日用候选位移严格为零。候选缓存已经
+按 6、12、18……惰性扩页；未来接入必须让第一页完全绕过精确层，并保证从 12 项
+继续扩到更深页面时，已经展示过的插入决定保持单调。这个跨深度缓存不变量尚未实现，
+所以当前结论只是“查询与合并成本通过”，不是“可以换代”。在它通过前不新增槽位、
 开关或自动换代行为。
 
 导入器同时聚合报告三字、四字规范码，而不显示词条文字。上述固定切片中，

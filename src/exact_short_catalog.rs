@@ -260,6 +260,22 @@ impl ExactShortWordCatalog {
             return Ok(primary.iter().take(total_limit).cloned().collect());
         }
         let exact = self.candidate_texts(code, MAX_EXACT_SHORT_WORDS_PER_CODE)?;
+        Ok(Self::merge_candidate_texts_after_prefix(
+            primary,
+            &exact,
+            total_limit,
+            exact_promotions,
+            stable_prefix,
+        ))
+    }
+
+    fn merge_candidate_texts_after_prefix(
+        primary: &[String],
+        exact: &[&str],
+        total_limit: usize,
+        exact_promotions: usize,
+        stable_prefix: usize,
+    ) -> Vec<String> {
         let mut merged = Vec::with_capacity(total_limit);
         let primary_start = stable_prefix.min(primary.len());
         merged.extend(primary.iter().take(primary_start).cloned());
@@ -272,7 +288,7 @@ impl ExactShortWordCatalog {
             if primary.iter().any(|existing| existing == candidate) {
                 continue;
             }
-            merged.push(candidate.to_owned());
+            merged.push((*candidate).to_owned());
         }
         for candidate in primary.iter().skip(primary_start) {
             if merged.len() == total_limit {
@@ -280,7 +296,7 @@ impl ExactShortWordCatalog {
             }
             merged.push(candidate.clone());
         }
-        Ok(merged)
+        merged
     }
 
     /// Previews exact insertion at the second-page boundary while protecting
@@ -338,13 +354,13 @@ impl ExactShortWordCatalog {
                 })
             })
             .unwrap_or(0);
-        self.preview_candidate_texts_after_prefix(
+        Ok(Self::merge_candidate_texts_after_prefix(
             primary,
-            code,
+            &exact,
             total_limit,
             safe_insertions,
             page_size,
-        )
+        ))
     }
 
     /// Returns the validated data revision.

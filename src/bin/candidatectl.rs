@@ -35,19 +35,19 @@ use ziranma_core::{
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
     MAX_CANDIDATE_SNAPSHOT_RANK, MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
-    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
-    MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
-    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH,
-    MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES, MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES,
-    PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
-    PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
-    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SentenceCandidate, SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
-    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
-    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
-    candidate_package_authentication_sha256, candidate_package_storage_id,
-    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
-    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    MAX_EXACT_SHORT_WORDS_PER_CODE, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
+    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
+    MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
+    MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH, MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES,
+    MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES, PublicLexiconRankProbe,
+    PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
+    PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
+    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SentenceCandidate, SupplementalCandidateLayerConfig,
+    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
+    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_rime_target,
+    audit_public_supplemental_layer, candidate_package_authentication_sha256,
+    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
+    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
     load_candidate_runtime_snapshots, load_current_candidate_snapshot, parse_lexicon_tsv,
     parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_public_short_word_consensus,
@@ -150,6 +150,17 @@ enum Options {
         held_out_corpus: PathBuf,
         frontier_limit: usize,
         supplemental_promotions: usize,
+    },
+    ExactShortLayerBenchmark {
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        exact_package: PathBuf,
+        frontier_limit: usize,
+        supplemental_promotions: usize,
+        exact_promotions: usize,
+        candidate_limit: usize,
+        sample_limit: usize,
+        repetitions: usize,
     },
     PhraseCoverageAudit {
         source: PathBuf,
@@ -498,6 +509,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frontier_limit,
             supplemental_promotions,
         })?,
+        Options::ExactShortLayerBenchmark {
+            core_payload,
+            supplemental_payload,
+            exact_package,
+            frontier_limit,
+            supplemental_promotions,
+            exact_promotions,
+            candidate_limit,
+            sample_limit,
+            repetitions,
+        } => benchmark_exact_short_layer(ExactShortLayerBenchmarkRequest {
+            core_payload: &core_payload,
+            supplemental_payload: &supplemental_payload,
+            exact_package: &exact_package,
+            frontier_limit,
+            supplemental_promotions,
+            exact_promotions,
+            candidate_limit,
+            sample_limit,
+            repetitions,
+        })?,
         Options::PhraseCoverageAudit {
             source,
             allowlist,
@@ -716,6 +748,7 @@ fn parse_options(
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "short-consensus-audit" => parse_short_consensus_audit(arguments),
         "exact-short-layer-audit" => parse_exact_short_layer_audit(arguments),
+        "exact-short-layer-benchmark" => parse_exact_short_layer_benchmark(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
@@ -1590,6 +1623,101 @@ fn parse_exact_short_layer_audit(
     })
 }
 
+fn parse_exact_short_layer_benchmark(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut exact_package = None;
+    let mut frontier_limit = None;
+    let mut supplemental_promotions = None;
+    let mut exact_promotions = None;
+    let mut candidate_limit = None;
+    let mut sample_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--exact-package" => set_path(&mut exact_package, &mut arguments, "--exact-package")?,
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--supplemental-promotions" => set_usize(
+                &mut supplemental_promotions,
+                &mut arguments,
+                "--supplemental-promotions",
+            )?,
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            "--candidate-limit" => {
+                set_usize(&mut candidate_limit, &mut arguments, "--candidate-limit")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err(
+                    "unknown exact-short-layer-benchmark argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let frontier_limit =
+        frontier_limit.ok_or("exact-short-layer-benchmark requires --frontier-limit")?;
+    if !(2..=MAX_CANDIDATE_SNAPSHOT_RANK / 2).contains(&frontier_limit) {
+        return Err("exact-short-layer-benchmark --frontier-limit must be within 2..25".into());
+    }
+    let supplemental_promotions = supplemental_promotions
+        .ok_or("exact-short-layer-benchmark requires --supplemental-promotions")?;
+    if supplemental_promotions > frontier_limit {
+        return Err(
+            "exact-short-layer-benchmark --supplemental-promotions exceeds the frontier".into(),
+        );
+    }
+    let exact_promotions =
+        exact_promotions.ok_or("exact-short-layer-benchmark requires --exact-promotions")?;
+    if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+        return Err(
+            "exact-short-layer-benchmark --exact-promotions is outside the fixed bound".into(),
+        );
+    }
+    let candidate_limit =
+        candidate_limit.ok_or("exact-short-layer-benchmark requires --candidate-limit")?;
+    if !(frontier_limit.saturating_mul(2)..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&candidate_limit)
+    {
+        return Err(
+            "exact-short-layer-benchmark --candidate-limit must contain at least two complete pages and stay within 50"
+                .into(),
+        );
+    }
+    let sample_limit = sample_limit.ok_or("exact-short-layer-benchmark requires --sample-limit")?;
+    if !(8..=2048).contains(&sample_limit) {
+        return Err("exact-short-layer-benchmark --sample-limit must be within 8..2048".into());
+    }
+    let repetitions = repetitions.ok_or("exact-short-layer-benchmark requires --repetitions")?;
+    if !(1..=100).contains(&repetitions) {
+        return Err("exact-short-layer-benchmark --repetitions must be within 1..100".into());
+    }
+    Ok(Options::ExactShortLayerBenchmark {
+        core_payload: core_payload.ok_or("exact-short-layer-benchmark requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("exact-short-layer-benchmark requires --supplemental-payload")?,
+        exact_package: exact_package
+            .ok_or("exact-short-layer-benchmark requires --exact-package")?,
+        frontier_limit,
+        supplemental_promotions,
+        exact_promotions,
+        candidate_limit,
+        sample_limit,
+        repetitions,
+    })
+}
+
 fn parse_phrase_coverage_audit(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -2417,6 +2545,9 @@ fn print_usage() {
     );
     eprintln!(
         "  exact-short-layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --exact-package <PUBLIC_PACKAGE_DIR> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <2..50> --supplemental-promotions <0..FRONTIER>"
+    );
+    eprintln!(
+        "  exact-short-layer-benchmark --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --exact-package <PUBLIC_PACKAGE_DIR> --frontier-limit <2..25> --supplemental-promotions <0..FRONTIER> --exact-promotions <1..8> --candidate-limit <TWO-PAGES..50> --sample-limit <8..2048> --repetitions <1..100>"
     );
     eprintln!(
         "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
@@ -4300,6 +4431,18 @@ struct ExactShortLayerAuditRequest<'a> {
     supplemental_promotions: usize,
 }
 
+struct ExactShortLayerBenchmarkRequest<'a> {
+    core_payload: &'a Path,
+    supplemental_payload: &'a Path,
+    exact_package: &'a Path,
+    frontier_limit: usize,
+    supplemental_promotions: usize,
+    exact_promotions: usize,
+    candidate_limit: usize,
+    sample_limit: usize,
+    repetitions: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ExactShortTargetDepthAudit {
     first: usize,
@@ -4741,6 +4884,262 @@ fn audit_exact_short_layer(
         "本次操作：只读预览；不写候选包、不改槽位、不接入 TSF"
     )?;
     Ok(output)
+}
+
+fn benchmark_exact_short_layer(
+    request: ExactShortLayerBenchmarkRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("exact-short-layer-benchmark must run from a release build".into());
+    }
+    let core_text = read_explicit_text(
+        request.core_payload,
+        "core public exact-short benchmark payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        request.supplemental_payload,
+        "supplemental public exact-short benchmark payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    if candidate_sha256_hex(core_text.as_bytes())
+        == candidate_sha256_hex(supplemental_text.as_bytes())
+    {
+        return Err(
+            "exact-short-layer-benchmark requires distinct core and supplemental data".into(),
+        );
+    }
+
+    let core_started = Instant::now();
+    let core = snapshot_from_payload("exact-short-benchmark-core-v1", &core_text)?;
+    let core_build = core_started.elapsed();
+    let supplemental_started = Instant::now();
+    let supplemental =
+        snapshot_from_payload("exact-short-benchmark-supplemental-v1", &supplemental_text)?;
+    let supplemental_build = supplemental_started.elapsed();
+    let exact_started = Instant::now();
+    let exact = load_exact_short_package_directory(request.exact_package)?;
+    let exact_load = exact_started.elapsed();
+
+    let exact_payload = read_explicit_text(
+        &request.exact_package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+        "exact-short benchmark sampling payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let exact_entries = parse_lexicon_tsv(&exact_payload)?;
+    if exact_entries.len() != exact.catalog.entry_count() {
+        return Err("exact-short benchmark sampling payload changed after authentication".into());
+    }
+    let codes = evenly_spaced_exact_short_codes(&exact_entries, request.sample_limit);
+    if codes.len() < 8 {
+        return Err("exact-short benchmark package exposes too few distinct codes".into());
+    }
+    let supplemental_config = SupplementalCandidateLayerConfig {
+        exact_promotions: request.supplemental_promotions,
+    };
+    let baselines = codes
+        .iter()
+        .map(|code| {
+            layered_candidate_texts(
+                &core,
+                &supplemental,
+                code,
+                request.candidate_limit,
+                supplemental_config,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut full_first_pages = 0_usize;
+    let mut raw_changed_codes = 0_usize;
+    let mut guarded_changed_codes = 0_usize;
+    let mut guarded_reductions = 0_usize;
+    let mut guarded_inserted_slots = 0_usize;
+    for (code, baseline) in codes.iter().zip(&baselines) {
+        full_first_pages += usize::from(baseline.len() >= request.frontier_limit);
+        let raw = exact.catalog.preview_candidate_texts_after_prefix(
+            baseline,
+            code,
+            request.candidate_limit,
+            request.exact_promotions,
+            request.frontier_limit,
+        )?;
+        let guarded = exact.catalog.preview_candidate_texts_after_page_guarded(
+            baseline,
+            code,
+            request.candidate_limit,
+            request.exact_promotions,
+            request.frontier_limit,
+        )?;
+        if baseline
+            .iter()
+            .take(request.frontier_limit)
+            .ne(guarded.iter().take(request.frontier_limit))
+        {
+            return Err("exact-short guarded benchmark changed the first page".into());
+        }
+        if !existing_exact_short_pages_are_stable(
+            &exact.catalog,
+            code,
+            baseline,
+            &guarded,
+            request.frontier_limit,
+        )? {
+            return Err(
+                "exact-short guarded benchmark moved an existing exact word across pages".into(),
+            );
+        }
+        raw_changed_codes += usize::from(raw != *baseline);
+        guarded_changed_codes += usize::from(guarded != *baseline);
+        guarded_reductions += usize::from(raw != guarded);
+        guarded_inserted_slots += guarded
+            .iter()
+            .filter(|candidate| !baseline.contains(candidate))
+            .count();
+    }
+
+    for (code, baseline) in codes.iter().zip(&baselines) {
+        black_box(exact.catalog.preview_candidate_texts_after_page_guarded(
+            black_box(baseline),
+            black_box(code),
+            request.candidate_limit,
+            request.exact_promotions,
+            request.frontier_limit,
+        )?);
+    }
+
+    let sample_count = request.repetitions.saturating_mul(codes.len());
+    let mut baseline_durations = Vec::with_capacity(sample_count);
+    let mut merge_durations = Vec::with_capacity(sample_count);
+    let mut combined_durations = Vec::with_capacity(sample_count);
+    let mut checksum = 0_usize;
+    for _ in 0..request.repetitions {
+        for (code, precomputed) in codes.iter().zip(&baselines) {
+            let started = Instant::now();
+            let baseline = layered_candidate_texts(
+                &core,
+                &supplemental,
+                black_box(code),
+                request.candidate_limit,
+                supplemental_config,
+            )?;
+            baseline_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &baseline);
+            black_box(baseline);
+
+            let started = Instant::now();
+            let merged = exact.catalog.preview_candidate_texts_after_page_guarded(
+                black_box(precomputed),
+                black_box(code),
+                request.candidate_limit,
+                request.exact_promotions,
+                request.frontier_limit,
+            )?;
+            merge_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &merged);
+            black_box(merged);
+
+            let started = Instant::now();
+            let baseline = layered_candidate_texts(
+                &core,
+                &supplemental,
+                black_box(code),
+                request.candidate_limit,
+                supplemental_config,
+            )?;
+            let merged = exact.catalog.preview_candidate_texts_after_page_guarded(
+                &baseline,
+                black_box(code),
+                request.candidate_limit,
+                request.exact_promotions,
+                request.frontier_limit,
+            )?;
+            combined_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &merged);
+            black_box(merged);
+        }
+    }
+    let baseline_latency = summarize_durations(&mut baseline_durations)
+        .ok_or("exact-short benchmark produced no baseline samples")?;
+    let merge_latency = summarize_durations(&mut merge_durations)
+        .ok_or("exact-short benchmark produced no merge samples")?;
+    let combined_latency = summarize_durations(&mut combined_durations)
+        .ok_or("exact-short benchmark produced no combined samples")?;
+    let median_delta_ms =
+        duration_ms(combined_latency.median) - duration_ms(baseline_latency.median);
+    let local_gate_passed = merge_latency.p95 <= Duration::from_micros(100);
+
+    Ok(format!(
+        "公开精确短词分页保护 release 热路径\n精确层：{} 条，{} 个码；认证 SHA-256 {}\n工作负载：全目录等距取码 {}；请求前 {} 项；完整第一页 {}；重复 {repetitions}；计时样本 {}\n冷准备：核心索引 {:.3} ms；补充索引 {:.3} ms；精确包认证与索引 {:.3} ms\n核心＋补充基线：median {:.3} ms；p95 {:.3} ms；p99 {:.3} ms；max {:.3} ms\n仅精确查询与分页保护合并：median {:.3} ms；p95 {:.3} ms；p99 {:.3} ms；max {:.3} ms\n完整三层路径：median {:.3} ms；p95 {:.3} ms；p99 {:.3} ms；max {:.3} ms\n完整路径 median 相对基线：{median_delta_ms:+.3} ms（两个深解码分布之差，仅报告，不作增量门）\n结构：无保护会变化 {} 个码；保护后变化 {} 个码；保护缩减 {} 个码；实际新增槽 {}；第一页变化 0；已有精确词跨页 0\n本机增量门：独立 merge p95 ≤ 0.100 ms：{}\n结果校验和：{checksum}\n口径：release、同机、预热；取样只来自已认证公开精确层并覆盖整个码序。请求范围只验证当前已加载页，不能替代 Top-50 离线全局分页审计；冷准备不是 TSF 绘制首帧，单机阈值也不是跨设备承诺。\n本次操作：只读；不写槽位、不接入 TSF\n",
+        exact.catalog.entry_count(),
+        exact.catalog.code_count(),
+        exact.authentication_sha256,
+        codes.len(),
+        request.candidate_limit,
+        full_first_pages,
+        baseline_latency.samples,
+        duration_ms(core_build),
+        duration_ms(supplemental_build),
+        duration_ms(exact_load),
+        duration_ms(baseline_latency.median),
+        duration_ms(baseline_latency.p95),
+        duration_ms(baseline_latency.p99),
+        duration_ms(baseline_latency.maximum),
+        duration_ms(merge_latency.median),
+        duration_ms(merge_latency.p95),
+        duration_ms(merge_latency.p99),
+        duration_ms(merge_latency.maximum),
+        duration_ms(combined_latency.median),
+        duration_ms(combined_latency.p95),
+        duration_ms(combined_latency.p99),
+        duration_ms(combined_latency.maximum),
+        raw_changed_codes,
+        guarded_changed_codes,
+        guarded_reductions,
+        guarded_inserted_slots,
+        if local_gate_passed {
+            "通过"
+        } else {
+            "未通过"
+        },
+        repetitions = request.repetitions,
+    ))
+}
+
+fn evenly_spaced_exact_short_codes(entries: &[LexiconEntry], limit: usize) -> Vec<String> {
+    let unique = entries
+        .iter()
+        .map(|entry| entry.code.as_str().to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique.len() <= limit {
+        return unique;
+    }
+    (0..limit)
+        .map(|sample| unique[sample * unique.len() / limit].clone())
+        .collect()
+}
+
+fn existing_exact_short_pages_are_stable(
+    catalog: &ExactShortWordCatalog,
+    code: &str,
+    before: &[String],
+    after: &[String],
+    page_size: usize,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    for candidate in catalog.candidate_texts(code, MAX_EXACT_SHORT_WORDS_PER_CODE)? {
+        let Some(before_rank) = candidate_rank(before, candidate) else {
+            continue;
+        };
+        let Some(after_rank) = candidate_rank(after, candidate) else {
+            return Ok(false);
+        };
+        if (before_rank - 1) / page_size != (after_rank - 1) / page_size {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn audit_phrase_coverage(
@@ -8780,6 +9179,7 @@ struct DurationSummary {
     samples: usize,
     median: Duration,
     p95: Duration,
+    p99: Duration,
     maximum: Duration,
 }
 
@@ -8789,10 +9189,12 @@ fn summarize_durations(samples: &mut [Duration]) -> Option<DurationSummary> {
     }
     samples.sort_unstable();
     let p95_index = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+    let p99_index = (samples.len() * 99).div_ceil(100).saturating_sub(1);
     Some(DurationSummary {
         samples: samples.len(),
         median: samples[samples.len() / 2],
         p95: samples[p95_index],
+        p99: samples[p99_index],
         maximum: *samples.last()?,
     })
 }
@@ -10634,6 +11036,61 @@ mod tests {
     }
 
     #[test]
+    fn exact_short_layer_benchmark_parser_binds_the_guarded_release_workload() {
+        assert_eq!(
+            parse_options([
+                "exact-short-layer-benchmark".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--exact-package".to_owned(),
+                "exact-package".to_owned(),
+                "--frontier-limit".to_owned(),
+                "7".to_owned(),
+                "--supplemental-promotions".to_owned(),
+                "1".to_owned(),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+                "--candidate-limit".to_owned(),
+                "14".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortLayerBenchmark {
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                exact_package: PathBuf::from("exact-package"),
+                frontier_limit: 7,
+                supplemental_promotions: 1,
+                exact_promotions: 2,
+                candidate_limit: 14,
+                sample_limit: 128,
+                repetitions: 5,
+            }
+        );
+        for (flag, value) in [
+            ("--frontier-limit", "1"),
+            ("--exact-promotions", "9"),
+            ("--candidate-limit", "11"),
+            ("--sample-limit", "7"),
+            ("--repetitions", "101"),
+        ] {
+            assert!(
+                parse_options([
+                    "exact-short-layer-benchmark".to_owned(),
+                    flag.to_owned(),
+                    value.to_owned(),
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn public_package_merge_parser_requires_explicit_public_inputs() {
         let arguments = [
             "merge-public-packages",
@@ -11828,6 +12285,36 @@ mod tests {
         assert_eq!(recursive_regular_file_count(&root), files_before);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_short_benchmark_sampling_is_bounded_sorted_and_deterministic() {
+        const PAYLOAD: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t40\n\
+首项\tshou xiang\t30\n\
+电赛\tdian sai\t20\n\
+揉揉\trou rou\t10\n";
+        let entries = parse_lexicon_tsv(PAYLOAD).unwrap();
+        let first = evenly_spaced_exact_short_codes(&entries, 3);
+        let second = evenly_spaced_exact_short_codes(&entries, 3);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        assert!(first.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(evenly_spaced_exact_short_codes(&entries, 8).len(), 4);
+    }
+
+    #[test]
+    fn duration_summary_uses_nearest_rank_tail_percentiles() {
+        let mut samples = (1..=100)
+            .rev()
+            .map(Duration::from_micros)
+            .collect::<Vec<_>>();
+        let summary = summarize_durations(&mut samples).unwrap();
+        assert_eq!(summary.samples, 100);
+        assert_eq!(summary.median, Duration::from_micros(51));
+        assert_eq!(summary.p95, Duration::from_micros(95));
+        assert_eq!(summary.p99, Duration::from_micros(99));
+        assert_eq!(summary.maximum, Duration::from_micros(100));
     }
 
     fn recursive_regular_file_count(root: &Path) -> usize {
