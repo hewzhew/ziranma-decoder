@@ -16,7 +16,7 @@ pub const TYPING_LAB_USAGE: &str = "\
 减号向前翻页，加号（或等号）向后翻页；PageUp / PageDown 也可使用。
 本轮选过的同码候选会优先显示，退出后清空。
 Shift+Tab 打开独立的换序候选，用于查看相邻两键颠倒的结果；Esc 返回。
-完整单字码可以按 Tab 进入笔画辅助，再按 h 横、s 竖、p 撇、n 捺、z 折。
+完整单字码可以按 Tab 进入音形辅助；h/u/p/n/v 是横竖撇捺折，其他小写字母保留为部件前缀。
 Esc 返回或清空；输入为空时再按 Esc 退出。q 始终是普通双拼字母。
 重定向输入时也可使用 -、+、= 或 :prev、:next 等行命令。
 
@@ -286,7 +286,7 @@ pub fn render_typing_lab_screen(
     if session.tab_mode() {
         writeln!(
             output,
-            "输入：{}　Tab {}",
+            "输入：{}　Tab 形码 {}",
             session.phonetic(),
             session.stroke_prefix()
         )
@@ -438,8 +438,11 @@ mod tests {
         session.apply(TypingLabInput::Letters("nh".to_owned()));
         assert_eq!(session.stroke_prefix(), "nh");
         session.apply(TypingLabInput::Letters("a".to_owned()));
-        assert_eq!(session.stroke_prefix(), "nh");
-        assert_eq!(session.notice(), Some("笔画用 h u p n v"));
+        assert_eq!(session.stroke_prefix(), "nha");
+        assert_eq!(session.notice(), None);
+        session.apply(TypingLabInput::Letters("A".to_owned()));
+        assert_eq!(session.stroke_prefix(), "nha");
+        assert_eq!(session.notice(), Some("形码用小写字母；笔画为 h u p n v"));
         session.apply(TypingLabInput::Escape);
         assert!(!session.tab_mode());
         assert_eq!(

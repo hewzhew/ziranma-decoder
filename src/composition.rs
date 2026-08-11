@@ -391,6 +391,13 @@ impl CompositionSession {
             .map(|assembly| assembly.pinyin_segments.len())
     }
 
+    pub(crate) fn tab_assembly_has_trailing_initial(&self) -> bool {
+        self.tab_assembly
+            .as_ref()
+            .and_then(|assembly| assembly.pinyin_segments.last())
+            .is_some_and(|segment| segment.len() == 1)
+    }
+
     pub fn recovery_mode(&self) -> bool {
         self.recovery_mode
     }
@@ -468,9 +475,7 @@ impl CompositionSession {
 
     pub(crate) fn enter_tab_path(&mut self, pinyin_segments: &[&str]) -> bool {
         if !(2..=MAX_TAB_ASSEMBLY_CHARACTERS).contains(&pinyin_segments.len())
-            || pinyin_segments
-                .iter()
-                .any(|pinyin| !valid_tab_assembly_pinyin(pinyin))
+            || !valid_tab_assembly_segments(pinyin_segments)
         {
             return false;
         }
@@ -564,11 +569,11 @@ impl CompositionSession {
                 self.set_notice("空格确认，退格返回");
             }
             CompositionInput::Letters(letters) if self.tab_mode() => {
-                if let Some(strokes) = canonical_stroke_letters(&letters) {
-                    self.stroke_prefix.push_str(&strokes);
+                if let Some(shape) = canonical_shape_letters(&letters) {
+                    self.stroke_prefix.push_str(&shape);
                     self.candidate_page_start = 0;
                 } else {
-                    self.set_notice("笔画用 h u p n v");
+                    self.set_notice("形码用小写字母；笔画为 h u p n v");
                 }
             }
             CompositionInput::Letters(letters)
@@ -679,11 +684,22 @@ impl CompositionSession {
     }
 }
 
-fn valid_tab_assembly_pinyin(pinyin: &str) -> bool {
-    pinyin.len() == 2 && pinyin.as_bytes().iter().all(u8::is_ascii_lowercase)
+fn valid_tab_assembly_segments(segments: &[&str]) -> bool {
+    let Some((last, complete)) = segments.split_last() else {
+        return false;
+    };
+    complete
+        .iter()
+        .all(|segment| valid_tab_slot(segment, false))
+        && valid_tab_slot(last, true)
 }
 
-fn canonical_stroke_letters(letters: &str) -> Option<String> {
+fn valid_tab_slot(slot: &str, trailing: bool) -> bool {
+    (slot.len() == 2 || (trailing && slot.len() == 1))
+        && slot.as_bytes().iter().all(u8::is_ascii_lowercase)
+}
+
+fn canonical_shape_letters(letters: &str) -> Option<String> {
     letters
         .bytes()
         .map(|letter| match letter {
@@ -692,6 +708,7 @@ fn canonical_stroke_letters(letters: &str) -> Option<String> {
             b'p' => Some('p'),
             b'n' => Some('n'),
             b'v' | b'z' => Some('z'),
+            b'a'..=b'z' => Some(char::from(letter)),
             _ => None,
         })
         .collect()
@@ -804,6 +821,31 @@ mod tests {
         );
         assert_eq!(session.notice(), Some("选完整词后再输入标点"));
         assert_eq!(session.phonetic(), "qthp");
+    }
+
+    #[test]
+    fn tab_assembly_accepts_only_one_trailing_initial_slot() {
+        let mut session = CompositionSession::default();
+        session.apply(CompositionInput::Letters("jdj".to_owned()));
+
+        assert!(session.enter_tab_path(&["jd", "j"]));
+        assert!(session.tab_assembly_has_trailing_initial());
+        assert_eq!(session.shape_pinyin(), Some("jd"));
+        assert_eq!(
+            session.accept_tab_assembly_candidate("甲"),
+            Some(TabAssemblySelection::Advanced)
+        );
+        assert_eq!(session.shape_pinyin(), Some("j"));
+
+        session.apply(CompositionInput::Letters("x".to_owned()));
+        assert_eq!(session.stroke_prefix(), "x");
+        session.apply(CompositionInput::Backspace);
+        assert_eq!(session.stroke_prefix(), "");
+        session.apply(CompositionInput::Backspace);
+        assert_eq!(session.shape_pinyin(), Some("jd"));
+
+        assert!(!session.enter_tab_path(&["j", "jd"]));
+        assert!(!session.enter_tab_path(&["jd", "j", "d"]));
     }
 
     #[test]

@@ -323,9 +323,12 @@ trait CandidateProvider: Send + Sync {
         false
     }
 
-    /// Returns the stable exact-code single-character pool after an explicit
-    /// Tab stroke-prefix filter. Ordinary providers may leave this unsupported;
-    /// the Windows host never infers shape mode from candidate contents.
+    /// Returns the stable single-character pool for one explicit Tab slot.
+    ///
+    /// A two-key slot requests an exact full-code pool. A one-key slot requests
+    /// complete exact readings beginning with that trailing initial. The shape
+    /// prefix is interpreted as the auditable union of stroke and component
+    /// prefixes; ordinary providers may leave this unsupported.
     fn shape_candidates(&self, _code: &str, _stroke_prefix: &str, _limit: usize) -> Vec<String> {
         Vec::new()
     }
@@ -1212,21 +1215,25 @@ impl CandidateProvider for SnapshotCandidateProvider {
     }
 
     fn shape_candidates(&self, code: &str, stroke_prefix: &str, limit: usize) -> Vec<String> {
-        if code.len() != 2
+        if !matches!(code.len(), 1 | 2)
             || limit == 0
-            || !stroke_prefix
-                .as_bytes()
-                .iter()
-                .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z'))
+            || !stroke_prefix.as_bytes().iter().all(u8::is_ascii_lowercase)
         {
             return Vec::new();
         }
         let Some(shapes) = public_shape_index() else {
             return Vec::new();
         };
-        self.snapshot
-            .exact_full_code_texts(code, CANDIDATE_LIMIT)
-            .unwrap_or_default()
+        let candidates = if code.len() == 1 {
+            self.snapshot
+                .initial_single_character_texts(code, CANDIDATE_LIMIT)
+                .unwrap_or_default()
+        } else {
+            self.snapshot
+                .exact_full_code_texts(code, CANDIDATE_LIMIT)
+                .unwrap_or_default()
+        };
+        candidates
             .into_iter()
             .filter(|candidate| {
                 let mut characters = candidate.chars();
@@ -1242,6 +1249,10 @@ impl CandidateProvider for SnapshotCandidateProvider {
                             .stroke_codes()
                             .iter()
                             .any(|code| code.starts_with(stroke_prefix))
+                            || shape
+                                .component_codes()
+                                .iter()
+                                .any(|code| code.starts_with(stroke_prefix))
                     })
             })
             .take(limit.min(CANDIDATE_LIMIT))
@@ -1347,22 +1358,75 @@ fn shape_candidate_display(
     mut display: CandidateDisplay,
     session: &CompositionSession,
 ) -> CandidateDisplay {
-    display.tab_assembly = session
-        .tab_assembly_position()
-        .zip(session.tab_assembly_character_count())
-        .map(|(position, total)| {
-            NativeTabAssemblyState::new(position, total, session.stroke_prefix())
-        });
+    let position = session.tab_assembly_position().unwrap_or(1);
+    let total = session.tab_assembly_character_count().unwrap_or(1);
+    display.tab_assembly = Some(NativeTabAssemblyState::new(
+        position,
+        total,
+        session.stroke_prefix(),
+    ));
     let display = display.with_mode(shape_display_mode(session));
-    match (
+    let stage = match (
         session.tab_assembly_selected_text(),
         session.tab_assembly_position(),
     ) {
-        (Some(selected), Some(position)) => {
-            display.with_mode_label(format!("{selected} → 第 {position} 字"))
-        }
-        _ => display,
+        (Some(selected), Some(position)) => format!("{selected} → 第 {position} 字"),
+        (None, Some(position)) => format!("找第 {position} 字"),
+        _ => "找字".to_owned(),
+    };
+    let slot = active_shape_code(session);
+    let slot = if slot.len() == 1 {
+        format!("{slot}·声母")
+    } else {
+        slot.to_owned()
+    };
+    let refinement = shape_prefix_display(session.stroke_prefix());
+    display.with_mode_label(format!("{stage} · {slot} · {refinement}"))
+}
+
+fn shape_prefix_display(prefix: &str) -> String {
+    if prefix.is_empty() {
+        return "形码 —".to_owned();
     }
+    if prefix
+        .as_bytes()
+        .iter()
+        .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z'))
+    {
+        let strokes = prefix
+            .bytes()
+            .map(|byte| match byte {
+                b'h' => "横",
+                b's' => "竖",
+                b'p' => "撇",
+                b'n' => "捺",
+                b'z' => "折",
+                _ => unreachable!("stroke prefix was validated"),
+            })
+            .collect::<Vec<_>>()
+            .join("·");
+        format!("笔画 {strokes}")
+    } else {
+        format!("部件 {prefix}")
+    }
+}
+
+fn tab_phonetic_segments(code: &str) -> Option<Vec<&str>> {
+    if code.is_empty()
+        || code.len() > MAX_TAB_ASSEMBLY_CHARACTERS.saturating_mul(2)
+        || !code.as_bytes().iter().all(u8::is_ascii_lowercase)
+    {
+        return None;
+    }
+    let complete_end = code.len() / 2 * 2;
+    let mut segments = (0..complete_end)
+        .step_by(2)
+        .map(|start| &code[start..start + 2])
+        .collect::<Vec<_>>();
+    if complete_end < code.len() {
+        segments.push(&code[complete_end..]);
+    }
+    (segments.len() <= MAX_TAB_ASSEMBLY_CHARACTERS).then_some(segments)
 }
 
 impl CandidateDisplay {
@@ -2674,16 +2738,17 @@ fn plan_tab_assembly_selection(
     };
     let selected_text = selected_text.filter(|text| !text.is_empty())?;
     let before = session.clone();
+    let may_remember_complete_word = !before.tab_assembly_has_trailing_initial();
     let mut after = before.clone();
     let selection = after.accept_tab_assembly_candidate(&selected_text)?;
     let (edit, selection_to_remember, feedback_after_success) = match selection {
         TabAssemblySelection::Advanced => (None, None, None),
         TabAssemblySelection::Complete(text) => {
-            let selection = PlannedSelection {
+            let selection = may_remember_complete_word.then(|| PlannedSelection {
                 code: before.phonetic().to_owned(),
                 text: text.clone(),
                 retractable_by_immediate_backspace: true,
-            };
+            });
             let feedback = NativeFeedbackEvent::CandidateCommitted {
                 code: before.phonetic().to_owned(),
                 text: text.clone(),
@@ -2694,7 +2759,7 @@ fn plan_tab_assembly_selection(
             };
             (
                 Some(PendingDocumentEdit::Commit(text)),
-                Some(selection),
+                selection,
                 Some(feedback),
             )
         }
@@ -9403,26 +9468,7 @@ impl TsfTextService_Impl {
             && !session.wish_prompt()
         {
             let code = session.phonetic();
-            let entry = if code.len() == 2 {
-                let batch = self.load_shape_candidate_batch(
-                    provider.as_ref(),
-                    code,
-                    "",
-                    CANDIDATE_PAGE_SIZE,
-                );
-                (!batch.candidates.is_empty()).then(|| {
-                    let mut after = session.clone();
-                    after.enter_tab(code.to_owned());
-                    (after, batch)
-                })
-            } else if (4..=MAX_TAB_ASSEMBLY_CHARACTERS.saturating_mul(2)).contains(&code.len())
-                && code.len() % 2 == 0
-                && code.as_bytes().iter().all(u8::is_ascii_lowercase)
-            {
-                let pinyin_segments = (0..code.len())
-                    .step_by(2)
-                    .map(|start| &code[start..start + 2])
-                    .collect::<Vec<_>>();
+            let entry = tab_phonetic_segments(code).and_then(|pinyin_segments| {
                 let first_batch = self.load_shape_candidate_batch(
                     provider.as_ref(),
                     pinyin_segments[0],
@@ -9437,13 +9483,15 @@ impl TsfTextService_Impl {
                 });
                 (!first_batch.candidates.is_empty() && remaining_available).then(|| {
                     let mut after = session.clone();
-                    let entered = after.enter_tab_path(&pinyin_segments);
-                    debug_assert!(entered, "validated bounded Tab segments must enter");
+                    if pinyin_segments.len() == 1 {
+                        after.enter_tab(pinyin_segments[0].to_owned());
+                    } else {
+                        let entered = after.enter_tab_path(&pinyin_segments);
+                        debug_assert!(entered, "validated bounded Tab slots must enter");
+                    }
                     (after, first_batch)
                 })
-            } else {
-                None
-            };
+            });
             if let Some((after, batch)) = entry {
                 let display =
                     shape_candidate_display(CandidateDisplay::from_batch(batch, 0), &after);
@@ -11346,12 +11394,16 @@ mod tests {
             let candidates: &[&str] = match (code, prefix) {
                 ("qt", "") => &["却", "缺", "雀"],
                 ("qt", "s") => &["雀"],
+                ("qt", "x") => &["雀"],
                 ("hp", "") => &["很", "和", "魂"],
                 ("hp", "p") => &["魂"],
                 ("lm", "") => &["连", "脸", "练"],
                 ("lm", "s") => &["练"],
                 ("xi", "") => &["西", "系", "习"],
                 ("xi", "z") => &["习"],
+                ("jd", "") => &["甲"],
+                ("j", "") => &["乙", "件", "今", "经", "就", "见", "进", "仅"],
+                ("j", "h") => &["件"],
                 _ => &[],
             };
             candidates
@@ -15684,14 +15736,55 @@ mod tests {
             enter.candidate_display.as_ref().unwrap().mode(),
             CandidateDisplayMode::Shape
         );
+        assert_eq!(
+            candidate_popup_mode_label(enter.candidate_display.as_ref().unwrap()),
+            Some("找字 · qt · 形码 —")
+        );
         assert!(matches!(
             enter.feedback_after_success,
             Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                 view: NativeCandidateView::Shape,
+                tab_assembly: Some(tab),
                 ..
-            })
+            }) if tab.position() == 1
+                && tab.total_characters() == 1
+                && tab.shape_prefix().is_empty()
         ));
         *service.composition.borrow_mut() = enter.after;
+
+        let component = service
+            .plan_key(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'x' - b'a'))),
+                KeyModifiers::default(),
+            )
+            .unwrap()
+            .expect("an arbitrary lowercase component prefix should share the Tab protocol");
+        assert_eq!(component.after.stroke_prefix(), "x");
+        assert_eq!(
+            component.candidate_display.as_ref().unwrap().visible(),
+            ["雀"]
+        );
+        assert_eq!(
+            candidate_popup_mode_label(component.candidate_display.as_ref().unwrap()),
+            Some("找字 · qt · 部件 x")
+        );
+        assert!(matches!(
+            component.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                tab_assembly: Some(tab),
+                ..
+            }) if tab.position() == 1
+                && tab.total_characters() == 1
+                && tab.shape_prefix() == "x"
+        ));
+        *service.composition.borrow_mut() = component.after;
+
+        let clear_component = service
+            .plan_key(WPARAM(usize::from(VK_BACK.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Backspace should remove one shape-prefix key without leaving Tab");
+        assert_eq!(clear_component.after.stroke_prefix(), "");
+        *service.composition.borrow_mut() = clear_component.after;
 
         let filtered = service
             .plan_key(
@@ -15707,6 +15800,10 @@ mod tests {
         assert_eq!(
             filtered.candidate_display.as_ref().unwrap().visible(),
             ["雀"]
+        );
+        assert_eq!(
+            candidate_popup_mode_label(filtered.candidate_display.as_ref().unwrap()),
+            Some("找字 · qt · 笔画 竖")
         );
         *service.composition.borrow_mut() = filtered.after;
 
@@ -15728,6 +15825,101 @@ mod tests {
         assert!(commit.selection_to_remember.is_none());
         assert!(commit.after.phonetic().is_empty());
         assert!(!commit.after.tab_mode());
+    }
+
+    #[test]
+    fn odd_key_tab_path_uses_a_trailing_initial_slot_without_short_code_learning() {
+        let _guard = test_lock();
+        assert_eq!(tab_phonetic_segments("jdj"), Some(vec!["jd", "j"]));
+        assert_eq!(tab_phonetic_segments("jdjd"), Some(vec!["jd", "jd"]));
+
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("jdj".to_owned()));
+
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("a complete slot followed by one initial should enter staged Tab lookup");
+        assert_eq!(enter.after.shape_pinyin(), Some("jd"));
+        assert!(enter.after.tab_assembly_has_trailing_initial());
+        assert_eq!(enter.candidate_display.as_ref().unwrap().visible(), ["甲"]);
+        assert_eq!(
+            candidate_popup_mode_label(enter.candidate_display.as_ref().unwrap()),
+            Some("找第 1 字 · jd · 形码 —")
+        );
+        *service.composition.borrow_mut() = enter.after;
+
+        let first = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Space should advance from the complete first slot");
+        assert!(first.edit.is_none());
+        assert_eq!(first.after.shape_pinyin(), Some("j"));
+        assert_eq!(
+            first.candidate_display.as_ref().unwrap().visible(),
+            ["乙", "件", "今", "经", "就", "见"]
+        );
+        assert_eq!(
+            candidate_popup_mode_label(first.candidate_display.as_ref().unwrap()),
+            Some("甲 → 第 2 字 · j·声母 · 形码 —")
+        );
+        *service.composition.borrow_mut() = first.after;
+
+        let next_page = service
+            .plan_key(WPARAM(usize::from(VK_NEXT.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the trailing-initial pool should retain ordinary candidate paging");
+        assert_eq!(next_page.after.candidate_page_start(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(
+            next_page.candidate_display.as_ref().unwrap().visible(),
+            ["进", "仅"]
+        );
+        *service.composition.borrow_mut() = next_page.after;
+
+        let previous_page = service
+            .plan_key(WPARAM(usize::from(VK_PRIOR.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("PageUp should return to the first trailing-initial page");
+        assert_eq!(previous_page.after.candidate_page_start(), 0);
+        assert_eq!(
+            previous_page.candidate_display.as_ref().unwrap().visible(),
+            ["乙", "件", "今", "经", "就", "见"]
+        );
+        *service.composition.borrow_mut() = previous_page.after;
+
+        let stroke = service
+            .plan_key(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'h' - b'a'))),
+                KeyModifiers::default(),
+            )
+            .unwrap()
+            .expect("the trailing-initial pool should accept ordinary shape refinement");
+        assert_eq!(stroke.after.stroke_prefix(), "h");
+        assert_eq!(stroke.candidate_display.as_ref().unwrap().visible(), ["件"]);
+        assert_eq!(
+            candidate_popup_mode_label(stroke.candidate_display.as_ref().unwrap()),
+            Some("甲 → 第 2 字 · j·声母 · 笔画 横")
+        );
+        *service.composition.borrow_mut() = stroke.after;
+
+        let complete = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("selecting the trailing-initial character should complete the word");
+        assert!(matches!(
+            complete.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "甲件"
+        ));
+        assert!(
+            complete.selection_to_remember.is_none(),
+            "an unresolved trailing initial must not train an ordinary short-code preference"
+        );
+        assert!(!complete.after.tab_mode());
     }
 
     #[test]
@@ -15789,7 +15981,10 @@ mod tests {
         let display = enter.candidate_display.as_ref().unwrap();
         assert_eq!(display.visible(), ["却", "缺", "雀"]);
         assert_eq!(display.mode(), CandidateDisplayMode::ShapeAssemblyFirst);
-        assert_eq!(candidate_popup_mode_label(display), Some("找第 1 字"));
+        assert_eq!(
+            candidate_popup_mode_label(display),
+            Some("找第 1 字 · qt · 形码 —")
+        );
         *service.composition.borrow_mut() = enter.after;
 
         let first = service
@@ -15807,7 +16002,10 @@ mod tests {
         let display = first.candidate_display.as_ref().unwrap();
         assert_eq!(display.visible(), ["很", "和", "魂"]);
         assert_eq!(display.mode(), CandidateDisplayMode::ShapeAssemblySecond);
-        assert_eq!(candidate_popup_mode_label(display), Some("雀 → 第 2 字"));
+        assert_eq!(
+            candidate_popup_mode_label(display),
+            Some("雀 → 第 2 字 · hp · 形码 —")
+        );
         assert!(matches!(
             first.feedback_after_success,
             Some(NativeFeedbackEvent::CandidatesPresentedWithProvenance {
@@ -15987,14 +16185,14 @@ mod tests {
         );
         assert_eq!(
             candidate_popup_mode_label(enter.candidate_display.as_ref().unwrap()),
-            Some("找第 1 字")
+            Some("找第 1 字 · qt · 形码 —")
         );
         *service.composition.borrow_mut() = enter.after;
 
         for (expected_stage, expected_label) in [
-            (TabAssemblyStage::Second, "雀 → 第 2 字"),
-            (TabAssemblyStage::Later(3), "雀魂 → 第 3 字"),
-            (TabAssemblyStage::Later(4), "雀魂练 → 第 4 字"),
+            (TabAssemblyStage::Second, "雀 → 第 2 字 · hp · 形码 —"),
+            (TabAssemblyStage::Later(3), "雀魂 → 第 3 字 · lm · 形码 —"),
+            (TabAssemblyStage::Later(4), "雀魂练 → 第 4 字 · xi · 形码 —"),
         ] {
             let advance = service
                 .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())

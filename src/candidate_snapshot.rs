@@ -359,6 +359,53 @@ impl CandidateSnapshot {
             })
     }
 
+    /// Returns ranked single-character candidates for one trailing initial key.
+    ///
+    /// This is the deliberately narrow pool used by explicit Tab lookup when
+    /// an odd-length composition ends in a still-incomplete double-pinyin
+    /// syllable. Every returned character comes from a complete exact two-key
+    /// lexicon entry whose first key equals `initial`; abbreviations,
+    /// corrections, sentence paths, and unresolved input are excluded.
+    pub fn initial_single_character_texts(
+        &self,
+        initial: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KeySequenceError> {
+        let initial = KeySequence::new(initial)?;
+        let requested_limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        if initial.as_str().len() != 1 || requested_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let initial = initial.as_str().as_bytes()[0];
+        let mut candidates = Vec::new();
+        for final_key in b'a'..=b'z' {
+            let code = String::from_utf8(vec![initial, final_key])
+                .expect("lowercase ASCII keys are valid UTF-8");
+            candidates.extend(
+                self.decoder
+                    .decode_exact_full_code(&code, MAX_CANDIDATE_SNAPSHOT_RANK)?
+                    .into_iter()
+                    .filter(|candidate| candidate.text.chars().count() == 1),
+            );
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .total
+                .total_cmp(&left.score.total)
+                .then_with(|| left.text.cmp(&right.text))
+                .then_with(|| left.code.as_str().cmp(right.code.as_str()))
+        });
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(candidate.text.clone()));
+        candidates.truncate(requested_limit);
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.text)
+            .collect())
+    }
+
     /// Finds complete four-character public whole words behind one key edit.
     ///
     /// Only four full double-pinyin syllables are accepted. Mixed initials,
@@ -1891,6 +1938,36 @@ mod tests {
         assert_eq!(
             snapshot.candidate_texts("zzzzzzzz", 5).unwrap(),
             ["zzzzzzzz"]
+        );
+    }
+
+    #[test]
+    fn trailing_initial_pool_merges_exact_readings_by_global_character_rank() {
+        let lexicon = "text\tpinyin\tfrequency\n\
+                       甲\tjia\t100\n\
+                       甲\tju\t500\n\
+                       乙\tji\t50\n\
+                       丙\tba\t1000\n\
+                       丁\tjian\t200\n";
+        let snapshot = load_test_snapshot("initial-slot-v1", lexicon, 5);
+
+        assert_eq!(
+            snapshot.initial_single_character_texts("j", 10).unwrap(),
+            ["甲", "丁", "乙"]
+        );
+        assert_eq!(
+            snapshot.initial_single_character_texts("j", 2).unwrap(),
+            ["甲", "丁"]
+        );
+        assert_eq!(
+            snapshot.initial_single_character_texts("b", 10).unwrap(),
+            ["丙"]
+        );
+        assert!(
+            snapshot
+                .initial_single_character_texts("jd", 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -246,6 +246,12 @@ impl NativeCandidateProvenance {
     }
 }
 
+/// Active explicit Tab lookup state.
+///
+/// The type name is retained for wish-schema compatibility. `total_characters`
+/// may be one for ordinary single-character lookup, while larger values
+/// describe staged character assembly. `stroke_prefix` is likewise the legacy
+/// field name for the unified stroke-or-component shape prefix.
 #[derive(Clone, Eq, PartialEq)]
 pub struct NativeTabAssemblyState {
     position: usize,
@@ -274,15 +280,19 @@ impl NativeTabAssemblyState {
         &self.stroke_prefix
     }
 
+    pub fn shape_prefix(&self) -> &str {
+        &self.stroke_prefix
+    }
+
     fn validate_and_measure(&self) -> Option<usize> {
-        ((2..=MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS).contains(&self.total_characters)
+        ((1..=MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS).contains(&self.total_characters)
             && (1..=self.total_characters).contains(&self.position)
             && self.stroke_prefix.len() <= MAX_FEEDBACK_STROKE_PREFIX_BYTES
             && self
                 .stroke_prefix
                 .as_bytes()
                 .iter()
-                .all(|byte| matches!(byte, b'h' | b's' | b'p' | b'n' | b'z')))
+                .all(u8::is_ascii_lowercase))
         .then_some(self.stroke_prefix.len())
     }
 }
@@ -1740,6 +1750,18 @@ mod tests {
                 event(NativeCandidateView::Shape, 6, Some(tab.clone()))
             ),
             NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(
+            record(
+                &mut valid,
+                event(
+                    NativeCandidateView::Shape,
+                    1,
+                    Some(NativeTabAssemblyState::new(1, 1, "nx")),
+                )
+            ),
+            NativeFeedbackRecordResult::Recorded,
+            "single-character Tab lookup must retain its component-prefix state"
         );
 
         for invalid in [

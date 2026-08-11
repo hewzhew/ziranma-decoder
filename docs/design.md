@@ -30,7 +30,7 @@ codec 把每个拼音音节变成标准两键自然码，同时保留音节边�
 ## 宿主无关的组合状态
 
 终端 `typing-lab` 已不再独占组合协议。`CompositionSession` 保存当前
-双拼串、候选页、换序状态和 Tab 笔画状态，通过 `CompositionInput`
+双拼串、候选页、换序状态和 Tab 音码槽/形码状态，通过 `CompositionInput`
 接收语义按键，通过 `CompositionEffect` 请求候选确认、翻页或单字查询。
 
 已提交文字不属于该状态：终端宿主只为显示累积它，未来 TSF 宿主则
