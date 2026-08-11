@@ -134,6 +134,45 @@ impl CandidatePackageManifest {
         .map_err(CandidatePackageError::Snapshot)
     }
 
+    /// Validates payload identity and an independently counted row total.
+    ///
+    /// Lightweight consumers can use this after applying their own stricter
+    /// payload profile. Unlike [`Self::load_snapshot`], it never parses the
+    /// generic lexicon or constructs a decoder index.
+    pub fn validate_payload_metadata(
+        &self,
+        lexicon_tsv: &str,
+        actual_entry_count: usize,
+    ) -> Result<(), CandidatePackageError> {
+        let actual_payload_bytes = lexicon_tsv.len();
+        if actual_payload_bytes != self.payload_bytes {
+            return Err(CandidatePackageError::Snapshot(
+                CandidateSnapshotError::PayloadLengthMismatch {
+                    expected: self.payload_bytes,
+                    actual: actual_payload_bytes,
+                },
+            ));
+        }
+        let actual_fingerprint = candidate_payload_fingerprint(lexicon_tsv.as_bytes());
+        if actual_fingerprint != self.payload_fingerprint {
+            return Err(CandidatePackageError::Snapshot(
+                CandidateSnapshotError::PayloadFingerprintMismatch {
+                    expected: self.payload_fingerprint,
+                    actual: actual_fingerprint,
+                },
+            ));
+        }
+        if actual_entry_count != self.entry_count {
+            return Err(CandidatePackageError::Snapshot(
+                CandidateSnapshotError::EntryCountMismatch {
+                    expected: self.entry_count,
+                    actual: actual_entry_count,
+                },
+            ));
+        }
+        Ok(())
+    }
+
     /// Renders the canonical eight-line v1 manifest.
     pub fn render(&self) -> String {
         format!(
@@ -346,5 +385,27 @@ mod tests {
         let rendered = format!("{error:?} {error}");
         assert!(!rendered.contains("你好"));
         assert!(!rendered.contains("您好"));
+    }
+
+    #[test]
+    fn lightweight_metadata_validation_does_not_require_a_decoder() {
+        let manifest = CandidatePackageManifest::parse(MANIFEST).unwrap();
+        assert_eq!(manifest.validate_payload_metadata(LEXICON, 50), Ok(()));
+        assert!(matches!(
+            manifest.validate_payload_metadata(LEXICON, 49),
+            Err(CandidatePackageError::Snapshot(
+                CandidateSnapshotError::EntryCountMismatch {
+                    expected: 50,
+                    actual: 49
+                }
+            ))
+        ));
+        assert!(matches!(
+            manifest.validate_payload_metadata(&LEXICON.replace("你好", "您好"), 50),
+            Err(CandidatePackageError::Snapshot(
+                CandidateSnapshotError::PayloadFingerprintMismatch { .. }
+                    | CandidateSnapshotError::PayloadLengthMismatch { .. }
+            ))
+        ));
     }
 }

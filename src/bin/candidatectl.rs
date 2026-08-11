@@ -29,24 +29,25 @@ use ziranma_core::{
     CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
     CandidateSourceMaterial, CandidateSupplementalState, CharacterBigramLanguageModel,
-    ContinuousCompositionProbe, Decoder, DecoderIndexStats, FourCharacterCorrectionDecision,
-    FourCharacterCorrectionKeepReason, LexiconEntry, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
-    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
-    MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
-    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
-    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
-    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
-    MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
-    MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH, MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES,
-    MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES, PublicLexiconRankProbe,
-    PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
-    PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
-    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SentenceCandidate, SupplementalCandidateLayerConfig,
-    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
-    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_rime_target,
-    audit_public_supplemental_layer, candidate_package_authentication_sha256,
-    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
-    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    ContinuousCompositionProbe, Decoder, DecoderIndexStats, ExactShortWordCatalog,
+    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason, LexiconEntry,
+    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
+    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
+    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
+    MAX_CANDIDATE_SNAPSHOT_RANK, MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
+    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
+    MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH,
+    MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES, MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES,
+    PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
+    PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
+    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
+    SentenceCandidate, SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
+    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
+    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
+    candidate_package_authentication_sha256, candidate_package_storage_id,
+    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
+    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
     load_candidate_runtime_snapshots, load_current_candidate_snapshot, parse_lexicon_tsv,
     parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_public_short_word_consensus,
@@ -92,6 +93,7 @@ enum Options {
         declaration: PublicSourceDeclaration,
         config: PublicRimeSliceConfig,
     },
+    BuildShortConsensusLayer(Box<ShortConsensusLayerBuildOptions>),
     BuildPhraseLayer(Box<PhraseLayerBuildOptions>),
     MergePublicPackages {
         base: PathBuf,
@@ -224,6 +226,16 @@ enum Options {
         code: String,
         limit: usize,
     },
+    ExactShortQuery {
+        package: PathBuf,
+        code: String,
+        limit: usize,
+    },
+    ExactShortBenchmark {
+        package: PathBuf,
+        code: String,
+        repetitions: usize,
+    },
     Verify {
         package: PathBuf,
         expected_sha256: String,
@@ -285,6 +297,12 @@ struct LoadedPackage {
     authentication_sha256: String,
 }
 
+struct LoadedExactShortPackage {
+    provenance: CandidatePackageProvenance,
+    catalog: ExactShortWordCatalog,
+    authentication_sha256: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PublicSourceDeclaration {
     id: String,
@@ -303,6 +321,20 @@ struct PhraseLayerBuildOptions {
     entry_limit: usize,
     source_declaration: PublicSourceDeclaration,
     allowlist_declaration: PublicSourceDeclaration,
+    base_declaration: PublicSourceDeclaration,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ShortConsensusLayerBuildOptions {
+    source: PathBuf,
+    confirmation: PathBuf,
+    base_payload: PathBuf,
+    output: PathBuf,
+    revision: String,
+    per_code_depth: usize,
+    entry_limit: usize,
+    source_declaration: PublicSourceDeclaration,
+    confirmation_declaration: PublicSourceDeclaration,
     base_declaration: PublicSourceDeclaration,
 }
 
@@ -344,6 +376,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             declaration,
             config,
         } => build_rime_slice_public_package(&source, &output, &revision, &declaration, config)?,
+        Options::BuildShortConsensusLayer(options) => {
+            build_short_consensus_layer_public_package(*options)?
+        }
         Options::BuildPhraseLayer(options) => {
             let PhraseLayerBuildOptions {
                 source,
@@ -572,6 +607,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             code,
             limit,
         } => public_package_query(&package, &code, limit)?,
+        Options::ExactShortQuery {
+            package,
+            code,
+            limit,
+        } => exact_short_package_query(&package, &code, limit)?,
+        Options::ExactShortBenchmark {
+            package,
+            code,
+            repetitions,
+        } => benchmark_exact_short_package(&package, &code, repetitions)?,
         Options::Verify {
             package,
             expected_sha256,
@@ -635,6 +680,7 @@ fn parse_options(
         "build" => parse_build(arguments, false),
         "build-rime" => parse_build(arguments, true),
         "build-rime-slice" => parse_build_rime_slice(arguments),
+        "build-short-consensus-layer" => parse_build_short_consensus_layer(arguments),
         "build-phrase-layer" => parse_build_phrase_layer(arguments),
         "merge-public-packages" => parse_merge_public_packages(arguments),
         "diagnose-public-miss" => parse_diagnose_public_miss(arguments),
@@ -665,6 +711,8 @@ fn parse_options(
             package: parse_package_only(arguments, "preflight")?,
         }),
         "package-query" => parse_package_query(arguments),
+        "exact-short-query" => parse_exact_short_query(arguments),
+        "exact-short-benchmark" => parse_exact_short_benchmark(arguments),
         "verify" => {
             let (package, expected_sha256) =
                 parse_package_and_expected_sha256(arguments, "verify")?;
@@ -939,6 +987,133 @@ fn parse_build_rime_slice(
         },
         config,
     })
+}
+
+fn parse_build_short_consensus_layer(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut confirmation = None;
+    let mut base_payload = None;
+    let mut output = None;
+    let mut revision = None;
+    let mut per_code_depth = None;
+    let mut entry_limit = None;
+    let mut source_id = None;
+    let mut source_license = None;
+    let mut source_url = None;
+    let mut source_sha256 = None;
+    let mut confirmation_id = None;
+    let mut confirmation_license = None;
+    let mut confirmation_url = None;
+    let mut confirmation_sha256 = None;
+    let mut base_id = None;
+    let mut base_license = None;
+    let mut base_url = None;
+    let mut base_sha256 = None;
+    let mut public = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--confirmation" => set_path(&mut confirmation, &mut arguments, "--confirmation")?,
+            "--base-payload" => set_path(&mut base_payload, &mut arguments, "--base-payload")?,
+            "--output" => set_path(&mut output, &mut arguments, "--output")?,
+            "--revision" => set_value(&mut revision, &mut arguments, "--revision")?,
+            "--per-code-depth" => {
+                set_usize(&mut per_code_depth, &mut arguments, "--per-code-depth")?
+            }
+            "--entry-limit" => set_usize(&mut entry_limit, &mut arguments, "--entry-limit")?,
+            "--source-id" => set_value(&mut source_id, &mut arguments, "--source-id")?,
+            "--source-license" => {
+                set_value(&mut source_license, &mut arguments, "--source-license")?
+            }
+            "--source-url" => set_value(&mut source_url, &mut arguments, "--source-url")?,
+            "--source-sha256" => set_value(&mut source_sha256, &mut arguments, "--source-sha256")?,
+            "--confirmation-id" => {
+                set_value(&mut confirmation_id, &mut arguments, "--confirmation-id")?
+            }
+            "--confirmation-license" => set_value(
+                &mut confirmation_license,
+                &mut arguments,
+                "--confirmation-license",
+            )?,
+            "--confirmation-url" => {
+                set_value(&mut confirmation_url, &mut arguments, "--confirmation-url")?
+            }
+            "--confirmation-sha256" => set_value(
+                &mut confirmation_sha256,
+                &mut arguments,
+                "--confirmation-sha256",
+            )?,
+            "--base-id" => set_value(&mut base_id, &mut arguments, "--base-id")?,
+            "--base-license" => set_value(&mut base_license, &mut arguments, "--base-license")?,
+            "--base-url" => set_value(&mut base_url, &mut arguments, "--base-url")?,
+            "--base-sha256" => set_value(&mut base_sha256, &mut arguments, "--base-sha256")?,
+            "--public" => {
+                if public {
+                    return Err("--public can be given only once".into());
+                }
+                public = true;
+            }
+            _ => {
+                return Err(
+                    "unknown build-short-consensus-layer argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    if !public {
+        return Err("build-short-consensus-layer requires explicit --public".into());
+    }
+    let per_code_depth =
+        per_code_depth.ok_or("build-short-consensus-layer requires --per-code-depth")?;
+    if !(1..=MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH).contains(&per_code_depth) {
+        return Err(
+            "build-short-consensus-layer --per-code-depth is outside the fixed bound".into(),
+        );
+    }
+    let entry_limit = entry_limit.ok_or("build-short-consensus-layer requires --entry-limit")?;
+    if !(1..=MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES).contains(&entry_limit) {
+        return Err("build-short-consensus-layer --entry-limit is outside the fixed bound".into());
+    }
+    Ok(Options::BuildShortConsensusLayer(Box::new(
+        ShortConsensusLayerBuildOptions {
+            source: source.ok_or("build-short-consensus-layer requires --source")?,
+            confirmation: confirmation
+                .ok_or("build-short-consensus-layer requires --confirmation")?,
+            base_payload: base_payload
+                .ok_or("build-short-consensus-layer requires --base-payload")?,
+            output: output.ok_or("build-short-consensus-layer requires --output")?,
+            revision: revision.ok_or("build-short-consensus-layer requires --revision")?,
+            per_code_depth,
+            entry_limit,
+            source_declaration: PublicSourceDeclaration {
+                id: source_id.ok_or("build-short-consensus-layer requires --source-id")?,
+                license: source_license
+                    .ok_or("build-short-consensus-layer requires --source-license")?,
+                url: source_url.ok_or("build-short-consensus-layer requires --source-url")?,
+                sha256: source_sha256
+                    .ok_or("build-short-consensus-layer requires --source-sha256")?,
+            },
+            confirmation_declaration: PublicSourceDeclaration {
+                id: confirmation_id
+                    .ok_or("build-short-consensus-layer requires --confirmation-id")?,
+                license: confirmation_license
+                    .ok_or("build-short-consensus-layer requires --confirmation-license")?,
+                url: confirmation_url
+                    .ok_or("build-short-consensus-layer requires --confirmation-url")?,
+                sha256: confirmation_sha256
+                    .ok_or("build-short-consensus-layer requires --confirmation-sha256")?,
+            },
+            base_declaration: PublicSourceDeclaration {
+                id: base_id.ok_or("build-short-consensus-layer requires --base-id")?,
+                license: base_license
+                    .ok_or("build-short-consensus-layer requires --base-license")?,
+                url: base_url.ok_or("build-short-consensus-layer requires --base-url")?,
+                sha256: base_sha256.ok_or("build-short-consensus-layer requires --base-sha256")?,
+            },
+        },
+    )))
 }
 
 fn parse_build_phrase_layer(
@@ -1478,6 +1653,66 @@ fn parse_package_query(
         package: package.ok_or("package-query requires --package")?,
         code,
         limit,
+    })
+}
+
+fn parse_exact_short_query(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut package = None;
+    let mut code = None;
+    let mut limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--code" => set_value(&mut code, &mut arguments, "--code")?,
+            "--limit" => set_usize(&mut limit, &mut arguments, "--limit")?,
+            _ => return Err("unknown exact-short-query argument; value was suppressed".into()),
+        }
+    }
+    let code = code.ok_or("exact-short-query requires --code")?;
+    if code.len() != 4 || !code.as_bytes().iter().all(u8::is_ascii_lowercase) {
+        return Err("exact-short-query --code must be four lowercase ASCII letters".into());
+    }
+    let limit = limit.ok_or("exact-short-query requires --limit")?;
+    if !(1..=MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH).contains(&limit) {
+        return Err("exact-short-query --limit is outside the fixed bound".into());
+    }
+    Ok(Options::ExactShortQuery {
+        package: package.ok_or("exact-short-query requires --package")?,
+        code,
+        limit,
+    })
+}
+
+fn parse_exact_short_benchmark(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut package = None;
+    let mut code = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--code" => set_value(&mut code, &mut arguments, "--code")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err("unknown exact-short-benchmark argument; value was suppressed".into());
+            }
+        }
+    }
+    let code = code.ok_or("exact-short-benchmark requires --code")?;
+    if code.len() != 4 || !code.as_bytes().iter().all(u8::is_ascii_lowercase) {
+        return Err("exact-short-benchmark --code must be four lowercase ASCII letters".into());
+    }
+    let repetitions = repetitions.ok_or("exact-short-benchmark requires --repetitions")?;
+    if !(1..=1_000_000).contains(&repetitions) {
+        return Err("exact-short-benchmark --repetitions is outside the fixed bound".into());
+    }
+    Ok(Options::ExactShortBenchmark {
+        package: package.ok_or("exact-short-benchmark requires --package")?,
+        code,
+        repetitions,
     })
 }
 
@@ -2067,6 +2302,9 @@ fn print_usage() {
         "  build-rime-slice --source <TONED_RIME.dict.yaml> --output <NEW_PACKAGE_DIR> --revision <REV> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --max-entries <1..120000> [--frequency-frontier-entries <1..MAX>] [--two-character-coverage-depth <1..8>] [--three-character-coverage-entries <N>] [--four-character-coverage-entries <N>] --max-text-characters <1..12> --public"
     );
     eprintln!(
+        "  build-short-consensus-layer --source <TONED_RIME.dict.yaml> --confirmation <PUBLIC_WORDS.txt> --base-payload <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --per-code-depth <1..8> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --confirmation-id <ID> --confirmation-license <SPDX> --confirmation-url <HTTPS_URL> --confirmation-sha256 <SHA256> --base-id <ID> --base-license <SPDX> --base-url <HTTPS_URL> --base-sha256 <SHA256> --public"
+    );
+    eprintln!(
         "  build-phrase-layer --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --allowlist-id <ID> --allowlist-license <SPDX> --allowlist-url <HTTPS_URL> --allowlist-sha256 <SHA256> --base-id <ID> --base-license <SPDX> --base-url <HTTPS_URL> --base-sha256 <SHA256> --public"
     );
     eprintln!(
@@ -2121,6 +2359,12 @@ fn print_usage() {
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!(
         "  package-query --package <PUBLIC_PACKAGE_DIR> --code <LOWERCASE_KEYS> --limit <1..50>"
+    );
+    eprintln!(
+        "  exact-short-query --package <PUBLIC_PACKAGE_DIR> --code <FOUR_KEYS> --limit <1..8>"
+    );
+    eprintln!(
+        "  exact-short-benchmark --package <PUBLIC_PACKAGE_DIR> --code <FOUR_KEYS> --repetitions <1..1000000>"
     );
     eprintln!("  verify --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
@@ -2188,6 +2432,64 @@ fn public_package_query(
     )?;
     writeln!(output, "本次操作：只读")?;
     Ok(output)
+}
+
+fn exact_short_package_query(
+    package: &Path,
+    code: &str,
+    limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loaded = load_exact_short_package_directory(package)?;
+    let candidates = loaded.catalog.candidate_texts(code, limit)?;
+    let mut output = String::new();
+    writeln!(output, "公开精确短词查询")?;
+    writeln!(output, "版本：{}", loaded.catalog.revision())?;
+    writeln!(output, "输入：{code}")?;
+    for (index, candidate) in candidates.iter().enumerate() {
+        writeln!(output, "{}. {}", index + 1, candidate)?;
+    }
+    if candidates.is_empty() {
+        writeln!(output, "（没有精确短词）")?;
+    }
+    writeln!(
+        output,
+        "口径：认证包后只查询四键码的 TSV 字节范围；未构造通用 Decoder。"
+    )?;
+    writeln!(output, "本次操作：只读")?;
+    Ok(output)
+}
+
+fn benchmark_exact_short_package(
+    package: &Path,
+    code: &str,
+    repetitions: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let load_started = Instant::now();
+    let loaded = load_exact_short_package_directory(package)?;
+    let load_elapsed = load_started.elapsed();
+    let expected = loaded.catalog.candidate_texts(code, 8)?;
+    let expected_count = expected.len();
+    drop(expected);
+
+    let query_started = Instant::now();
+    for _ in 0..repetitions {
+        let candidates = loaded.catalog.candidate_texts(black_box(code), 8)?;
+        black_box(candidates);
+    }
+    let query_elapsed = query_started.elapsed();
+    let average_query_microseconds = query_elapsed.as_secs_f64() * 1_000_000.0 / repetitions as f64;
+    Ok(format!(
+        "公开精确短词层本机观测\n版本：{}\n词条：{}；完整码：{}；载荷：{} 字节；索引：{} 字节\n首次认证与建索引：{:.3} ms\n热查询：{} 次；每次平均 {:.3} µs；目标码返回 {} 项\n口径：release 模式、当前机器、文件系统当前缓存状态；不是跨设备延迟承诺。\n本次操作：只读\n",
+        loaded.catalog.revision(),
+        loaded.catalog.entry_count(),
+        loaded.catalog.code_count(),
+        loaded.catalog.payload_bytes(),
+        loaded.catalog.index_bytes(),
+        load_elapsed.as_secs_f64() * 1_000.0,
+        repetitions,
+        average_query_microseconds,
+        expected_count,
+    ))
 }
 
 fn build_public_package(
@@ -2276,6 +2578,92 @@ fn build_rime_slice_public_package(
     }
     let mut report = write_public_package(output, revision, declaration, &payload)?;
     write_slice_stats(&mut report, imported.stats);
+    Ok(report)
+}
+
+fn build_short_consensus_layer_public_package(
+    options: ShortConsensusLayerBuildOptions,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        &options.source,
+        "public toned Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let confirmation_text = read_explicit_text(
+        &options.confirmation,
+        "independent public short-word confirmation",
+        MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES,
+    )?;
+    let base_text = read_explicit_text(
+        &options.base_payload,
+        "base public candidate payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+
+    let materials = vec![
+        verified_source_material(
+            &options.source_declaration,
+            source_text.as_bytes(),
+            "public Rime source",
+        )?,
+        verified_source_material(
+            &options.confirmation_declaration,
+            confirmation_text.as_bytes(),
+            "independent public short-word confirmation",
+        )?,
+        verified_source_material(
+            &options.base_declaration,
+            base_text.as_bytes(),
+            "base public candidate payload",
+        )?,
+    ];
+    if materials
+        .iter()
+        .map(CandidateSourceMaterial::sha256)
+        .collect::<HashSet<_>>()
+        .len()
+        != materials.len()
+    {
+        return Err("build-short-consensus-layer requires three distinct public materials".into());
+    }
+
+    let base_entries = parse_lexicon_tsv(&base_text)?;
+    let imported = parse_public_short_word_consensus(
+        &source_text,
+        &confirmation_text,
+        &base_entries,
+        options.per_code_depth,
+        options.entry_limit,
+    )?;
+    let stats = imported.stats;
+    if imported.entries.is_empty() {
+        return Err("build-short-consensus-layer found no new confirmed identities".into());
+    }
+    let mut entries = imported.entries;
+    // Stable sorting preserves Rime source order for equal-weight identities.
+    entries.sort_by(|left, right| {
+        left.code
+            .as_str()
+            .cmp(right.code.as_str())
+            .then_with(|| right.frequency.cmp(&left.frequency))
+    });
+    let payload = serialize_lexicon_payload(&entries);
+    let mut report =
+        write_exact_short_public_package(&options.output, &options.revision, materials, &payload)?;
+    writeln!(
+        report,
+        "双来源短词：基础 {} 条；可用新增身份 {}；规范码 {}；每码最多 {}；写入 {} 条；上限外 {}",
+        base_entries.len(),
+        stats.available_new_identities,
+        stats.available_new_codes,
+        stats.per_code_depth,
+        stats.imported_entries,
+        stats.dropped_by_entry_cap,
+    )?;
+    writeln!(
+        report,
+        "运行时状态：未接入、未安装、未启用；当前 TSF 候选保持不变"
+    )?;
     Ok(report)
 }
 
@@ -7982,6 +8370,61 @@ fn write_multi_source_public_package(
     write_public_package_files(output, &manifest_text, &provenance_text, payload)
 }
 
+fn write_exact_short_public_package(
+    output: &Path,
+    revision: &str,
+    materials: Vec<CandidateSourceMaterial>,
+    payload: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let manifest = CandidatePackageManifest::from_payload(revision, false, payload)?;
+    let manifest_text = manifest.render();
+    let provenance_text =
+        CandidatePackageProvenance::from_source_materials(materials, &manifest_text, payload)?
+            .render();
+    ensure_path_absent(output, "exact short-word package output")?;
+
+    fs::create_dir(output)
+        .map_err(|_| "cannot create explicitly named exact short-word package output")?;
+    let build_result = (|| -> Result<LoadedExactShortPackage, Box<dyn std::error::Error>> {
+        write_new_synced(
+            &output.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+            payload.as_bytes(),
+        )?;
+        write_new_synced(
+            &output.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
+            manifest_text.as_bytes(),
+        )?;
+        write_new_synced(
+            &output.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            provenance_text.as_bytes(),
+        )?;
+        load_exact_short_package_directory(output)
+    })();
+    if build_result.is_err() {
+        let _ = fs::remove_dir_all(output);
+    }
+    let loaded = build_result?;
+    let mut report = String::new();
+    writeln!(report, "公开精确短词包已生成")?;
+    writeln!(report, "版本：{}", loaded.catalog.revision())?;
+    writeln!(report, "词条：{}", loaded.catalog.entry_count())?;
+    writeln!(report, "完整码：{}", loaded.catalog.code_count())?;
+    writeln!(
+        report,
+        "最大同码深度：{}",
+        loaded.catalog.maximum_code_depth()
+    )?;
+    writeln!(report, "载荷：{} 字节", loaded.catalog.payload_bytes())?;
+    writeln!(report, "紧凑索引：{} 字节", loaded.catalog.index_bytes())?;
+    writeln!(
+        report,
+        "来源：{}",
+        provenance_source_summary(&loaded.provenance)
+    )?;
+    writeln!(report, "认证 SHA-256：{}", loaded.authentication_sha256)?;
+    Ok(report)
+}
+
 fn write_public_package_files(
     output: &Path,
     manifest_text: &str,
@@ -8562,6 +9005,38 @@ fn load_package_directory(package: &Path) -> Result<LoadedPackage, Box<dyn std::
     })
 }
 
+fn load_exact_short_package_directory(
+    package: &Path,
+) -> Result<LoadedExactShortPackage, Box<dyn std::error::Error>> {
+    ensure_regular_directory(package, "exact short-word package")?;
+    let manifest_text = read_explicit_text(
+        &package.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
+        "exact short-word manifest",
+        MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    )?;
+    let provenance_text = read_explicit_text(
+        &package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+        "exact short-word provenance",
+        MAX_CANDIDATE_PROVENANCE_BYTES,
+    )?;
+    let payload_text = read_explicit_text(
+        &package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE),
+        "exact short-word payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let manifest = CandidatePackageManifest::parse(&manifest_text)?;
+    let provenance = CandidatePackageProvenance::parse(&provenance_text)?;
+    provenance.validate_materials(&manifest_text, &payload_text)?;
+    let authentication_sha256 =
+        candidate_package_authentication_sha256(&provenance_text, &manifest_text, &payload_text);
+    let catalog = ExactShortWordCatalog::load_owned(&manifest, payload_text)?;
+    Ok(LoadedExactShortPackage {
+        provenance,
+        catalog,
+        authentication_sha256,
+    })
+}
+
 fn validate_installed_slot(
     root: &Path,
     package_id: Option<&str>,
@@ -8933,6 +9408,12 @@ mod tests {
     const PHRASE_ALLOWLIST: &str = "gkdy\t公开短语\ngddy\t更多短语\nyydy\t已有短语\n";
     const PHRASE_BASE: &str =
         "text\tpinyin\tfrequency\n已有短语\tyi you duan yu\t10\n基础词\tji chu ci\t9\n";
+    const SHORT_CONSENSUS_SOURCE: &str = "---\nname: public-short-words\n...\n\
+收束\tshōu shù\t80\n\
+手术\tshǒu shù\t70\n\
+首项\tshǒu xiàng\t60\n";
+    const SHORT_CONSENSUS_CONFIRMATION: &str = "收束 80\n手术 70\n首项 60\n";
+    const SHORT_CONSENSUS_BASE: &str = "text\tpinyin\tfrequency\n基础\tji chu\t9\n";
     const PROVENANCE: &str =
         include_str!("../../tests/fixtures/public/demo_candidate_provenance.zcp");
 
@@ -9431,6 +9912,121 @@ mod tests {
             .map(|(_, argument)| argument.clone())
             .collect::<Vec<_>>();
         assert!(parse_options(without_base_hash).is_err());
+    }
+
+    #[test]
+    fn short_consensus_build_parser_requires_three_pins_and_public_intent() {
+        let arguments = vec![
+            "build-short-consensus-layer",
+            "--source",
+            "jichu.dict.yaml",
+            "--confirmation",
+            "words.txt",
+            "--base-payload",
+            "base.tsv",
+            "--output",
+            "package",
+            "--revision",
+            "short-consensus-v1",
+            "--per-code-depth",
+            "2",
+            "--entry-limit",
+            "50000",
+            "--source-id",
+            "wanxiang-jichu",
+            "--source-license",
+            "CC-BY-4.0",
+            "--source-url",
+            "https://example.com/jichu",
+            "--source-sha256",
+            &"1".repeat(64),
+            "--confirmation-id",
+            "jieba-words",
+            "--confirmation-license",
+            "MIT",
+            "--confirmation-url",
+            "https://example.com/jieba",
+            "--confirmation-sha256",
+            &"2".repeat(64),
+            "--base-id",
+            "ziranma-base",
+            "--base-license",
+            "MPL-2.0",
+            "--base-url",
+            "https://example.com/base",
+            "--base-sha256",
+            &"3".repeat(64),
+            "--public",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let Options::BuildShortConsensusLayer(parsed) = parse_options(arguments.clone()).unwrap()
+        else {
+            panic!("expected build-short-consensus-layer options");
+        };
+        assert_eq!(parsed.per_code_depth, 2);
+        assert_eq!(parsed.entry_limit, 50_000);
+        assert!(parse_options(arguments[..arguments.len() - 1].to_vec()).is_err());
+    }
+
+    #[test]
+    fn exact_short_query_parser_requires_one_complete_code() {
+        assert_eq!(
+            parse_options(
+                [
+                    "exact-short-query",
+                    "--package",
+                    "package",
+                    "--code",
+                    "ubuu",
+                    "--limit",
+                    "8",
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap(),
+            Options::ExactShortQuery {
+                package: PathBuf::from("package"),
+                code: "ubuu".to_owned(),
+                limit: 8,
+            }
+        );
+        assert!(
+            parse_options(
+                [
+                    "exact-short-query",
+                    "--package",
+                    "package",
+                    "--code",
+                    "ubu",
+                    "--limit",
+                    "8",
+                ]
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_options(
+                [
+                    "exact-short-benchmark",
+                    "--package",
+                    "package",
+                    "--code",
+                    "ubuu",
+                    "--repetitions",
+                    "1000",
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap(),
+            Options::ExactShortBenchmark {
+                package: PathBuf::from("package"),
+                code: "ubuu".to_owned(),
+                repetitions: 1000,
+            }
+        );
     }
 
     #[test]
@@ -10454,6 +11050,108 @@ mod tests {
                 fs::read(package_a.join(filename)).unwrap(),
                 fs::read(package_b.join(filename)).unwrap(),
             );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_consensus_layer_build_is_deterministic_and_lightweight_queryable() {
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let confirmation = root.join("words.txt");
+        let base = root.join("base.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, SHORT_CONSENSUS_SOURCE).unwrap();
+        fs::write(&confirmation, SHORT_CONSENSUS_CONFIRMATION).unwrap();
+        fs::write(&base, SHORT_CONSENSUS_BASE).unwrap();
+        let make_options = |output: PathBuf| ShortConsensusLayerBuildOptions {
+            source: source.clone(),
+            confirmation: confirmation.clone(),
+            base_payload: base.clone(),
+            output,
+            revision: "short-consensus-v1".to_owned(),
+            per_code_depth: 2,
+            entry_limit: 50_000,
+            source_declaration: phrase_material_declaration("dictionary", SHORT_CONSENSUS_SOURCE),
+            confirmation_declaration: phrase_material_declaration(
+                "confirmation",
+                SHORT_CONSENSUS_CONFIRMATION,
+            ),
+            base_declaration: phrase_material_declaration("base-payload", SHORT_CONSENSUS_BASE),
+        };
+
+        let report =
+            build_short_consensus_layer_public_package(make_options(package_a.clone())).unwrap();
+        build_short_consensus_layer_public_package(make_options(package_b.clone())).unwrap();
+        let loaded = load_exact_short_package_directory(&package_a).unwrap();
+        assert_eq!(loaded.provenance.source_count(), 3);
+        assert_eq!(loaded.catalog.entry_count(), 3);
+        assert_eq!(loaded.catalog.code_count(), 2);
+        assert_eq!(loaded.catalog.maximum_code_depth(), 2);
+        assert_eq!(
+            loaded.catalog.candidate_texts("ubuu", 8).unwrap(),
+            ["收束", "手术"]
+        );
+        assert!(report.contains("运行时状态：未接入、未安装、未启用"));
+        assert!(!report.contains("收束"));
+        let query = exact_short_package_query(&package_a, "ubxd", 8).unwrap();
+        assert!(query.contains("1. 首项"));
+        assert!(query.contains("未构造通用 Decoder"));
+        let benchmark = benchmark_exact_short_package(&package_a, "ubuu", 10).unwrap();
+        assert!(benchmark.contains("目标码返回 2 项"));
+        assert!(benchmark.contains("不是跨设备延迟承诺"));
+        for filename in [
+            CANDIDATE_PACKAGE_MANIFEST_FILE,
+            CANDIDATE_PACKAGE_PAYLOAD_FILE,
+            CANDIDATE_PACKAGE_PROVENANCE_FILE,
+        ] {
+            assert_eq!(
+                fs::read(package_a.join(filename)).unwrap(),
+                fs::read(package_b.join(filename)).unwrap(),
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_consensus_layer_checks_every_pin_before_creating_output() {
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let confirmation = root.join("words.txt");
+        let base = root.join("base.tsv");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, SHORT_CONSENSUS_SOURCE).unwrap();
+        fs::write(&confirmation, SHORT_CONSENSUS_CONFIRMATION).unwrap();
+        fs::write(&base, SHORT_CONSENSUS_BASE).unwrap();
+
+        for changed in 0..3 {
+            let mut declarations = [
+                phrase_material_declaration("dictionary", SHORT_CONSENSUS_SOURCE),
+                phrase_material_declaration("confirmation", SHORT_CONSENSUS_CONFIRMATION),
+                phrase_material_declaration("base-payload", SHORT_CONSENSUS_BASE),
+            ];
+            declarations[changed].sha256 = "0".repeat(64);
+            let output = root.join(format!("package-{changed}"));
+            assert!(
+                build_short_consensus_layer_public_package(ShortConsensusLayerBuildOptions {
+                    source: source.clone(),
+                    confirmation: confirmation.clone(),
+                    base_payload: base.clone(),
+                    output: output.clone(),
+                    revision: "short-consensus-v1".to_owned(),
+                    per_code_depth: 2,
+                    entry_limit: 50_000,
+                    source_declaration: declarations[0].clone(),
+                    confirmation_declaration: declarations[1].clone(),
+                    base_declaration: declarations[2].clone(),
+                })
+                .is_err()
+            );
+            assert!(!output.exists());
         }
 
         fs::remove_dir_all(root).unwrap();

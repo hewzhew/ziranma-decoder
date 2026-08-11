@@ -1458,7 +1458,7 @@ fn validate_config(config: PublicRimeSliceConfig) -> Result<(), PublicRimeSliceE
     Ok(())
 }
 
-fn is_han_character(character: char) -> bool {
+pub(crate) fn is_han_character(character: char) -> bool {
     matches!(
         character,
         '\u{3400}'..='\u{4dbf}'

@@ -443,6 +443,13 @@ cargo run --release --bin candidatectl -- build `
 provenance，但只包含新增层，不复制基础载荷，也不自动安装。完整的三材料命令与
 固定万象示例见 [候选快照文档](docs/candidate-snapshots.md#同修订固定短语表审计)。
 
+同码深层双字词使用另一条默认关闭的边界：`build-short-consensus-layer` 认证
+万象、独立词面确认表和参与去重的基础载荷，生成按完整四键码排序的精确短词包。
+`exact-short-query` 与 `exact-short-benchmark` 只建立 `code -> TSV 字节范围` 索引，
+不构造通用 Decoder。它尚未接入 TSF，也不会被普通换代脚本自动安装；完整命令、
+固定数据规模和当前安全门见
+[候选快照文档](docs/candidate-snapshots.md#大型公开词典切片实验)。
+
 `build` 会输出绑定三份包材料的“发布 SHA-256”。发布者应把它放在与候选包
 分开的可信渠道；使用者不能从同一个待验证目录读取摘要再称为可信。拿到独立
 摘要后，可以先只读验证。这个值是 `candidatectl` 对三份规范文件计算的域分隔

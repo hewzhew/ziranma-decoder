@@ -193,8 +193,46 @@ target\release\candidatectl.exe short-consensus-audit `
 
 命令逐字节报告三个输入的 SHA-256，并只输出聚合计数。固定结果为 55,950 个
 基础外双来源确认身份、34,894 个规范码；每码 1 项需 34,894 条，每码 2 项需
-46,832 条。该规模不能塞进基础包到当前快照上限之间的余量；在独立精确层或惰性
-码索引完成前，审计结果不会自动生成、安装或启用候选包。
+46,832 条。该规模不能塞进基础包到当前快照上限之间的余量，因此现在使用独立、
+默认关闭的精确短词包，而不是扩大通用 Decoder：
+
+```powershell
+target\release\candidatectl.exe build-short-consensus-layer `
+  --source .local\public-audit\wanxiang-fdda7afb\jichu.dict.yaml `
+  --confirmation .local\research\upstreams\jieba\jieba\dict.txt `
+  --base-payload .local\public-audit\wanxiang-fdda7afb\package-top120k-v1\lexicon.tsv `
+  --output .local\public-audit\wanxiang-fdda7afb\package-exact-short-consensus-depth2-v1 `
+  --revision wanxiang-jieba-exact-short-depth2-v1 `
+  --per-code-depth 2 --entry-limit 50000 `
+  --source-id wanxiang-jichu-fdda7afb --source-license CC-BY-4.0 `
+  --source-url https://github.com/amzxyz/rime_wanxiang `
+  --source-sha256 9d14c0c49588d63b16c554df4711bed5da822c63de9d50f4759c53542138ac00 `
+  --confirmation-id jieba-dict-67fa2e36 --confirmation-license MIT `
+  --confirmation-url https://github.com/fxsjy/jieba `
+  --confirmation-sha256 7197c3211ddd98962b036cdf40324d1ea2bfaa12bd028e68faa70111a88e12a8 `
+  --base-id wanxiang-top120k-v1 --base-license CC-BY-4.0 `
+  --base-url https://github.com/hewzhew/ziranma-decoder `
+  --base-sha256 849aae039dfe503eb4dadfcb8529ddb74992a05b202e7cf6a69be932c73c8717 `
+  --public
+```
+
+构建命令在创建输出目录前认证三份普通公开材料，并把三者写入 v2 provenance；
+基础载荷只参与去重，不被复制进新包。输出仍使用标准 `manifest.zcm`、
+`provenance.zcp` 和 `lexicon.tsv`，但额外要求所有行是双汉字、双音节、按四键完整
+码排序，同码内按万象权重递减，且每码不超过 8 项。加载器只保留约
+`code -> TSV 字节范围` 的数组，不构造 trie、纠错图或句子 lattice。
+
+固定 depth-2 包有 46,832 条、34,894 个完整码，载荷 899,671 字节，紧凑索引
+558,304 字节，认证摘要为
+`2cd80edd03f2c420e8b54b37db32576dc73c7f63e787df1c82ba99980c0ddec3`。
+本机 release 的一次观测中，首次文件认证与建索引约 36.846 ms，固定码热查询
+十万次平均约 0.105 µs；这只证明没有构造第二个通用 Decoder，不是跨机器性能承诺。
+可用 `exact-short-benchmark` 复测当前机器与文件缓存状态。
+
+`exact-short-query` 只读查询一个四键码。纯预览合并器固定保留已有 Top-1，只能
+把最多 8 个新身份插到它后面，重复身份不提升，候选总数仍受 50 项边界约束；
+该不变量已有回归覆盖。TSF 尚未加载、安装或启用这个包，因此当前日用候选位移
+严格为零。下一安全门是在公开场景中审计预览插入造成的分页位移，再决定是否接入。
 
 导入器同时聚合报告三字、四字规范码，而不显示词条文字。上述固定切片中，
 536,722 个合格三字码有 26,897 个进入最终切片，635,180 个合格四字码有
