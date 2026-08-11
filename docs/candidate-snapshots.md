@@ -416,6 +416,40 @@ cargo run --release --bin candidatectl -- short-rank-audit `
 输入时的真实意图，而且这份 test 已经被观察过；结果只能定位下一轮公开协议，
 不能直接拿来重排日用候选。
 
+### 公开连续短语少分段反事实
+
+`segment-penalty-audit` 检查一种比逐词修补更一般、但仍很弱的假设：在现行
+句子解码 Top-50 已经生成以后，每多一个词界统一扣少量分，能否让较完整的词段
+越过同码的多段单字组合。它冻结原候选池，只比较
+`0 / .010 / .025 / .050 / .100 / .250 / .500` 七档，不创建新候选、不读取
+私人记录，也不按目标词面逐例调参：
+
+```powershell
+target\release\candidatectl.exe segment-penalty-audit `
+  --core-payload .local\candidate-rime-pinyin-simp-0c6861ef-v1\lexicon.tsv `
+  --fit-corpus data\public\ud-chinese-gsdsimp\zh_gsdsimp-ud-train.conllu `
+  --held-out-corpus data\public\ud-chinese-gsdsimp\zh_gsdsimp-ud-dev.conllu `
+  --frontier-limit 6 `
+  --sample-limit 128
+```
+
+固定核心 SHA-256 为
+`fec5d5173127d568a047655b2f92a94c4e546c91565d7fd14808fbf71266b834`；
+train 与 dev 的 SHA-256 分别为
+`956636fe612a1166e8b19e7413fee2e73d68231aca2f0455be2c616b947d629d` 和
+`d03f1eeb93b16071bfbbe6c76b971554be87c9a2307b3f3a820dd7c07f73fb63`。
+两侧各按公开相邻双词选取 128 个句代表。train 基线首选为 83/128、Top-6
+为 114/128；`.025 / .050 / .100` 只各改善一个目标的池内名次，没有新增
+正确首选。`.250 / .500` 各新增一个正确首选并让一个目标进入 Top-6，但也各
+改变了一个仍不正确的非目标首选。严格拟合规则因此选择 `0.000`。dev 基线为
+首选 78/128、Top-6 114/128；因为拟合侧没有安全的非零档位，最终安全门明确
+未通过，运行时排序保持不变。
+
+这个结果说明类似“捕获到”被三段碎片轻微压住的局部现象真实存在，却否定了
+全局固定少分段惩罚。下一轮若继续，应要求更有条件的公开词界证据或完整词结构，
+并继续冻结候选池、保留非目标首选零变化的门槛；不能把一次局部改善写成通用
+排序规则。
+
 静态冲突数量不能证明校准有益，因此还要在不参与词典构建和规则选择的独立公开
 UD test 上比较普通分层与共识校准。审计只保留核心词典能够确认、且词面只有一个
 规范码的 1～4 字 token，避免把语料没有标注的多音读法冒充排序错误：

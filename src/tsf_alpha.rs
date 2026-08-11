@@ -5834,10 +5834,17 @@ impl TsfDocumentEditSession {
         let Some(target) = self.cleanup_target.as_ref() else {
             return Ok(false);
         };
-        self.active_composition()?
-            .map(|active| same_com_identity(&active.composition, target))
-            .transpose()
-            .map(|matches| matches.unwrap_or(false))
+        let state = self
+            .document_composition
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        let Some(active) = state.active.as_ref() else {
+            return Ok(false);
+        };
+        if active.context.as_raw() != self.context.as_raw() {
+            return Ok(false);
+        }
+        same_com_identity(&active.composition, target)
     }
 
     fn start_composition(&self, ec: u32, text: &str) -> Result<()> {
@@ -6009,21 +6016,26 @@ impl Drop for TsfDocumentEditSession {
 
 impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let guarded_cleanup = self.mode != EditSessionMode::KeySynchronous;
         // Input-scope classification also gates personal learning. Keep it
         // available even when the optional wish/feedback recorder is stopped;
         // the classification reads no surrounding text and stores no event.
         let feedback_context_before =
             if !matches!(&self.action, PendingDocumentEdit::UpdatePreedit(_)) {
-                self.active_composition()?
-                    .map(|active| {
-                        classify_feedback_context(
-                            &self.context,
-                            &active.range,
-                            ec,
-                            self.key_advice_mode,
-                        )
-                    })
-                    .unwrap_or(NativeFeedbackContext::Unknown)
+                if guarded_cleanup && !self.cleanup_target_is_current()? {
+                    NativeFeedbackContext::Unknown
+                } else {
+                    self.active_composition()?
+                        .map(|active| {
+                            classify_feedback_context(
+                                &self.context,
+                                &active.range,
+                                ec,
+                                self.key_advice_mode,
+                            )
+                        })
+                        .unwrap_or(NativeFeedbackContext::Unknown)
+                }
             } else {
                 NativeFeedbackContext::Unknown
             };
@@ -6034,7 +6046,7 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
                 Some(active) => self.update_composition(ec, &active, text)?,
                 None => self.start_composition(ec, text)?,
             },
-            PendingDocumentEdit::Cancel if self.mode == EditSessionMode::CleanupAsync => {
+            PendingDocumentEdit::Cancel if guarded_cleanup => {
                 if self.cleanup_target_is_current()? {
                     let _ = self.finish_composition(ec, "")?;
                     cleanup_applied = true;
@@ -6062,7 +6074,8 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
                     tracker.clear();
                 }
             }
-        } else if !matches!(&self.action, PendingDocumentEdit::UpdatePreedit(_))
+        } else if (!guarded_cleanup || cleanup_applied)
+            && !matches!(&self.action, PendingDocumentEdit::UpdatePreedit(_))
             && let Ok(mut tracker) = self.personal_phrase_document_tracker.try_borrow_mut()
         {
             tracker.clear();
@@ -6096,11 +6109,13 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
                 } else {
                     false
                 }
-            } else if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
+            } else if (!guarded_cleanup || cleanup_applied)
+                && let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut()
+            {
                 candidate_ui.end();
-                self.mode != EditSessionMode::CleanupAsync || cleanup_applied
+                true
             } else {
-                self.mode != EditSessionMode::CleanupAsync || cleanup_applied
+                false
             };
         if cleanup_applied {
             self.logical_composition
@@ -6140,6 +6155,7 @@ impl ITfEditSession_Impl for TsfDocumentEditSession_Impl {
 enum EditSessionMode {
     KeySynchronous,
     CleanupAsync,
+    CleanupSynchronousHandoff,
 }
 
 #[derive(Default)]
@@ -9396,7 +9412,9 @@ impl TsfTextService_Impl {
         )
         .into();
         let scheduling = match mode {
-            EditSessionMode::KeySynchronous => TF_ES_SYNC,
+            EditSessionMode::KeySynchronous | EditSessionMode::CleanupSynchronousHandoff => {
+                TF_ES_SYNC
+            }
             EditSessionMode::CleanupAsync => TF_ES_ASYNC,
         };
         let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(scheduling.0 | TF_ES_READWRITE.0);
@@ -9502,6 +9520,70 @@ impl TsfTextService_Impl {
             composition.finish_commit();
         }
         Ok(())
+    }
+
+    fn pending_focus_cleanup_routes_letter(
+        &self,
+        vkey: u16,
+        modifiers: KeyModifiers,
+    ) -> Result<bool> {
+        if self.input_mode.get() != InputMode::Chinese
+            || self.has_active_logical_composition()?
+            || !decode_virtual_key(vkey, modifiers, InputMode::Chinese)
+                .is_some_and(|input| matches!(input, CompositionInput::Letters(_)))
+        {
+            return Ok(false);
+        }
+        let state = self
+            .document_composition
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        Ok(state.cleanup_scheduled && state.active.is_some())
+    }
+
+    fn complete_pending_focus_cleanup_before_letter(&self) -> Result<bool> {
+        let Some(client_id) = self.active_client_id()? else {
+            return Ok(false);
+        };
+        let pending = {
+            let state = self
+                .document_composition
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            if !state.cleanup_scheduled {
+                return Ok(true);
+            }
+            state
+                .active
+                .as_ref()
+                .map(|active| (active.context.clone(), active.composition.clone()))
+        };
+        let Some((context, cleanup_target)) = pending else {
+            return Ok(false);
+        };
+
+        // OnTestKeyDown routes only a plain Chinese letter into this callback.
+        // Try to finish the exact old composition synchronously before making
+        // a new one. If the old Context refuses the request, OnKeyDown returns
+        // FALSE and the host still receives the original key.
+        let _ = self.request_document_edit_session(
+            &context,
+            client_id,
+            DocumentEditRequest {
+                action: PendingDocumentEdit::Cancel,
+                candidate_display: None,
+                feedback_after_success: None,
+                personal_phrase_commit_text: None,
+                mode: EditSessionMode::CleanupSynchronousHandoff,
+                cleanup_target: Some(cleanup_target),
+            },
+        );
+
+        let state = self
+            .document_composition
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        Ok(!state.cleanup_scheduled && state.active.is_none())
     }
 
     fn cleanup_after_focus_loss(&self) -> Result<()> {
@@ -10858,6 +10940,12 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
             // return FALSE when the key still belongs to the host.
             return Ok(true.into());
         }
+        if self.pending_focus_cleanup_routes_letter(vkey, modifiers)? {
+            // The old document still owns a queued cancellation. Route the
+            // real callback so it can attempt an exact synchronous handoff;
+            // failure returns FALSE there and leaves this key to the host.
+            return Ok(true.into());
+        }
         if self.should_route_candidate_forget_key(vkey, modifiers)? {
             return Ok(self.plan_key(wparam, modifiers)?.is_some().into());
         }
@@ -10926,6 +11014,11 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
             return Ok(true.into());
         }
         modifiers = self.observe_nonshift_key_down_modifiers(modifiers);
+        if self.pending_focus_cleanup_routes_letter(vkey, modifiers)?
+            && !self.complete_pending_focus_cleanup_before_letter()?
+        {
+            return Ok(false.into());
+        }
         if self.should_route_candidate_forget_key(vkey, modifiers)? {
             return self.apply_key_with_modifiers(context, wparam, modifiers);
         }
@@ -15190,6 +15283,176 @@ mod tests {
         unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
         drop(context);
         drop(document_manager);
+        drop(key_sink);
+        drop(service);
+        drop(service_object);
+        drop(thread_manager);
+        assert_eq!(DllCanUnloadNow(), S_OK);
+    }
+
+    #[test]
+    fn process_test_hands_first_letter_across_pending_focus_cleanup() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(FixedCandidateProvider),
+        )));
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+        let key_sink: ITfKeyEventSink = service_object.to_interface();
+        let thread_event_sink: ITfThreadMgrEventSink = service_object.to_interface();
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        unsafe { service.ActivateEx(&thread_manager, client_id, 0) }
+            .expect("process-test activation should succeed");
+        let document_manager =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("document manager creation");
+        let mut context = None;
+        let mut text_store_cookie = 0;
+        unsafe {
+            document_manager.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut context,
+                &mut text_store_cookie,
+            )
+        }
+        .expect("synthetic context creation");
+        let context = context.expect("CreateContext should return a context");
+        unsafe { document_manager.Push(&context) }.expect("context push");
+        unsafe { thread_manager.SetFocus(&document_manager) }.expect("document focus");
+
+        let a = WPARAM(usize::from(VK_A.0));
+        let b = WPARAM(usize::from(VK_A.0 + 1));
+        let lparam = LPARAM(0);
+        assert!(
+            unsafe { key_sink.OnTestKeyDown(&context, a, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert!(
+            unsafe { key_sink.OnKeyDown(&context, a, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+
+        let second_document =
+            unsafe { thread_manager.CreateDocumentMgr() }.expect("second document creation");
+        let mut second_context = None;
+        let mut second_text_store_cookie = 0;
+        unsafe {
+            second_document.CreateContext(
+                client_id,
+                0,
+                None::<&IUnknown>,
+                &mut second_context,
+                &mut second_text_store_cookie,
+            )
+        }
+        .expect("second context creation");
+        let second_context = second_context.expect("second context should be returned");
+        unsafe { second_document.Push(&second_context) }.expect("second context push");
+        unsafe { thread_manager.SetFocus(&second_document) }.expect("second document focus");
+
+        // Moving to another TSF document accepts an asynchronous cancellation
+        // and clears the logical buffer immediately, while the old document
+        // composition stays active until that edit session or host termination.
+        unsafe { thread_event_sink.OnSetFocus(&second_document, &document_manager) }
+            .expect("document focus cleanup");
+        assert!(service_object.composition.borrow().phonetic().is_empty());
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .cleanup_scheduled
+        );
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_some()
+        );
+        let old_cleanup_target = service_object
+            .document_composition
+            .borrow()
+            .active
+            .as_ref()
+            .expect("the old document composition should still be pending")
+            .composition
+            .clone();
+
+        // Typing in the newly focused document before queued cleanup runs must
+        // synchronously finish the exact old composition and establish the new
+        // one. A failed handoff instead returns FALSE from OnKeyDown, so this
+        // path never claims success without a document edit.
+        assert!(
+            unsafe { key_sink.OnTestKeyDown(&second_context, b, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert!(
+            unsafe { key_sink.OnKeyDown(&second_context, b, lparam) }
+                .unwrap()
+                .as_bool()
+        );
+        assert_eq!(service_object.composition.borrow().phonetic(), "b");
+        assert_eq!(read_context_text(&context, client_id), "");
+        assert_eq!(read_context_text(&second_context, client_id), "b");
+        assert!(
+            !service_object
+                .document_composition
+                .borrow()
+                .cleanup_scheduled
+        );
+
+        // Model the already queued asynchronous edit arriving after the new
+        // composition starts. Its exact old identity must make it a no-op;
+        // otherwise a late focus cleanup could erase the recovered first key.
+        service_object
+            .request_document_edit_session(
+                &context,
+                client_id,
+                DocumentEditRequest {
+                    action: PendingDocumentEdit::Cancel,
+                    candidate_display: None,
+                    feedback_after_success: None,
+                    personal_phrase_commit_text: None,
+                    mode: EditSessionMode::CleanupSynchronousHandoff,
+                    cleanup_target: Some(old_cleanup_target),
+                },
+            )
+            .expect("a stale guarded cleanup should complete as a no-op");
+        assert_eq!(service_object.composition.borrow().phonetic(), "b");
+        assert_eq!(read_context_text(&second_context, client_id), "b");
+
+        terminate_composition_from_host(&second_context);
+        assert!(
+            service_object
+                .document_composition
+                .borrow()
+                .active
+                .is_none()
+        );
+        assert!(
+            !service_object
+                .document_composition
+                .borrow()
+                .cleanup_scheduled
+        );
+
+        unsafe { second_document.Pop(TF_POPF_ALL) }.expect("second context pop");
+        unsafe { document_manager.Pop(TF_POPF_ALL) }.expect("context pop");
+        unsafe { service.Deactivate() }.expect("service deactivation");
+        unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
+        drop(second_context);
+        drop(second_document);
+        drop(context);
+        drop(document_manager);
+        drop(thread_event_sink);
         drop(key_sink);
         drop(service);
         drop(service_object);

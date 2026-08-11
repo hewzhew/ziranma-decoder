@@ -40,7 +40,7 @@ use ziranma_core::{
     PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
     PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
+    SentenceCandidate, SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
     SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
     audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
     candidate_package_authentication_sha256, candidate_package_storage_id,
@@ -118,6 +118,13 @@ enum Options {
         core_payload: PathBuf,
         held_out_corpus: PathBuf,
         frontier_limit: usize,
+    },
+    SegmentPenaltyAudit {
+        core_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+        sample_limit: usize,
     },
     LengthCoverageAudit {
         base_payload: PathBuf,
@@ -385,6 +392,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             held_out_corpus,
             frontier_limit,
         } => audit_public_short_ranks(&core_payload, &held_out_corpus, frontier_limit)?,
+        Options::SegmentPenaltyAudit {
+            core_payload,
+            fit_corpus,
+            held_out_corpus,
+            frontier_limit,
+            sample_limit,
+        } => audit_public_segment_penalty(
+            &core_payload,
+            &fit_corpus,
+            &held_out_corpus,
+            frontier_limit,
+            sample_limit,
+        )?,
         Options::LengthCoverageAudit {
             base_payload,
             challenger_payload,
@@ -599,6 +619,7 @@ fn parse_options(
         "compare" => parse_compare(arguments),
         "consensus-audit" => parse_consensus_audit(arguments),
         "short-rank-audit" => parse_short_rank_audit(arguments),
+        "segment-penalty-audit" => parse_segment_penalty_audit(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
@@ -1153,6 +1174,48 @@ fn parse_short_rank_audit(
         core_payload: core_payload.ok_or("short-rank-audit requires --core-payload")?,
         held_out_corpus: held_out_corpus.ok_or("short-rank-audit requires --held-out-corpus")?,
         frontier_limit,
+    })
+}
+
+fn parse_segment_penalty_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    let mut sample_limit = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            _ => {
+                return Err("unknown segment-penalty-audit argument; value was suppressed".into());
+            }
+        }
+    }
+    let frontier_limit = frontier_limit.ok_or("segment-penalty-audit requires --frontier-limit")?;
+    if !(1..=10).contains(&frontier_limit) {
+        return Err("segment-penalty-audit --frontier-limit must be 1..10".into());
+    }
+    let sample_limit = sample_limit.ok_or("segment-penalty-audit requires --sample-limit")?;
+    if !(1..=512).contains(&sample_limit) {
+        return Err("segment-penalty-audit --sample-limit must be 1..512".into());
+    }
+    Ok(Options::SegmentPenaltyAudit {
+        core_payload: core_payload.ok_or("segment-penalty-audit requires --core-payload")?,
+        fit_corpus: fit_corpus.ok_or("segment-penalty-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("segment-penalty-audit requires --held-out-corpus")?,
+        frontier_limit,
+        sample_limit,
     })
 }
 
@@ -1942,6 +2005,9 @@ fn print_usage() {
     );
     eprintln!(
         "  short-rank-audit --core-payload <LEXICON.tsv> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <1..50>"
+    );
+    eprintln!(
+        "  segment-penalty-audit --core-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <1..10> --sample-limit <1..512>"
     );
     eprintln!(
         "  length-coverage-audit --base-payload <LEXICON.tsv> --challenger-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu>"
@@ -3124,6 +3190,307 @@ fn audit_public_short_ranks(
         "口径：目标只来自独立公开 UD 留出中、核心词典可确认且只有一个规范码的 1～2 字 token；逐键前沿把未完成规范码称为“预览”，不把它冒充已经表达完的用户意图。完整码次序只读取核心精确词候选，不混入补充层、个人记忆或纠错。报告不显示词面，不写文件、不改候选槽位。\n本次操作：只读\n",
     );
     Ok(output)
+}
+
+const SEGMENT_PENALTY_PROFILES_MILLI: [u32; 7] = [0, 10, 25, 50, 100, 250, 500];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicSegmentPenaltyAudit {
+    probes: usize,
+    baseline_at_one: usize,
+    reranked_at_one: usize,
+    baseline_visible: usize,
+    reranked_visible: usize,
+    correct_top_gained: usize,
+    correct_top_lost: usize,
+    newly_visible: usize,
+    lost_visible: usize,
+    non_target_top_changes: usize,
+    target_rank_improved: usize,
+    target_rank_unchanged: usize,
+    target_rank_worsened: usize,
+    target_outside_pool: usize,
+}
+
+impl PublicSegmentPenaltyAudit {
+    fn observe(
+        &mut self,
+        baseline: &[SentenceCandidate],
+        reranked: &[usize],
+        expected: &str,
+        frontier_limit: usize,
+    ) {
+        let baseline_rank = baseline
+            .iter()
+            .position(|candidate| candidate.text == expected)
+            .map(|index| index + 1);
+        let reranked_rank = reranked
+            .iter()
+            .position(|index| baseline[*index].text == expected)
+            .map(|index| index + 1);
+        let baseline_top = baseline.first().map(|candidate| candidate.text.as_str());
+        let reranked_top = reranked.first().map(|index| baseline[*index].text.as_str());
+        self.probes += 1;
+        self.baseline_at_one += usize::from(baseline_rank == Some(1));
+        self.reranked_at_one += usize::from(reranked_rank == Some(1));
+        self.baseline_visible +=
+            usize::from(baseline_rank.is_some_and(|rank| rank <= frontier_limit));
+        self.reranked_visible +=
+            usize::from(reranked_rank.is_some_and(|rank| rank <= frontier_limit));
+        self.correct_top_gained +=
+            usize::from(baseline_rank != Some(1) && reranked_rank == Some(1));
+        self.correct_top_lost += usize::from(baseline_rank == Some(1) && reranked_rank != Some(1));
+        self.newly_visible += usize::from(
+            baseline_rank.is_none_or(|rank| rank > frontier_limit)
+                && reranked_rank.is_some_and(|rank| rank <= frontier_limit),
+        );
+        self.lost_visible += usize::from(
+            baseline_rank.is_some_and(|rank| rank <= frontier_limit)
+                && reranked_rank.is_none_or(|rank| rank > frontier_limit),
+        );
+        self.non_target_top_changes += usize::from(
+            baseline_top != reranked_top && baseline_rank != Some(1) && reranked_rank != Some(1),
+        );
+        match (baseline_rank, reranked_rank) {
+            (Some(before), Some(after)) if after < before => self.target_rank_improved += 1,
+            (Some(before), Some(after)) if after > before => self.target_rank_worsened += 1,
+            (Some(_), Some(_)) => self.target_rank_unchanged += 1,
+            (None, None) => self.target_outside_pool += 1,
+            (None, Some(_)) => self.target_rank_improved += 1,
+            (Some(_), None) => self.target_rank_worsened += 1,
+        }
+    }
+
+    fn safe(self) -> bool {
+        self.correct_top_lost == 0 && self.lost_visible == 0 && self.non_target_top_changes == 0
+    }
+}
+
+fn audit_public_segment_penalty(
+    core_payload: &Path,
+    fit_corpus: &Path,
+    held_out_corpus: &Path,
+    frontier_limit: usize,
+    sample_limit: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        core_payload,
+        "core public segment-penalty payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        fit_corpus,
+        "public segment-penalty fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        held_out_corpus,
+        "public segment-penalty held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let core_sha256 = candidate_sha256_hex(core_text.as_bytes());
+    let fit_sha256 = candidate_sha256_hex(fit_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if fit_sha256 == held_out_sha256 {
+        return Err("segment-penalty-audit requires a distinct held-out corpus".into());
+    }
+    if core_sha256 == fit_sha256 || core_sha256 == held_out_sha256 {
+        return Err("segment-penalty-audit requires separate lexicon and corpus materials".into());
+    }
+
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let decoder = Decoder::new(core_entries.clone());
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let fit_selection =
+        select_public_continuous_composition_cases(&fit, &core_entries, sample_limit);
+    let held_out_selection =
+        select_public_continuous_composition_cases(&held_out, &core_entries, sample_limit);
+    if fit_selection.probes.is_empty() || held_out_selection.probes.is_empty() {
+        return Err("segment-penalty-audit public corpora produced no eligible probes".into());
+    }
+
+    let fit_reports = evaluate_public_segment_penalty_profiles(
+        &decoder,
+        &fit_selection.probes,
+        frontier_limit,
+        &SEGMENT_PENALTY_PROFILES_MILLI,
+    )?;
+    let mut selected_index = 0;
+    for index in 1..fit_reports.len() {
+        if public_segment_penalty_profile_precedes(
+            fit_reports[index],
+            SEGMENT_PENALTY_PROFILES_MILLI[index],
+            fit_reports[selected_index],
+            SEGMENT_PENALTY_PROFILES_MILLI[selected_index],
+        ) {
+            selected_index = index;
+        }
+    }
+    let selected_penalty = SEGMENT_PENALTY_PROFILES_MILLI[selected_index];
+    let held_out_reports = if selected_penalty == 0 {
+        evaluate_public_segment_penalty_profiles(
+            &decoder,
+            &held_out_selection.probes,
+            frontier_limit,
+            &[0],
+        )?
+    } else {
+        evaluate_public_segment_penalty_profiles(
+            &decoder,
+            &held_out_selection.probes,
+            frontier_limit,
+            &[0, selected_penalty],
+        )?
+    };
+    let held_out_baseline = held_out_reports[0];
+    let held_out_selected = held_out_reports[held_out_reports.len() - 1];
+    let held_out_gate = held_out_selected.safe()
+        && held_out_selected.correct_top_gained != 0
+        && held_out_selected.reranked_at_one > held_out_baseline.baseline_at_one;
+
+    let mut output = String::new();
+    writeln!(output, "公开连续短语少分段惩罚审计")?;
+    writeln!(
+        output,
+        "核心词条：{} · SHA-256 {core_sha256}；冻结候选池：前 {MAX_CANDIDATE_SNAPSHOT_RANK}；可见前沿：前 {frontier_limit}",
+        core_entries.len(),
+    )?;
+    writeln!(
+        output,
+        "拟合：{} 句 · SHA-256 {fit_sha256}；候选窗口 {}，可覆盖 {}，句代表 {}，选取 {}",
+        fit.stats.sentences,
+        fit_selection.stats.source_windows,
+        fit_selection.stats.exact_word_coverable,
+        fit_selection.stats.sentence_representatives,
+        fit_selection.stats.selected,
+    )?;
+    writeln!(
+        output,
+        "保留：{} 句 · SHA-256 {held_out_sha256}；候选窗口 {}，可覆盖 {}，句代表 {}，选取 {}",
+        held_out.stats.sentences,
+        held_out_selection.stats.source_windows,
+        held_out_selection.stats.exact_word_coverable,
+        held_out_selection.stats.sentence_representatives,
+        held_out_selection.stats.selected,
+    )?;
+    writeln!(output, "拟合档位（每多一个词界扣分）：")?;
+    for (penalty, report) in SEGMENT_PENALTY_PROFILES_MILLI.iter().zip(&fit_reports) {
+        write_public_segment_penalty_report(&mut output, *penalty, *report, frontier_limit)?;
+    }
+    writeln!(
+        output,
+        "拟合选择：{}；先要求正确首选零损失、可见零损失、非目标首选零变化，再比较新增正确首选和可见召回；平局保留更小惩罚。",
+        public_segment_penalty_label(selected_penalty),
+    )?;
+    writeln!(output, "保留评测：")?;
+    write_public_segment_penalty_report(&mut output, 0, held_out_baseline, frontier_limit)?;
+    if selected_penalty != 0 {
+        write_public_segment_penalty_report(
+            &mut output,
+            selected_penalty,
+            held_out_selected,
+            frontier_limit,
+        )?;
+    }
+    writeln!(
+        output,
+        "安全门：{}",
+        if held_out_gate {
+            "通过（保留集新增正确首选，且正确首选、可见目标和非目标首选均零损失）"
+        } else {
+            "未通过（不得把该少分段惩罚接入运行时）"
+        }
+    )?;
+    output.push_str(
+        "口径：只从公开 UD 相邻双词构造完整双拼短语；所有档位重排同一份现行 Top-50，不创建候选，不读取私人记录，也不按目标文字逐例调参。分段数只作为离线反事实，当前运行时排序未改变。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn evaluate_public_segment_penalty_profiles(
+    decoder: &Decoder,
+    probes: &[ContinuousCompositionProbe],
+    frontier_limit: usize,
+    penalty_profiles_milli: &[u32],
+) -> Result<Vec<PublicSegmentPenaltyAudit>, Box<dyn std::error::Error>> {
+    let mut reports = vec![PublicSegmentPenaltyAudit::default(); penalty_profiles_milli.len()];
+    for probe in probes {
+        let candidates =
+            decoder.decode_sentence(probe.full_observed.as_str(), MAX_CANDIDATE_SNAPSHOT_RANK)?;
+        for (report, penalty_milli) in reports.iter_mut().zip(penalty_profiles_milli) {
+            let penalty = f64::from(*penalty_milli) / 1_000.0;
+            let mut reranked = (0..candidates.len()).collect::<Vec<_>>();
+            reranked.sort_by(|left, right| {
+                let left_boundaries = candidates[*left].segments.len().saturating_sub(1) as f64;
+                let right_boundaries = candidates[*right].segments.len().saturating_sub(1) as f64;
+                let left_score = candidates[*left].total_score - penalty * left_boundaries;
+                let right_score = candidates[*right].total_score - penalty * right_boundaries;
+                right_score
+                    .total_cmp(&left_score)
+                    .then_with(|| left.cmp(right))
+            });
+            report.observe(&candidates, &reranked, &probe.expected_text, frontier_limit);
+        }
+    }
+    Ok(reports)
+}
+
+fn public_segment_penalty_profile_precedes(
+    challenger: PublicSegmentPenaltyAudit,
+    challenger_penalty: u32,
+    current: PublicSegmentPenaltyAudit,
+    current_penalty: u32,
+) -> bool {
+    challenger
+        .safe()
+        .cmp(&current.safe())
+        .then_with(|| {
+            challenger
+                .correct_top_gained
+                .cmp(&current.correct_top_gained)
+        })
+        .then_with(|| challenger.reranked_at_one.cmp(&current.reranked_at_one))
+        .then_with(|| challenger.reranked_visible.cmp(&current.reranked_visible))
+        .then_with(|| {
+            current
+                .target_rank_worsened
+                .cmp(&challenger.target_rank_worsened)
+        })
+        .then_with(|| current_penalty.cmp(&challenger_penalty))
+        .is_gt()
+}
+
+fn public_segment_penalty_label(penalty_milli: u32) -> String {
+    format!("每词界 {:.3}", f64::from(penalty_milli) / 1_000.0)
+}
+
+fn write_public_segment_penalty_report(
+    output: &mut String,
+    penalty_milli: u32,
+    report: PublicSegmentPenaltyAudit,
+    frontier_limit: usize,
+) -> Result<(), std::fmt::Error> {
+    writeln!(
+        output,
+        "  {}：首选 {}/{}（基线 {}），新增正确首选 {}、丢失 {}、非目标首选变化 {}；Top-{frontier_limit} {}/{}（基线 {}），新进 {}、掉出 {}；目标名次改善 / 不变 / 变差 / 池外：{} / {} / {} / {}",
+        public_segment_penalty_label(penalty_milli),
+        report.reranked_at_one,
+        report.probes,
+        report.baseline_at_one,
+        report.correct_top_gained,
+        report.correct_top_lost,
+        report.non_target_top_changes,
+        report.reranked_visible,
+        report.probes,
+        report.baseline_visible,
+        report.newly_visible,
+        report.lost_visible,
+        report.target_rank_improved,
+        report.target_rank_unchanged,
+        report.target_rank_worsened,
+        report.target_outside_pool,
+    )
 }
 
 fn ambiguous_lexicon_surfaces(entries: &[LexiconEntry]) -> HashSet<&str> {
@@ -8671,6 +9038,49 @@ mod tests {
     }
 
     #[test]
+    fn segment_penalty_audit_parser_binds_fit_holdout_and_bounds() {
+        assert_eq!(
+            parse_options([
+                "segment-penalty-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "6".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+            ])
+            .unwrap(),
+            Options::SegmentPenaltyAudit {
+                core_payload: PathBuf::from("core.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                frontier_limit: 6,
+                sample_limit: 128,
+            }
+        );
+        assert!(
+            parse_options([
+                "segment-penalty-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "11".to_owned(),
+                "--sample-limit".to_owned(),
+                "128".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn phrase_coverage_parser_binds_both_public_materials_and_holdout() {
         assert_eq!(
             parse_options([
@@ -10310,6 +10720,73 @@ mod tests {
         assert!(report.contains("不把它冒充已经表达完的用户意图"));
         assert!(report.contains("本次操作：只读"));
         for public_value in ["甲", "钾", "吗", "马", "行"] {
+            assert!(!report.contains(public_value));
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn segment_penalty_audit_reorders_only_the_frozen_pool() {
+        let entries = parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+             不\tbu\t100\n\
+             或\thuo\t20\n\
+             到\tdao\t100\n\
+             捕获\tbu huo\t8\n",
+        )
+        .unwrap();
+        let decoder = Decoder::new(entries);
+        let full = encode_pinyin_phrase("bu huo dao").unwrap().full_code;
+        let probes = [ContinuousCompositionProbe {
+            id: "synthetic-segment-penalty".to_owned(),
+            full_observed: full.clone(),
+            tail_abbreviated_observed: full.clone(),
+            transposed_observed: full,
+            expected_text: "捕获到".to_owned(),
+            expected_segments: vec!["捕获".to_owned(), "到".to_owned()],
+        }];
+
+        let reports =
+            evaluate_public_segment_penalty_profiles(&decoder, &probes, 6, &[0, 100]).unwrap();
+        let [baseline, reranked] = reports.as_slice() else {
+            panic!("both requested segment-penalty profiles should be returned");
+        };
+        assert_eq!(baseline.baseline_at_one, 0);
+        assert_eq!(baseline.reranked_at_one, 0);
+        assert_eq!(reranked.correct_top_gained, 1);
+        assert_eq!(reranked.correct_top_lost, 0);
+        assert_eq!(reranked.non_target_top_changes, 0);
+        assert_eq!(reranked.target_rank_improved, 1);
+    }
+
+    #[test]
+    fn segment_penalty_audit_is_aggregate_only_and_read_only() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲乙\tjia yi\t100\n\
+丙丁\tbing ding\t80\n";
+        const FIT: &str = "# sent_id = public-fit\n\
+1\t甲乙\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t丙丁\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+        const HELD_OUT: &str = "# sent_id = public-held-out\n\
+1\t甲乙\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\
+2\t丙丁\t_\tNOUN\t_\t_\t1\tdep\t_\t_\n\n";
+
+        let root = temporary_test_root();
+        let core = root.join("core.tsv");
+        let fit = root.join("fit.conllu");
+        let held_out = root.join("held-out.conllu");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&fit, FIT).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+
+        let report = audit_public_segment_penalty(&core, &fit, &held_out, 6, 8).unwrap();
+        assert!(report.contains("公开连续短语少分段惩罚审计"));
+        assert!(report.contains("拟合档位（每多一个词界扣分）"));
+        assert!(report.contains("安全门："));
+        assert!(report.contains("本次操作：只读"));
+        for public_value in ["甲乙", "丙丁", "甲乙丙丁"] {
             assert!(!report.contains(public_value));
         }
 
