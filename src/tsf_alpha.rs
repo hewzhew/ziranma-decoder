@@ -13276,6 +13276,7 @@ mod tests {
 
     #[test]
     fn tsf_plan_exposes_shen_me_for_two_timed_reversed_pairs() {
+        let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             reversed_adjacent_pair_provider(),
         ))));
