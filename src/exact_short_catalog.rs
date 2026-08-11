@@ -14,7 +14,7 @@ use std::mem::size_of;
 use crate::public_lexicon_slice::is_han_character;
 use crate::{
     CandidatePackageError, CandidatePackageManifest, MAX_CANDIDATE_SNAPSHOT_RANK,
-    encode_pinyin_phrase, normalize_pinyin_tone_marks,
+    candidate_payload_fingerprint, encode_pinyin_phrase, normalize_pinyin_tone_marks,
 };
 
 const LEXICON_HEADER: &str = "text\tpinyin\tfrequency\n";
@@ -35,10 +35,149 @@ struct CodeRange {
 #[derive(Clone, Debug)]
 pub struct ExactShortWordCatalog {
     revision: String,
+    payload_fingerprint: u64,
     payload: Box<str>,
     ranges: Vec<CodeRange>,
     entry_count: usize,
     maximum_code_depth: usize,
+}
+
+/// Memory-only candidate-page state for one exact-short query.
+///
+/// The first page bypasses the exact catalog completely. Crossing into the
+/// second page makes one guarded insertion decision; later depth increases
+/// freeze every candidate already returned and append only unseen primary
+/// identities. The state has no persistence or debug representation because
+/// callers may supply personalized candidate text in `primary`.
+#[derive(Default)]
+pub struct ExactShortPageSession {
+    code: String,
+    catalog_revision: String,
+    catalog_payload_fingerprint: u64,
+    page_size: usize,
+    exact_promotions: usize,
+    requested_limit: usize,
+    primary: Vec<String>,
+    candidates: Vec<String>,
+    second_page_decided: bool,
+}
+
+impl ExactShortPageSession {
+    /// Extends one candidate query without rewriting an already returned
+    /// prefix.
+    ///
+    /// `primary` must be the deterministic primary-layer prefix for
+    /// `total_limit`. A changed code starts a fresh session. For the same code,
+    /// the catalog revision, page size, promotion bound, and previously seen
+    /// primary prefix are immutable. Requests at or below the high-water mark
+    /// reuse the deepest cached result.
+    pub fn extend<'a>(
+        &'a mut self,
+        catalog: &ExactShortWordCatalog,
+        primary: &[String],
+        code: &str,
+        total_limit: usize,
+        exact_promotions: usize,
+        page_size: usize,
+    ) -> Result<&'a [String], ExactShortWordCatalogError> {
+        if pack_code(code).is_none() {
+            return Err(ExactShortWordCatalogError::InvalidQueryCode);
+        }
+        if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&total_limit) {
+            return Err(ExactShortWordCatalogError::InvalidVisibleLimit);
+        }
+        if page_size == 0 || page_size > total_limit {
+            return Err(ExactShortWordCatalogError::InvalidStablePrefix);
+        }
+        if exact_promotions > MAX_EXACT_SHORT_WORDS_PER_CODE {
+            return Err(ExactShortWordCatalogError::InvalidPromotionLimit);
+        }
+
+        if self.catalog_revision.is_empty() || self.code != code {
+            self.clear();
+            self.code.push_str(code);
+            self.catalog_revision.push_str(catalog.revision());
+            self.catalog_payload_fingerprint = catalog.payload_fingerprint;
+            self.page_size = page_size;
+            self.exact_promotions = exact_promotions;
+        } else if self.catalog_revision != catalog.revision()
+            || self.catalog_payload_fingerprint != catalog.payload_fingerprint
+            || self.page_size != page_size
+            || self.exact_promotions != exact_promotions
+        {
+            return Err(ExactShortWordCatalogError::ChangedPageSession);
+        }
+
+        if self.requested_limit >= total_limit {
+            return Ok(&self.candidates);
+        }
+
+        let primary = &primary[..primary.len().min(total_limit)];
+        if self.primary.len() > primary.len()
+            || self
+                .primary
+                .iter()
+                .ne(primary.iter().take(self.primary.len()))
+        {
+            return Err(ExactShortWordCatalogError::UnstablePrimaryPrefix);
+        }
+
+        let candidates = if self.second_page_decided {
+            let mut extended = self.candidates.clone();
+            for candidate in primary {
+                if extended.len() == total_limit {
+                    break;
+                }
+                if !extended.contains(candidate) {
+                    extended.push(candidate.clone());
+                }
+            }
+            extended
+        } else if total_limit > page_size && primary.len() >= page_size {
+            let merged = catalog.preview_candidate_texts_after_page_guarded(
+                primary,
+                code,
+                total_limit,
+                exact_promotions,
+                page_size,
+            )?;
+            if !self.candidates.is_empty()
+                && self
+                    .candidates
+                    .iter()
+                    .ne(merged.iter().take(self.candidates.len()))
+            {
+                return Err(ExactShortWordCatalogError::UnstablePrimaryPrefix);
+            }
+            self.second_page_decided = true;
+            merged
+        } else {
+            primary.to_vec()
+        };
+
+        self.primary = primary.to_vec();
+        self.candidates = candidates;
+        self.requested_limit = total_limit;
+        Ok(&self.candidates)
+    }
+
+    /// Discards the in-memory high-water mark and all candidate text.
+    pub fn clear(&mut self) {
+        self.code.clear();
+        self.catalog_revision.clear();
+        self.catalog_payload_fingerprint = 0;
+        self.page_size = 0;
+        self.exact_promotions = 0;
+        self.requested_limit = 0;
+        self.primary.clear();
+        self.candidates.clear();
+        self.second_page_decided = false;
+    }
+
+    /// Returns the deepest logical request already represented by this state.
+    pub fn requested_limit(&self) -> usize {
+        self.requested_limit
+    }
 }
 
 impl ExactShortWordCatalog {
@@ -184,6 +323,7 @@ impl ExactShortWordCatalog {
         drop(texts_for_code);
         Ok(Self {
             revision: manifest.revision().to_owned(),
+            payload_fingerprint: candidate_payload_fingerprint(payload.as_bytes()),
             payload,
             ranges,
             entry_count,
@@ -449,6 +589,10 @@ pub enum ExactShortWordCatalogError {
     InvalidPromotionLimit,
     /// A preview prefix was zero or exceeded the total result boundary.
     InvalidStablePrefix,
+    /// One active page session changed its catalog or insertion configuration.
+    ChangedPageSession,
+    /// A deeper primary request rewrote a prefix that had already been seen.
+    UnstablePrimaryPrefix,
 }
 
 impl From<CandidatePackageError> for ExactShortWordCatalogError {
@@ -491,6 +635,8 @@ impl fmt::Display for ExactShortWordCatalogError {
             Self::InvalidVisibleLimit => write!(formatter, "精确短词预览候选上限无效"),
             Self::InvalidPromotionLimit => write!(formatter, "精确短词预览提升上限无效"),
             Self::InvalidStablePrefix => write!(formatter, "精确短词预览固定前缀无效"),
+            Self::ChangedPageSession => write!(formatter, "精确短词分页会话配置发生变化"),
+            Self::UnstablePrimaryPrefix => write!(formatter, "精确短词分页基础候选前缀不稳定"),
         }
     }
 }
@@ -751,6 +897,134 @@ mod tests {
                 .unwrap(),
             primary
         );
+    }
+
+    #[test]
+    fn page_session_keeps_the_first_page_unmodified_until_a_second_page_exists() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = (1..=12)
+            .map(|rank| format!("基础{rank}"))
+            .collect::<Vec<_>>();
+        let mut session = ExactShortPageSession::default();
+
+        assert_eq!(
+            session
+                .extend(&catalog, &primary[..6], "ubuu", 6, 2, 6)
+                .unwrap(),
+            &primary[..6]
+        );
+        assert_eq!(session.requested_limit(), 6);
+        assert!(!session.second_page_decided);
+        assert_eq!(session.candidates, primary[..6]);
+    }
+
+    #[test]
+    fn page_session_freezes_every_presented_prefix_across_lazy_depths() {
+        const GUARDED_PAYLOAD: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t90\n\
+手术\tshou shu\t80\n\
+首数\tshou shu\t70\n";
+        let catalog =
+            ExactShortWordCatalog::load(&manifest(GUARDED_PAYLOAD), GUARDED_PAYLOAD).unwrap();
+        let mut primary = (1..=50)
+            .map(|rank| format!("基础{rank}"))
+            .collect::<Vec<_>>();
+        primary[16] = "收束".to_owned();
+        let mut session = ExactShortPageSession::default();
+
+        let first = session
+            .extend(&catalog, &primary[..6], "ubuu", 6, 2, 6)
+            .unwrap()
+            .to_vec();
+        let second = session
+            .extend(&catalog, &primary[..12], "ubuu", 12, 2, 6)
+            .unwrap()
+            .to_vec();
+        let third = session
+            .extend(&catalog, &primary[..18], "ubuu", 18, 2, 6)
+            .unwrap()
+            .to_vec();
+        let deepest = session
+            .extend(&catalog, &primary, "ubuu", 50, 2, 6)
+            .unwrap()
+            .to_vec();
+
+        assert_eq!(first, primary[..6]);
+        assert_eq!(&second[..first.len()], first.as_slice());
+        assert_eq!(&second[6..8], ["收束", "手术"]);
+        assert_eq!(&third[..second.len()], second.as_slice());
+        assert_eq!(&deepest[..third.len()], third.as_slice());
+        assert_eq!(deepest.len(), 50);
+        assert_eq!(deepest.iter().collect::<HashSet<_>>().len(), deepest.len());
+        assert_eq!(session.requested_limit(), 50);
+
+        let independently_recomputed = catalog
+            .preview_candidate_texts_after_page_guarded(&primary[..18], "ubuu", 18, 2, 6)
+            .unwrap();
+        assert_eq!(independently_recomputed[6], "手术");
+        assert_ne!(
+            &independently_recomputed[..second.len()],
+            second.as_slice(),
+            "a fresh deeper guard would retract the already presented second-page decision"
+        );
+
+        assert_eq!(
+            session
+                .extend(&catalog, &primary[..6], "ubuu", 6, 2, 6)
+                .unwrap(),
+            deepest,
+            "shallower navigation reuses the deepest high-water result"
+        );
+    }
+
+    #[test]
+    fn page_session_rejects_primary_reordering_and_midstream_configuration_drift() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = (1..=12)
+            .map(|rank| format!("基础{rank}"))
+            .collect::<Vec<_>>();
+        let mut session = ExactShortPageSession::default();
+        session
+            .extend(&catalog, &primary[..6], "ubuu", 6, 2, 6)
+            .unwrap();
+
+        assert_eq!(
+            session.extend(&catalog, &primary[..6], "ubuu", 6, 1, 6),
+            Err(ExactShortWordCatalogError::ChangedPageSession)
+        );
+        let changed_payload = PAYLOAD.replace("手术", "首数");
+        let same_revision_changed_catalog =
+            ExactShortWordCatalog::load(&manifest(&changed_payload), &changed_payload).unwrap();
+        assert_eq!(
+            session.extend(&same_revision_changed_catalog, &primary, "ubuu", 12, 2, 6,),
+            Err(ExactShortWordCatalogError::ChangedPageSession)
+        );
+        let replacement_catalog = ExactShortWordCatalog::load(
+            &CandidatePackageManifest::from_payload("exact-short-test-v2", false, PAYLOAD).unwrap(),
+            PAYLOAD,
+        )
+        .unwrap();
+        assert_eq!(
+            session.extend(&replacement_catalog, &primary, "ubuu", 12, 2, 6),
+            Err(ExactShortWordCatalogError::ChangedPageSession)
+        );
+
+        let mut reordered = primary.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            session.extend(&catalog, &reordered, "ubuu", 12, 2, 6),
+            Err(ExactShortWordCatalogError::UnstablePrimaryPrefix)
+        );
+        assert_eq!(session.requested_limit(), 6);
+
+        assert_eq!(
+            session
+                .extend(&replacement_catalog, &primary[..6], "ubxd", 6, 2, 6)
+                .unwrap(),
+            &primary[..6],
+            "a changed code starts a fresh bounded session"
+        );
+        assert_eq!(session.requested_limit(), 6);
     }
 
     fn candidate_position(candidates: &[String], expected: &str) -> Option<usize> {

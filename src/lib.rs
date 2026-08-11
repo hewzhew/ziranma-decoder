@@ -238,7 +238,8 @@ pub use event_capsule::{
     MAX_EVENT_CAPSULE_TEXT_BYTES_PER_FIELD, MAX_EVENT_CAPSULE_TOTAL_TEXT_BYTES, TimedTrackerOutput,
 };
 pub use exact_short_catalog::{
-    ExactShortWordCatalog, ExactShortWordCatalogError, MAX_EXACT_SHORT_WORDS_PER_CODE,
+    ExactShortPageSession, ExactShortWordCatalog, ExactShortWordCatalogError,
+    MAX_EXACT_SHORT_WORDS_PER_CODE,
 };
 pub use explicit_alias::{
     EXPLICIT_ALIAS_PACKAGE_FILE, EXPLICIT_ALIAS_PACKAGES_DIRECTORY, EXPLICIT_ALIAS_SCHEMA_V1,
