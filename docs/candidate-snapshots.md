@@ -229,10 +229,35 @@ target\release\candidatectl.exe build-short-consensus-layer `
 十万次平均约 0.105 µs；这只证明没有构造第二个通用 Decoder，不是跨机器性能承诺。
 可用 `exact-short-benchmark` 复测当前机器与文件缓存状态。
 
-`exact-short-query` 只读查询一个四键码。纯预览合并器固定保留已有 Top-1，只能
-把最多 8 个新身份插到它后面，重复身份不提升，候选总数仍受 50 项边界约束；
-该不变量已有回归覆盖。TSF 尚未加载、安装或启用这个包，因此当前日用候选位移
-严格为零。下一安全门是在公开场景中审计预览插入造成的分页位移，再决定是否接入。
+`exact-short-query` 只读查询一个四键码。纯预览合并器可选择固定已有 Top-1，
+也可固定完整第一页；它只插入既有 50 项中不存在的新身份，重复身份不消耗插入
+名额，候选总数仍受 50 项边界约束，剩余旧候选相对顺序不变。分页保护版本还会
+检查同码已有精确短词：若一次插入会让其中任何一个跨页或掉出总范围，就缩减插入
+数，必要时完全跳过该码。浅于一页的候选不会被它擅自扩成第一页。
+
+公开分页安全门可用下列只读命令复现；它同时比较首选后补 1/2 项、固定第一页后
+补 1/2 项，以及分页保护后补 1/2 项，不写包、不改槽位：
+
+```powershell
+cargo run --release --bin candidatectl -- exact-short-layer-audit `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top120k-v1/lexicon.tsv `
+  --exact-package .local/public-audit/wanxiang-fdda7afb/package-exact-short-consensus-depth2-v1 `
+  --held-out-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu `
+  --frontier-limit 7 --supplemental-promotions 1
+```
+
+固定 UD test 留出有 334 个精确层匹配词面（421 次）。机械插在首选后会改变
+113 个第一页，并让 36 个目标名次后移，其中 6 个跨页，故被否决。仅把插入点移到
+第二页开头虽使第一页零变化，仍有 3 个目标跨页，也被否决。分页保护后，补 1 项
+让 59 个目标新进入前两页，补 2 项让 64 个目标新进入；两者均保持第一页逐项零
+变化、目标零跨页、零掉出 50 项总范围。补 2 项额外挤出 22 个第 50 名附近的旧尾项，
+却多覆盖 5 个公开目标，且没有增加目标跨页，因此它是当前离线胜出配置。尾端位移
+仍单独报告，不等同于正确性结论。
+
+TSF 尚未加载、安装或启用这个包，因此当前日用候选位移严格为零。下一安全门是
+受保护的 depth-2 路径在 release 热查询和真实宿主首帧中的成本；通过前不新增槽位、
+开关或自动换代行为。
 
 导入器同时聚合报告三字、四字规范码，而不显示词条文字。上述固定切片中，
 536,722 个合格三字码有 26,897 个进入最终切片，635,180 个合格四字码有

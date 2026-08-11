@@ -231,25 +231,40 @@ impl ExactShortWordCatalog {
         visible_limit: usize,
         exact_promotions: usize,
     ) -> Result<Vec<String>, ExactShortWordCatalogError> {
-        if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&visible_limit) {
+        self.preview_candidate_texts_after_prefix(primary, code, visible_limit, exact_promotions, 1)
+    }
+
+    /// Previews insertion after an immutable leading candidate prefix.
+    ///
+    /// Setting `stable_prefix` to the UI page size preserves the complete
+    /// first page while making exact words available at the start of the next
+    /// page. The total result remains bounded independently.
+    pub fn preview_candidate_texts_after_prefix(
+        &self,
+        primary: &[String],
+        code: &str,
+        total_limit: usize,
+        exact_promotions: usize,
+        stable_prefix: usize,
+    ) -> Result<Vec<String>, ExactShortWordCatalogError> {
+        if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&total_limit) {
             return Err(ExactShortWordCatalogError::InvalidVisibleLimit);
+        }
+        if stable_prefix == 0 || stable_prefix > total_limit {
+            return Err(ExactShortWordCatalogError::InvalidStablePrefix);
         }
         if exact_promotions > MAX_EXACT_SHORT_WORDS_PER_CODE {
             return Err(ExactShortWordCatalogError::InvalidPromotionLimit);
         }
         if exact_promotions == 0 {
-            return Ok(primary.iter().take(visible_limit).cloned().collect());
+            return Ok(primary.iter().take(total_limit).cloned().collect());
         }
         let exact = self.candidate_texts(code, MAX_EXACT_SHORT_WORDS_PER_CODE)?;
-        let mut merged = Vec::with_capacity(visible_limit);
-        let primary_start = if let Some(first) = primary.first() {
-            merged.push(first.clone());
-            1
-        } else {
-            0
-        };
+        let mut merged = Vec::with_capacity(total_limit);
+        let primary_start = stable_prefix.min(primary.len());
+        merged.extend(primary.iter().take(primary_start).cloned());
         for candidate in exact {
-            if merged.len() == visible_limit
+            if merged.len() == total_limit
                 || merged.len().saturating_sub(primary_start) == exact_promotions
             {
                 break;
@@ -260,12 +275,76 @@ impl ExactShortWordCatalog {
             merged.push(candidate.to_owned());
         }
         for candidate in primary.iter().skip(primary_start) {
-            if merged.len() == visible_limit {
+            if merged.len() == total_limit {
                 break;
             }
             merged.push(candidate.clone());
         }
         Ok(merged)
+    }
+
+    /// Previews exact insertion at the second-page boundary while protecting
+    /// every exact identity that is already present from crossing a page.
+    ///
+    /// A shallow primary list is returned unchanged because it has no second
+    /// page yet. For a full first page, the largest safe insertion count up to
+    /// `exact_promotions` is selected. This deliberately prefers omission to
+    /// moving an existing exact short word into a later page or beyond the
+    /// bounded result.
+    pub fn preview_candidate_texts_after_page_guarded(
+        &self,
+        primary: &[String],
+        code: &str,
+        total_limit: usize,
+        exact_promotions: usize,
+        page_size: usize,
+    ) -> Result<Vec<String>, ExactShortWordCatalogError> {
+        if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&total_limit) {
+            return Err(ExactShortWordCatalogError::InvalidVisibleLimit);
+        }
+        if page_size == 0 || page_size > total_limit {
+            return Err(ExactShortWordCatalogError::InvalidStablePrefix);
+        }
+        if exact_promotions > MAX_EXACT_SHORT_WORDS_PER_CODE {
+            return Err(ExactShortWordCatalogError::InvalidPromotionLimit);
+        }
+        if exact_promotions == 0 || primary.len() < page_size {
+            return Ok(primary.iter().take(total_limit).cloned().collect());
+        }
+
+        let exact = self.candidate_texts(code, MAX_EXACT_SHORT_WORDS_PER_CODE)?;
+        let desired_insertions = exact
+            .iter()
+            .filter(|candidate| !primary.iter().any(|existing| existing == *candidate))
+            .take(exact_promotions)
+            .count();
+        let safe_insertions = (0..=desired_insertions)
+            .rev()
+            .find(|insertions| {
+                exact.iter().all(|candidate| {
+                    let Some(index) = primary
+                        .iter()
+                        .position(|existing| existing.as_str() == *candidate)
+                    else {
+                        return true;
+                    };
+                    let before_rank = index + 1;
+                    if before_rank <= page_size || before_rank > total_limit {
+                        return true;
+                    }
+                    let after_rank = before_rank + insertions;
+                    after_rank <= total_limit
+                        && (before_rank - 1) / page_size == (after_rank - 1) / page_size
+                })
+            })
+            .unwrap_or(0);
+        self.preview_candidate_texts_after_prefix(
+            primary,
+            code,
+            total_limit,
+            safe_insertions,
+            page_size,
+        )
     }
 
     /// Returns the validated data revision.
@@ -352,6 +431,8 @@ pub enum ExactShortWordCatalogError {
     InvalidVisibleLimit,
     /// A preview requested more exact insertions than one code can contain.
     InvalidPromotionLimit,
+    /// A preview prefix was zero or exceeded the total result boundary.
+    InvalidStablePrefix,
 }
 
 impl From<CandidatePackageError> for ExactShortWordCatalogError {
@@ -393,6 +474,7 @@ impl fmt::Display for ExactShortWordCatalogError {
             Self::InvalidQueryLimit => write!(formatter, "精确短词查询上限无效"),
             Self::InvalidVisibleLimit => write!(formatter, "精确短词预览候选上限无效"),
             Self::InvalidPromotionLimit => write!(formatter, "精确短词预览提升上限无效"),
+            Self::InvalidStablePrefix => write!(formatter, "精确短词预览固定前缀无效"),
         }
     }
 }
@@ -535,6 +617,131 @@ mod tests {
                 .unwrap(),
             ["叔叔", "手术", "收束", "输出"]
         );
+    }
+
+    #[test]
+    fn preview_after_page_preserves_the_page_and_does_not_charge_duplicates() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = [
+            "候选一".to_owned(),
+            "候选二".to_owned(),
+            "候选三".to_owned(),
+            "候选四".to_owned(),
+            "候选五".to_owned(),
+            "候选六".to_owned(),
+            "候选七".to_owned(),
+            "收束".to_owned(),
+            "末尾".to_owned(),
+        ];
+        let merged = catalog
+            .preview_candidate_texts_after_prefix(&primary, "ubuu", 9, 1, 7)
+            .unwrap();
+        assert_eq!(&merged[..7], &primary[..7]);
+        assert_eq!(
+            merged,
+            [
+                "候选一",
+                "候选二",
+                "候选三",
+                "候选四",
+                "候选五",
+                "候选六",
+                "候选七",
+                "手术",
+                "收束",
+            ]
+        );
+        assert_eq!(merged.len(), 9);
+        let retained_primary = merged
+            .iter()
+            .filter(|candidate| primary.contains(candidate))
+            .collect::<Vec<_>>();
+        let expected_primary = primary
+            .iter()
+            .filter(|candidate| merged.contains(candidate))
+            .collect::<Vec<_>>();
+        assert_eq!(retained_primary, expected_primary);
+    }
+
+    #[test]
+    fn preview_after_page_rejects_an_invalid_stable_prefix() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = ["候选".to_owned()];
+        assert_eq!(
+            catalog.preview_candidate_texts_after_prefix(&primary, "ubuu", 7, 1, 0),
+            Err(ExactShortWordCatalogError::InvalidStablePrefix)
+        );
+        assert_eq!(
+            catalog.preview_candidate_texts_after_prefix(&primary, "ubuu", 7, 1, 8),
+            Err(ExactShortWordCatalogError::InvalidStablePrefix)
+        );
+    }
+
+    #[test]
+    fn page_guard_refuses_to_push_an_existing_exact_identity_across_a_boundary() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = (1..=14)
+            .map(|rank| {
+                if rank == 14 {
+                    "收束".to_owned()
+                } else {
+                    format!("候选{rank}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let raw = catalog
+            .preview_candidate_texts_after_prefix(&primary, "ubuu", 16, 1, 7)
+            .unwrap();
+        assert_eq!(candidate_position(&raw, "收束"), Some(15));
+        let guarded = catalog
+            .preview_candidate_texts_after_page_guarded(&primary, "ubuu", 16, 1, 7)
+            .unwrap();
+        assert_eq!(guarded, primary);
+    }
+
+    #[test]
+    fn page_guard_uses_the_largest_insertion_count_that_keeps_exact_pages_stable() {
+        const GUARDED_PAYLOAD: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t90\n\
+手术\tshou shu\t80\n\
+首数\tshou shu\t70\n";
+        let catalog =
+            ExactShortWordCatalog::load(&manifest(GUARDED_PAYLOAD), GUARDED_PAYLOAD).unwrap();
+        let primary = (1..=13)
+            .map(|rank| {
+                if rank == 13 {
+                    "收束".to_owned()
+                } else {
+                    format!("候选{rank}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let guarded = catalog
+            .preview_candidate_texts_after_page_guarded(&primary, "ubuu", 16, 2, 7)
+            .unwrap();
+        assert_eq!(&guarded[..7], &primary[..7]);
+        assert_eq!(guarded[7], "手术");
+        assert_eq!(candidate_position(&guarded, "首数"), None);
+        assert_eq!(candidate_position(&guarded, "收束"), Some(14));
+    }
+
+    #[test]
+    fn page_guard_does_not_create_a_first_page_for_a_shallow_primary() {
+        let catalog = ExactShortWordCatalog::load(&manifest(PAYLOAD), PAYLOAD).unwrap();
+        let primary = ["已有一".to_owned(), "已有二".to_owned()];
+        assert_eq!(
+            catalog
+                .preview_candidate_texts_after_page_guarded(&primary, "ubuu", 14, 2, 7)
+                .unwrap(),
+            primary
+        );
+    }
+
+    fn candidate_position(candidates: &[String], expected: &str) -> Option<usize> {
+        candidates
+            .iter()
+            .position(|candidate| candidate == expected)
+            .map(|index| index + 1)
     }
 
     #[test]

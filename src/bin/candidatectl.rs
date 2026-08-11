@@ -143,6 +143,14 @@ enum Options {
         per_code_depth: usize,
         entry_limit: usize,
     },
+    ExactShortLayerAudit {
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        exact_package: PathBuf,
+        held_out_corpus: PathBuf,
+        frontier_limit: usize,
+        supplemental_promotions: usize,
+    },
     PhraseCoverageAudit {
         source: PathBuf,
         allowlist: PathBuf,
@@ -302,6 +310,8 @@ struct LoadedExactShortPackage {
     catalog: ExactShortWordCatalog,
     authentication_sha256: String,
 }
+
+type ExactShortPackageMaterials = (LoadedExactShortPackage, Option<Vec<LexiconEntry>>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PublicSourceDeclaration {
@@ -473,6 +483,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             per_code_depth,
             entry_limit,
         )?,
+        Options::ExactShortLayerAudit {
+            core_payload,
+            supplemental_payload,
+            exact_package,
+            held_out_corpus,
+            frontier_limit,
+            supplemental_promotions,
+        } => audit_exact_short_layer(ExactShortLayerAuditRequest {
+            core_payload: &core_payload,
+            supplemental_payload: &supplemental_payload,
+            exact_package: &exact_package,
+            held_out_corpus: &held_out_corpus,
+            frontier_limit,
+            supplemental_promotions,
+        })?,
         Options::PhraseCoverageAudit {
             source,
             allowlist,
@@ -690,6 +715,7 @@ fn parse_options(
         "segment-penalty-audit" => parse_segment_penalty_audit(arguments),
         "length-coverage-audit" => parse_length_coverage_audit(arguments),
         "short-consensus-audit" => parse_short_consensus_audit(arguments),
+        "exact-short-layer-audit" => parse_exact_short_layer_audit(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
@@ -1501,6 +1527,66 @@ fn parse_short_consensus_audit(
         base_payload: base_payload.ok_or("short-consensus-audit requires --base-payload")?,
         per_code_depth,
         entry_limit,
+    })
+}
+
+fn parse_exact_short_layer_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut exact_package = None;
+    let mut held_out_corpus = None;
+    let mut frontier_limit = None;
+    let mut supplemental_promotions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--exact-package" => set_path(&mut exact_package, &mut arguments, "--exact-package")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--frontier-limit" => {
+                set_usize(&mut frontier_limit, &mut arguments, "--frontier-limit")?
+            }
+            "--supplemental-promotions" => set_usize(
+                &mut supplemental_promotions,
+                &mut arguments,
+                "--supplemental-promotions",
+            )?,
+            _ => {
+                return Err(
+                    "unknown exact-short-layer-audit argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let frontier_limit =
+        frontier_limit.ok_or("exact-short-layer-audit requires --frontier-limit")?;
+    if !(2..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&frontier_limit) {
+        return Err("exact-short-layer-audit --frontier-limit must be within 2..50".into());
+    }
+    let supplemental_promotions = supplemental_promotions
+        .ok_or("exact-short-layer-audit requires --supplemental-promotions")?;
+    if supplemental_promotions > frontier_limit {
+        return Err(
+            "exact-short-layer-audit --supplemental-promotions exceeds the frontier".into(),
+        );
+    }
+    Ok(Options::ExactShortLayerAudit {
+        core_payload: core_payload.ok_or("exact-short-layer-audit requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("exact-short-layer-audit requires --supplemental-payload")?,
+        exact_package: exact_package.ok_or("exact-short-layer-audit requires --exact-package")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("exact-short-layer-audit requires --held-out-corpus")?,
+        frontier_limit,
+        supplemental_promotions,
     })
 }
 
@@ -2328,6 +2414,9 @@ fn print_usage() {
     );
     eprintln!(
         "  short-consensus-audit --source <TONED_RIME.dict.yaml> --confirmation <PUBLIC_WORDS.txt> --base-payload <LEXICON.tsv> --per-code-depth <1..8> --entry-limit <1..50000>"
+    );
+    eprintln!(
+        "  exact-short-layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --exact-package <PUBLIC_PACKAGE_DIR> --held-out-corpus <PUBLIC-TEST.conllu> --frontier-limit <2..50> --supplemental-promotions <0..FRONTIER>"
     );
     eprintln!(
         "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
@@ -4199,6 +4288,458 @@ fn audit_short_word_consensus(
         "口径：第二来源只确认词面存在；读音、规范码和层内顺序只来自 Rime；不比较跨来源频率。"
     )?;
     writeln!(output, "本次操作：只读；没有生成、安装或启用候选包")?;
+    Ok(output)
+}
+
+struct ExactShortLayerAuditRequest<'a> {
+    core_payload: &'a Path,
+    supplemental_payload: &'a Path,
+    exact_package: &'a Path,
+    held_out_corpus: &'a Path,
+    frontier_limit: usize,
+    supplemental_promotions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactShortTargetDepthAudit {
+    first: usize,
+    first_instances: usize,
+    second: usize,
+    second_instances: usize,
+    deeper: usize,
+    deeper_instances: usize,
+}
+
+impl ExactShortTargetDepthAudit {
+    fn observe(&mut self, rank: usize, instances: usize) {
+        match rank {
+            1 => {
+                self.first += 1;
+                self.first_instances += instances;
+            }
+            2 => {
+                self.second += 1;
+                self.second_instances += instances;
+            }
+            _ => {
+                self.deeper += 1;
+                self.deeper_instances += instances;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExactShortInsertionPlacement {
+    #[default]
+    TopOne,
+    FirstPage,
+    GuardedFirstPage,
+}
+
+impl ExactShortInsertionPlacement {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TopOne => "首选后立即插入",
+            Self::FirstPage => "固定第一页、第二页开头插入",
+            Self::GuardedFirstPage => "分页保护、第二页开头插入",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactShortPagingAudit {
+    placement: ExactShortInsertionPlacement,
+    stable_prefix: usize,
+    promotions: usize,
+    probes: usize,
+    instances: usize,
+    baseline_visible: usize,
+    baseline_visible_instances: usize,
+    preview_visible: usize,
+    preview_visible_instances: usize,
+    changed_pages: usize,
+    changed_page_instances: usize,
+    first_page_changes: usize,
+    first_page_change_instances: usize,
+    top_changes: usize,
+    top_change_instances: usize,
+    baseline_two_page_visible: usize,
+    baseline_two_page_visible_instances: usize,
+    preview_two_page_visible: usize,
+    preview_two_page_visible_instances: usize,
+    newly_two_page_visible: usize,
+    newly_two_page_visible_instances: usize,
+    lost_two_page_visible: usize,
+    lost_two_page_visible_instances: usize,
+    cross_page_degradations: usize,
+    cross_page_degradation_instances: usize,
+    useful_changes: usize,
+    useful_change_instances: usize,
+    neutral_changes: usize,
+    neutral_change_instances: usize,
+    harmful_changes: usize,
+    harmful_change_instances: usize,
+    inserted_slots: usize,
+    displaced_slots: usize,
+    movement: WeightedRankMovement,
+}
+
+impl ExactShortPagingAudit {
+    fn with_profile(
+        placement: ExactShortInsertionPlacement,
+        promotions: usize,
+        first_page_size: usize,
+    ) -> Self {
+        Self {
+            placement,
+            stable_prefix: match placement {
+                ExactShortInsertionPlacement::TopOne => 1,
+                ExactShortInsertionPlacement::FirstPage
+                | ExactShortInsertionPlacement::GuardedFirstPage => first_page_size,
+            },
+            promotions,
+            ..Self::default()
+        }
+    }
+
+    fn observe(
+        &mut self,
+        before: &[String],
+        after: &[String],
+        expected: &str,
+        instances: usize,
+        first_page_size: usize,
+    ) {
+        let before_rank = candidate_rank(before, expected);
+        let after_rank = candidate_rank(after, expected);
+        let changed = before != after;
+        let first_page_changed = before
+            .iter()
+            .take(first_page_size)
+            .ne(after.iter().take(first_page_size));
+        let top_changed = before.first() != after.first();
+        let two_page_limit = first_page_size
+            .saturating_mul(2)
+            .min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        let before_two_page = before_rank.is_some_and(|rank| rank <= two_page_limit);
+        let after_two_page = after_rank.is_some_and(|rank| rank <= two_page_limit);
+        let cross_page_degradation = match (before_rank, after_rank) {
+            (Some(before), Some(after)) => {
+                (after - 1) / first_page_size > (before - 1) / first_page_size
+            }
+            _ => false,
+        };
+        let useful = match (before_rank, after_rank) {
+            (None, Some(_)) => true,
+            (Some(before), Some(after)) => after < before,
+            _ => false,
+        };
+        let harmful = match (before_rank, after_rank) {
+            (Some(_), None) => true,
+            (Some(before), Some(after)) => after > before,
+            _ => false,
+        };
+
+        self.probes += 1;
+        self.instances += instances;
+        self.baseline_visible += usize::from(before_rank.is_some());
+        self.baseline_visible_instances += instances * usize::from(before_rank.is_some());
+        self.preview_visible += usize::from(after_rank.is_some());
+        self.preview_visible_instances += instances * usize::from(after_rank.is_some());
+        self.changed_pages += usize::from(changed);
+        self.changed_page_instances += instances * usize::from(changed);
+        self.first_page_changes += usize::from(first_page_changed);
+        self.first_page_change_instances += instances * usize::from(first_page_changed);
+        self.top_changes += usize::from(top_changed);
+        self.top_change_instances += instances * usize::from(top_changed);
+        self.baseline_two_page_visible += usize::from(before_two_page);
+        self.baseline_two_page_visible_instances += instances * usize::from(before_two_page);
+        self.preview_two_page_visible += usize::from(after_two_page);
+        self.preview_two_page_visible_instances += instances * usize::from(after_two_page);
+        self.newly_two_page_visible += usize::from(!before_two_page && after_two_page);
+        self.newly_two_page_visible_instances +=
+            instances * usize::from(!before_two_page && after_two_page);
+        self.lost_two_page_visible += usize::from(before_two_page && !after_two_page);
+        self.lost_two_page_visible_instances +=
+            instances * usize::from(before_two_page && !after_two_page);
+        self.cross_page_degradations += usize::from(cross_page_degradation);
+        self.cross_page_degradation_instances += instances * usize::from(cross_page_degradation);
+        self.useful_changes += usize::from(useful);
+        self.useful_change_instances += instances * usize::from(useful);
+        self.harmful_changes += usize::from(harmful);
+        self.harmful_change_instances += instances * usize::from(harmful);
+        self.neutral_changes += usize::from(changed && !useful && !harmful);
+        self.neutral_change_instances += instances * usize::from(changed && !useful && !harmful);
+        self.inserted_slots += after
+            .iter()
+            .filter(|candidate| !before.contains(candidate))
+            .count();
+        self.displaced_slots += before
+            .iter()
+            .filter(|candidate| !after.contains(candidate))
+            .count();
+        self.movement.observe(before_rank, after_rank, instances);
+    }
+
+    fn safety_gate_passed(self) -> bool {
+        match self.placement {
+            ExactShortInsertionPlacement::TopOne => {
+                self.useful_changes != 0
+                    && self.top_changes == 0
+                    && self.harmful_changes == 0
+                    && self.movement.lost_visible == 0
+            }
+            ExactShortInsertionPlacement::FirstPage
+            | ExactShortInsertionPlacement::GuardedFirstPage => {
+                self.useful_changes != 0
+                    && self.first_page_changes == 0
+                    && self.cross_page_degradations == 0
+                    && self.movement.lost_visible == 0
+            }
+        }
+    }
+}
+
+fn audit_exact_short_layer(
+    request: ExactShortLayerAuditRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let core_text = read_explicit_text(
+        request.core_payload,
+        "core public exact-short audit payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        request.supplemental_payload,
+        "supplemental public exact-short audit payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        request.held_out_corpus,
+        "public exact-short held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let core_sha256 = candidate_sha256_hex(core_text.as_bytes());
+    let supplemental_sha256 = candidate_sha256_hex(supplemental_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if core_sha256 == supplemental_sha256 {
+        return Err("exact-short-layer-audit requires distinct core and supplemental data".into());
+    }
+    if held_out_sha256 == core_sha256 || held_out_sha256 == supplemental_sha256 {
+        return Err("exact-short-layer-audit requires an independent held-out corpus".into());
+    }
+
+    let core = snapshot_from_payload("exact-short-audit-core-v1", &core_text)?;
+    let supplemental =
+        snapshot_from_payload("exact-short-audit-supplemental-v1", &supplemental_text)?;
+    let (exact, exact_entries) =
+        load_exact_short_package_directory_with_entries(request.exact_package)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let selection = select_public_lexicon_rank_probes(&held_out, &exact_entries, 2);
+    let ambiguous_surfaces = ambiguous_lexicon_surfaces(&exact_entries);
+    let matched_unique_tokens = selection.probes.len();
+    let mut ambiguous_unique_tokens = 0_usize;
+    let mut ambiguous_token_instances = 0_usize;
+    let probes = selection
+        .probes
+        .into_iter()
+        .filter(|probe| {
+            let ambiguous = ambiguous_surfaces.contains(probe.expected_text.as_str());
+            ambiguous_unique_tokens += usize::from(ambiguous);
+            ambiguous_token_instances += probe.instances * usize::from(ambiguous);
+            !ambiguous
+        })
+        .collect::<Vec<_>>();
+
+    let supplemental_config = SupplementalCandidateLayerConfig {
+        exact_promotions: request.supplemental_promotions,
+    };
+    let mut target_depth = ExactShortTargetDepthAudit::default();
+    let mut profiles = [
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::TopOne,
+            1,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::TopOne,
+            2,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::FirstPage,
+            1,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::FirstPage,
+            2,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::GuardedFirstPage,
+            1,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::GuardedFirstPage,
+            2,
+            request.frontier_limit,
+        ),
+    ];
+    for probe in &probes {
+        let code = probe.observed.as_str();
+        let exact_candidates = exact.catalog.candidate_texts(code, 8)?;
+        let exact_rank = exact_candidates
+            .iter()
+            .position(|candidate| *candidate == probe.expected_text)
+            .map(|index| index + 1)
+            .ok_or("selected exact-short target is absent from its authenticated code")?;
+        target_depth.observe(exact_rank, probe.instances);
+        let baseline = layered_candidate_texts(
+            &core,
+            &supplemental,
+            code,
+            MAX_CANDIDATE_SNAPSHOT_RANK,
+            supplemental_config,
+        )?;
+        for profile in &mut profiles {
+            let preview = match profile.placement {
+                ExactShortInsertionPlacement::GuardedFirstPage => {
+                    exact.catalog.preview_candidate_texts_after_page_guarded(
+                        &baseline,
+                        code,
+                        MAX_CANDIDATE_SNAPSHOT_RANK,
+                        profile.promotions,
+                        request.frontier_limit,
+                    )?
+                }
+                ExactShortInsertionPlacement::TopOne | ExactShortInsertionPlacement::FirstPage => {
+                    exact.catalog.preview_candidate_texts_after_prefix(
+                        &baseline,
+                        code,
+                        MAX_CANDIDATE_SNAPSHOT_RANK,
+                        profile.promotions,
+                        profile.stable_prefix,
+                    )?
+                }
+            };
+            profile.observe(
+                &baseline,
+                &preview,
+                &probe.expected_text,
+                probe.instances,
+                request.frontier_limit,
+            );
+        }
+    }
+
+    let mut output = String::new();
+    writeln!(output, "公开精确短词分页位移审计")?;
+    writeln!(
+        output,
+        "核心：{} 条 · SHA-256 {core_sha256}",
+        core.entry_count()
+    )?;
+    writeln!(
+        output,
+        "补充：{} 条 · SHA-256 {supplemental_sha256}；每码补 {} 项",
+        supplemental.entry_count(),
+        request.supplemental_promotions,
+    )?;
+    writeln!(
+        output,
+        "精确层：{} 条，{} 个码 · 认证 SHA-256 {}",
+        exact.catalog.entry_count(),
+        exact.catalog.code_count(),
+        exact.authentication_sha256,
+    )?;
+    writeln!(
+        output,
+        "独立留出：{} 句，{} 个句法 token · SHA-256 {held_out_sha256}",
+        held_out.stats.sentences, held_out.stats.syntactic_tokens,
+    )?;
+    writeln!(
+        output,
+        "选样：双字词面 {}（实例 {}）；精确层匹配 {}（实例 {}）；多音排除 {}（实例 {}）；评测 {}（实例 {}）",
+        selection.source_unique_tokens,
+        selection.source_token_instances,
+        matched_unique_tokens,
+        selection.matched_token_instances,
+        ambiguous_unique_tokens,
+        ambiguous_token_instances,
+        probes.len(),
+        probes.iter().map(|probe| probe.instances).sum::<usize>(),
+    )?;
+    writeln!(
+        output,
+        "目标在精确层内：第 1 项 {}（实例 {}），第 2 项 {}（实例 {}），更深 {}（实例 {}）",
+        target_depth.first,
+        target_depth.first_instances,
+        target_depth.second,
+        target_depth.second_instances,
+        target_depth.deeper,
+        target_depth.deeper_instances,
+    )?;
+    writeln!(
+        output,
+        "候选范围：固定总候选前 {MAX_CANDIDATE_SNAPSHOT_RANK}；第一页前 {}；前两页前 {}",
+        request.frontier_limit,
+        request
+            .frontier_limit
+            .saturating_mul(2)
+            .min(MAX_CANDIDATE_SNAPSHOT_RANK),
+    )?;
+    for profile in profiles {
+        writeln!(
+            output,
+            "  {} · 精确补 {}：总范围基线可见 {}（实例 {}），预览可见 {}（实例 {}）；前两页基线可见 {}（实例 {}），预览可见 {}（实例 {}），新进入 {}（实例 {}），掉出 {}（实例 {}）；候选变化 {}（实例 {}），有益 {}（实例 {}），中性 {}（实例 {}），名次后移 {}（实例 {}）；第一页变化 {}（实例 {}），首选变化 {}，跨页退化 {}（实例 {}）；新插槽 {}，总范围尾部挤出 {}；新进入总范围 {}，掉出总范围 {}；安全门 {}",
+            profile.placement.label(),
+            profile.promotions,
+            profile.baseline_visible,
+            profile.baseline_visible_instances,
+            profile.preview_visible,
+            profile.preview_visible_instances,
+            profile.baseline_two_page_visible,
+            profile.baseline_two_page_visible_instances,
+            profile.preview_two_page_visible,
+            profile.preview_two_page_visible_instances,
+            profile.newly_two_page_visible,
+            profile.newly_two_page_visible_instances,
+            profile.lost_two_page_visible,
+            profile.lost_two_page_visible_instances,
+            profile.changed_pages,
+            profile.changed_page_instances,
+            profile.useful_changes,
+            profile.useful_change_instances,
+            profile.neutral_changes,
+            profile.neutral_change_instances,
+            profile.harmful_changes,
+            profile.harmful_change_instances,
+            profile.first_page_changes,
+            profile.first_page_change_instances,
+            profile.top_changes,
+            profile.cross_page_degradations,
+            profile.cross_page_degradation_instances,
+            profile.inserted_slots,
+            profile.displaced_slots,
+            profile.movement.newly_visible,
+            profile.movement.lost_visible,
+            if profile.safety_gate_passed() {
+                "通过"
+            } else {
+                "未通过"
+            },
+        )?;
+    }
+    writeln!(
+        output,
+        "安全门口径：立即插入仍要求至少一个目标受益、首选零变化、公开目标零名次后移且零掉出；普通与受保护的第二页通道均要求至少一个目标受益、第一页逐项零变化、目标零跨页退化且零掉出总范围。总范围尾部位移单独报告，不被伪装成正确性结论。"
+    )?;
+    writeln!(
+        output,
+        "本次操作：只读预览；不写候选包、不改槽位、不接入 TSF"
+    )?;
     Ok(output)
 }
 
@@ -9008,6 +9549,23 @@ fn load_package_directory(package: &Path) -> Result<LoadedPackage, Box<dyn std::
 fn load_exact_short_package_directory(
     package: &Path,
 ) -> Result<LoadedExactShortPackage, Box<dyn std::error::Error>> {
+    load_exact_short_package_materials(package, false).map(|(loaded, _)| loaded)
+}
+
+fn load_exact_short_package_directory_with_entries(
+    package: &Path,
+) -> Result<(LoadedExactShortPackage, Vec<LexiconEntry>), Box<dyn std::error::Error>> {
+    let (loaded, entries) = load_exact_short_package_materials(package, true)?;
+    Ok((
+        loaded,
+        entries.expect("the exact short-word loader was asked to retain entries"),
+    ))
+}
+
+fn load_exact_short_package_materials(
+    package: &Path,
+    retain_entries: bool,
+) -> Result<ExactShortPackageMaterials, Box<dyn std::error::Error>> {
     ensure_regular_directory(package, "exact short-word package")?;
     let manifest_text = read_explicit_text(
         &package.join(CANDIDATE_PACKAGE_MANIFEST_FILE),
@@ -9029,12 +9587,18 @@ fn load_exact_short_package_directory(
     provenance.validate_materials(&manifest_text, &payload_text)?;
     let authentication_sha256 =
         candidate_package_authentication_sha256(&provenance_text, &manifest_text, &payload_text);
+    let entries = retain_entries
+        .then(|| parse_lexicon_tsv(&payload_text))
+        .transpose()?;
     let catalog = ExactShortWordCatalog::load_owned(&manifest, payload_text)?;
-    Ok(LoadedExactShortPackage {
-        provenance,
-        catalog,
-        authentication_sha256,
-    })
+    Ok((
+        LoadedExactShortPackage {
+            provenance,
+            catalog,
+            authentication_sha256,
+        },
+        entries,
+    ))
 }
 
 fn validate_installed_slot(
@@ -10026,6 +10590,46 @@ mod tests {
                 code: "ubuu".to_owned(),
                 repetitions: 1000,
             }
+        );
+    }
+
+    #[test]
+    fn exact_short_layer_audit_parser_binds_public_materials_and_page_size() {
+        assert_eq!(
+            parse_options([
+                "exact-short-layer-audit".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--exact-package".to_owned(),
+                "exact-package".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--frontier-limit".to_owned(),
+                "7".to_owned(),
+                "--supplemental-promotions".to_owned(),
+                "1".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortLayerAudit {
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                exact_package: PathBuf::from("exact-package"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                frontier_limit: 7,
+                supplemental_promotions: 1,
+            }
+        );
+        assert!(
+            parse_options([
+                "exact-short-layer-audit".to_owned(),
+                "--frontier-limit".to_owned(),
+                "1".to_owned(),
+                "--supplemental-promotions".to_owned(),
+                "1".to_owned(),
+            ])
+            .is_err()
         );
     }
 
@@ -11155,6 +11759,91 @@ mod tests {
         }
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_short_layer_audit_compares_raw_and_page_guarded_insertions_without_writes() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+手书\tshou shu\t100\n\
+受书\tshou shu\t90\n\
+售书\tshou shu\t80\n\
+授书\tshou shu\t70\n\
+兽术\tshou shu\t60\n\
+绶书\tshou shu\t50\n\
+守书\tshou shu\t40\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n别的\tbie de\t10\n";
+        const HELD_OUT: &str = "# sent_id = held-out\n1\t收束\t_\tNOUN\t_\t_\t0\troot\t_\t_\n\n";
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let confirmation = root.join("words.txt");
+        let base = root.join("base.tsv");
+        let core = root.join("core.tsv");
+        let supplemental = root.join("supplemental.tsv");
+        let held_out = root.join("held-out.conllu");
+        let package = root.join("exact-package");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, SHORT_CONSENSUS_SOURCE).unwrap();
+        fs::write(&confirmation, SHORT_CONSENSUS_CONFIRMATION).unwrap();
+        fs::write(&base, SHORT_CONSENSUS_BASE).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&supplemental, SUPPLEMENTAL).unwrap();
+        fs::write(&held_out, HELD_OUT).unwrap();
+        build_short_consensus_layer_public_package(ShortConsensusLayerBuildOptions {
+            source: source.clone(),
+            confirmation: confirmation.clone(),
+            base_payload: base.clone(),
+            output: package.clone(),
+            revision: "exact-short-audit-test-v1".to_owned(),
+            per_code_depth: 2,
+            entry_limit: 50_000,
+            source_declaration: phrase_material_declaration("dictionary", SHORT_CONSENSUS_SOURCE),
+            confirmation_declaration: phrase_material_declaration(
+                "confirmation",
+                SHORT_CONSENSUS_CONFIRMATION,
+            ),
+            base_declaration: phrase_material_declaration("base-payload", SHORT_CONSENSUS_BASE),
+        })
+        .unwrap();
+        let files_before = recursive_regular_file_count(&root);
+
+        let report = audit_exact_short_layer(ExactShortLayerAuditRequest {
+            core_payload: &core,
+            supplemental_payload: &supplemental,
+            exact_package: &package,
+            held_out_corpus: &held_out,
+            frontier_limit: 7,
+            supplemental_promotions: 1,
+        })
+        .unwrap();
+        let guarded = report
+            .lines()
+            .find(|line| line.contains("分页保护、第二页开头插入 · 精确补 2"))
+            .unwrap();
+        assert!(report.contains("首选后立即插入 · 精确补 1"));
+        assert!(report.contains("固定第一页、第二页开头插入 · 精确补 2"));
+        assert!(guarded.contains("第一页变化 0（实例 0）"));
+        assert!(guarded.contains("安全门 通过"));
+        assert!(report.contains("本次操作：只读预览"));
+        assert!(!report.contains("收束"));
+        assert_eq!(recursive_regular_file_count(&root), files_before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn recursive_regular_file_count(root: &Path) -> usize {
+        let mut pending = vec![root.to_owned()];
+        let mut files = 0;
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files += 1;
+                }
+            }
+        }
+        files
     }
 
     #[cfg(windows)]
