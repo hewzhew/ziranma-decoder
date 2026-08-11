@@ -635,6 +635,14 @@ UI、新采集字段仍必须先安全换代 DLL。详细矩阵见
   PageDown 与空格。`candidatectl exact-short-tsf-preflight` 只读认证核心、可选补充
   和精确包，作有界 release 重复并输出无正文的聚合耗时；它不生成预检凭据、不发布
   或启用状态，也不能替代候选窗绘制、实际宿主和运行时换包安全门。
+- `candidatectl popup-render-preflight --repetitions <1..20>` 是另一条默认不运行、
+  release-only 的隔离视觉预检。它不激活 TSF，而是用 ownerless、nonactivating 的
+  进程内临时窗口依次复用生产候选窗的创建、定位、`WM_PAINT`、双缓冲 GDI、
+  `BitBlt`、`EndPaint`、隐藏和销毁路径；固定覆盖首次创建、原位更新、第二页重绘与
+  96/120/144/192 DPI。报告只有阶段耗时与 DPI，不含候选正文；窗口会在命令运行时
+  短暂显示，但不注册、安装、换代、读取候选槽或反馈记录。单独的 `DwmFlush` 只作为
+  桌面合成队列同步边界，不能解释为显示器已经扫描或真人已经看见，也不代表具体编辑器
+  宿主的调度。
 - `candidatectl verify-signature` 可以用独立渠道取得的公钥只读验证候选包
   Ed25519 脱离签名，并给出供 `--expected-sha256` 使用的发布摘要；
   `adopt-signed` / `stage-signed` 也可在任何槽位写入前完成相同验签，并把同一

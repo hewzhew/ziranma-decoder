@@ -59,8 +59,9 @@ use ziranma_core::{
 };
 #[cfg(windows)]
 use ziranma_core::{
-    TSF_ALPHA_CANDIDATE_PAGE_SIZE, TsfCandidatePreflightError, preflight_candidate_snapshot,
-    preflight_exact_short_candidate_layers,
+    CandidatePopupRenderPreflightReport, CandidatePopupRenderScenario,
+    TSF_ALPHA_CANDIDATE_PAGE_SIZE, TsfCandidatePreflightError, preflight_candidate_popup_rendering,
+    preflight_candidate_snapshot, preflight_exact_short_candidate_layers,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
@@ -172,6 +173,9 @@ enum Options {
         supplemental_promotions: Option<usize>,
         exact_promotions: usize,
         sample_limit: usize,
+        repetitions: usize,
+    },
+    PopupRenderPreflight {
         repetitions: usize,
     },
     PhraseCoverageAudit {
@@ -559,6 +563,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_limit,
             repetitions,
         })?,
+        Options::PopupRenderPreflight { repetitions } => preflight_popup_rendering(repetitions)?,
         Options::PhraseCoverageAudit {
             source,
             allowlist,
@@ -779,6 +784,7 @@ fn parse_options(
         "exact-short-layer-audit" => parse_exact_short_layer_audit(arguments),
         "exact-short-layer-benchmark" => parse_exact_short_layer_benchmark(arguments),
         "exact-short-tsf-preflight" => parse_exact_short_tsf_preflight(arguments),
+        "popup-render-preflight" => parse_popup_render_preflight(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
@@ -1823,6 +1829,25 @@ fn parse_exact_short_tsf_preflight(
     })
 }
 
+fn parse_popup_render_preflight(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err("unknown popup-render-preflight argument; value was suppressed".into());
+            }
+        }
+    }
+    let repetitions = repetitions.ok_or("popup-render-preflight requires --repetitions")?;
+    if !(1..=20).contains(&repetitions) {
+        return Err("popup-render-preflight --repetitions must be within 1..20".into());
+    }
+    Ok(Options::PopupRenderPreflight { repetitions })
+}
+
 fn parse_phrase_coverage_audit(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -2657,6 +2682,7 @@ fn print_usage() {
     eprintln!(
         "  exact-short-tsf-preflight --core-package <PUBLIC_PACKAGE_DIR> [--supplemental-package <PUBLIC_PACKAGE_DIR> --supplemental-promotions <1..50>] --exact-package <PUBLIC_PACKAGE_DIR> --exact-promotions <1..8> --sample-limit <1..32> --repetitions <1..20>"
     );
+    eprintln!("  popup-render-preflight --repetitions <1..20>");
     eprintln!(
         "  phrase-coverage-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000>"
     );
@@ -5515,6 +5541,169 @@ fn write_tsf_preflight_duration(output: &mut String, label: &str, summary: Durat
         duration_ms(summary.maximum),
     )
     .unwrap();
+}
+
+#[cfg(windows)]
+fn preflight_popup_rendering(repetitions: usize) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("popup render preflight must run from a release build".into());
+    }
+    let report = preflight_candidate_popup_rendering(repetitions)?;
+    render_popup_render_preflight_report(&report)
+}
+
+#[cfg(not(windows))]
+fn preflight_popup_rendering(_repetitions: usize) -> Result<String, Box<dyn std::error::Error>> {
+    Err("popup render preflight requires Windows".into())
+}
+
+#[cfg(windows)]
+fn render_popup_render_preflight_report(
+    report: &CandidatePopupRenderPreflightReport,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut grouped = BTreeMap::<(CandidatePopupRenderScenario, u32), Vec<_>>::new();
+    for sample in report.samples() {
+        if sample.effective_dpi() != sample.requested_dpi() {
+            return Err("popup render preflight observed an unexpected DPI".into());
+        }
+        grouped
+            .entry((sample.scenario(), sample.requested_dpi()))
+            .or_default()
+            .push(sample);
+    }
+    let expected_groups = 3_usize.saturating_mul(4);
+    let expected_samples = report.repetitions().saturating_mul(expected_groups);
+    if grouped.len() != expected_groups
+        || report.samples().len() != expected_samples
+        || grouped
+            .values()
+            .any(|samples| samples.len() != report.repetitions())
+        || report.hide_durations().len() != report.repetitions().saturating_mul(4)
+        || report.destroy_durations().len() != report.repetitions().saturating_mul(4)
+    {
+        return Err("popup render preflight returned an incomplete fixed workload".into());
+    }
+
+    let mut output = String::new();
+    writeln!(output, "候选窗生产 GDI release 预检")?;
+    writeln!(
+        output,
+        "工作负载：3 条固定视觉路径 × 4 档 DPI × 重复 {}；绘制样本 {}；候选正文不进入报告",
+        report.repetitions(),
+        report.samples().len(),
+    )?;
+    for ((scenario, dpi), samples) in grouped {
+        let window_ready =
+            summarize_popup_render_stage(&samples, |sample| sample.window_ready_duration())?;
+        let paint_entered =
+            summarize_popup_render_stage(&samples, |sample| sample.paint_entered_duration())?;
+        let drawing =
+            summarize_popup_render_stage(&samples, |sample| sample.drawing_completed_duration())?;
+        let published =
+            summarize_popup_render_stage(&samples, |sample| sample.frame_published_duration())?;
+        let completed =
+            summarize_popup_render_stage(&samples, |sample| sample.paint_completed_duration())?;
+        let buffered = samples.iter().filter(|sample| sample.buffered()).count();
+        writeln!(
+            output,
+            "{} · {} DPI · {} 样本 · 双缓冲 {}/{}",
+            popup_render_scenario_label(scenario),
+            dpi,
+            samples.len(),
+            buffered,
+            samples.len(),
+        )?;
+        write_popup_render_stage(&mut output, "  窗口就绪", window_ready)?;
+        write_popup_render_stage(&mut output, "  进入 WM_PAINT", paint_entered)?;
+        write_popup_render_stage(&mut output, "  GDI 绘制完成", drawing)?;
+        write_popup_render_stage(&mut output, "  完整帧发布", published)?;
+        write_popup_render_stage(&mut output, "  EndPaint 完成", completed)?;
+
+        let mut flush_calls = samples
+            .iter()
+            .filter_map(|sample| sample.compositor_flush_duration())
+            .collect::<Vec<_>>();
+        let mut request_to_flush = samples
+            .iter()
+            .filter_map(|sample| sample.request_to_compositor_flush_duration())
+            .collect::<Vec<_>>();
+        match (
+            summarize_durations(&mut flush_calls),
+            summarize_durations(&mut request_to_flush),
+        ) {
+            (Some(flush), Some(total)) => writeln!(
+                output,
+                "  DwmFlush：{}/{} 成功；调用 p95 {:.3} ms；请求至返回 p95 {:.3} ms",
+                flush.samples,
+                samples.len(),
+                duration_ms(flush.p95),
+                duration_ms(total.p95),
+            )?,
+            _ => writeln!(output, "  DwmFlush：当前桌面合成环境不可观测")?,
+        }
+    }
+
+    let mut hide = report.hide_durations().to_vec();
+    let mut destroy = report.destroy_durations().to_vec();
+    write_popup_render_stage(
+        &mut output,
+        "隐藏并确认不可见",
+        summarize_durations(&mut hide).ok_or("popup render preflight has no hide samples")?,
+    )?;
+    write_popup_render_stage(
+        &mut output,
+        "销毁并确认 HWND 失效",
+        summarize_durations(&mut destroy).ok_or("popup render preflight has no destroy samples")?,
+    )?;
+    writeln!(
+        output,
+        "功能门：每次绘制均依次到达窗口就绪、WM_PAINT、GDI 绘制、完整帧发布和 EndPaint；隐藏与销毁均已由系统窗口状态确认。"
+    )?;
+    writeln!(
+        output,
+        "边界：DwmFlush 只表示桌面合成队列的同步边界，不证明屏幕已扫描显示；本预检也不覆盖真实编辑器宿主的调度、显示器刷新或肉眼感知。"
+    )?;
+    writeln!(
+        output,
+        "本次操作：release-only、显式运行、进程内临时窗口；不注册 TSF、不安装、不换代、不读写候选槽、反馈记录或个人数据。"
+    )?;
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn summarize_popup_render_stage(
+    samples: &[&ziranma_core::CandidatePopupRenderSample],
+    stage: impl Fn(&ziranma_core::CandidatePopupRenderSample) -> Duration,
+) -> Result<DurationSummary, Box<dyn std::error::Error>> {
+    let mut durations = samples
+        .iter()
+        .map(|sample| stage(sample))
+        .collect::<Vec<_>>();
+    summarize_durations(&mut durations).ok_or_else(|| "popup render stage has no samples".into())
+}
+
+#[cfg(windows)]
+fn popup_render_scenario_label(scenario: CandidatePopupRenderScenario) -> &'static str {
+    match scenario {
+        CandidatePopupRenderScenario::InitialShow => "首次创建",
+        CandidatePopupRenderScenario::ContentUpdate => "原位更新",
+        CandidatePopupRenderScenario::PageRedraw => "第二页重绘",
+    }
+}
+
+#[cfg(windows)]
+fn write_popup_render_stage(
+    output: &mut String,
+    label: &str,
+    summary: DurationSummary,
+) -> Result<(), std::fmt::Error> {
+    writeln!(
+        output,
+        "{label}：median {:.3} ms；p95 {:.3} ms；max {:.3} ms",
+        duration_ms(summary.median),
+        duration_ms(summary.p95),
+        duration_ms(summary.maximum),
+    )
 }
 
 fn evenly_spaced_exact_short_codes(entries: &[LexiconEntry], limit: usize) -> Vec<String> {
@@ -11598,6 +11787,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "exact-short-tsf-preflight must run from a release build"
+        );
+    }
+
+    #[test]
+    fn popup_render_preflight_parser_accepts_only_the_fixed_workload_bound() {
+        assert_eq!(
+            parse_options([
+                "popup-render-preflight".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::PopupRenderPreflight { repetitions: 5 }
+        );
+        for arguments in [
+            vec!["popup-render-preflight".to_owned()],
+            vec![
+                "popup-render-preflight".to_owned(),
+                "--repetitions".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "popup-render-preflight".to_owned(),
+                "--repetitions".to_owned(),
+                "21".to_owned(),
+            ],
+            vec!["popup-render-preflight".to_owned(), "--unknown".to_owned()],
+        ] {
+            assert!(parse_options(arguments).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn popup_render_preflight_debug_guard_runs_before_creating_a_window() {
+        let error = preflight_popup_rendering(1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "popup render preflight must run from a release build"
         );
     }
 

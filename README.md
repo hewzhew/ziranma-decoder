@@ -484,6 +484,18 @@ cargo run --release --bin candidatectl -- preflight `
 报告只显示版本、按键数、上屏字数和结果，不显示候选正文。预检凭据使用
 SHA-256 绑定来源侧车、清单、载荷、宿主和解码兼容标识。
 
+候选窗本身另有一条默认不运行的 Windows release 视觉预检。它只创建并销毁
+进程内 nonactivating 临时窗口，使用固定公开行覆盖首次出现、原位更新、第二页重绘
+及 96/120/144/192 DPI；不安装或激活输入法，也不读取候选槽、反馈记录或私人数据：
+
+```powershell
+cargo run --release --bin candidatectl -- popup-render-preflight --repetitions 20
+```
+
+命令运行时窗口会短暂显示。报告把窗口就绪、`WM_PAINT`、GDI 绘制、完整帧发布、
+`EndPaint` 和可用时的 `DwmFlush` 分开；后者只说明桌面合成队列同步，不等于画面已经
+被显示器扫描，也不能替代真实编辑器宿主测试。
+
 显式指定的本地槽库支持 `status`、摘要驱动或签名驱动的 `adopt` / `stage`、
 `promote` 和 `rollback`。它只接受通过完整校验和 TSF 预检的公开明文包；槽位
 状态原子替换，包文件不就地改写。预检凭据以 SHA-256 绑定三份包材料和兼容

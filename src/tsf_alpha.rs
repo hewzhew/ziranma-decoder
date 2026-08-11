@@ -69,7 +69,8 @@ use windows::Win32::Foundation::{
     WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CombineRgn, CreateCompatibleBitmap,
@@ -79,7 +80,7 @@ use windows::Win32::Graphics::Gdi::{
     FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ,
     InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
-    TEXTMETRICW, TRANSPARENT,
+    TEXTMETRICW, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -128,11 +129,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DI_NORMAL,
     DefWindowProcW, DestroyMenu, DestroyWindow, DrawIconEx, GWLP_USERDATA, GWLP_WNDPROC,
     GetClientRect, GetForegroundWindow, GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON,
-    KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY,
-    WM_PAINT, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IsWindow, IsWindowVisible, KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MENU_ITEM_FLAGS,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
+    WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -2521,6 +2523,139 @@ impl TsfExactShortPreflightReport {
     }
 }
 
+/// Fixed visual paths exercised by the isolated candidate-popup preflight.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CandidatePopupRenderScenario {
+    /// Creates, positions, shows, and paints a fresh popup.
+    InitialShow,
+    /// Repaints changed candidates without moving an already visible popup.
+    ContentUpdate,
+    /// Repaints the second page, including its footer metadata.
+    PageRedraw,
+}
+
+/// Redacted timing evidence from one production candidate-popup paint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidatePopupRenderSample {
+    scenario: CandidatePopupRenderScenario,
+    requested_dpi: u32,
+    effective_dpi: u32,
+    buffered: bool,
+    window_ready: Duration,
+    paint_entered: Duration,
+    drawing_completed: Duration,
+    frame_published: Duration,
+    paint_completed: Duration,
+    compositor_flush: Option<Duration>,
+    request_to_compositor_flush: Option<Duration>,
+}
+
+impl CandidatePopupRenderSample {
+    pub fn scenario(&self) -> CandidatePopupRenderScenario {
+        self.scenario
+    }
+
+    pub fn requested_dpi(&self) -> u32 {
+        self.requested_dpi
+    }
+
+    pub fn effective_dpi(&self) -> u32 {
+        self.effective_dpi
+    }
+
+    pub fn buffered(&self) -> bool {
+        self.buffered
+    }
+
+    /// Time until the popup has its final position, size, and visibility.
+    pub fn window_ready_duration(&self) -> Duration {
+        self.window_ready
+    }
+
+    /// Time until the production window procedure enters `WM_PAINT`.
+    pub fn paint_entered_duration(&self) -> Duration {
+        self.paint_entered
+    }
+
+    /// Time until all GDI drawing into the selected target has completed.
+    pub fn drawing_completed_duration(&self) -> Duration {
+        self.drawing_completed
+    }
+
+    /// Time until the completed frame has been copied to the paint DC.
+    pub fn frame_published_duration(&self) -> Duration {
+        self.frame_published
+    }
+
+    /// Time until `EndPaint` completes successfully.
+    pub fn paint_completed_duration(&self) -> Duration {
+        self.paint_completed
+    }
+
+    /// Duration of a successful, separately measured `DwmFlush` call.
+    pub fn compositor_flush_duration(&self) -> Option<Duration> {
+        self.compositor_flush
+    }
+
+    /// Time from the render request until a successful `DwmFlush` returns.
+    pub fn request_to_compositor_flush_duration(&self) -> Option<Duration> {
+        self.request_to_compositor_flush
+    }
+}
+
+/// Aggregate-free, text-free evidence returned by the local popup preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidatePopupRenderPreflightReport {
+    repetitions: usize,
+    samples: Vec<CandidatePopupRenderSample>,
+    hide_durations: Vec<Duration>,
+    destroy_durations: Vec<Duration>,
+}
+
+impl CandidatePopupRenderPreflightReport {
+    pub fn repetitions(&self) -> usize {
+        self.repetitions
+    }
+
+    pub fn samples(&self) -> &[CandidatePopupRenderSample] {
+        &self.samples
+    }
+
+    pub fn hide_durations(&self) -> &[Duration] {
+        &self.hide_durations
+    }
+
+    pub fn destroy_durations(&self) -> &[Duration] {
+        &self.destroy_durations
+    }
+}
+
+/// Sanitized failures from the isolated candidate-popup rendering preflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidatePopupRenderPreflightError {
+    InvalidRepetitions,
+    WindowSetup,
+    PaintNotObserved,
+    PaintFailed,
+    HideFailed,
+    CleanupFailed,
+}
+
+impl fmt::Display for CandidatePopupRenderPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRepetitions => write!(formatter, "候选窗绘制预检重复次数无效"),
+            Self::WindowSetup => write!(formatter, "候选窗绘制预检无法建立隔离窗口"),
+            Self::PaintNotObserved => write!(formatter, "候选窗绘制预检未观察到 WM_PAINT"),
+            Self::PaintFailed => write!(formatter, "候选窗绘制预检未完成 GDI 帧"),
+            Self::HideFailed => write!(formatter, "候选窗绘制预检无法确认隐藏"),
+            Self::CleanupFailed => write!(formatter, "候选窗绘制预检无法确认窗口清理"),
+        }
+    }
+}
+
+impl StdError for CandidatePopupRenderPreflightError {}
+
 /// Sanitized failures from a candidate snapshot's TSF synthetic-host preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TsfCandidatePreflightError {
@@ -4282,6 +4417,30 @@ struct PendingCandidatePopupTiming {
     started_at: Instant,
     context: NativeFeedbackContext,
     initial_show: bool,
+    render_preflight: Option<PendingCandidatePopupRenderTiming>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidatePopupRenderRequest {
+    scenario: CandidatePopupRenderScenario,
+    requested_dpi: u32,
+}
+
+#[derive(Debug)]
+struct PendingCandidatePopupRenderTiming {
+    request: CandidatePopupRenderRequest,
+    effective_dpi: u32,
+    window_ready: Duration,
+    paint_entered: Option<Duration>,
+    drawing_completed: Option<Duration>,
+    frame_published: Option<Duration>,
+    buffered: bool,
+}
+
+#[derive(Debug)]
+struct CompletedCandidatePopupRenderTiming {
+    started_at: Instant,
+    sample: CandidatePopupRenderSample,
 }
 
 #[derive(Default)]
@@ -4293,6 +4452,12 @@ struct CandidatePopupPaintState {
     native_feedback: SyncWeak<Mutex<NativeFeedbackRuntime>>,
     native_feedback_language_bar_state: Weak<NativeFeedbackLanguageBarState>,
     pending_timing: Option<PendingCandidatePopupTiming>,
+    completed_render_preflight: Option<
+        std::result::Result<
+            CompletedCandidatePopupRenderTiming,
+            CandidatePopupRenderPreflightError,
+        >,
+    >,
     corner_strategy: CandidatePopupCornerStrategy,
     transient_notice: bool,
     transient_hidden: bool,
@@ -4341,13 +4506,78 @@ fn configure_candidate_popup_corners(hwnd: HWND) -> CandidatePopupCornerStrategy
 }
 
 impl CandidatePopupPaintState {
-    fn complete_pending_timing(&mut self) {
+    fn mark_paint_entered(&mut self) {
+        if let Some(pending) = self.pending_timing.as_mut()
+            && let Some(render) = pending.render_preflight.as_mut()
+        {
+            render.paint_entered = Some(pending.started_at.elapsed());
+        }
+    }
+
+    fn mark_drawing_completed(&mut self, buffered: bool) {
+        if let Some(pending) = self.pending_timing.as_mut()
+            && let Some(render) = pending.render_preflight.as_mut()
+        {
+            render.drawing_completed = Some(pending.started_at.elapsed());
+            render.buffered = buffered;
+        }
+    }
+
+    fn mark_frame_published(&mut self) {
+        if let Some(pending) = self.pending_timing.as_mut()
+            && let Some(render) = pending.render_preflight.as_mut()
+        {
+            render.frame_published = Some(pending.started_at.elapsed());
+        }
+    }
+
+    fn fail_pending_timing(&mut self, failure: CandidatePopupRenderPreflightError) {
         let Some(pending) = self.pending_timing.take() else {
             return;
         };
-        let elapsed_ms = pending
-            .started_at
-            .elapsed()
+        if pending.render_preflight.is_some() {
+            self.completed_render_preflight = Some(Err(failure));
+        }
+    }
+
+    fn complete_pending_timing(&mut self, paint_completed: bool) {
+        let Some(pending) = self.pending_timing.take() else {
+            return;
+        };
+        let paint_completed_duration = pending.started_at.elapsed();
+        if let Some(render) = pending.render_preflight {
+            let completed = match (
+                paint_completed,
+                render.paint_entered,
+                render.drawing_completed,
+                render.frame_published,
+            ) {
+                (true, Some(paint_entered), Some(drawing_completed), Some(frame_published)) => {
+                    Ok(CompletedCandidatePopupRenderTiming {
+                        started_at: pending.started_at,
+                        sample: CandidatePopupRenderSample {
+                            scenario: render.request.scenario,
+                            requested_dpi: render.request.requested_dpi,
+                            effective_dpi: render.effective_dpi,
+                            buffered: render.buffered,
+                            window_ready: render.window_ready,
+                            paint_entered,
+                            drawing_completed,
+                            frame_published,
+                            paint_completed: paint_completed_duration,
+                            compositor_flush: None,
+                            request_to_compositor_flush: None,
+                        },
+                    })
+                }
+                _ => Err(CandidatePopupRenderPreflightError::PaintFailed),
+            };
+            self.completed_render_preflight = Some(completed);
+        }
+        if !paint_completed {
+            return;
+        }
+        let elapsed_ms = paint_completed_duration
             .as_millis()
             .min(u128::from(u32::MAX)) as u32;
         let Some(feedback) = self.native_feedback.upgrade() else {
@@ -4420,14 +4650,21 @@ impl CandidatePopup {
         display: &CandidateDisplay,
         feedback_context: NativeFeedbackContext,
     ) -> Result<()> {
-        self.show_inner(owner, anchor, display, feedback_context, false)
+        self.show_inner(owner, anchor, display, feedback_context, false, None)
     }
 
     fn show_notice(&mut self, display: &CandidateDisplay) -> Result<()> {
         let (Some(owner), Some(anchor)) = (self.owner, self.anchor) else {
             return Err(lifecycle_error(E_UNEXPECTED));
         };
-        self.show_inner(owner, anchor, display, NativeFeedbackContext::Unknown, true)
+        self.show_inner(
+            owner,
+            anchor,
+            display,
+            NativeFeedbackContext::Unknown,
+            true,
+            None,
+        )
     }
 
     fn show_inner(
@@ -4437,6 +4674,7 @@ impl CandidatePopup {
         display: &CandidateDisplay,
         feedback_context: NativeFeedbackContext,
         transient_notice: bool,
+        render_preflight: Option<CandidatePopupRenderRequest>,
     ) -> Result<()> {
         let timing_started_at = Instant::now();
         if let Some(hwnd) = self.hwnd {
@@ -4455,13 +4693,18 @@ impl CandidatePopup {
         if self.owner.is_some_and(|current| current != owner) {
             self.destroy();
         }
-        let dpi = if owner.is_invalid() {
-            96
-        } else {
-            // SAFETY: GetDpiForWindow is read-only and accepts this host-owned
-            // HWND. A zero result falls back to the platform baseline.
-            unsafe { GetDpiForWindow(owner) }.max(96)
-        };
+        let dpi = render_preflight.map_or_else(
+            || {
+                if owner.is_invalid() {
+                    96
+                } else {
+                    // SAFETY: GetDpiForWindow is read-only and accepts this
+                    // host-owned HWND. Zero falls back to the baseline.
+                    unsafe { GetDpiForWindow(owner) }.max(96)
+                }
+            },
+            |request| request.requested_dpi,
+        );
         self.paint.display = display.clone();
         self.paint.dpi = dpi;
         self.feedback_context = feedback_context;
@@ -4594,10 +4837,23 @@ impl CandidatePopup {
             self.placement = Some(placement);
             self.visible = true;
         }
+        if self.paint.pending_timing.is_some() {
+            self.paint
+                .fail_pending_timing(CandidatePopupRenderPreflightError::PaintNotObserved);
+        }
         self.paint.pending_timing = Some(PendingCandidatePopupTiming {
             started_at: timing_started_at,
             context: feedback_context,
             initial_show: !was_visible,
+            render_preflight: render_preflight.map(|request| PendingCandidatePopupRenderTiming {
+                request,
+                effective_dpi: dpi,
+                window_ready: timing_started_at.elapsed(),
+                paint_entered: None,
+                drawing_completed: None,
+                frame_published: None,
+                buffered: false,
+            }),
         });
         // SAFETY: the stable paint state and final client size are now ready.
         unsafe {
@@ -4605,6 +4861,38 @@ impl CandidatePopup {
         }
         self.anchor = Some(anchor);
         Ok(())
+    }
+
+    fn render_preflight(
+        &mut self,
+        anchor: RECT,
+        display: &CandidateDisplay,
+        request: CandidatePopupRenderRequest,
+    ) -> std::result::Result<CompletedCandidatePopupRenderTiming, CandidatePopupRenderPreflightError>
+    {
+        self.paint.completed_render_preflight = None;
+        self.show_inner(
+            HWND::default(),
+            anchor,
+            display,
+            NativeFeedbackContext::Unknown,
+            false,
+            Some(request),
+        )
+        .map_err(|_| CandidatePopupRenderPreflightError::WindowSetup)?;
+        let hwnd = self
+            .hwnd
+            .ok_or(CandidatePopupRenderPreflightError::WindowSetup)?;
+        // SAFETY: the popup is live, invalidated, and owned by this thread.
+        // UpdateWindow synchronously routes the production WM_PAINT path.
+        if !unsafe { UpdateWindow(hwnd) }.as_bool() {
+            self.paint
+                .fail_pending_timing(CandidatePopupRenderPreflightError::PaintNotObserved);
+        }
+        self.paint
+            .completed_render_preflight
+            .take()
+            .ok_or(CandidatePopupRenderPreflightError::PaintNotObserved)?
     }
 
     fn update(
@@ -4619,6 +4907,10 @@ impl CandidatePopup {
     }
 
     fn set_visible(&mut self, visible: bool) {
+        if !visible {
+            self.paint
+                .fail_pending_timing(CandidatePopupRenderPreflightError::PaintNotObserved);
+        }
         let Some(hwnd) = self.hwnd else {
             return;
         };
@@ -4640,7 +4932,6 @@ impl CandidatePopup {
             return;
         }
         self.visible = false;
-        self.paint.pending_timing = None;
         // SAFETY: candidate dismissal is immediate so committed text is never
         // covered by a fading stale list.
         unsafe {
@@ -4659,6 +4950,8 @@ impl CandidatePopup {
     }
 
     fn destroy(&mut self) {
+        self.paint
+            .fail_pending_timing(CandidatePopupRenderPreflightError::CleanupFailed);
         if let Some(hwnd) = self.hwnd.take() {
             // SAFETY: this controller owns the popup and its fixed timer id.
             let _ = unsafe { KillTimer(Some(hwnd), INLINE_WISH_NOTICE_TIMER_ID) };
@@ -4681,6 +4974,138 @@ impl Drop for CandidatePopup {
     fn drop(&mut self) {
         self.destroy();
     }
+}
+
+const CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS: [u32; 4] = [96, 120, 144, 192];
+const MAX_CANDIDATE_POPUP_RENDER_PREFLIGHT_REPETITIONS: usize = 20;
+
+fn candidate_popup_render_preflight_display(variant: usize, page_start: usize) -> CandidateDisplay {
+    let candidates = match variant {
+        0 => [
+            "春风", "秋雨", "山川", "星河", "晨光", "晚霞", "清泉", "松林", "竹影", "云海", "微风",
+            "月色", "远山", "归舟",
+        ],
+        _ => [
+            "新芽", "流云", "青石", "白鹭", "疏影", "长风", "晴空", "灯火", "潮声", "飞鸟", "暖阳",
+            "清露", "花径", "溪桥",
+        ],
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let len = candidates.len();
+    CandidateDisplay::from_batch(
+        CandidateBatch {
+            candidates,
+            resolved_shape_codes: vec![None; len],
+            provenance: vec![NativeCandidateProvenance::default(); len],
+            personalized: vec![false; len],
+            protected_prefix_len: 0,
+            automatic_transposition: None,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+        },
+        page_start,
+    )
+}
+
+fn candidate_popup_render_sample_is_monotonic(sample: &CandidatePopupRenderSample) -> bool {
+    sample.window_ready <= sample.paint_entered
+        && sample.paint_entered <= sample.drawing_completed
+        && sample.drawing_completed <= sample.frame_published
+        && sample.frame_published <= sample.paint_completed
+        && sample
+            .request_to_compositor_flush
+            .is_none_or(|duration| sample.paint_completed <= duration)
+}
+
+/// Paints fixed public candidate rows through the production popup window.
+///
+/// The popup is process-local, ownerless, nonactivating, and destroyed before
+/// return. No TSF profile, package slot, user preference, or feedback store is
+/// opened. Returned evidence contains only phase durations and DPI values.
+/// A successful `DwmFlush` is a compositor synchronization boundary; it does
+/// not prove the physical display has scanned out the frame.
+pub fn preflight_candidate_popup_rendering(
+    repetitions: usize,
+) -> std::result::Result<CandidatePopupRenderPreflightReport, CandidatePopupRenderPreflightError> {
+    if !(1..=MAX_CANDIDATE_POPUP_RENDER_PREFLIGHT_REPETITIONS).contains(&repetitions) {
+        return Err(CandidatePopupRenderPreflightError::InvalidRepetitions);
+    }
+
+    let anchor = RECT {
+        left: 24,
+        top: 24,
+        right: 120,
+        bottom: 56,
+    };
+    let first_page = candidate_popup_render_preflight_display(0, 0);
+    let updated_page = candidate_popup_render_preflight_display(1, 0);
+    let second_page = candidate_popup_render_preflight_display(1, CANDIDATE_PAGE_SIZE);
+    let mut samples = Vec::with_capacity(
+        repetitions
+            .saturating_mul(CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS.len())
+            .saturating_mul(3),
+    );
+    let mut hide_durations =
+        Vec::with_capacity(repetitions.saturating_mul(CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS.len()));
+    let mut destroy_durations = Vec::with_capacity(hide_durations.capacity());
+
+    for _ in 0..repetitions {
+        for requested_dpi in CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS {
+            let mut popup = CandidatePopup::default();
+            for (scenario, display) in [
+                (CandidatePopupRenderScenario::InitialShow, &first_page),
+                (CandidatePopupRenderScenario::ContentUpdate, &updated_page),
+                (CandidatePopupRenderScenario::PageRedraw, &second_page),
+            ] {
+                let mut completed = popup.render_preflight(
+                    anchor,
+                    display,
+                    CandidatePopupRenderRequest {
+                        scenario,
+                        requested_dpi,
+                    },
+                )?;
+                let compositor_started_at = Instant::now();
+                // SAFETY: this is a process-local synchronization request and
+                // does not retain handles or modify system configuration.
+                if unsafe { DwmFlush() }.is_ok() {
+                    completed.sample.compositor_flush = Some(compositor_started_at.elapsed());
+                    completed.sample.request_to_compositor_flush =
+                        Some(completed.started_at.elapsed());
+                }
+                if !candidate_popup_render_sample_is_monotonic(&completed.sample) {
+                    return Err(CandidatePopupRenderPreflightError::PaintFailed);
+                }
+                samples.push(completed.sample);
+            }
+
+            let hwnd = popup
+                .hwnd
+                .ok_or(CandidatePopupRenderPreflightError::WindowSetup)?;
+            let hide_started_at = Instant::now();
+            popup.hide();
+            hide_durations.push(hide_started_at.elapsed());
+            if popup.visible || unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                return Err(CandidatePopupRenderPreflightError::HideFailed);
+            }
+
+            let destroy_started_at = Instant::now();
+            popup.destroy();
+            destroy_durations.push(destroy_started_at.elapsed());
+            if popup.hwnd.is_some() || unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                return Err(CandidatePopupRenderPreflightError::CleanupFailed);
+            }
+        }
+    }
+
+    Ok(CandidatePopupRenderPreflightReport {
+        repetitions,
+        samples,
+        hide_durations,
+        destroy_durations,
+    })
 }
 
 fn popup_rgb(red: u8, green: u8, blue: u8) -> COLORREF {
@@ -5260,6 +5685,14 @@ unsafe extern "system" fn candidate_popup_window_proc(
         unsafe { (*state_pointer).original_window_proc }
     };
     if message == WM_NCDESTROY {
+        if !state_pointer.is_null() {
+            // SAFETY: the stable paint state remains live until the owning
+            // CandidatePopup finishes DestroyWindow.
+            unsafe {
+                (*state_pointer)
+                    .fail_pending_timing(CandidatePopupRenderPreflightError::CleanupFailed);
+            }
+        }
         // SAFETY: prevents any later message from observing a stale pointer.
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -5322,10 +5755,12 @@ unsafe fn paint_candidate_notice_icon(
 }
 
 unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState) {
+    state.mark_paint_entered();
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: standard WM_PAINT lifecycle for this popup.
     let paint_dc = unsafe { BeginPaint(hwnd, &mut paint) };
     if paint_dc.is_invalid() {
+        state.fail_pending_timing(CandidatePopupRenderPreflightError::PaintFailed);
         return;
     }
     let mut client = RECT::default();
@@ -5335,6 +5770,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
         unsafe {
             let _ = EndPaint(hwnd, &paint);
         }
+        state.fail_pending_timing(CandidatePopupRenderPreflightError::PaintFailed);
         return;
     }
 
@@ -5672,11 +6108,13 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             let _ = DeleteObject(HGDIOBJ(background_brush.0));
         }
     }
-    if hdc == buffer_dc && !buffer_dc.is_invalid() {
+    let buffered = hdc == buffer_dc && !buffer_dc.is_invalid();
+    state.mark_drawing_completed(buffered);
+    let frame_published = if buffered {
         // SAFETY: both DCs and the selected bitmap remain valid. One BitBlt
         // publishes the complete frame without an intermediate blank state.
-        unsafe {
-            let _ = BitBlt(
+        let result = unsafe {
+            BitBlt(
                 paint_dc,
                 0,
                 0,
@@ -5686,9 +6124,17 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                 0,
                 0,
                 SRCCOPY,
-            );
+            )
+        };
+        unsafe {
             let _ = SelectObject(buffer_dc, previous_bitmap);
         }
+        result.is_ok()
+    } else {
+        true
+    };
+    if frame_published {
+        state.mark_frame_published();
     }
     if !buffer_bitmap.is_invalid() {
         // SAFETY: the bitmap is no longer selected into the compatible DC.
@@ -5703,10 +6149,8 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
         }
     }
     // SAFETY: balances BeginPaint.
-    unsafe {
-        let _ = EndPaint(hwnd, &paint);
-    }
-    state.complete_pending_timing();
+    let paint_completed = unsafe { EndPaint(hwnd, &paint) }.as_bool();
+    state.complete_pending_timing(paint_completed && frame_published);
 }
 
 #[implement(ITfCandidateListUIElement)]
@@ -22724,6 +23168,96 @@ mod tests {
         assert!(candidate_popup_should_show(true, true, true));
         assert!(!candidate_popup_should_show(false, true, true));
         assert!(!candidate_popup_should_show(true, false, true));
+    }
+
+    fn pending_popup_render_timing() -> PendingCandidatePopupTiming {
+        PendingCandidatePopupTiming {
+            started_at: Instant::now(),
+            context: NativeFeedbackContext::Unknown,
+            initial_show: true,
+            render_preflight: Some(PendingCandidatePopupRenderTiming {
+                request: CandidatePopupRenderRequest {
+                    scenario: CandidatePopupRenderScenario::InitialShow,
+                    requested_dpi: 144,
+                },
+                effective_dpi: 144,
+                window_ready: Duration::ZERO,
+                paint_entered: None,
+                drawing_completed: None,
+                frame_published: None,
+                buffered: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn popup_render_probe_requires_every_successful_paint_phase_in_order() {
+        let mut state = CandidatePopupPaintState {
+            pending_timing: Some(pending_popup_render_timing()),
+            ..Default::default()
+        };
+        state.mark_paint_entered();
+        state.mark_drawing_completed(true);
+        state.mark_frame_published();
+        state.complete_pending_timing(true);
+
+        let completed = state
+            .completed_render_preflight
+            .take()
+            .expect("probe completion")
+            .expect("successful probe");
+        assert!(candidate_popup_render_sample_is_monotonic(
+            &completed.sample
+        ));
+        assert_eq!(
+            completed.sample.scenario(),
+            CandidatePopupRenderScenario::InitialShow
+        );
+        assert_eq!(completed.sample.requested_dpi(), 144);
+        assert_eq!(completed.sample.effective_dpi(), 144);
+        assert!(completed.sample.buffered());
+        assert!(state.pending_timing.is_none());
+    }
+
+    #[test]
+    fn popup_render_probe_fails_closed_on_missing_phase_or_destroy() {
+        let mut incomplete = CandidatePopupPaintState {
+            pending_timing: Some(pending_popup_render_timing()),
+            ..Default::default()
+        };
+        incomplete.mark_paint_entered();
+        incomplete.complete_pending_timing(true);
+        assert!(matches!(
+            incomplete.completed_render_preflight,
+            Some(Err(CandidatePopupRenderPreflightError::PaintFailed))
+        ));
+
+        let mut popup = CandidatePopup::default();
+        popup.paint.pending_timing = Some(pending_popup_render_timing());
+        popup.destroy();
+        assert!(popup.paint.pending_timing.is_none());
+        assert!(matches!(
+            popup.paint.completed_render_preflight,
+            Some(Err(CandidatePopupRenderPreflightError::CleanupFailed))
+        ));
+    }
+
+    #[test]
+    fn popup_render_preflight_static_pages_cover_every_requested_dpi() {
+        let first = candidate_popup_render_preflight_display(0, 0);
+        let updated = candidate_popup_render_preflight_display(1, 0);
+        let second = candidate_popup_render_preflight_display(1, CANDIDATE_PAGE_SIZE);
+        assert_eq!(first.visible().len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(updated.visible().len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(second.visible().len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(second.current_page(), 1);
+        for dpi in CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS {
+            let first_metrics = candidate_popup_metrics(&first, dpi, popup_scale(dpi, 1_920));
+            let updated_metrics = candidate_popup_metrics(&updated, dpi, popup_scale(dpi, 1_920));
+            let second_metrics = candidate_popup_metrics(&second, dpi, popup_scale(dpi, 1_920));
+            assert!(first_metrics.width > 0 && first_metrics.height > 0);
+            assert_eq!(updated_metrics, second_metrics);
+        }
     }
 
     #[test]
