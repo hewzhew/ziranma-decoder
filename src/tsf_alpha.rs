@@ -41,24 +41,24 @@ use crate::{
     NativeCancellationSource, NativeCandidatePersonalization, NativeCandidateProvenance,
     NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
     NativeFeedbackAuthorization, NativeFeedbackClearResult, NativeFeedbackContext,
-    NativeFeedbackEvent, NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle,
-    NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
-    NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
-    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeTabAssemblyState,
-    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
-    PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
-    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
-    PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
-    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
-    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
-    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
-    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_snapshots,
-    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
-    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
-    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
-    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
-    save_personal_ranking_batch, save_personal_ranking_checkpoint,
-    save_personal_ranking_suppression_action, save_wish_snapshot,
+    NativeFeedbackEvent, NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError,
+    NativeFeedbackLifecycle, NativeFeedbackLimits, NativeFeedbackRecordResult,
+    NativeFeedbackSession, NativeFeedbackStartResult, NativeFeedbackStopResult,
+    NativeFeedbackSummary, NativePersonalPhraseAdjacency, NativeSelectionSource,
+    NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY,
+    PersonalContextRanking, PersonalRankingBatch, PersonalRankingSelection,
+    PersonalRankingSnapshot, PersonalRankingSuppressionAction,
+    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
+    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, WISH_ACK_COMPARTMENT_GUID,
+    WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
+    WishCommand, WishCommandAck, WishCommandAckStatus, WishJournalAnchor, WishJournalContext,
+    WishJournalSpan, WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot,
+    candidate_sha256_hex, load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
+    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
+    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
+    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -1875,21 +1875,35 @@ fn inline_wish_actions(summary: NativeFeedbackSummary) -> Vec<InlineWishAction> 
     }
 }
 
-fn inline_wish_notice(operation: InlineWishOperation, succeeded: bool) -> CandidateDisplay {
-    let label = match (operation, succeeded) {
-        (InlineWishOperation::Capture { .. }, true) => "已经保存",
-        (InlineWishOperation::Capture { .. }, false) => "保存失败",
-        (InlineWishOperation::Command(WishCommand::Start), true) => "反馈已开始",
-        (InlineWishOperation::Command(WishCommand::ClearStopped), true) => "反馈已清除",
-        (InlineWishOperation::Command(_), true) => "操作已完成",
-        (InlineWishOperation::Command(_), false) => "操作未完成",
+fn inline_wish_notice(
+    operation: InlineWishOperation,
+    status: WishCommandAckStatus,
+) -> CandidateDisplay {
+    let label = match (operation, status) {
+        (InlineWishOperation::Capture { .. }, WishCommandAckStatus::Applied) => "已经保存",
+        (InlineWishOperation::Capture { .. }, WishCommandAckStatus::NoChange) => {
+            "刚才没有可保存的内容"
+        }
+        (InlineWishOperation::Capture { .. }, WishCommandAckStatus::Failed) => "保存失败",
+        (InlineWishOperation::Command(WishCommand::Start), WishCommandAckStatus::Applied) => {
+            "反馈已开始"
+        }
+        (
+            InlineWishOperation::Command(WishCommand::ClearStopped),
+            WishCommandAckStatus::Applied,
+        ) => "反馈已清除",
+        (InlineWishOperation::Command(_), WishCommandAckStatus::Applied) => "操作已完成",
+        (InlineWishOperation::Command(_), WishCommandAckStatus::NoChange) => "状态没有变化",
+        (InlineWishOperation::Command(_), WishCommandAckStatus::Failed) => "操作未完成",
     };
-    let detail = if succeeded {
-        "可以继续输入"
-    } else {
-        "稍后再试"
+    let detail = match status {
+        WishCommandAckStatus::Applied => "可以继续输入",
+        WishCommandAckStatus::NoChange => "继续输入后再试",
+        WishCommandAckStatus::Failed => "稍后再试",
     };
-    if matches!(operation, InlineWishOperation::Capture { .. }) && succeeded {
+    if matches!(operation, InlineWishOperation::Capture { .. })
+        && status == WishCommandAckStatus::Applied
+    {
         CandidateDisplay::notice_with_icon(label, detail, CandidateNoticeIcon::WishReceived)
     } else {
         CandidateDisplay::notice(label, detail)
@@ -6257,31 +6271,42 @@ struct NativeFeedbackLanguageBarState {
     wish_save_status: Cell<WishSaveStatus>,
 }
 
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum WishSaveStatus {
     #[default]
     Never,
     Saved {
         events: usize,
     },
+    NothingRecent,
     Failed,
+}
+
+impl WishSaveStatus {
+    fn acknowledgement(self) -> WishCommandAckStatus {
+        match self {
+            Self::Saved { .. } => WishCommandAckStatus::Applied,
+            Self::Never | Self::NothingRecent => WishCommandAckStatus::NoChange,
+            Self::Failed => WishCommandAckStatus::Failed,
+        }
+    }
 }
 
 fn freeze_recent_wish_with_context(
     feedback: &NativeFeedbackSession,
     marker_ms: u64,
-) -> Option<FrozenNativeFeedbackSnapshot> {
+) -> std::result::Result<Option<FrozenNativeFeedbackSnapshot>, NativeFeedbackFreezeError> {
     let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
-    feedback
-        .freeze_recent_episodes(
-            authorization,
-            marker_ms,
-            DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
-            DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
-            DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
-        )
-        .ok()
-        .flatten()?;
+    let Some(_) = feedback.freeze_recent_episodes(
+        authorization,
+        marker_ms,
+        DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
+        DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
+        DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+    )?
+    else {
+        return Ok(None);
+    };
     // The episode probe above guarantees that the package has a meaningful
     // completed focus. Persist the wider bounded context as well:
     // `WishSnapshot` marks the latest completed episode as focus and keeps
@@ -6294,7 +6319,7 @@ fn freeze_recent_wish_with_context(
             DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
             DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
         )
-        .ok()
+        .map(Some)
 }
 
 impl NativeFeedbackLanguageBarState {
@@ -6364,30 +6389,29 @@ impl NativeFeedbackLanguageBarState {
         ))
     }
 
-    fn save_wish(&self, scope: WishCaptureScope, category: WishCategory) -> bool {
+    fn save_wish(&self, scope: WishCaptureScope, category: WishCategory) -> WishSaveStatus {
         let Some(root) = self.wish_root.as_deref() else {
             self.wish_save_status.set(WishSaveStatus::Failed);
             self.notify();
-            return false;
+            return WishSaveStatus::Failed;
         };
-        let frozen = self.feedback.lock().ok().and_then(|feedback| {
+        let frozen = self.feedback.lock().map_err(|_| ()).and_then(|feedback| {
             let marker_ms = native_feedback_monotonic_ms();
             let authorization = NativeFeedbackFreezeAuthorization::explicit_private_snapshot();
             let frozen = match scope {
                 WishCaptureScope::RecentEpisodes => {
-                    { freeze_recent_wish_with_context(&feedback, marker_ms) }
-                        .map(|frozen| (frozen, WishCaptureScope::RecentEpisodes))
-                        .or_else(|| {
-                            feedback
-                                .freeze_recent(
-                                    authorization,
-                                    marker_ms,
-                                    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
-                                    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
-                                )
-                                .ok()
-                                .map(|frozen| (frozen, WishCaptureScope::RecentWindow))
-                        })
+                    match freeze_recent_wish_with_context(&feedback, marker_ms) {
+                        Ok(Some(frozen)) => Ok((frozen, WishCaptureScope::RecentEpisodes)),
+                        Ok(None) => feedback
+                            .freeze_recent(
+                                authorization,
+                                marker_ms,
+                                DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+                                DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
+                            )
+                            .map(|frozen| (frozen, WishCaptureScope::RecentWindow)),
+                        Err(error) => Err(error),
+                    }
                 }
                 WishCaptureScope::LegacyWindow
                 | WishCaptureScope::RecentWindow
@@ -6398,53 +6422,59 @@ impl NativeFeedbackLanguageBarState {
                         DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
                         DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS,
                     )
-                    .ok()
                     .map(|frozen| (frozen, WishCaptureScope::RecentWindow)),
-            }?;
-            Some((
-                frozen.0,
-                frozen.1,
-                feedback.research.runtime_identity(),
-                feedback
-                    .research
-                    .current_anchor()
-                    .map(WishJournalContext::WishAnchor),
-            ))
+            };
+            match frozen {
+                Ok((frozen, _)) if frozen.events().is_empty() => Ok(None),
+                Ok((frozen, effective_scope)) => Ok(Some((
+                    frozen,
+                    effective_scope,
+                    feedback.research.runtime_identity(),
+                    feedback
+                        .research
+                        .current_anchor()
+                        .map(WishJournalContext::WishAnchor),
+                ))),
+                Err(NativeFeedbackFreezeError::Disabled)
+                | Err(NativeFeedbackFreezeError::NotAccepting) => Ok(None),
+                Err(_) => Err(()),
+            }
         });
-        let saved_events = frozen
-            .and_then(
-                |(frozen, effective_scope, runtime_identity, journal_context)| {
-                    WishSnapshot::from_frozen_with_context_and_public_order_policy(
-                        &frozen,
-                        effective_scope,
-                        category,
-                        runtime_identity,
-                        TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
-                        journal_context,
-                    )
-                    .ok()
-                },
-            )
-            .and_then(|snapshot| {
-                let event_count = snapshot.events().len();
-                if event_count == 0 {
-                    return None;
+        let status = match frozen {
+            Err(()) => WishSaveStatus::Failed,
+            Ok(None) => WishSaveStatus::NothingRecent,
+            Ok(Some((frozen, effective_scope, runtime_identity, journal_context))) => {
+                let snapshot = WishSnapshot::from_frozen_with_context_and_public_order_policy(
+                    &frozen,
+                    effective_scope,
+                    category,
+                    runtime_identity,
+                    TSF_PUBLIC_CANDIDATE_ORDER_POLICY,
+                    journal_context,
+                );
+                match snapshot {
+                    Ok(snapshot) => {
+                        let events = snapshot.events().len();
+                        match save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector) {
+                            Ok(_) => WishSaveStatus::Saved { events },
+                            Err(_) => WishSaveStatus::Failed,
+                        }
+                    }
+                    Err(_) => WishSaveStatus::Failed,
                 }
-                save_wish_snapshot(root, &snapshot, &WindowsUserDataProtector)
-                    .ok()
-                    .map(|_| event_count)
-            });
-        self.wish_save_status.set(match saved_events {
-            Some(events) => WishSaveStatus::Saved { events },
-            None => WishSaveStatus::Failed,
-        });
+            }
+        };
+        self.wish_save_status.set(status);
         self.notify();
-        saved_events.is_some()
+        status
     }
 
     fn perform_feedback_action(&self, action: u32) -> Result<bool> {
         if action == FEEDBACK_MENU_WISH {
-            return Ok(self.save_wish(WishCaptureScope::RecentWindow, WishCategory::Other));
+            return Ok(self
+                .save_wish(WishCaptureScope::RecentWindow, WishCategory::Other)
+                .acknowledgement()
+                == WishCommandAckStatus::Applied);
         }
         let changed = {
             let mut feedback = self
@@ -6479,15 +6509,9 @@ impl NativeFeedbackLanguageBarState {
         let action = match command {
             WishCommand::Start => FEEDBACK_MENU_START,
             WishCommand::SaveRecent => {
-                let event_count = self.summary().map_or(0, |summary| summary.events);
-                if event_count == 0 {
-                    return WishCommandAckStatus::NoChange;
-                }
-                return if self.save_wish(WishCaptureScope::RecentWindow, WishCategory::Other) {
-                    WishCommandAckStatus::Applied
-                } else {
-                    WishCommandAckStatus::Failed
-                };
+                return self
+                    .save_wish(WishCaptureScope::RecentWindow, WishCategory::Other)
+                    .acknowledgement();
             }
             WishCommand::Stop => FEEDBACK_MENU_STOP,
             WishCommand::ClearStopped => FEEDBACK_MENU_CLEAR,
@@ -6499,12 +6523,15 @@ impl NativeFeedbackLanguageBarState {
         }
     }
 
-    fn perform_inline_wish_operation(&self, operation: InlineWishOperation) -> bool {
+    fn perform_inline_wish_operation(
+        &self,
+        operation: InlineWishOperation,
+    ) -> WishCommandAckStatus {
         match operation {
-            InlineWishOperation::Command(command) => {
-                self.perform_wish_command(command) == WishCommandAckStatus::Applied
+            InlineWishOperation::Command(command) => self.perform_wish_command(command),
+            InlineWishOperation::Capture { scope, category } => {
+                self.save_wish(scope, category).acknowledgement()
             }
-            InlineWishOperation::Capture { scope, category } => self.save_wish(scope, category),
         }
     }
 }
@@ -6608,6 +6635,11 @@ fn feedback_language_bar_menu(
                 FEEDBACK_MENU_STATUS + 4,
                 TF_LBMENUF_CHECKED | TF_LBMENUF_GRAYED,
                 format!("许愿已加密保存（{events} 条）"),
+            )),
+            WishSaveStatus::NothingRecent => items.push((
+                FEEDBACK_MENU_STATUS + 4,
+                TF_LBMENUF_GRAYED,
+                "最近没有可保存的输入法事件".to_owned(),
             )),
             WishSaveStatus::Failed => items.push((
                 FEEDBACK_MENU_STATUS + 4,
@@ -10629,11 +10661,11 @@ impl TsfTextService_Impl {
             }
         }
         if let Some(PlannedAction::Wish(operation)) = action_after_success {
-            let succeeded = self
+            let status = self
                 .native_feedback_language_bar_state
                 .perform_inline_wish_operation(operation);
             if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
-                let _ = candidate_ui.show_notice(inline_wish_notice(operation, succeeded));
+                let _ = candidate_ui.show_notice(inline_wish_notice(operation, status));
             }
         }
         if let Some(action) = candidate_forget_action_after_success
@@ -16293,6 +16325,39 @@ mod tests {
     }
 
     #[test]
+    fn explicit_wish_action_reports_nothing_recent_without_claiming_storage_failure() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ziranma-tsf-wish-empty-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let feedback = Arc::new(Mutex::new(NativeFeedbackRuntime::memory_only()));
+        let state = NativeFeedbackLanguageBarState::with_wish_root(
+            Arc::clone(&feedback),
+            Arc::new(Mutex::new(NativeFeedbackContextCache::default())),
+            Rc::new(Cell::new(InputMode::Chinese)),
+            Some(root.clone()),
+        );
+        assert!(state.perform_feedback_action(FEEDBACK_MENU_START).unwrap());
+
+        assert!(!state.perform_feedback_action(FEEDBACK_MENU_WISH).unwrap());
+        assert_eq!(state.wish_save_status.get(), WishSaveStatus::NothingRecent);
+        assert_eq!(
+            feedback.lock().unwrap().summary().lifecycle,
+            NativeFeedbackLifecycle::Recording
+        );
+        assert!(
+            state
+                .menu()
+                .unwrap()
+                .iter()
+                .any(|(_, _, label)| label == "最近没有可保存的输入法事件")
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn wish_storage_failure_never_stops_the_live_feedback_session() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -16714,7 +16779,7 @@ mod tests {
                 scope: WishCaptureScope::RecentEpisodes,
                 category: WishCategory::Other,
             },
-            true,
+            WishCommandAckStatus::Applied,
         );
         assert_eq!(notice.visible(), ["已经保存"]);
         assert_eq!(notice.action_detail(), Some("可以继续输入"));
@@ -16733,11 +16798,25 @@ mod tests {
                 scope: WishCaptureScope::RecentEpisodes,
                 category: WishCategory::Other,
             },
-            false,
+            WishCommandAckStatus::Failed,
         );
         assert_eq!(failure.notice_icon(), CandidateNoticeIcon::None);
 
-        let lifecycle = inline_wish_notice(InlineWishOperation::Command(WishCommand::Start), true);
+        let nothing_recent = inline_wish_notice(
+            InlineWishOperation::Capture {
+                scope: WishCaptureScope::RecentEpisodes,
+                category: WishCategory::Other,
+            },
+            WishCommandAckStatus::NoChange,
+        );
+        assert_eq!(nothing_recent.visible(), ["刚才没有可保存的内容"]);
+        assert_eq!(nothing_recent.action_detail(), Some("继续输入后再试"));
+        assert_eq!(nothing_recent.notice_icon(), CandidateNoticeIcon::None);
+
+        let lifecycle = inline_wish_notice(
+            InlineWishOperation::Command(WishCommand::Start),
+            WishCommandAckStatus::Applied,
+        );
         assert_eq!(lifecycle.notice_icon(), CandidateNoticeIcon::None);
 
         let mut ui = CandidateUiController::new_headless();
@@ -18372,7 +18451,9 @@ mod tests {
             NativeFeedbackRecordResult::Recorded
         );
 
-        let frozen = freeze_recent_wish_with_context(&feedback, 5_000).unwrap();
+        let frozen = freeze_recent_wish_with_context(&feedback, 5_000)
+            .unwrap()
+            .unwrap();
         assert_eq!(frozen.source_events(), 9);
         assert_eq!(frozen.events().len(), 9);
         assert_eq!(frozen.omitted_before_window(), 0);
