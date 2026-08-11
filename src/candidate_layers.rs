@@ -6,7 +6,10 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::{MAX_CANDIDATE_SNAPSHOT_RANK, candidate_slots::validate_candidate_package_id};
+use crate::{
+    MAX_CANDIDATE_SNAPSHOT_RANK, MAX_EXACT_SHORT_WORDS_PER_CODE,
+    candidate_slots::validate_candidate_package_id,
+};
 
 /// Fixed state file inside an independently managed supplemental slot root.
 pub const CANDIDATE_SUPPLEMENTAL_STATE_FILE: &str = "supplemental.zcl";
@@ -14,6 +17,13 @@ pub const CANDIDATE_SUPPLEMENTAL_STATE_FILE: &str = "supplemental.zcl";
 pub const CANDIDATE_SUPPLEMENTAL_STATE_SCHEMA_V1: &str = "ziranma-candidate-supplemental-v1";
 /// Maximum accepted size of one supplemental-layer state file.
 pub const MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES: usize = 512;
+
+/// Fixed state file inside an independently managed exact-short slot root.
+pub const CANDIDATE_EXACT_SHORT_STATE_FILE: &str = "exact-short.zcl";
+/// First exact-short candidate-layer state schema.
+pub const CANDIDATE_EXACT_SHORT_STATE_SCHEMA_V1: &str = "ziranma-candidate-exact-short-v1";
+/// Maximum accepted size of one exact-short layer state file.
+pub const MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES: usize = 512;
 
 /// Explicit activation state for one public supplemental exact-word package.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -130,6 +140,149 @@ impl fmt::Display for CandidateSupplementalStateError {
 
 impl Error for CandidateSupplementalStateError {}
 
+/// Explicit activation state for one public exact-short package.
+///
+/// This state is deliberately separate from [`CandidateSupplementalState`]:
+/// the supplemental layer participates in the primary query, while this
+/// layer may insert only after the first candidate page has been frozen.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CandidateExactShortState {
+    package: Option<String>,
+    exact_promotions: usize,
+}
+
+impl CandidateExactShortState {
+    /// Constructs an enabled state bound to one immutable package.
+    pub fn enabled(
+        package: &str,
+        exact_promotions: usize,
+    ) -> Result<Self, CandidateExactShortStateError> {
+        validate_candidate_package_id(package)
+            .map_err(|_| CandidateExactShortStateError::InvalidPackageId)?;
+        if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+            return Err(CandidateExactShortStateError::InvalidPromotionLimit);
+        }
+        Ok(Self {
+            package: Some(package.to_owned()),
+            exact_promotions,
+        })
+    }
+
+    /// Parses the exact four-line, LF-terminated state.
+    pub fn parse(contents: &str) -> Result<Self, CandidateExactShortStateError> {
+        if contents.is_empty() || contents.len() > MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES {
+            return Err(CandidateExactShortStateError::InvalidStateSize);
+        }
+        if contents.contains('\r') || !contents.ends_with('\n') {
+            return Err(CandidateExactShortStateError::InvalidStructure);
+        }
+        let lines = contents.split('\n').collect::<Vec<_>>();
+        if lines.len() != 5 || !lines[4].is_empty() {
+            return Err(CandidateExactShortStateError::InvalidStructure);
+        }
+        if exact_short_field(lines[0], "schema")? != CANDIDATE_EXACT_SHORT_STATE_SCHEMA_V1 {
+            return Err(CandidateExactShortStateError::UnsupportedSchema);
+        }
+        let enabled = match exact_short_field(lines[1], "enabled")? {
+            "true" => true,
+            "false" => false,
+            _ => return Err(CandidateExactShortStateError::InvalidField),
+        };
+        let package = exact_short_field(lines[2], "package")?;
+        let exact_promotions =
+            exact_short_canonical_usize(exact_short_field(lines[3], "exact_promotions")?)?;
+        match (enabled, package, exact_promotions) {
+            (false, "-", 0) => Ok(Self::default()),
+            (true, package, exact_promotions) => Self::enabled(package, exact_promotions),
+            _ => Err(CandidateExactShortStateError::InvalidCombination),
+        }
+    }
+
+    /// Renders the canonical state representation.
+    pub fn render(&self) -> String {
+        format!(
+            "schema={CANDIDATE_EXACT_SHORT_STATE_SCHEMA_V1}\nenabled={}\npackage={}\nexact_promotions={}\n",
+            self.package.is_some(),
+            self.package.as_deref().unwrap_or("-"),
+            self.exact_promotions,
+        )
+    }
+
+    /// Returns whether the exact-short lane is explicitly enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.package.is_some()
+    }
+
+    /// Returns the immutable package bound to the enabled state.
+    pub fn package(&self) -> Option<&str> {
+        self.package.as_deref()
+    }
+
+    /// Returns the maximum number of exact-short insertions per code.
+    pub fn exact_promotions(&self) -> usize {
+        self.exact_promotions
+    }
+}
+
+/// Strict exact-short layer state parsing errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateExactShortStateError {
+    /// The input is empty or exceeds its fixed bound.
+    InvalidStateSize,
+    /// The input is not the exact canonical four-line shape.
+    InvalidStructure,
+    /// A field is missing, reordered, duplicated, or noncanonical.
+    InvalidField,
+    /// The schema identifier is not supported.
+    UnsupportedSchema,
+    /// The enabled package identifier is outside the internal grammar.
+    InvalidPackageId,
+    /// The enabled and disabled fields form an invalid combination.
+    InvalidCombination,
+    /// The insertion cap is outside the fixed per-code catalog depth.
+    InvalidPromotionLimit,
+}
+
+impl fmt::Display for CandidateExactShortStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidStateSize => "精确短词层状态大小无效",
+            Self::InvalidStructure => "精确短词层状态结构无效",
+            Self::InvalidField => "精确短词层状态字段无效",
+            Self::UnsupportedSchema => "不支持的精确短词层状态格式",
+            Self::InvalidPackageId => "精确短词层候选包标识无效",
+            Self::InvalidCombination => "精确短词层状态组合无效",
+            Self::InvalidPromotionLimit => "精确短词层影响上限无效",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for CandidateExactShortStateError {}
+
+fn exact_short_field<'a>(
+    line: &'a str,
+    expected_key: &str,
+) -> Result<&'a str, CandidateExactShortStateError> {
+    let Some((key, value)) = line.split_once('=') else {
+        return Err(CandidateExactShortStateError::InvalidField);
+    };
+    if key != expected_key || value.is_empty() || value.contains('=') {
+        return Err(CandidateExactShortStateError::InvalidField);
+    }
+    Ok(value)
+}
+
+fn exact_short_canonical_usize(value: &str) -> Result<usize, CandidateExactShortStateError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| CandidateExactShortStateError::InvalidField)?;
+    if parsed.to_string() != value {
+        return Err(CandidateExactShortStateError::InvalidField);
+    }
+    Ok(parsed)
+}
+
 fn field<'a>(
     line: &'a str,
     expected_key: &str,
@@ -217,5 +370,60 @@ mod tests {
         );
         assert!(CandidateSupplementalState::parse(&valid.replace('\n', "\r\n")).is_err());
         assert!(CandidateSupplementalState::parse(&format!("{valid}extra=x\n")).is_err());
+    }
+
+    #[test]
+    fn exact_short_disabled_and_enabled_states_round_trip_canonically() {
+        let disabled = CandidateExactShortState::default();
+        assert_eq!(
+            disabled.render(),
+            "schema=ziranma-candidate-exact-short-v1\n\
+             enabled=false\n\
+             package=-\n\
+             exact_promotions=0\n"
+        );
+        assert_eq!(
+            CandidateExactShortState::parse(&disabled.render()).unwrap(),
+            disabled
+        );
+
+        let enabled = CandidateExactShortState::enabled(PACKAGE, 2).unwrap();
+        assert!(enabled.is_enabled());
+        assert_eq!(enabled.package(), Some(PACKAGE));
+        assert_eq!(enabled.exact_promotions(), 2);
+        assert_eq!(
+            CandidateExactShortState::parse(&enabled.render()).unwrap(),
+            enabled
+        );
+    }
+
+    #[test]
+    fn exact_short_parser_rejects_cross_layer_and_noncanonical_states() {
+        let valid = CandidateExactShortState::enabled(PACKAGE, 2)
+            .unwrap()
+            .render();
+        assert_eq!(
+            CandidateExactShortState::parse(&valid.replace(
+                "ziranma-candidate-exact-short-v1",
+                "ziranma-candidate-supplemental-v1"
+            ))
+            .unwrap_err(),
+            CandidateExactShortStateError::UnsupportedSchema
+        );
+        assert_eq!(
+            CandidateExactShortState::parse(
+                &valid.replace("exact_promotions=2", "exact_promotions=02")
+            )
+            .unwrap_err(),
+            CandidateExactShortStateError::InvalidField
+        );
+        assert_eq!(
+            CandidateExactShortState::parse(
+                &valid.replace("exact_promotions=2", "exact_promotions=9")
+            )
+            .unwrap_err(),
+            CandidateExactShortStateError::InvalidPromotionLimit
+        );
+        assert!(CandidateExactShortState::parse(&valid.replace('\n', "\r\n")).is_err());
     }
 }

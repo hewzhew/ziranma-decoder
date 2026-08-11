@@ -29,14 +29,14 @@ use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabA
 use crate::personal_ranking::CandidateTextPromotion;
 use crate::{
     CANDIDATE_RUNTIME_DIRECTORY, CandidatePackageError, CandidatePackageManifest,
-    CandidateRuntimeError, CandidateRuntimeSupplemental, CandidateRuntimeSupplementalSelection,
-    CandidateSnapshot, CharacterShapeIndex, CompositionEffect, CompositionInput,
-    CompositionPunctuation, CompositionSession,
-    DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES,
-    DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS, DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder,
-    ExactShortPageSession, ExactShortWordCatalog, ExactShortWordCatalogError,
-    ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot, LoadedPersonalRanking,
-    LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
+    CandidateRuntimeError, CandidateRuntimeExactShort, CandidateRuntimeExactShortSelection,
+    CandidateRuntimeSupplemental, CandidateRuntimeSupplementalSelection, CandidateSnapshot,
+    CharacterShapeIndex, CompositionEffect, CompositionInput, CompositionPunctuation,
+    CompositionSession, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
+    DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES, DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
+    DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder, ExactShortPageSession, ExactShortWordCatalog,
+    ExactShortWordCatalogError, ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot,
+    LoadedPersonalRanking, LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
     NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
     NativeCancellationSource, NativeCandidatePersonalization, NativeCandidateProvenance,
@@ -54,12 +54,14 @@ use crate::{
     WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
     WishCommand, WishCommandAck, WishCommandAckStatus, WishJournalAnchor, WishJournalContext,
     WishJournalSpan, WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot,
-    candidate_sha256_hex, load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
-    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
-    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
-    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
-    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
+    candidate_sha256_hex, load_candidate_runtime_exact_short,
+    load_candidate_runtime_exact_short_selection, load_candidate_runtime_snapshots_with_layers,
+    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
+    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
+    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
+    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
+    save_personal_ranking_batch, save_personal_ranking_checkpoint,
+    save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -393,9 +395,9 @@ impl ShapeCandidatePoolCache {
 /// Bounded memory-only memoization for public whole-word verification.
 ///
 /// Personal text may be presented to this lookup, so the cache deliberately
-/// has no `Debug` or serialization surface. The supplemental revision is part
-/// of every identity; a safe-boundary data refresh can therefore never reuse
-/// a decision made against a different public snapshot.
+/// has no `Debug` or serialization surface. Both optional public-layer
+/// revisions are part of every identity; a safe-boundary data refresh can
+/// therefore never reuse a decision made against different public data.
 #[derive(Default)]
 struct ExactFullCodeCandidateCache {
     entries: VecDeque<ExactFullCodeCandidateCacheEntry>,
@@ -405,15 +407,23 @@ struct ExactFullCodeCandidateCacheEntry {
     code: String,
     text: String,
     supplemental_revision: Option<String>,
+    exact_short_revision: Option<String>,
     exact: bool,
 }
 
 impl ExactFullCodeCandidateCache {
-    fn get(&mut self, code: &str, text: &str, supplemental_revision: Option<&str>) -> Option<bool> {
+    fn get(
+        &mut self,
+        code: &str,
+        text: &str,
+        supplemental_revision: Option<&str>,
+        exact_short_revision: Option<&str>,
+    ) -> Option<bool> {
         let index = self.entries.iter().position(|entry| {
             entry.code == code
                 && entry.text == text
                 && entry.supplemental_revision.as_deref() == supplemental_revision
+                && entry.exact_short_revision.as_deref() == exact_short_revision
         })?;
         let entry = self.entries.remove(index)?;
         let exact = entry.exact;
@@ -421,11 +431,19 @@ impl ExactFullCodeCandidateCache {
         Some(exact)
     }
 
-    fn insert(&mut self, code: &str, text: &str, supplemental_revision: Option<&str>, exact: bool) {
+    fn insert(
+        &mut self,
+        code: &str,
+        text: &str,
+        supplemental_revision: Option<&str>,
+        exact_short_revision: Option<&str>,
+        exact: bool,
+    ) {
         if let Some(index) = self.entries.iter().position(|entry| {
             entry.code == code
                 && entry.text == text
                 && entry.supplemental_revision.as_deref() == supplemental_revision
+                && entry.exact_short_revision.as_deref() == exact_short_revision
         }) {
             self.entries.remove(index);
         }
@@ -433,6 +451,7 @@ impl ExactFullCodeCandidateCache {
             code: code.to_owned(),
             text: text.to_owned(),
             supplemental_revision: supplemental_revision.map(str::to_owned),
+            exact_short_revision: exact_short_revision.map(str::to_owned),
             exact,
         });
         while self.entries.len() > EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY {
@@ -885,6 +904,7 @@ impl RefreshThrottle {
 struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
     supplemental: PublicSupplementRuntime,
+    exact_short: PublicExactShortRuntime,
     aliases: Option<ExplicitAliasRuntime>,
     refresh_throttle: Mutex<RefreshThrottle>,
     shape_candidate_pools: Mutex<ShapeCandidatePoolCache>,
@@ -904,6 +924,7 @@ impl SnapshotCandidateProvider {
         Self {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(supplemental),
+            exact_short: PublicExactShortRuntime::managed(None, None),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -915,11 +936,14 @@ impl SnapshotCandidateProvider {
         snapshot: Arc<CandidateSnapshot>,
         supplemental: Option<CandidateRuntimeSupplemental>,
         supplemental_root: Option<PathBuf>,
+        exact_short: Option<CandidateRuntimeExactShort>,
+        exact_short_root: Option<PathBuf>,
         alias_root: Option<PathBuf>,
     ) -> Self {
         Self {
             snapshot,
             supplemental: PublicSupplementRuntime::managed(supplemental_root, supplemental),
+            exact_short: PublicExactShortRuntime::managed(exact_short_root, exact_short),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -972,7 +996,8 @@ impl SnapshotCandidateProvider {
             .as_ref()
             .is_some_and(ExplicitAliasRuntime::refresh);
         let supplemental_changed = self.supplemental.refresh();
-        aliases_changed || supplemental_changed
+        let exact_short_changed = self.exact_short.refresh();
+        aliases_changed || supplemental_changed || exact_short_changed
     }
 
     fn candidate_output(
@@ -1154,6 +1179,8 @@ struct CandidateProviderBlueprint {
     snapshot: Arc<CandidateSnapshot>,
     supplemental: Option<CandidateRuntimeSupplemental>,
     supplemental_root: Option<PathBuf>,
+    exact_short: Option<CandidateRuntimeExactShort>,
+    exact_short_root: Option<PathBuf>,
     alias_root: Option<PathBuf>,
 }
 
@@ -1163,6 +1190,8 @@ impl CandidateProviderBlueprint {
             Arc::clone(&self.snapshot),
             self.supplemental.clone(),
             self.supplemental_root.clone(),
+            self.exact_short.clone(),
+            self.exact_short_root.clone(),
             self.alias_root.clone(),
         ))
     }
@@ -1305,6 +1334,114 @@ impl PublicSupplementRuntime {
     }
 }
 
+struct PublicExactShortRuntime {
+    root: Option<PathBuf>,
+    state: Mutex<PublicExactShortRuntimeState>,
+}
+
+struct PublicExactShortRuntimeState {
+    package_id: Option<String>,
+    catalog: Option<Arc<ExactShortWordCatalog>>,
+    exact_promotions: Option<usize>,
+}
+
+impl PublicExactShortRuntime {
+    fn managed(root: Option<PathBuf>, exact_short: Option<CandidateRuntimeExactShort>) -> Self {
+        let state = match exact_short {
+            Some(exact_short) => PublicExactShortRuntimeState {
+                package_id: Some(exact_short.package_id().to_owned()),
+                catalog: Some(Arc::clone(exact_short.catalog())),
+                exact_promotions: Some(exact_short.exact_promotions()),
+            },
+            None => PublicExactShortRuntimeState {
+                package_id: None,
+                catalog: None,
+                exact_promotions: None,
+            },
+        };
+        let runtime = Self {
+            root,
+            state: Mutex::new(state),
+        };
+        let _ = runtime.refresh();
+        runtime
+    }
+
+    fn current(&self) -> Option<ExactShortCandidateLayer> {
+        self.state.lock().ok().and_then(|state| {
+            Some(ExactShortCandidateLayer {
+                catalog: Arc::clone(state.catalog.as_ref()?),
+                exact_promotions: state.exact_promotions?,
+            })
+        })
+    }
+
+    fn refresh(&self) -> bool {
+        let Some(root) = self.root.as_deref() else {
+            return false;
+        };
+        let next = match load_candidate_runtime_exact_short_selection(root) {
+            Ok(next) => next,
+            Err(_) => return false,
+        };
+        let current = match self.state.lock() {
+            Ok(state) => (
+                state.package_id.clone(),
+                state.catalog.clone(),
+                state.exact_promotions,
+            ),
+            Err(_) => return false,
+        };
+        let next_state = match &next {
+            CandidateRuntimeExactShortSelection::Disabled => {
+                if current.0.is_none() && current.1.is_none() {
+                    return false;
+                }
+                PublicExactShortRuntimeState {
+                    package_id: None,
+                    catalog: None,
+                    exact_promotions: None,
+                }
+            }
+            CandidateRuntimeExactShortSelection::Enabled {
+                package_id,
+                exact_promotions,
+            } => {
+                if current.0.as_deref() == Some(package_id)
+                    && current.1.is_some()
+                    && current.2 == Some(*exact_promotions)
+                {
+                    return false;
+                }
+                if current.0.as_deref() == Some(package_id) {
+                    PublicExactShortRuntimeState {
+                        package_id: Some(package_id.clone()),
+                        catalog: current.1,
+                        exact_promotions: Some(*exact_promotions),
+                    }
+                } else {
+                    let loaded = match load_candidate_runtime_exact_short(root, &next) {
+                        Ok(Some(loaded)) => loaded,
+                        _ => return false,
+                    };
+                    PublicExactShortRuntimeState {
+                        package_id: Some(loaded.package_id().to_owned()),
+                        catalog: Some(Arc::clone(loaded.catalog())),
+                        exact_promotions: Some(loaded.exact_promotions()),
+                    }
+                }
+            }
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        state.package_id = next_state.package_id;
+        state.catalog = next_state.catalog;
+        state.exact_promotions = next_state.exact_promotions;
+        true
+    }
+}
+
 struct ExplicitAliasRuntime {
     root: PathBuf,
     state: Mutex<ExplicitAliasRuntimeState>,
@@ -1384,6 +1521,10 @@ impl CandidateProvider for SnapshotCandidateProvider {
         })
     }
 
+    fn exact_short_layer(&self) -> Option<ExactShortCandidateLayer> {
+        self.exact_short.current()
+    }
+
     fn candidates_with_provenance(
         &self,
         code: &str,
@@ -1453,11 +1594,13 @@ impl CandidateProvider for SnapshotCandidateProvider {
 
     fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
         let supplemental = self.supplemental.current();
+        let exact_short = self.exact_short.current();
         let supplemental_revision = supplemental
             .as_ref()
             .map(|(snapshot, _)| snapshot.revision());
+        let exact_short_revision = exact_short.as_ref().map(|layer| layer.catalog.revision());
         if let Ok(mut cache) = self.exact_full_code_candidates.lock()
-            && let Some(exact) = cache.get(code, text, supplemental_revision)
+            && let Some(exact) = cache.get(code, text, supplemental_revision, exact_short_revision)
         {
             return exact;
         }
@@ -1475,9 +1618,22 @@ impl CandidateProvider for SnapshotCandidateProvider {
                     .exact_full_code_texts(code, CANDIDATE_LIMIT)
                     .ok()
                     .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
+            })
+            || exact_short.as_ref().is_some_and(|layer| {
+                layer
+                    .catalog
+                    .candidate_texts(code, crate::MAX_EXACT_SHORT_WORDS_PER_CODE)
+                    .ok()
+                    .is_some_and(|candidates| candidates.contains(&text))
             });
         if let Ok(mut cache) = self.exact_full_code_candidates.lock() {
-            cache.insert(code, text, supplemental_revision, exact);
+            cache.insert(
+                code,
+                text,
+                supplemental_revision,
+                exact_short_revision,
+                exact,
+            );
         }
         exact
     }
@@ -2047,6 +2203,8 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
                 snapshot,
                 supplemental: None,
                 supplemental_root: None,
+                exact_short: None,
+                exact_short_root: None,
                 alias_root: None,
             })
         })
@@ -2064,25 +2222,29 @@ fn candidate_provider_for_root(
     root: &Path,
     alias_root: Option<PathBuf>,
 ) -> CandidateProviderLoadResult {
-    candidate_provider_for_roots(root, alias_root, None)
+    candidate_provider_for_roots(root, alias_root, None, None)
 }
 
 fn candidate_provider_for_roots(
     root: &Path,
     alias_root: Option<PathBuf>,
     supplemental_root: Option<&Path>,
+    exact_short_root: Option<&Path>,
 ) -> CandidateProviderLoadResult {
-    match load_candidate_runtime_snapshots(root, supplemental_root)
+    match load_candidate_runtime_snapshots_with_layers(root, supplemental_root, exact_short_root)
         .map_err(CandidateProviderLoadError::Runtime)?
     {
         Some(runtime) => Ok(CandidateProviderBlueprint {
             snapshot: Arc::clone(runtime.core()),
             supplemental: runtime.supplemental().cloned(),
             supplemental_root: supplemental_root.map(Path::to_path_buf),
+            exact_short: runtime.exact_short().cloned(),
+            exact_short_root: exact_short_root.map(Path::to_path_buf),
             alias_root,
         }),
         None => development_candidate_blueprint().map(|mut blueprint| {
             blueprint.supplemental_root = supplemental_root.map(Path::to_path_buf);
+            blueprint.exact_short_root = exact_short_root.map(Path::to_path_buf);
             blueprint.alias_root = alias_root;
             blueprint
         }),
@@ -2204,6 +2366,10 @@ fn public_supplement_root_for_module(module_path: &Path) -> Option<PathBuf> {
     installed_user_data_root_for_module(module_path, "public-supplement")
 }
 
+fn public_exact_short_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, "public-exact-short")
+}
+
 fn class_factory_candidate_provider() -> CandidateProviderLoadResult {
     static BLUEPRINT: OnceLock<CandidateProviderLoadResult> = OnceLock::new();
     BLUEPRINT
@@ -2212,7 +2378,13 @@ fn class_factory_candidate_provider() -> CandidateProviderLoadResult {
             let module_path = module_path()?;
             let alias_root = explicit_alias_root_for_module(&module_path);
             let supplemental_root = public_supplement_root_for_module(&module_path);
-            candidate_provider_for_roots(&root, alias_root, supplemental_root.as_deref())
+            let exact_short_root = public_exact_short_root_for_module(&module_path);
+            candidate_provider_for_roots(
+                &root,
+                alias_root,
+                supplemental_root.as_deref(),
+                exact_short_root.as_deref(),
+            )
         })
         .clone()
 }
@@ -2492,6 +2664,8 @@ fn run_candidate_preflight(
             snapshot,
             supplemental: None,
             supplemental_root: None,
+            exact_short: None,
+            exact_short_root: None,
             alias_root: None,
         }),
         KeyAdviceMode::SyntheticHost,
@@ -11349,6 +11523,23 @@ mod tests {
         .unwrap();
     }
 
+    fn select_exact_short_runtime_test_package(
+        root: &Path,
+        package_id: &str,
+        exact_promotions: usize,
+    ) {
+        let mut slots = crate::CandidateSlotState::default();
+        slots.adopt(package_id).unwrap();
+        fs::write(root.join(crate::CANDIDATE_SLOT_STATE_FILE), slots.render()).unwrap();
+        fs::write(
+            root.join(crate::CANDIDATE_EXACT_SHORT_STATE_FILE),
+            crate::CandidateExactShortState::enabled(package_id, exact_promotions)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn candidate_promotion_mirrors_existing_personal_markers_by_position() {
         let mut batch = CandidateBatch {
@@ -11471,6 +11662,12 @@ mod tests {
             public_supplement_root_for_module(&module),
             Some(PathBuf::from(
                 r"D:\repo\.local\tsf-alpha\user-data\public-supplement"
+            ))
+        );
+        assert_eq!(
+            public_exact_short_root_for_module(&module),
+            Some(PathBuf::from(
+                r"D:\repo\.local\tsf-alpha\user-data\public-exact-short"
             ))
         );
         assert_eq!(immutable_module_sha256(&module), Some(digest));
@@ -11965,6 +12162,7 @@ mod tests {
         let provider = SnapshotCandidateProvider {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(None),
+            exact_short: PublicExactShortRuntime::managed(None, None),
             aliases: Some(runtime),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -13241,36 +13439,63 @@ mod tests {
                 &format!("code-{index}"),
                 &format!("public-{index}"),
                 Some("supplement-a"),
+                Some("exact-a"),
                 index.is_multiple_of(2),
             );
         }
         assert_eq!(
-            cache.get("code-0", "public-0", Some("supplement-a")),
+            cache.get("code-0", "public-0", Some("supplement-a"), Some("exact-a")),
             Some(true)
         );
-        cache.insert("code-new", "public-new", Some("supplement-a"), false);
+        cache.insert(
+            "code-new",
+            "public-new",
+            Some("supplement-a"),
+            Some("exact-a"),
+            false,
+        );
 
         assert_eq!(
             cache.entries.len(),
             EXACT_FULL_CODE_CANDIDATE_CACHE_CAPACITY
         );
         assert_eq!(
-            cache.get("code-1", "public-1", Some("supplement-a")),
+            cache.get("code-1", "public-1", Some("supplement-a"), Some("exact-a")),
             None,
             "the least-recent identity is evicted"
         );
         assert_eq!(
-            cache.get("code-0", "public-0", Some("supplement-a")),
+            cache.get("code-0", "public-0", Some("supplement-a"), Some("exact-a")),
             Some(true),
             "a recently read identity remains cached"
         );
         assert_eq!(
-            cache.get("code-new", "public-new", Some("supplement-b")),
+            cache.get(
+                "code-new",
+                "public-new",
+                Some("supplement-b"),
+                Some("exact-a")
+            ),
             None,
             "the same code and text cannot cross a public supplement revision"
         );
         assert_eq!(
-            cache.get("code-new", "public-new", Some("supplement-a")),
+            cache.get(
+                "code-new",
+                "public-new",
+                Some("supplement-a"),
+                Some("exact-b")
+            ),
+            None,
+            "the same code and text cannot cross an exact-short revision"
+        );
+        assert_eq!(
+            cache.get(
+                "code-new",
+                "public-new",
+                Some("supplement-a"),
+                Some("exact-a")
+            ),
             Some(false),
             "negative verification decisions are cached too"
         );
@@ -14007,6 +14232,8 @@ mod tests {
             Some(initial),
             Some(root.clone()),
             None,
+            None,
+            None,
         );
 
         assert_eq!(
@@ -14108,6 +14335,142 @@ mod tests {
             provider.candidates("ufme", 3, InteractiveCandidateView::Primary),
             ["什么", "神马"]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_short_runtime_refreshes_at_safe_boundaries_and_keeps_last_good_catalog() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+甲甲\tshou shu\t140\n\
+乙乙\tshou shu\t130\n\
+丙丙\tshou shu\t120\n\
+丁丁\tshou shu\t110\n\
+戊戊\tshou shu\t100\n\
+己己\tshou shu\t90\n\
+庚庚\tshou shu\t80\n\
+辛辛\tshou shu\t70\n\
+壬壬\tshou shu\t60\n\
+癸癸\tshou shu\t50\n\
+子子\tshou shu\t40\n\
+丑丑\tshou shu\t30\n\
+寅寅\tshou shu\t20\n\
+卯卯\tshou shu\t10\n";
+        const FIRST: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t100\n";
+        const SECOND: &str = "text\tpinyin\tfrequency\n手术\tshou shu\t100\n";
+        const BROKEN: &str = "text\tpinyin\tfrequency\n首数\tshou shu\t100\n";
+        let core = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-exact-hot-core-v1",
+                contains_private_text: false,
+                lexicon_tsv: CORE,
+                expected_payload_bytes: CORE.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(CORE.as_bytes()),
+                expected_entry_count: 14,
+            })
+            .unwrap(),
+        );
+        let root = candidate_runtime_test_root("exact-short-hot-refresh");
+        let first = install_candidate_runtime_test_package(&root, "tsf-exact-first-v1", FIRST);
+        let second = install_candidate_runtime_test_package(&root, "tsf-exact-second-v1", SECOND);
+        let broken = install_candidate_runtime_test_package(&root, "tsf-exact-broken-v1", BROKEN);
+        select_exact_short_runtime_test_package(&root, &first, 1);
+        let selection = load_candidate_runtime_exact_short_selection(&root).unwrap();
+        let initial = load_candidate_runtime_exact_short(&root, &selection)
+            .unwrap()
+            .unwrap();
+        let provider = SnapshotCandidateProvider::new_with_runtime(
+            core,
+            None,
+            None,
+            Some(initial),
+            Some(root.clone()),
+            None,
+        );
+
+        let mut first_composition = CandidateCache::default();
+        let first_page = first_composition.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE,
+            InteractiveCandidateView::Primary,
+        );
+        assert!(!first_page.candidates.iter().any(|text| text == "收束"));
+        let second_page = first_composition.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+        );
+        assert_eq!(&second_page.candidates[..6], first_page.candidates);
+        assert_eq!(second_page.candidates[6], "收束");
+        assert_eq!(
+            second_page.provenance[6].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        assert!(provider.is_exact_full_code_candidate("ubuu", "收束"));
+
+        select_exact_short_runtime_test_package(&root, &second, 1);
+        let mut before_refresh = CandidateCache::default();
+        let unchanged = before_refresh.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+        );
+        assert!(unchanged.candidates.iter().any(|text| text == "收束"));
+        assert!(!unchanged.candidates.iter().any(|text| text == "手术"));
+
+        let mut refresh_at = Instant::now() + CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
+        let mut after_refresh = CandidateCache::default();
+        let refreshed = after_refresh.load(
+            &provider,
+            "ubuu",
+            CANDIDATE_PAGE_SIZE * 2,
+            InteractiveCandidateView::Primary,
+        );
+        assert!(refreshed.candidates.iter().any(|text| text == "手术"));
+        assert!(!refreshed.candidates.iter().any(|text| text == "收束"));
+        assert!(provider.is_exact_full_code_candidate("ubuu", "手术"));
+        assert!(!provider.is_exact_full_code_candidate("ubuu", "收束"));
+
+        let second_catalog = provider.exact_short.current().unwrap().catalog;
+        select_exact_short_runtime_test_package(&root, &second, 2);
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
+        let reconfigured = provider.exact_short.current().unwrap();
+        assert!(Arc::ptr_eq(&second_catalog, &reconfigured.catalog));
+        assert_eq!(reconfigured.exact_promotions, 2);
+
+        fs::remove_file(
+            root.join(crate::CANDIDATE_PREFLIGHTS_DIRECTORY)
+                .join(format!("{broken}.zpf")),
+        )
+        .unwrap();
+        select_exact_short_runtime_test_package(&root, &broken, 1);
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(!provider.refresh_at_safe_boundary_at(refresh_at));
+        assert_eq!(
+            provider
+                .exact_short_layer()
+                .unwrap()
+                .catalog
+                .candidate_texts("ubuu", 1)
+                .unwrap(),
+            ["手术"],
+            "a damaged replacement must retain the last valid catalog"
+        );
+
+        fs::write(
+            root.join(crate::CANDIDATE_EXACT_SHORT_STATE_FILE),
+            crate::CandidateExactShortState::default().render(),
+        )
+        .unwrap();
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
+        assert!(provider.exact_short_layer().is_none());
+
         fs::remove_dir_all(root).unwrap();
     }
 

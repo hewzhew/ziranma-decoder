@@ -13,10 +13,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_PACKAGE_PROVENANCE_FILE,
-    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageError, CandidatePackageManifest,
+    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_EXACT_SHORT_STATE_FILE,
+    CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortState,
+    CandidateExactShortStateError, CandidatePackageError, CandidatePackageManifest,
     CandidatePackageProvenance, CandidateProvenanceError, CandidateSlotError, CandidateSlotState,
     CandidateSnapshot, CandidateSupplementalState, CandidateSupplementalStateError,
+    ExactShortWordCatalog, ExactShortWordCatalogError, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, SupplementalCandidateLayerConfig,
@@ -42,13 +44,15 @@ pub const CANDIDATE_PREFLIGHT_HOST_V1: &str = "tsf-synthetic-context-v1";
 /// Maximum accepted size of one preflight receipt.
 pub const MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES: usize = 512;
 
-/// Immutable core snapshot plus an optional independently validated public
-/// exact-word supplement.
+/// Immutable core snapshot plus independently validated optional public
+/// candidate layers.
 #[derive(Clone, Debug)]
 pub struct CandidateRuntimeSnapshots {
     core: Arc<CandidateSnapshot>,
     supplemental: Option<CandidateRuntimeSupplemental>,
     supplemental_fell_back: bool,
+    exact_short: Option<CandidateRuntimeExactShort>,
+    exact_short_fell_back: bool,
 }
 
 impl CandidateRuntimeSnapshots {
@@ -65,6 +69,16 @@ impl CandidateRuntimeSnapshots {
     /// Reports that an explicit supplemental configuration failed closed.
     pub fn supplemental_fell_back(&self) -> bool {
         self.supplemental_fell_back
+    }
+
+    /// Returns the enabled, validated exact-short catalog when available.
+    pub fn exact_short(&self) -> Option<&CandidateRuntimeExactShort> {
+        self.exact_short.as_ref()
+    }
+
+    /// Reports that an explicit exact-short configuration failed closed.
+    pub fn exact_short_fell_back(&self) -> bool {
+        self.exact_short_fell_back
     }
 }
 
@@ -93,6 +107,31 @@ impl CandidateRuntimeSupplemental {
     }
 }
 
+/// Validated exact-short catalog and its fixed per-code influence cap.
+#[derive(Clone, Debug)]
+pub struct CandidateRuntimeExactShort {
+    package_id: String,
+    catalog: Arc<ExactShortWordCatalog>,
+    exact_promotions: usize,
+}
+
+impl CandidateRuntimeExactShort {
+    /// Returns the immutable package selected by the exact-short state.
+    pub fn package_id(&self) -> &str {
+        &self.package_id
+    }
+
+    /// Returns the strictly validated two-character catalog.
+    pub fn catalog(&self) -> &Arc<ExactShortWordCatalog> {
+        &self.catalog
+    }
+
+    /// Returns the maximum number of page-guarded insertions per code.
+    pub fn exact_promotions(&self) -> usize {
+        self.exact_promotions
+    }
+}
+
 /// Small, validated supplemental selection that can be polled without loading
 /// the lexicon payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,9 +147,29 @@ pub enum CandidateRuntimeSupplementalSelection {
     },
 }
 
+/// Small exact-short selection that can be polled without loading its payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateRuntimeExactShortSelection {
+    /// The exact-short root or activation state is absent or explicitly off.
+    Disabled,
+    /// One immutable package is enabled with a bounded page insertion cap.
+    Enabled {
+        /// Package identifier bound by both activation and slot states.
+        package_id: String,
+        /// Maximum number of page-guarded insertions per code.
+        exact_promotions: usize,
+    },
+}
+
 struct LoadedRuntimeCandidate {
     package_id: String,
     snapshot: Arc<CandidateSnapshot>,
+}
+
+struct LoadedRuntimePackage {
+    package_id: String,
+    manifest: CandidatePackageManifest,
+    payload: String,
 }
 
 /// Computes the internal immutable-package identifier from all exact package bytes.
@@ -161,6 +220,19 @@ pub fn load_candidate_runtime_snapshots(
     core_root: &Path,
     supplemental_root: Option<&Path>,
 ) -> Result<Option<CandidateRuntimeSnapshots>, CandidateRuntimeError> {
+    load_candidate_runtime_snapshots_with_layers(core_root, supplemental_root, None)
+}
+
+/// Loads the required core root and both independent optional public layers.
+///
+/// Optional roots are fail-closed and do not alter the validated core. An
+/// absent activation file is a normal disabled state. A present but malformed
+/// or drifting activation is reported through the corresponding fallback bit.
+pub fn load_candidate_runtime_snapshots_with_layers(
+    core_root: &Path,
+    supplemental_root: Option<&Path>,
+    exact_short_root: Option<&Path>,
+) -> Result<Option<CandidateRuntimeSnapshots>, CandidateRuntimeError> {
     let Some(core) = load_current_candidate_package(core_root)? else {
         return Ok(None);
     };
@@ -173,10 +245,21 @@ pub fn load_candidate_runtime_snapshots(
         },
         None => (None, false),
     };
+    let (exact_short, exact_short_fell_back) = match exact_short_root {
+        Some(root) => match load_candidate_runtime_exact_short_selection(root)
+            .and_then(|selection| load_candidate_runtime_exact_short(root, &selection))
+        {
+            Ok(exact_short) => (exact_short, false),
+            Err(_) => (None, true),
+        },
+        None => (None, false),
+    };
     Ok(Some(CandidateRuntimeSnapshots {
         core: core.snapshot,
         supplemental,
         supplemental_fell_back,
+        exact_short,
+        exact_short_fell_back,
     }))
 }
 
@@ -263,9 +346,109 @@ pub fn load_candidate_runtime_supplemental(
     Ok(loaded)
 }
 
+/// Reads only the exact-short activation and slot pointers.
+///
+/// Package bytes are not opened until a caller observes a changed enabled
+/// selection. This keeps the new-composition polling boundary small.
+pub fn load_candidate_runtime_exact_short_selection(
+    root: &Path,
+) -> Result<CandidateRuntimeExactShortSelection, CandidateRuntimeError> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateRuntimeExactShortSelection::Disabled);
+        }
+        Err(_) => return Err(CandidateRuntimeError::ExactShortRootUnavailable),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CandidateRuntimeError::InvalidExactShortRoot);
+        }
+        Ok(_) => {}
+    }
+    let state_path = root.join(CANDIDATE_EXACT_SHORT_STATE_FILE);
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateRuntimeExactShortSelection::Disabled);
+        }
+        Err(_) => return Err(CandidateRuntimeError::ExactShortStateUnavailable),
+        Ok(_) => {}
+    }
+    let state_text = read_regular_utf8(
+        &state_path,
+        MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
+        CandidateRuntimeError::ExactShortStateUnavailable,
+    )?;
+    let state = CandidateExactShortState::parse(&state_text)
+        .map_err(CandidateRuntimeError::ExactShortState)?;
+    let Some(expected_package) = state.package() else {
+        return Ok(CandidateRuntimeExactShortSelection::Disabled);
+    };
+    let slot_text = read_regular_utf8(
+        &root.join(CANDIDATE_SLOT_STATE_FILE),
+        MAX_CANDIDATE_SLOT_STATE_BYTES,
+        CandidateRuntimeError::SlotStateUnavailable,
+    )?;
+    let slots = CandidateSlotState::parse(&slot_text).map_err(CandidateRuntimeError::SlotState)?;
+    if slots.current() != Some(expected_package) {
+        return Err(CandidateRuntimeError::ExactShortPackageMismatch);
+    }
+    Ok(CandidateRuntimeExactShortSelection::Enabled {
+        package_id: expected_package.to_owned(),
+        exact_promotions: state.exact_promotions(),
+    })
+}
+
+/// Loads one exact-short catalog after its small selection changed.
+///
+/// The selection is re-read after package authentication. A concurrent slot
+/// update therefore cannot publish a catalog assembled from mixed states.
+pub fn load_candidate_runtime_exact_short(
+    root: &Path,
+    expected: &CandidateRuntimeExactShortSelection,
+) -> Result<Option<CandidateRuntimeExactShort>, CandidateRuntimeError> {
+    let loaded = match expected {
+        CandidateRuntimeExactShortSelection::Disabled => None,
+        CandidateRuntimeExactShortSelection::Enabled {
+            package_id,
+            exact_promotions,
+        } => {
+            let loaded = load_current_runtime_package(root)?
+                .ok_or(CandidateRuntimeError::ExactShortPackageMismatch)?;
+            if loaded.package_id != *package_id {
+                return Err(CandidateRuntimeError::ExactShortPackageMismatch);
+            }
+            let catalog = ExactShortWordCatalog::load(&loaded.manifest, &loaded.payload)
+                .map_err(CandidateRuntimeError::ExactShortCatalog)?;
+            Some(CandidateRuntimeExactShort {
+                package_id: loaded.package_id,
+                catalog: Arc::new(catalog),
+                exact_promotions: *exact_promotions,
+            })
+        }
+    };
+    if load_candidate_runtime_exact_short_selection(root)? != *expected {
+        return Err(CandidateRuntimeError::ExactShortSelectionChanged);
+    }
+    Ok(loaded)
+}
+
 fn load_current_candidate_package(
     root: &Path,
 ) -> Result<Option<LoadedRuntimeCandidate>, CandidateRuntimeError> {
+    let Some(loaded) = load_current_runtime_package(root)? else {
+        return Ok(None);
+    };
+    let snapshot = loaded
+        .manifest
+        .load_snapshot(&loaded.payload)
+        .map_err(CandidateRuntimeError::Package)?;
+    Ok(Some(LoadedRuntimeCandidate {
+        package_id: loaded.package_id,
+        snapshot: Arc::new(snapshot),
+    }))
+}
+
+fn load_current_runtime_package(
+    root: &Path,
+) -> Result<Option<LoadedRuntimePackage>, CandidateRuntimeError> {
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(CandidateRuntimeError::RootUnavailable),
@@ -315,9 +498,6 @@ fn load_current_candidate_package(
     provenance
         .validate_materials(&manifest_text, &payload_text)
         .map_err(CandidateRuntimeError::Provenance)?;
-    let snapshot = manifest
-        .load_snapshot(&payload_text)
-        .map_err(CandidateRuntimeError::Package)?;
     if candidate_package_storage_id(&provenance_text, &manifest_text, &payload_text) != package_id {
         return Err(CandidateRuntimeError::StorageIdentifierMismatch);
     }
@@ -335,9 +515,10 @@ fn load_current_candidate_package(
         return Err(CandidateRuntimeError::PreflightReceiptMismatch);
     }
 
-    Ok(Some(LoadedRuntimeCandidate {
+    Ok(Some(LoadedRuntimePackage {
         package_id: package_id.to_owned(),
-        snapshot: Arc::new(snapshot),
+        manifest,
+        payload: payload_text,
     }))
 }
 
@@ -432,6 +613,20 @@ pub enum CandidateRuntimeError {
     SupplementalPackageMismatch,
     /// The supplemental selection changed while its immutable package was loading.
     SupplementalSelectionChanged,
+    /// The optional exact-short activation state could not be read safely.
+    ExactShortStateUnavailable,
+    /// The exact-short root metadata could not be inspected.
+    ExactShortRootUnavailable,
+    /// The existing exact-short root is not a regular directory.
+    InvalidExactShortRoot,
+    /// The exact-short activation state did not satisfy its strict schema.
+    ExactShortState(CandidateExactShortStateError),
+    /// The activation state and current package slot do not select the same package.
+    ExactShortPackageMismatch,
+    /// The exact-short payload did not satisfy the strict two-character profile.
+    ExactShortCatalog(ExactShortWordCatalogError),
+    /// The exact-short selection changed while its immutable package was loading.
+    ExactShortSelectionChanged,
 }
 
 impl fmt::Display for CandidateRuntimeError {
@@ -460,6 +655,13 @@ impl fmt::Display for CandidateRuntimeError {
             Self::SupplementalState(_) => "补充词层状态无效",
             Self::SupplementalPackageMismatch => "补充词层状态与当前候选包不符",
             Self::SupplementalSelectionChanged => "补充词层在载入期间发生变化",
+            Self::ExactShortStateUnavailable => "精确短词层状态不可用",
+            Self::ExactShortRootUnavailable => "无法检查精确短词层目录",
+            Self::InvalidExactShortRoot => "精确短词层目录无效",
+            Self::ExactShortState(_) => "精确短词层状态无效",
+            Self::ExactShortPackageMismatch => "精确短词层状态与当前候选包不符",
+            Self::ExactShortCatalog(_) => "精确短词层载荷校验失败",
+            Self::ExactShortSelectionChanged => "精确短词层在载入期间发生变化",
         };
         formatter.write_str(message)
     }
@@ -472,6 +674,8 @@ impl Error for CandidateRuntimeError {
             Self::Package(error) => Some(error),
             Self::Provenance(error) => Some(error),
             Self::SupplementalState(error) => Some(error),
+            Self::ExactShortState(error) => Some(error),
+            Self::ExactShortCatalog(error) => Some(error),
             _ => None,
         }
     }
@@ -835,5 +1039,147 @@ mod tests {
         assert!(damaged.supplemental().is_none());
         assert!(damaged.supplemental_fell_back());
         assert_eq!(damaged.core().revision(), "runtime-fallback-core");
+    }
+
+    #[test]
+    fn exact_short_root_is_default_off_and_loads_only_a_strict_catalog() {
+        const EXACT: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t90\n\
+手术\tshou shu\t80\n";
+        let (core_root, _) = configured_root("runtime-exact-core", false);
+        let exact_root = TestDirectory::new();
+        let exact_id = install_test_package(exact_root.path(), "runtime-exact-short", false, EXACT);
+        let mut slots = CandidateSlotState::default();
+        slots.adopt(&exact_id).unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+
+        let disabled = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            None,
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(disabled.exact_short().is_none());
+        assert!(!disabled.exact_short_fell_back());
+
+        fs::write(
+            exact_root.path().join(CANDIDATE_EXACT_SHORT_STATE_FILE),
+            CandidateExactShortState::enabled(&exact_id, 2)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let enabled = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            None,
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        let exact = enabled.exact_short().unwrap();
+        assert_eq!(exact.package_id(), exact_id);
+        assert_eq!(exact.catalog().revision(), "runtime-exact-short");
+        assert_eq!(exact.exact_promotions(), 2);
+        assert_eq!(
+            exact.catalog().candidate_texts("ubuu", 2).unwrap(),
+            ["收束", "手术"]
+        );
+        assert!(!enabled.exact_short_fell_back());
+        assert_eq!(enabled.core().revision(), "runtime-exact-core");
+    }
+
+    #[test]
+    fn exact_short_damage_pointer_drift_and_wrong_payload_profile_fail_closed() {
+        const FIRST: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t90\n";
+        const WRONG_PROFILE: &str = "text\tpinyin\tfrequency\n候选词\thou xuan ci\t90\n";
+        let (core_root, _) = configured_root("runtime-exact-fallback-core", false);
+        let exact_root = TestDirectory::new();
+        let first_id = install_test_package(exact_root.path(), "runtime-exact-first", false, FIRST);
+        let wrong_id = install_test_package(
+            exact_root.path(),
+            "runtime-exact-wrong-profile",
+            false,
+            WRONG_PROFILE,
+        );
+        let mut slots = CandidateSlotState::default();
+        slots.adopt(&first_id).unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_EXACT_SHORT_STATE_FILE),
+            CandidateExactShortState::enabled(&first_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+
+        slots.stage(&wrong_id).unwrap();
+        slots.promote().unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+        let drifted = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            None,
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(drifted.exact_short().is_none());
+        assert!(drifted.exact_short_fell_back());
+        assert_eq!(drifted.core().revision(), "runtime-exact-fallback-core");
+
+        fs::write(
+            exact_root.path().join(CANDIDATE_EXACT_SHORT_STATE_FILE),
+            CandidateExactShortState::enabled(&wrong_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_candidate_runtime_exact_short(
+                exact_root.path(),
+                &load_candidate_runtime_exact_short_selection(exact_root.path()).unwrap()
+            ),
+            Err(CandidateRuntimeError::ExactShortCatalog(_))
+        ));
+        let wrong_profile = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            None,
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(wrong_profile.exact_short().is_none());
+        assert!(wrong_profile.exact_short_fell_back());
+        assert_eq!(
+            wrong_profile.core().revision(),
+            "runtime-exact-fallback-core"
+        );
+
+        fs::write(
+            exact_root.path().join(CANDIDATE_EXACT_SHORT_STATE_FILE),
+            "schema=damaged\n",
+        )
+        .unwrap();
+        let damaged = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            None,
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(damaged.exact_short().is_none());
+        assert!(damaged.exact_short_fell_back());
     }
 }
