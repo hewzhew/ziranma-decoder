@@ -7391,6 +7391,23 @@ impl PersonalRankingRuntime {
             )
     }
 
+    fn promote_or_recall_verified_anchored_suffix_text_after_decision(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+    ) -> Option<CandidateTextPromotion> {
+        self.snapshot
+            .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                code,
+                candidates,
+                protected_prefix,
+                &self.suppressions,
+                |source_code, text| provider.is_exact_full_code_candidate(source_code, text),
+            )
+    }
+
     fn is_suppressed(&self, code: &str, text: &str) -> bool {
         self.suppressions.is_suppressed(code, text)
     }
@@ -8263,22 +8280,36 @@ impl TsfTextService_Impl {
                     NativeCandidatePersonalization::PERSISTENT_EXACT,
                 );
             }
-            let persistent_anchored_promotion =
-                if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
-                    personal_ranking.promote_anchored_suffix_texts_after_decision(
+            let persistent_anchored_promotion = if persistent_exact_promotion.is_none()
+                && session_exact_text.is_none()
+            {
+                if automatic_transposition_request.is_none() {
+                    personal_ranking.promote_or_recall_verified_anchored_suffix_text_after_decision(
                         provider,
                         code,
                         &mut batch.candidates,
                         protected_prefix,
                     )
                 } else {
-                    None
-                };
+                    personal_ranking.promote_anchored_suffix_texts_after_decision(
+                        provider,
+                        code,
+                        &mut batch.candidates,
+                        protected_prefix,
+                    )
+                }
+            } else {
+                None
+            };
             if let Some(promotion) = persistent_anchored_promotion {
                 mirror_candidate_promotion(
                     &mut batch,
                     promotion,
-                    NativeCandidatePersonalization::PERSISTENT_ANCHORED,
+                    if promotion.source_index.is_none() {
+                        NativeCandidatePersonalization::PERSISTENT_DISCOVERY
+                    } else {
+                        NativeCandidatePersonalization::PERSISTENT_ANCHORED
+                    },
                 );
             }
             let personal_discovery_promotion = if persistent_exact_promotion.is_none()
@@ -8302,21 +8333,25 @@ impl TsfTextService_Impl {
                     NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
                 );
             }
-            let session_anchored_promotion =
-                if persistent_exact_promotion.is_none() && session_exact_text.is_none() {
-                    selection_memory.promote_anchored_suffix_texts_after_decision(
-                        code,
-                        &mut batch.candidates,
-                        protected_prefix,
-                        |source_code, text| {
-                            !personal_ranking.is_suppressed(code, text)
-                                && !personal_ranking.is_suppressed(source_code, text)
-                                && provider.is_exact_full_code_candidate(source_code, text)
-                        },
-                    )
-                } else {
-                    None
-                };
+            let persistent_anchored_discovered = persistent_anchored_promotion
+                .is_some_and(|promotion| promotion.source_index.is_none());
+            let session_anchored_promotion = if persistent_exact_promotion.is_none()
+                && session_exact_text.is_none()
+                && !persistent_anchored_discovered
+            {
+                selection_memory.promote_anchored_suffix_texts_after_decision(
+                    code,
+                    &mut batch.candidates,
+                    protected_prefix,
+                    |source_code, text| {
+                        !personal_ranking.is_suppressed(code, text)
+                            && !personal_ranking.is_suppressed(source_code, text)
+                            && provider.is_exact_full_code_candidate(source_code, text)
+                    },
+                )
+            } else {
+                None
+            };
             if let Some(promotion) = session_anchored_promotion {
                 mirror_candidate_promotion(
                     &mut batch,
@@ -11654,6 +11689,43 @@ mod tests {
         fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
             self.exact_calls.fetch_add(1, Ordering::Relaxed);
             CodeFamilyCandidateProvider.is_exact_full_code_candidate(code, text)
+        }
+    }
+
+    struct ExactShortDiscoveryCandidateProvider;
+
+    impl CandidateProvider for ExactShortDiscoveryCandidateProvider {
+        fn candidates(
+            &self,
+            code: &str,
+            limit: usize,
+            view: InteractiveCandidateView,
+        ) -> Vec<String> {
+            if limit == 0 || view != InteractiveCandidateView::Primary {
+                return Vec::new();
+            }
+            let candidates: &[&str] = match code {
+                "jdjd" => &["讲讲", "将将"],
+                "jdj" => &["固定", "简单", "降价", "降级"],
+                _ => &[],
+            };
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| (*candidate).to_owned())
+                .collect()
+        }
+
+        fn protected_candidate_prefix_len(
+            &self,
+            code: &str,
+            view: InteractiveCandidateView,
+        ) -> usize {
+            usize::from(code == "jdj" && view == InteractiveCandidateView::Primary)
+        }
+
+        fn is_exact_full_code_candidate(&self, code: &str, text: &str) -> bool {
+            code == "jdjd" && text == "讲讲"
         }
     }
 
@@ -17691,6 +17763,96 @@ mod tests {
         assert_eq!(exact.candidates, ["降价", "简单", "讲讲"]);
         assert!(
             exact.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+    }
+
+    #[test]
+    fn one_verified_complete_word_gets_a_guarded_short_code_discovery_position() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ExactShortDiscoveryCandidateProvider,
+        ))));
+        assert!(service.personal_ranking.borrow_mut().record("jdjd", "讲讲"));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("jdjd", "讲讲");
+
+        let automatic = service
+            .load_candidate_batch_with_automatic_transposition(
+                &ExactShortDiscoveryCandidateProvider,
+                "jdj",
+                4,
+                InteractiveCandidateView::Primary,
+                Some(reversed_single_pair_request(
+                    AutomaticTranspositionTier::Primary,
+                )),
+            )
+            .unwrap();
+        assert_eq!(automatic.candidates, ["固定", "简单", "降价", "降级"]);
+        assert!(
+            automatic
+                .personalized
+                .iter()
+                .all(|personalized| !personalized)
+        );
+
+        let discovered = service
+            .load_candidate_batch(
+                &ExactShortDiscoveryCandidateProvider,
+                "jdj",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(discovered.candidates, ["固定", "简单", "讲讲", "降价"]);
+        assert_eq!(discovered.personalized, [false, false, true, false]);
+        assert!(
+            discovered.provenance[2]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_DISCOVERY)
+        );
+        assert!(
+            !discovered.provenance[2]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_ANCHORED),
+            "session inheritance must not pull a newly discovered word across the ordinary guard"
+        );
+
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("jdj".to_owned()));
+        let choose_short = service
+            .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+            .unwrap()
+            .expect("the guarded discovery position should be selectable");
+        let exact_short_evidence = choose_short
+            .selection_to_remember
+            .expect("selecting the discovery position should establish short-code evidence");
+        assert_eq!(exact_short_evidence.code, "jdj");
+        assert_eq!(exact_short_evidence.text, "讲讲");
+        service.remember_selection_after_success_in_context(
+            exact_short_evidence,
+            NativeFeedbackContext::Eligible,
+        );
+        assert!(service.confirm_pending_personal_selection());
+        service.selection_memory.borrow_mut().clear();
+
+        let adopted = service
+            .load_candidate_batch(
+                &ExactShortDiscoveryCandidateProvider,
+                "jdj",
+                4,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(adopted.candidates, ["固定", "讲讲", "简单", "降价"]);
+        assert_eq!(adopted.personalized, [false, true, false, false]);
+        assert!(
+            adopted.provenance[1]
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
         );

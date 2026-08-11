@@ -766,6 +766,39 @@ impl PersonalRankingSnapshot {
         promote_preferred_text_decision(preferred, candidates, protected_prefix)
     }
 
+    /// Applies one verified public whole-word preference to its anchored-tail
+    /// abbreviation, including a guarded discovery position when the text is
+    /// absent from the ordinary short-code pool.
+    ///
+    /// An existing ordinary candidate keeps the normal inherited promotion
+    /// behavior. An absent candidate is inserted only after the first
+    /// unprotected ordinary candidate; aliases and other protected prefixes
+    /// therefore stay fixed, and one complete-code observation cannot become
+    /// the short code's first ordinary choice.
+    pub(crate) fn promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+        &self,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+        mut exact_full_code_candidate: impl FnMut(&str, &str) -> bool,
+    ) -> Option<CandidateTextPromotion> {
+        let preferred = self.preferred_verified_anchored_suffix_text_where(
+            code,
+            suppressions,
+            &mut exact_full_code_candidate,
+        )?;
+        if candidates.iter().any(|candidate| candidate == preferred) {
+            promote_preferred_text_decision(preferred, candidates, protected_prefix)
+        } else {
+            recall_preferred_text_after_first_ordinary_decision(
+                preferred,
+                candidates,
+                protected_prefix,
+            )
+        }
+    }
+
     pub(crate) fn has_anchored_suffix_evidence_with_suppressions(
         &self,
         code: &str,
@@ -857,6 +890,29 @@ impl PersonalRankingSnapshot {
             .filter(|((entry_code, text), _)| {
                 candidates.iter().any(|candidate| candidate == text)
                     && !suppressions.is_suppressed(code, text)
+                    && !suppressions.is_suppressed(entry_code, text)
+                    && exact_full_code_candidate(entry_code, text)
+            })
+            .max_by(|((_, left_text), left), ((_, right_text), right)| {
+                left.selections
+                    .min(PERSONAL_RANKING_SUPPORT_CAP)
+                    .cmp(&right.selections.min(PERSONAL_RANKING_SUPPORT_CAP))
+                    .then_with(|| left.last_generation.cmp(&right.last_generation))
+                    .then_with(|| left.selections.cmp(&right.selections))
+                    .then_with(|| right_text.cmp(left_text))
+            })
+            .map(|((_, text), _)| text.as_str())
+    }
+
+    fn preferred_verified_anchored_suffix_text_where<'a>(
+        &'a self,
+        code: &str,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+        exact_full_code_candidate: &mut impl FnMut(&str, &str) -> bool,
+    ) -> Option<&'a str> {
+        self.entries_for_anchored_code(code)
+            .filter(|((entry_code, text), _)| {
+                !suppressions.is_suppressed(code, text)
                     && !suppressions.is_suppressed(entry_code, text)
                     && exact_full_code_candidate(entry_code, text)
             })
@@ -2521,6 +2577,75 @@ mod tests {
             )
         );
         assert_eq!(absent, ["简单", "降价"]);
+    }
+
+    #[test]
+    fn verified_complete_word_can_enter_only_a_guarded_absent_short_code_position() {
+        let mut snapshot = PersonalRankingSnapshot::default();
+        snapshot.record("jdjd", "讲讲").unwrap();
+        let suppressions = PersonalRankingSuppressionSnapshot::default();
+        let mut candidates = vec![
+            "固定".to_owned(),
+            "简单".to_owned(),
+            "降价".to_owned(),
+            "降级".to_owned(),
+        ];
+
+        let promotion = snapshot
+            .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                "jdj",
+                &mut candidates,
+                1,
+                &suppressions,
+                |code, text| code == "jdjd" && text == "讲讲",
+            );
+        assert_eq!(
+            promotion,
+            Some(CandidateTextPromotion {
+                index: 2,
+                source_index: None,
+                changed: true,
+            })
+        );
+        assert_eq!(candidates, ["固定", "简单", "讲讲", "降价"]);
+
+        let mut unverified = vec!["固定".to_owned(), "简单".to_owned(), "降价".to_owned()];
+        assert_eq!(
+            snapshot
+                .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                    "jdj",
+                    &mut unverified,
+                    1,
+                    &suppressions,
+                    |_, _| false,
+                ),
+            None
+        );
+        assert_eq!(unverified, ["固定", "简单", "降价"]);
+    }
+
+    #[test]
+    fn either_side_suppression_blocks_verified_short_code_discovery() {
+        let mut snapshot = PersonalRankingSnapshot::default();
+        snapshot.record("jdjd", "讲讲").unwrap();
+        for suppressed_code in ["jdjd", "jdj"] {
+            let mut suppressions = PersonalRankingSuppressionSnapshot::default();
+            suppressions.suppress(suppressed_code, "讲讲").unwrap();
+            let mut candidates = vec!["固定".to_owned(), "简单".to_owned(), "降价".to_owned()];
+
+            assert_eq!(
+                snapshot
+                    .promote_or_recall_verified_anchored_suffix_text_after_with_suppressions_decision(
+                        "jdj",
+                        &mut candidates,
+                        1,
+                        &suppressions,
+                        |code, text| code == "jdjd" && text == "讲讲",
+                    ),
+                None
+            );
+            assert_eq!(candidates, ["固定", "简单", "降价"]);
+        }
     }
 
     #[test]
