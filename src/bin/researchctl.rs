@@ -561,6 +561,61 @@ struct InitialNonTopEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PersonalizedTopBypassAudit {
+    precise_non_top_commits: usize,
+    top_provenance_observations: usize,
+    personalized_top_commits: usize,
+    unpersonalized_top_commits: usize,
+    personalization_reasons: [usize; CANDIDATE_PERSONALIZATION_KINDS.len()],
+    stacked_personalization_commits: usize,
+    replacement_provenance_observations: usize,
+    personalized_replacements: usize,
+    unpersonalized_replacements: usize,
+}
+
+impl PersonalizedTopBypassAudit {
+    fn observe(
+        &mut self,
+        rank: usize,
+        precise_personalization: bool,
+        replacement: Option<NativeCandidateProvenance>,
+        global_top: Option<NativeCandidateProvenance>,
+    ) {
+        if rank <= 1 || !precise_personalization {
+            return;
+        }
+        self.precise_non_top_commits += 1;
+        let Some(global_top) = global_top else {
+            return;
+        };
+        self.top_provenance_observations += 1;
+        let personalization = global_top.personalization();
+        if personalization.is_empty() {
+            self.unpersonalized_top_commits += 1;
+            return;
+        }
+
+        self.personalized_top_commits += 1;
+        let mut reason_count = 0;
+        for (index, (reason, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
+            if personalization.contains(*reason) {
+                self.personalization_reasons[index] += 1;
+                reason_count += 1;
+            }
+        }
+        self.stacked_personalization_commits += usize::from(reason_count >= 2);
+        if let Some(replacement) = replacement {
+            self.replacement_provenance_observations += 1;
+            if replacement.personalization().is_empty() {
+                self.unpersonalized_replacements += 1;
+            } else {
+                self.personalized_replacements += 1;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SlowKeyPhaseDominance {
     refresh: usize,
     planning: usize,
@@ -663,6 +718,7 @@ struct ResearchReview {
     transposition_unknown: usize,
     runtime_batches: HashMap<WishRuntimeIdentity, usize>,
     unidentified_runtime_batches: usize,
+    personalized_top_bypass: PersonalizedTopBypassAudit,
     selections: HashMap<(String, String), SelectionPattern>,
     cancelled_codes: HashMap<String, usize>,
     raw_codes: HashMap<String, usize>,
@@ -780,6 +836,12 @@ impl ResearchReview {
                         frame
                             .as_ref()
                             .is_none_or(|frame| frame.code != *code || frame.view != *view),
+                    );
+                    self.personalized_top_bypass.observe(
+                        *absolute_rank,
+                        snapshot.supports_precise_candidate_personalization(),
+                        provenance,
+                        global_top_provenance,
                     );
                     let pattern = self
                         .selections
@@ -1226,6 +1288,37 @@ impl ResearchReview {
         .unwrap();
     }
 
+    fn render_personalized_top_bypass(&self, output: &mut String) {
+        let audit = self.personalized_top_bypass;
+        writeln!(
+            output,
+            "个人提升首选绕过审计：V11+ 非首选提交 {}；首选原因可比较 {}/{}（带个人原因 {}、未带个人原因 {}、来源缺失 {}）。",
+            audit.precise_non_top_commits,
+            audit.top_provenance_observations,
+            audit.precise_non_top_commits,
+            audit.personalized_top_commits,
+            audit.unpersonalized_top_commits,
+            audit
+                .precise_non_top_commits
+                .saturating_sub(audit.top_provenance_observations),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "被绕过首选的个人原因（可叠加）：{}；多原因叠加 {}。替代候选来源 {}/{}；其中也带个人原因 {}、未带个人原因 {}、来源缺失 {}。",
+            render_candidate_personalization_counts(&audit.personalization_reasons),
+            audit.stacked_personalization_commits,
+            audit.replacement_provenance_observations,
+            audit.personalized_top_commits,
+            audit.personalized_replacements,
+            audit.unpersonalized_replacements,
+            audit
+                .personalized_top_commits
+                .saturating_sub(audit.replacement_provenance_observations),
+        )
+        .unwrap();
+    }
+
     fn initial_non_top_evidence(&self) -> InitialNonTopEvidence {
         let mut evidence = InitialNonTopEvidence::default();
         for ((code, _), pattern) in self
@@ -1498,6 +1591,7 @@ impl ResearchReview {
             self.unpaired_commits,
         )
         .unwrap();
+        self.render_personalized_top_bypass(&mut output);
         self.render_selection_pressure(&mut output);
         writeln!(
             output,
@@ -1561,6 +1655,7 @@ impl ResearchReview {
             self.unpaired_commits,
         )
         .unwrap();
+        self.render_personalized_top_bypass(&mut output);
         writeln!(
             output,
             "候选：{} 帧；最大已加载深度 {}；仍可继续加载 {} 帧；Tab 找字 {} 帧（逐字组词 {} 帧）。",
@@ -1697,6 +1792,7 @@ impl ResearchReview {
             self.post_commit_backspaces_routed,
         )
         .unwrap();
+        self.render_personalized_top_bypass(&mut output);
         self.render_selection_pressure(&mut output);
         writeln!(
             output,
@@ -2446,6 +2542,66 @@ mod tests {
         for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
             assert!(!rendered.contains(private_value));
         }
+    }
+
+    #[test]
+    fn personalized_top_bypass_audit_requires_precise_reasons_and_keeps_stacks_visible() {
+        let stacked_top = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT
+                .with(NativeCandidatePersonalization::LEFT_CONTEXT),
+        );
+        let session_top = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::SESSION_EXACT,
+        );
+        let personalized_replacement = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::SupplementalExact,
+            NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
+        );
+        let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let mut audit = PersonalizedTopBypassAudit::default();
+
+        audit.observe(2, true, Some(personalized_replacement), Some(stacked_top));
+        audit.observe(3, true, Some(plain), Some(stacked_top));
+        audit.observe(2, true, None, Some(session_top));
+        audit.observe(2, true, None, Some(plain));
+        audit.observe(7, true, None, None);
+        audit.observe(1, true, Some(plain), Some(stacked_top));
+        audit.observe(2, false, Some(plain), Some(stacked_top));
+
+        let mut reasons = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
+        reasons[0] = 2;
+        reasons[3] = 1;
+        reasons[5] = 2;
+        assert_eq!(
+            audit,
+            PersonalizedTopBypassAudit {
+                precise_non_top_commits: 5,
+                top_provenance_observations: 4,
+                personalized_top_commits: 3,
+                unpersonalized_top_commits: 1,
+                personalization_reasons: reasons,
+                stacked_personalization_commits: 2,
+                replacement_provenance_observations: 2,
+                personalized_replacements: 1,
+                unpersonalized_replacements: 1,
+            }
+        );
+
+        let review = ResearchReview {
+            personalized_top_bypass: audit,
+            ..ResearchReview::default()
+        };
+        let aggregate = review.render_aggregate();
+        assert!(aggregate.contains(
+            "V11+ 非首选提交 5；首选原因可比较 4/5（带个人原因 3、未带个人原因 1、来源缺失 1）"
+        ));
+        assert!(aggregate.contains("持久精确 2、会话精确 1、左侧上下文 2"));
+        assert!(aggregate.contains("多原因叠加 2"));
+        assert!(
+            aggregate.contains("替代候选来源 2/3；其中也带个人原因 1、未带个人原因 1、来源缺失 1")
+        );
     }
 
     #[test]

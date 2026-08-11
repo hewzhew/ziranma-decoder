@@ -10612,6 +10612,77 @@ mod tests {
     }
 
     #[test]
+    fn persisted_suppression_survives_a_stale_positive_writer_and_remains_code_scoped() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-stale-personal-writer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let ranking_root = parent.join("ranking");
+        let suppression_root = parent.join(PERSONAL_RANKING_SUPPRESSION_DIRECTORY);
+
+        let mut stale_writer = PersonalRankingRuntime::new_with_roots(
+            Some(ranking_root.clone()),
+            Some(suppression_root.clone()),
+        );
+        assert!(stale_writer.record("ab", "乙词"));
+        assert!(stale_writer.record("ab", "丙词"));
+        assert!(stale_writer.record("ab", "丙词"));
+        assert!(stale_writer.record("cd", "丙词"));
+        assert!(stale_writer.flush());
+
+        let mut forgetter = PersonalRankingRuntime::new_with_roots(
+            Some(ranking_root.clone()),
+            Some(suppression_root.clone()),
+        );
+        assert!(forgetter.append_suppression_action(
+            PersonalRankingSuppressionActionKind::Suppress,
+            "ab",
+            "丙词"
+        ));
+
+        assert!(
+            !stale_writer.is_suppressed("ab", "丙词"),
+            "a runtime that has not refreshed must remain a faithful stale-host simulation"
+        );
+        assert!(stale_writer.record("ab", "丙词"));
+        assert!(stale_writer.flush());
+
+        let mut restarted = PersonalRankingRuntime::new_with_roots(
+            Some(ranking_root.clone()),
+            Some(suppression_root.clone()),
+        );
+        assert!(restarted.has_evidence("ab", "丙词"));
+        assert!(restarted.is_suppressed("ab", "丙词"));
+        assert!(!restarted.is_suppressed("cd", "丙词"));
+
+        let mut same_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
+        assert!(restarted.promote_texts_after("ab", &mut same_code, 0));
+        assert_eq!(same_code, ["乙词", "甲词", "丙词"]);
+
+        let mut other_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
+        assert!(restarted.promote_texts_after("cd", &mut other_code, 0));
+        assert_eq!(other_code, ["丙词", "甲词", "乙词"]);
+
+        assert!(restarted.append_suppression_action(
+            PersonalRankingSuppressionActionKind::Restore,
+            "ab",
+            "丙词"
+        ));
+        drop(restarted);
+
+        let restored =
+            PersonalRankingRuntime::new_with_roots(Some(ranking_root), Some(suppression_root));
+        let mut same_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
+        assert!(restored.promote_texts_after("ab", &mut same_code, 0));
+        assert_eq!(same_code, ["丙词", "甲词", "乙词"]);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn personal_ranking_runtime_appends_suppression_only_after_safe_persistence() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = std::env::temp_dir().join(format!(
