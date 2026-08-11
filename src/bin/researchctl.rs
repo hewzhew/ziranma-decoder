@@ -7,13 +7,13 @@ use std::thread;
 
 use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
-    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
-    RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind, ResearchHalfPairAnalysis,
-    ResearchSceneAnalysis, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
-    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
-    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
-    repository_root_for_user_tool_executable, research_feedback_enabled,
-    set_research_feedback_enabled,
+    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
+    NativeFeedbackEvent, NativeSelectionSource, RESEARCH_FEEDBACK_DIRECTORY, ResearchHabitKind,
+    ResearchHalfPairAnalysis, ResearchSceneAnalysis, TranspositionCalibrationLabel,
+    WishCaptureScope, WishJournalContext, WishPublicCandidateOrderPolicy, WishRuntimeIdentity,
+    WishSnapshot, analyze_linked_research, analyze_runtime_half_pairs, list_wish_packages,
+    native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+    research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -710,6 +710,7 @@ struct ResearchReview {
     post_commit_backspace_capable_batches: usize,
     precise_personalization_capable_batches: usize,
     precise_ranking_personalization_capable_batches: usize,
+    candidate_suppression_action_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
     public_candidate_order_policy_capable_batches: usize,
     public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
@@ -717,6 +718,8 @@ struct ResearchReview {
     transposition_accepted: usize,
     transposition_rejected: usize,
     transposition_unknown: usize,
+    candidate_suppression_actions: usize,
+    candidate_restore_actions: usize,
     runtime_batches: HashMap<WishRuntimeIdentity, usize>,
     unidentified_runtime_batches: usize,
     personalized_top_bypass: PersonalizedTopBypassAudit,
@@ -739,6 +742,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_precise_candidate_personalization());
         self.precise_ranking_personalization_capable_batches +=
             usize::from(snapshot.supports_precise_candidate_ranking_personalization());
+        self.candidate_suppression_action_capable_batches +=
+            usize::from(snapshot.supports_candidate_suppression_actions());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
         self.public_candidate_order_policy_capable_batches +=
@@ -870,6 +875,17 @@ impl ResearchReview {
                     *self.cancelled_codes.entry(code.clone()).or_insert(0) += 1;
                     frame = None;
                 }
+                NativeFeedbackEvent::CandidateSuppressionChanged { action, .. } => {
+                    match action {
+                        NativeCandidateSuppressionAction::Suppress => {
+                            self.candidate_suppression_actions += 1;
+                        }
+                        NativeCandidateSuppressionAction::Restore => {
+                            self.candidate_restore_actions += 1;
+                        }
+                    }
+                    frame = None;
+                }
                 NativeFeedbackEvent::CandidatePopupTiming {
                     first_frame_ms,
                     fully_visible_ms,
@@ -972,7 +988,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -981,8 +997,16 @@ impl ResearchReview {
             self.batches,
             self.precise_ranking_personalization_capable_batches,
             self.batches,
+            self.candidate_suppression_action_capable_batches,
+            self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "个人候选生命周期（仅成功落盘动作）：遗忘 {}，恢复 {}；V1–V14 不补猜。",
+            self.candidate_suppression_actions, self.candidate_restore_actions,
         )
         .unwrap();
         writeln!(
@@ -3351,6 +3375,16 @@ mod tests {
                 absolute_rank: 1,
                 visible_rank: 1,
             },
+            NativeFeedbackEvent::CandidateSuppressionChanged {
+                code: "dago".to_owned(),
+                text: "打过".to_owned(),
+                action: NativeCandidateSuppressionAction::Suppress,
+            },
+            NativeFeedbackEvent::CandidateSuppressionChanged {
+                code: "dago".to_owned(),
+                text: "打过".to_owned(),
+                action: NativeCandidateSuppressionAction::Restore,
+            },
             NativeFeedbackEvent::CandidatePopupTiming {
                 first_frame_ms: 7,
                 fully_visible_ms: 20,
@@ -3403,6 +3437,8 @@ mod tests {
 
         assert_eq!(review.candidate_commits, 2);
         assert_eq!(review.non_top_commits, 1);
+        assert_eq!(review.candidate_suppression_actions, 1);
+        assert_eq!(review.candidate_restore_actions, 1);
         assert_eq!(review.popup_first_frame_ms, [7, 65]);
         assert_eq!(review.popup_ms, [20, 130]);
         assert_eq!(review.initial_popup_ms, [20]);
@@ -3443,7 +3479,9 @@ mod tests {
         assert!(aggregate.contains("候选规划 1；编辑会话 0；其余阶段 0；并列 0"));
         assert!(aggregate.contains("精确个性化证据 1/1 批"));
         assert!(aggregate.contains("实际个人重排原因 1/1 批"));
-        assert!(aggregate.contains("反馈格式：V14 1"));
+        assert!(aggregate.contains("显式遗忘/恢复动作 1/1 批"));
+        assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
+        assert!(aggregate.contains("反馈格式：V15 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"

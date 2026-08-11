@@ -7,10 +7,10 @@ use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
-    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
-    WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
-    WishFeedbackError, WishImportance, WishJournalContext, WishNote,
-    WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
+    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
+    NativeFeedbackEvent, NativeSelectionSource, WishCaptureScope, WishCategory, WishCommand,
+    WishCommandAckStatus, WishEventRole, WishFeedbackError, WishImportance, WishJournalContext,
+    WishNote, WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
     list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
     move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash, save_wish_note,
 };
@@ -597,6 +597,15 @@ fn print_event(event: &NativeFeedbackEvent) {
         NativeFeedbackEvent::CompositionCancelled { code, source } => {
             println!("取消  {code} [{}]", cancellation_label(*source));
         }
+        NativeFeedbackEvent::CandidateSuppressionChanged { code, text, action } => {
+            println!(
+                "个人候选  {code} → “{text}” [{}]",
+                match action {
+                    NativeCandidateSuppressionAction::Suppress => "已忘记",
+                    NativeCandidateSuppressionAction::Restore => "已恢复",
+                }
+            );
+        }
         NativeFeedbackEvent::CandidatePopupTiming {
             first_frame_ms,
             fully_visible_ms,
@@ -855,6 +864,7 @@ mod tests {
         assert_eq!(wish_schema_version_label(12), "V12");
         assert_eq!(wish_schema_version_label(13), "V13");
         assert_eq!(wish_schema_version_label(14), "V14");
+        assert_eq!(wish_schema_version_label(15), "V15");
     }
 
     #[test]

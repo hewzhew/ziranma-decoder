@@ -303,6 +303,12 @@ pub enum NativeCancellationSource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCandidateSuppressionAction {
+    Suppress,
+    Restore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeAutomaticTranspositionTier {
     Shadow,
     Secondary,
@@ -492,6 +498,13 @@ pub enum NativeFeedbackEvent {
         code: String,
         source: NativeCancellationSource,
     },
+    /// One successfully persisted change to the exact code/text suppression
+    /// set. Failed saves do not produce this event.
+    CandidateSuppressionChanged {
+        code: String,
+        text: String,
+        action: NativeCandidateSuppressionAction,
+    },
     /// One completed candidate-popup paint. With immediate visibility the
     /// complete frame and the fully visible frame have the same duration.
     CandidatePopupTiming {
@@ -586,6 +599,12 @@ impl NativeFeedbackEvent {
             }
             Self::RawCodeCommitted { code } => valid_code(code).then_some(code.len()),
             Self::CompositionCancelled { code, .. } => valid_code(code).then_some(code.len()),
+            Self::CandidateSuppressionChanged { code, text, .. } => {
+                if !valid_code(code) || !valid_text(text) {
+                    return None;
+                }
+                measure_private_strings([code.as_str(), text.as_str()].into_iter())
+            }
             Self::CandidatePopupTiming {
                 first_frame_ms,
                 fully_visible_ms,
@@ -1250,6 +1269,7 @@ impl NativeFeedbackSession {
                 }
                 NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
                 NativeFeedbackEvent::PostCommitBackspaceRouted => {}
+                NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {}
             }
         }
         summary
@@ -1438,7 +1458,8 @@ impl NativeFeedbackSession {
                 self.finish_pending_automatic_transposition(label);
             }
             NativeFeedbackEvent::RawCodeCommitted { .. }
-            | NativeFeedbackEvent::CompositionCancelled { .. } => {
+            | NativeFeedbackEvent::CompositionCancelled { .. }
+            | NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {
                 self.finish_pending_automatic_transposition(TranspositionCalibrationLabel::Unknown)
             }
             NativeFeedbackEvent::CandidatePopupTiming { .. }

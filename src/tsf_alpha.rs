@@ -39,25 +39,25 @@ use crate::{
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
     NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
     NativeCancellationSource, NativeCandidatePersonalization, NativeCandidateProvenance,
-    NativeCandidateSource, NativeCandidateView, NativeFeedbackAuthorization,
-    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
-    NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle, NativeFeedbackLimits,
-    NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
-    NativeFeedbackStopResult, NativeFeedbackSummary, NativeSelectionSource, NativeTabAssemblyState,
-    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
-    PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
-    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
-    PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
-    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
-    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
-    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
-    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_snapshots,
-    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
-    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
-    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
-    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
-    save_personal_ranking_batch, save_personal_ranking_checkpoint,
-    save_personal_ranking_suppression_action, save_wish_snapshot,
+    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
+    NativeFeedbackAuthorization, NativeFeedbackClearResult, NativeFeedbackContext,
+    NativeFeedbackEvent, NativeFeedbackFreezeAuthorization, NativeFeedbackLifecycle,
+    NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
+    NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
+    NativeSelectionSource, NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH,
+    PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking, PersonalRankingBatch,
+    PersonalRankingSelection, PersonalRankingSnapshot, PersonalRankingSuppressionAction,
+    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
+    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, WISH_ACK_COMPARTMENT_GUID,
+    WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector, WishCaptureScope, WishCategory,
+    WishCommand, WishCommandAck, WishCommandAckStatus, WishJournalAnchor, WishJournalContext,
+    WishJournalSpan, WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot,
+    candidate_sha256_hex, load_candidate_runtime_snapshots, load_candidate_runtime_supplemental,
+    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
+    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
+    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -6686,7 +6686,8 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::CandidatesPresentedWithProvenance { code, .. }
         | NativeFeedbackEvent::CandidateCommitted { code, .. }
         | NativeFeedbackEvent::RawCodeCommitted { code }
-        | NativeFeedbackEvent::CompositionCancelled { code, .. } => Some(code),
+        | NativeFeedbackEvent::CompositionCancelled { code, .. }
+        | NativeFeedbackEvent::CandidateSuppressionChanged { code, .. } => Some(code),
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::PostCommitBackspaceRouted => None,
@@ -9140,6 +9141,38 @@ impl TsfTextService_Impl {
         .flatten()
     }
 
+    fn record_candidate_suppression_change(
+        &self,
+        code: &str,
+        text: &str,
+        action: NativeCandidateSuppressionAction,
+    ) {
+        let context = self
+            .native_feedback_context
+            .lock()
+            .map(|cache| cache.context_for(code))
+            .unwrap_or(NativeFeedbackContext::Unknown);
+        let Ok(mut feedback) = self.native_feedback.lock() else {
+            return;
+        };
+        if !feedback.is_accepting() {
+            return;
+        }
+        let result = feedback.record_at(
+            context,
+            NativeFeedbackEvent::CandidateSuppressionChanged {
+                code: code.to_owned(),
+                text: text.to_owned(),
+                action,
+            },
+            native_feedback_monotonic_ms(),
+        );
+        drop(feedback);
+        if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
+            self.native_feedback_language_bar_state.notify();
+        }
+    }
+
     fn apply_candidate_forget_action(
         &self,
         action: PlannedCandidateForgetAction,
@@ -9178,6 +9211,11 @@ impl TsfTextService_Impl {
                     if let Ok(mut memory) = self.selection_memory.try_borrow_mut() {
                         memory.forget_text(&code, &text);
                     }
+                    self.record_candidate_suppression_change(
+                        &code,
+                        &text,
+                        NativeCandidateSuppressionAction::Suppress,
+                    );
                     *self.candidate_forget_state.try_borrow_mut().ok()? =
                         CandidateForgetState::UndoAvailable {
                             code,
@@ -9211,6 +9249,11 @@ impl TsfTextService_Impl {
                     {
                         memory.remember_text(&code, &text);
                     }
+                    self.record_candidate_suppression_change(
+                        &code,
+                        &text,
+                        NativeCandidateSuppressionAction::Restore,
+                    );
                     *self.candidate_forget_state.try_borrow_mut().ok()? =
                         CandidateForgetState::Inactive;
                     self.refreshed_candidate_forget_display(CandidateDisplayMode::ForgetRestored)
@@ -16848,6 +16891,22 @@ mod tests {
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             SelectionCandidateProvider,
         ))));
+        assert_eq!(
+            service
+                .native_feedback
+                .lock()
+                .unwrap()
+                .start_rolling_memory(
+                    NativeFeedbackAuthorization::explicit_memory_only(),
+                    NativeFeedbackLimits::default(),
+                ),
+            NativeFeedbackStartResult::Started
+        );
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
         service
             .composition
             .borrow_mut()
@@ -16913,6 +16972,24 @@ mod tests {
             &*service.candidate_forget_state.borrow(),
             CandidateForgetState::Inactive
         ));
+        let feedback = service.native_feedback.lock().unwrap();
+        let actions = feedback
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                NativeFeedbackEvent::CandidateSuppressionChanged { code, text, action } => {
+                    Some((code.as_str(), text.as_str(), *action))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            [
+                ("ab", "乙", NativeCandidateSuppressionAction::Suppress),
+                ("ab", "乙", NativeCandidateSuppressionAction::Restore),
+            ]
+        );
     }
 
     #[test]

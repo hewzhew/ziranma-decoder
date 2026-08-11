@@ -26,9 +26,9 @@ use crate::{
     DataProtector, FrozenNativeFeedbackEvent, FrozenNativeFeedbackSnapshot,
     NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
-    NativeCandidateProvenance, NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent,
-    NativeSelectionSource, NativeTabAssemblyState, TranspositionCalibrationLabel,
-    TranspositionCalibrationObservation, candidate_sha256_hex,
+    NativeCandidateProvenance, NativeCandidateSource, NativeCandidateSuppressionAction,
+    NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource, NativeTabAssemblyState,
+    TranspositionCalibrationLabel, TranspositionCalibrationObservation, candidate_sha256_hex,
 };
 
 pub const WISH_SCHEMA_V1: &str = "ziranma-wish-v1";
@@ -45,6 +45,7 @@ pub const WISH_SCHEMA_V11: &str = "ziranma-wish-v11";
 pub const WISH_SCHEMA_V12: &str = "ziranma-wish-v12";
 pub const WISH_SCHEMA_V13: &str = "ziranma-wish-v13";
 pub const WISH_SCHEMA_V14: &str = "ziranma-wish-v14";
+pub const WISH_SCHEMA_V15: &str = "ziranma-wish-v15";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -53,7 +54,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 14;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 15;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -68,6 +69,7 @@ const WISH_PLAINTEXT_MAGIC_V11: &[u8] = b"ziranma-wish-v11\0";
 const WISH_PLAINTEXT_MAGIC_V12: &[u8] = b"ziranma-wish-v12\0";
 const WISH_PLAINTEXT_MAGIC_V13: &[u8] = b"ziranma-wish-v13\0";
 const WISH_PLAINTEXT_MAGIC_V14: &[u8] = b"ziranma-wish-v14\0";
+const WISH_PLAINTEXT_MAGIC_V15: &[u8] = b"ziranma-wish-v15\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -480,6 +482,10 @@ impl WishSnapshot {
         self.source_schema_version >= 14
     }
 
+    pub fn supports_candidate_suppression_actions(&self) -> bool {
+        self.source_schema_version >= 15
+    }
+
     pub fn category(&self) -> WishCategory {
         self.category
     }
@@ -650,7 +656,8 @@ impl WishSnapshot {
                     }
                 }
                 NativeFeedbackEvent::RawCodeCommitted { .. }
-                | NativeFeedbackEvent::CompositionCancelled { .. } => {
+                | NativeFeedbackEvent::CompositionCancelled { .. }
+                | NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {
                     if let Some(previous) = pending.take() {
                         finish(
                             &mut observations,
@@ -747,7 +754,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V14);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V15);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -806,7 +813,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V14) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V15) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V15)?;
+            15
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V14) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V14)?;
             14
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V13) {
@@ -1839,6 +1849,15 @@ fn render_event(
             put_string(output, code)?;
             output.push(cancellation_tag(*source));
         }
+        NativeFeedbackEvent::CandidateSuppressionChanged { code, text, action } => {
+            if version < 15 {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            output.push(13);
+            put_string(output, code)?;
+            put_string(output, text)?;
+            output.push(candidate_suppression_action_tag(*action));
+        }
         NativeFeedbackEvent::CandidatePopupTiming {
             first_frame_ms,
             fully_visible_ms,
@@ -1918,6 +1937,11 @@ fn parse_event(
             total_ms: reader.u32()?,
         },
         11 if version >= 10 => NativeFeedbackEvent::PostCommitBackspaceRouted,
+        13 if version >= 15 => NativeFeedbackEvent::CandidateSuppressionChanged {
+            code: reader.string()?,
+            text: reader.string()?,
+            action: parse_candidate_suppression_action(reader.byte()?)?,
+        },
         tag if (tag == 6 && version >= 3)
             || (tag == 7 && version >= 4)
             || (tag == 8 && version >= 5)
@@ -2071,6 +2095,23 @@ fn candidate_source_tag(value: NativeCandidateSource) -> u8 {
         NativeCandidateSource::Shape => 9,
         NativeCandidateSource::FourCharacterCorrection => 10,
         NativeCandidateSource::PublicConsensusExact => 11,
+    }
+}
+
+fn candidate_suppression_action_tag(value: NativeCandidateSuppressionAction) -> u8 {
+    match value {
+        NativeCandidateSuppressionAction::Suppress => 1,
+        NativeCandidateSuppressionAction::Restore => 2,
+    }
+}
+
+fn parse_candidate_suppression_action(
+    value: u8,
+) -> Result<NativeCandidateSuppressionAction, WishFeedbackError> {
+    match value {
+        1 => Ok(NativeCandidateSuppressionAction::Suppress),
+        2 => Ok(NativeCandidateSuppressionAction::Restore),
+        _ => Err(WishFeedbackError::InvalidSnapshot),
     }
 }
 
@@ -2575,13 +2616,15 @@ mod tests {
             12
         } else if magic == WISH_PLAINTEXT_MAGIC_V13 {
             13
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V14 {
             14
+        } else {
+            15
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V14.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V15.len()..]);
         rendered
     }
 
@@ -2600,19 +2643,20 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V14));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V15));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 14);
+        assert_eq!(parsed.source_schema_version(), 15);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
         assert!(parsed.supports_public_consensus_candidate_source());
         assert!(parsed.supports_public_candidate_order_policy());
         assert!(parsed.supports_precise_candidate_ranking_personalization());
+        assert!(parsed.supports_candidate_suppression_actions());
         assert_eq!(
             parsed.public_candidate_order_policy(),
             WishPublicCandidateOrderPolicy::Unrecorded
@@ -2715,10 +2759,11 @@ mod tests {
             may_have_more: false,
         };
 
-        let rendered = snapshot.render().unwrap();
+        let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V14);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V14));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_precise_candidate_ranking_personalization());
+        assert!(!parsed.supports_candidate_suppression_actions());
         let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
             parsed.events()[0].event()
         else {
@@ -2748,6 +2793,38 @@ mod tests {
         ranking_without_evidence[ranking_offset] =
             NativeCandidatePersonalization::PERSISTENT_DISCOVERY.bits();
         assert!(WishSnapshot::parse(&ranking_without_evidence).is_err());
+    }
+
+    #[test]
+    fn v15_round_trips_successful_candidate_suppression_actions_strictly() {
+        let mut snapshot = private_snapshot();
+        snapshot.events.push(WishEvent {
+            milliseconds_before_marker: 0,
+            event: NativeFeedbackEvent::CandidateSuppressionChanged {
+                code: "ab".to_owned(),
+                text: "甲".to_owned(),
+                action: NativeCandidateSuppressionAction::Suppress,
+            },
+        });
+        snapshot.source_events += 1;
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V15));
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert!(parsed.supports_candidate_suppression_actions());
+        assert!(matches!(
+            parsed.events().last().map(WishEvent::event),
+            Some(NativeFeedbackEvent::CandidateSuppressionChanged {
+                code,
+                text,
+                action: NativeCandidateSuppressionAction::Suppress,
+            }) if code == "ab" && text == "甲"
+        ));
+        assert!(snapshot.render_with_event_version(14).is_err());
+
+        let mut unknown_action = rendered;
+        *unknown_action.last_mut().unwrap() = u8::MAX;
+        assert!(WishSnapshot::parse(&unknown_action).is_err());
     }
 
     #[test]
@@ -2894,7 +2971,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V14));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V15));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
