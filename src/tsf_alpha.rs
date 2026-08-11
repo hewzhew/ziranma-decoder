@@ -5,7 +5,7 @@
 //! without adding an input profile to Windows.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::ffi::{OsString, c_void};
 use std::fmt;
@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use crate::candidate_snapshot::{
     FourCharacterCorrectionDecision, InteractiveCandidateQuery, InteractiveCandidateSource,
-    layered_candidate_query_with_consensus_sources, layered_candidate_query_with_sources,
-    layered_four_character_correction_decision,
+    MAX_TAB_SHAPE_SOURCE_RANK, layered_candidate_query_with_consensus_sources,
+    layered_candidate_query_with_sources, layered_four_character_correction_decision,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -158,6 +158,7 @@ const TSF_PUBLIC_STROKE_SEQUENCES: &str =
     include_str!("../data/public/conway-stroke-data/sequence-characters.txt");
 const CANDIDATE_PAGE_SIZE: usize = 6;
 const CANDIDATE_LIMIT: usize = MAX_CANDIDATE_SNAPSHOT_RANK;
+const SHAPE_CANDIDATE_POOL_CACHE_CAPACITY: usize = MAX_TAB_ASSEMBLY_CHARACTERS;
 const CANDIDATE_DISPLAY_MAX_CHARS: usize = 32;
 const TSF_PUBLIC_CANDIDATE_ORDER_POLICY: WishPublicCandidateOrderPolicy =
     WishPublicCandidateOrderPolicy::ConservativeCoreFirst;
@@ -343,6 +344,31 @@ trait CandidateProvider: Send + Sync {
 struct ShapeCandidate {
     text: String,
     resolved_code: String,
+}
+
+#[derive(Default)]
+struct ShapeCandidatePoolCache {
+    entries: VecDeque<(String, Arc<[ShapeCandidate]>)>,
+}
+
+impl ShapeCandidatePoolCache {
+    fn get(&mut self, code: &str) -> Option<Arc<[ShapeCandidate]>> {
+        let index = self.entries.iter().position(|(cached, _)| cached == code)?;
+        let entry = self.entries.remove(index)?;
+        let pool = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(pool)
+    }
+
+    fn insert(&mut self, code: &str, pool: Arc<[ShapeCandidate]>) {
+        if let Some(index) = self.entries.iter().position(|(cached, _)| cached == code) {
+            self.entries.remove(index);
+        }
+        self.entries.push_back((code.to_owned(), pool));
+        while self.entries.len() > SHAPE_CANDIDATE_POOL_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
 }
 
 struct CandidateProviderOutput {
@@ -685,6 +711,7 @@ struct SnapshotCandidateProvider {
     supplemental: PublicSupplementRuntime,
     aliases: Option<ExplicitAliasRuntime>,
     refresh_throttle: Mutex<RefreshThrottle>,
+    shape_candidate_pools: Mutex<ShapeCandidatePoolCache>,
 }
 
 impl SnapshotCandidateProvider {
@@ -702,6 +729,7 @@ impl SnapshotCandidateProvider {
             supplemental: PublicSupplementRuntime::static_layer(supplemental),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
+            shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
         }
     }
 
@@ -716,7 +744,39 @@ impl SnapshotCandidateProvider {
             supplemental: PublicSupplementRuntime::managed(supplemental_root, supplemental),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
+            shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
         }
+    }
+
+    fn shape_candidate_pool(&self, code: &str) -> Arc<[ShapeCandidate]> {
+        if let Ok(mut cache) = self.shape_candidate_pools.lock()
+            && let Some(pool) = cache.get(code)
+        {
+            return pool;
+        }
+
+        let candidates = if code.len() == 1 {
+            self.snapshot
+                .initial_single_character_candidates(code, MAX_TAB_SHAPE_SOURCE_RANK)
+                .unwrap_or_default()
+        } else {
+            self.snapshot
+                .exact_single_character_candidates(code, MAX_TAB_SHAPE_SOURCE_RANK)
+                .unwrap_or_default()
+        };
+        let pool = Arc::<[ShapeCandidate]>::from(
+            candidates
+                .into_iter()
+                .map(|candidate| ShapeCandidate {
+                    text: candidate.text,
+                    resolved_code: candidate.full_code,
+                })
+                .collect::<Vec<_>>(),
+        );
+        if let Ok(mut cache) = self.shape_candidate_pools.lock() {
+            cache.insert(code, Arc::clone(&pool));
+        }
+        pool
     }
 
     fn refresh_at_safe_boundary_at(&self, now: Instant) -> bool {
@@ -1242,28 +1302,16 @@ impl CandidateProvider for SnapshotCandidateProvider {
         {
             return Vec::new();
         }
-        let Some(shapes) = public_shape_index() else {
-            return Vec::new();
-        };
-        let candidates = if code.len() == 1 {
-            self.snapshot
-                .initial_single_character_candidates(code, CANDIDATE_LIMIT)
-                .unwrap_or_default()
+        let shapes = if stroke_prefix.is_empty() {
+            None
         } else {
-            self.snapshot
-                .exact_full_code_texts(code, CANDIDATE_LIMIT)
-                .unwrap_or_default()
-                .into_iter()
-                .map(
-                    |text| crate::candidate_snapshot::ExactSingleCharacterCandidate {
-                        text,
-                        full_code: code.to_owned(),
-                    },
-                )
-                .collect()
+            let Some(shapes) = public_shape_index() else {
+                return Vec::new();
+            };
+            Some(shapes)
         };
-        candidates
-            .into_iter()
+        self.shape_candidate_pool(code)
+            .iter()
             .filter(|candidate| {
                 let mut characters = candidate.text.chars();
                 let Some(character) = characters.next() else {
@@ -1272,8 +1320,8 @@ impl CandidateProvider for SnapshotCandidateProvider {
                 if characters.next().is_some() {
                     return false;
                 }
-                stroke_prefix.is_empty()
-                    || shapes.get(character).is_some_and(|shape| {
+                shapes.is_none_or(|shapes| {
+                    shapes.get(character).is_some_and(|shape| {
                         shape
                             .stroke_codes()
                             .iter()
@@ -1283,12 +1331,10 @@ impl CandidateProvider for SnapshotCandidateProvider {
                                 .iter()
                                 .any(|code| code.starts_with(stroke_prefix))
                     })
-            })
-            .map(|candidate| ShapeCandidate {
-                text: candidate.text,
-                resolved_code: candidate.full_code,
+                })
             })
             .take(limit.min(CANDIDATE_LIMIT))
+            .cloned()
             .collect()
     }
 }
@@ -11149,6 +11195,7 @@ mod tests {
             supplemental: PublicSupplementRuntime::static_layer(None),
             aliases: Some(runtime),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
+            shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
         };
         let mut candidates = provider.candidates("aa", 2, InteractiveCandidateView::Primary);
         assert_eq!(candidates, ["乙", "啊"]);
@@ -12054,6 +12101,89 @@ mod tests {
         );
         assert!(provider.shape_candidates("qthp", "", 6).is_empty());
         assert!(provider.shape_candidates("qt", "a", 6).is_empty());
+    }
+
+    #[test]
+    fn shape_candidate_pool_cache_is_bounded_and_keeps_recent_slots() {
+        let mut cache = ShapeCandidatePoolCache::default();
+        for code in ["aa", "bb", "cc", "dd"] {
+            let pool: Arc<[ShapeCandidate]> = vec![ShapeCandidate {
+                text: code.to_owned(),
+                resolved_code: code.to_owned(),
+            }]
+            .into();
+            cache.insert(code, pool);
+        }
+        assert!(cache.get("aa").is_some());
+        let newest: Arc<[ShapeCandidate]> = vec![ShapeCandidate {
+            text: "ee".to_owned(),
+            resolved_code: "ee".to_owned(),
+        }]
+        .into();
+        cache.insert("ee", newest);
+
+        assert!(
+            cache.get("bb").is_none(),
+            "the least-recent slot is evicted"
+        );
+        assert_eq!(cache.entries.len(), SHAPE_CANDIDATE_POOL_CACHE_CAPACITY);
+        assert!(
+            cache.get("aa").is_some(),
+            "a recent assembly slot remains cached"
+        );
+    }
+
+    #[test]
+    fn snapshot_provider_filters_shape_evidence_before_the_visible_rank_limit() {
+        let mut core = "text\tpinyin\tfrequency\n".to_owned();
+        let mut expected = Vec::new();
+        for offset in 0..60_u32 {
+            let character = char::from_u32(0x4e00 + offset).unwrap();
+            expected.push(character.to_string());
+            core.push_str(&format!(
+                "{character}\tji\t{}\n",
+                1_000_u64 - u64::from(offset)
+            ));
+        }
+        let snapshot = Arc::new(
+            CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                revision: "tsf-deep-shape-source-v1",
+                contains_private_text: false,
+                lexicon_tsv: &core,
+                expected_payload_bytes: core.len(),
+                expected_payload_fingerprint: crate::candidate_payload_fingerprint(core.as_bytes()),
+                expected_entry_count: expected.len(),
+            })
+            .unwrap(),
+        );
+        let provider = SnapshotCandidateProvider::new(snapshot, None, None);
+        let pool = provider.shape_candidate_pool("ji");
+        assert_eq!(pool.len(), expected.len());
+        assert_eq!(pool[50].text, expected[50]);
+        assert!(
+            provider
+                .shape_candidates("ji", "", CANDIDATE_LIMIT)
+                .iter()
+                .all(|candidate| candidate.text != expected[50]),
+            "the ordinary empty-prefix display remains capped before rank 51"
+        );
+
+        let target = expected[50].chars().next().unwrap();
+        let stroke_code = public_shape_index()
+            .and_then(|shapes| shapes.get(target))
+            .and_then(|shape| shape.stroke_codes().first())
+            .expect("the pinned public stroke table covers the synthetic public target");
+        let filtered = provider.shape_candidates("ji", stroke_code, CANDIDATE_LIMIT);
+        assert!(
+            filtered
+                .iter()
+                .any(|candidate| candidate.text == expected[50]),
+            "shape filtering must run against the deep source before applying rank 50"
+        );
+
+        let cached = provider.shape_candidate_pool("ji");
+        assert!(Arc::ptr_eq(&pool, &cached));
     }
 
     fn reversed_single_pair_provider() -> SnapshotCandidateProvider {

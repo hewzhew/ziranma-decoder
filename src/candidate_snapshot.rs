@@ -23,6 +23,14 @@ pub const MAX_CANDIDATE_SNAPSHOT_ENTRIES: usize = 131_072;
 /// Interactive hosts may reveal this bounded frontier lazily; they should not
 /// request all ranks on every composition update.
 pub const MAX_CANDIDATE_SNAPSHOT_RANK: usize = 50;
+/// Maximum ranked single-character identities inspected by explicit Tab shape
+/// refinement before its ordinary 50-item visible frontier is applied.
+///
+/// This is deliberately separate from [`MAX_CANDIDATE_SNAPSHOT_RANK`]: shape
+/// keys are useful precisely when a known-reading character is deeper than the
+/// ordinary candidate pages. The bound still prevents one explicit lookup from
+/// expanding to the snapshot's full entry limit.
+pub(crate) const MAX_TAB_SHAPE_SOURCE_RANK: usize = 4_096;
 const MAX_CANDIDATE_SNAPSHOT_REVISION_BYTES: usize = 64;
 const MAX_TRANSPOSITION_RECOVERY_KEYS: usize = 16;
 const AUTOMATIC_TRANSPOSITION_CANDIDATE_DEPTH: usize = 6;
@@ -365,6 +373,39 @@ impl CandidateSnapshot {
             })
     }
 
+    /// Returns a deeper, still bounded exact single-character pool for one
+    /// explicit Tab shape slot.
+    ///
+    /// Ordinary interactive queries remain capped by
+    /// [`MAX_CANDIDATE_SNAPSHOT_RANK`]. This source pool is kept separate so a
+    /// later shape prefix can filter before applying the visible rank limit.
+    pub(crate) fn exact_single_character_candidates(
+        &self,
+        code: &str,
+        limit: usize,
+    ) -> Result<Vec<ExactSingleCharacterCandidate>, KeySequenceError> {
+        let code = KeySequence::new(code)?;
+        let requested_limit = limit.min(MAX_TAB_SHAPE_SOURCE_RANK);
+        if code.as_str().len() != 2 || requested_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::new();
+        let mut candidates = self
+            .decoder
+            .decode_exact_full_code(code.as_str(), MAX_TAB_SHAPE_SOURCE_RANK)?
+            .into_iter()
+            .filter(|candidate| candidate.text.chars().count() == 1)
+            .filter(|candidate| seen.insert(candidate.text.clone()))
+            .map(|candidate| ExactSingleCharacterCandidate {
+                text: candidate.text,
+                full_code: code.as_str().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        candidates.truncate(requested_limit);
+        Ok(candidates)
+    }
+
     /// Returns ranked single-character candidates for one trailing initial key.
     ///
     /// This is the deliberately narrow pool used by explicit Tab lookup when
@@ -378,7 +419,7 @@ impl CandidateSnapshot {
         limit: usize,
     ) -> Result<Vec<ExactSingleCharacterCandidate>, KeySequenceError> {
         let initial = KeySequence::new(initial)?;
-        let requested_limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        let requested_limit = limit.min(MAX_TAB_SHAPE_SOURCE_RANK);
         if initial.as_str().len() != 1 || requested_limit == 0 {
             return Ok(Vec::new());
         }
@@ -390,7 +431,7 @@ impl CandidateSnapshot {
                 .expect("lowercase ASCII keys are valid UTF-8");
             candidates.extend(
                 self.decoder
-                    .decode_exact_full_code(&code, MAX_CANDIDATE_SNAPSHOT_RANK)?
+                    .decode_exact_full_code(&code, MAX_TAB_SHAPE_SOURCE_RANK)?
                     .into_iter()
                     .filter(|candidate| candidate.text.chars().count() == 1),
             );
@@ -2003,6 +2044,43 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn explicit_shape_sources_retain_single_characters_beyond_the_visible_rank_limit() {
+        let mut lexicon = "text\tpinyin\tfrequency\n".to_owned();
+        let mut expected = Vec::new();
+        for offset in 0..60_u32 {
+            let character = char::from_u32(0x4e00 + offset).unwrap();
+            expected.push(character.to_string());
+            lexicon.push_str(&format!(
+                "{character}\tji\t{}\n",
+                1_000_u64 - u64::from(offset)
+            ));
+        }
+        let snapshot = load_test_snapshot("deep-shape-source-v1", &lexicon, expected.len());
+
+        assert_eq!(
+            snapshot
+                .exact_full_code_texts("ji", usize::MAX)
+                .unwrap()
+                .len(),
+            MAX_CANDIDATE_SNAPSHOT_RANK,
+            "ordinary interactive exact candidates must keep their existing bound"
+        );
+        let exact = snapshot
+            .exact_single_character_candidates("ji", usize::MAX)
+            .unwrap();
+        assert_eq!(exact.len(), expected.len());
+        assert_eq!(exact[50].text, expected[50]);
+        assert!(exact.iter().all(|candidate| candidate.full_code == "ji"));
+
+        let initial = snapshot
+            .initial_single_character_candidates("j", usize::MAX)
+            .unwrap();
+        assert_eq!(initial.len(), expected.len());
+        assert_eq!(initial[50].text, expected[50]);
+        assert!(initial.iter().all(|candidate| candidate.full_code == "ji"));
     }
 
     #[test]
