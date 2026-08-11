@@ -7,6 +7,12 @@ TSF DLL 被 Codex、Typora 等宿主加载后，Windows 不允许安全地原地
 `refresh-ime.cmd` 因此只更新这些用户态工具，不注册输入法、不改变当前用户
 TSF 状态，也不要求关闭正在输入的宿主。
 
+仓库根目录的维护入口都以脚本自身位置解析仓库和固定数据目录，不依赖调用者的
+当前 PowerShell / CMD 工作目录。因此可以在任意目录使用完整路径调用，例如
+`D:\IME\ziranma-decoder\refresh-ime.cmd status`。刷新脚本还把解析出的
+`Cargo.toml` 作为显式 `--manifest-path` 传给 Cargo；当前目录不能再把构建误导到
+其他工程或用户主目录。
+
 ```powershell
 .\refresh-ime.cmd
 .\refresh-ime.cmd status

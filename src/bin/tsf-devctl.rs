@@ -3239,6 +3239,57 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_entry_points_anchor_paths_to_the_repository_location() {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let prepare = fs::read_to_string(repository.join("prepare-ime.cmd")).unwrap();
+        assert!(prepare.contains("set \"repository_root=%~dp0\""));
+        assert!(prepare.contains("pushd \"%repository_root%\""));
+        assert!(prepare.contains("call \"%repository_root%update-ime.cmd\" status"));
+
+        let refresh = fs::read_to_string(repository.join("refresh-ime.cmd")).unwrap();
+        assert!(refresh.contains("set \"refresh_script=%~dp0scripts\\refresh-user-tools.ps1\""));
+        let refresh_script =
+            fs::read_to_string(repository.join("scripts").join("refresh-user-tools.ps1")).unwrap();
+        assert!(refresh_script.contains("Join-Path $PSScriptRoot '..'"));
+        assert!(refresh_script.contains("'--manifest-path', $manifestPath"));
+
+        let update = fs::read_to_string(repository.join("update-ime.cmd")).unwrap();
+        assert!(update.contains("set \"update_script=%~dp0scripts\\replace-tsf-alpha.ps1\""));
+        let update_script =
+            fs::read_to_string(repository.join("scripts").join("replace-tsf-alpha.ps1")).unwrap();
+        assert!(update_script.contains("Join-Path $PSScriptRoot '..'"));
+        assert!(update_script.contains("Set-Location -LiteralPath $repositoryRoot"));
+
+        let resolver =
+            fs::read_to_string(repository.join("scripts").join("resolve-user-tool.cmd")).unwrap();
+        assert!(resolver.contains("set \"repository_root=%~dp0..\\\""));
+
+        for (wrapper, fixed_root) in [
+            ("alias-ime.cmd", ".local\\tsf-alpha\\user-data\\aliases"),
+            (
+                "personal-ime.cmd",
+                ".local\\tsf-alpha\\user-data\\personal-ranking",
+            ),
+            (
+                "research-ime.cmd",
+                ".local\\tsf-alpha\\user-data\\research-inbox",
+            ),
+            ("wish-ime.cmd", ".local\\tsf-alpha\\user-data\\wishes"),
+        ] {
+            let contents = fs::read_to_string(repository.join(wrapper)).unwrap();
+            assert!(contents.contains("set \"resolver=%~dp0scripts\\resolve-user-tool.cmd\""));
+            assert!(
+                contents.contains(&format!("%~dp0{fixed_root}")),
+                "{wrapper} must anchor its managed data root to the repository"
+            );
+        }
+
+        let candidate = fs::read_to_string(repository.join("candidate-data.cmd")).unwrap();
+        assert!(candidate.contains("set \"resolver=%~dp0scripts\\resolve-user-tool.cmd\""));
+    }
+
+    #[test]
     fn windows_powershell_51_parses_user_tool_refresh_script() {
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let script = repository.join("scripts").join("refresh-user-tools.ps1");
