@@ -9,7 +9,8 @@ use std::fmt;
 
 use crate::{
     NativeCandidateProvenance, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, WishCaptureScope, WishSnapshot, native_slow_key_remainder_ms,
+    NativeFeedbackEvent, WishCaptureScope, WishRuntimeIdentity, WishSnapshot,
+    native_slow_key_remainder_ms,
 };
 
 /// One 60 Hz frame, used as the fixed threshold for visible latency signals.
@@ -179,6 +180,26 @@ impl PresentedFrame {
 
 pub fn analyze_research_issue_signals(
     snapshots: &[WishSnapshot],
+) -> Result<ResearchIssueTriage, ResearchTriageError> {
+    analyze_research_issue_signals_from(snapshots.iter())
+}
+
+/// Aggregates only batches produced by one exact runtime identity. Other
+/// identities and unversioned legacy batches are excluded rather than folded
+/// into the selected cohort.
+pub fn analyze_research_issue_signals_for_runtime(
+    snapshots: &[WishSnapshot],
+    identity: &WishRuntimeIdentity,
+) -> Result<ResearchIssueTriage, ResearchTriageError> {
+    analyze_research_issue_signals_from(
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.runtime_identity() == Some(identity)),
+    )
+}
+
+fn analyze_research_issue_signals_from<'a>(
+    snapshots: impl IntoIterator<Item = &'a WishSnapshot>,
 ) -> Result<ResearchIssueTriage, ResearchTriageError> {
     let mut report = ResearchIssueTriage::default();
     for snapshot in snapshots {
@@ -410,13 +431,20 @@ mod tests {
     };
 
     fn snapshot(events: Vec<(u64, NativeFeedbackEvent)>) -> WishSnapshot {
+        snapshot_with_runtime(events, None)
+    }
+
+    fn snapshot_with_runtime(
+        events: Vec<(u64, NativeFeedbackEvent)>,
+        runtime_identity: Option<WishRuntimeIdentity>,
+    ) -> WishSnapshot {
         let marker = events.last().unwrap().0;
         let frozen = FrozenNativeFeedbackSnapshot::from_journal_events(marker, &events).unwrap();
         WishSnapshot::from_frozen_with_context(
             &frozen,
             WishCaptureScope::ContinuousJournal,
             WishCategory::Other,
-            None,
+            runtime_identity,
             Some(WishJournalContext::ContinuousSpan(
                 WishJournalSpan::new("12".repeat(32), 0, 0, None).unwrap(),
             )),
@@ -731,6 +759,67 @@ mod tests {
         assert_eq!(report.reachability.cancellation_while_more_available, 1);
         assert_eq!(report.coverage.unpaired_candidate_commits, 1);
         assert_eq!(report.reachability.paged_commits, 0);
+    }
+
+    #[test]
+    fn runtime_cohort_excludes_other_and_unversioned_batches_without_comparing_counts() {
+        let older_identity =
+            WishRuntimeIdentity::new("ab".repeat(32), "triage-core-v1".to_owned(), None).unwrap();
+        let latest_identity =
+            WishRuntimeIdentity::new("cd".repeat(32), "triage-core-v2".to_owned(), None).unwrap();
+        let older = snapshot_with_runtime(
+            vec![
+                (
+                    10,
+                    NativeFeedbackEvent::CandidatesPresented {
+                        code: "aa".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: 0,
+                        candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                        may_have_more: false,
+                    },
+                ),
+                (20, commit("aa", "乙", NativeCandidateView::Ordinary, 2)),
+            ],
+            Some(older_identity),
+        );
+        let latest = snapshot_with_runtime(
+            vec![
+                (
+                    10,
+                    NativeFeedbackEvent::CandidatesPresented {
+                        code: "bb".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: 0,
+                        candidates: vec!["丙".to_owned()],
+                        may_have_more: false,
+                    },
+                ),
+                (
+                    20,
+                    NativeFeedbackEvent::RawCodeCommitted {
+                        code: "bb".to_owned(),
+                    },
+                ),
+            ],
+            Some(latest_identity.clone()),
+        );
+        let unversioned = snapshot(vec![(10, NativeFeedbackEvent::PostCommitBackspaceRouted)]);
+        let snapshots = [older, latest, unversioned];
+
+        let all = analyze_research_issue_signals(&snapshots).unwrap();
+        let latest =
+            analyze_research_issue_signals_for_runtime(&snapshots, &latest_identity).unwrap();
+
+        assert_eq!(all.coverage.batches, 3);
+        assert_eq!(all.reachability.non_top_commits, 1);
+        assert_eq!(all.reachability.raw_after_exhausted_frame, 1);
+        assert_eq!(all.recovery.post_commit_backspaces_routed, 1);
+        assert_eq!(latest.coverage.batches, 1);
+        assert_eq!(latest.coverage.events, 2);
+        assert_eq!(latest.reachability.non_top_commits, 0);
+        assert_eq!(latest.reachability.raw_after_exhausted_frame, 1);
+        assert_eq!(latest.recovery.post_commit_backspaces_routed, 0);
     }
 
     #[test]

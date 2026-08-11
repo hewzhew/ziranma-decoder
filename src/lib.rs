@@ -344,7 +344,7 @@ pub use research_triage::{
     RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchCandidateReachabilitySignals, ResearchIssueTriage,
     ResearchLatencySignals, ResearchRankingSignals, ResearchRecoverySignals,
     ResearchSlowKeyPhaseSignals, ResearchTriageCoverage, ResearchTriageError,
-    analyze_research_issue_signals,
+    analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
 };
 pub use session_summary::{
     AggregatedSessionSummary, SESSION_SUMMARY_SCHEMA_V1, SessionSummaryCounts, SessionSummaryError,

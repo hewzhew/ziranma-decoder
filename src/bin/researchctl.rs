@@ -13,9 +13,10 @@ use ziranma_core::{
     ResearchHalfPairAnalysis, ResearchIssueTriage, ResearchSceneAnalysis,
     TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
-    analyze_research_issue_signals, analyze_runtime_half_pairs, list_wish_packages,
-    native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-    research_feedback_enabled, set_research_feedback_enabled,
+    analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
+    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
+    repository_root_for_user_tool_executable, research_feedback_enabled,
+    set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -144,17 +145,21 @@ fn print_summary(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     review.available_batches = available_batches;
     let triage = analyze_research_issue_signals(&snapshots)?;
-    let latest_runtime = match latest_runtime_review(&snapshots)? {
+    let (latest_runtime, latest_triage) = match latest_runtime_review(&snapshots)? {
         Some((identity, review)) => {
             let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
-            review.render_runtime_summary(&identity, &half_pairs)
+            let latest_triage = analyze_research_issue_signals_for_runtime(&snapshots, &identity)?;
+            (
+                review.render_runtime_summary(&identity, &half_pairs),
+                Some(latest_triage),
+            )
         }
-        None => "最新运行身份：尚无带版本标识的批次。".to_owned(),
+        None => ("最新运行身份：尚无带版本标识的批次。".to_owned(), None),
     };
     println!(
         "{}\n\n{}\n\n{}",
         latest_runtime,
-        render_issue_triage(&triage),
+        render_scoped_issue_triage(latest_triage.as_ref(), &triage),
         review.render_aggregate()
     );
     Ok(())
@@ -181,26 +186,54 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
     let latest_runtime = latest_runtime_review(&snapshots)?;
     let wishes = load_linkable_wishes(root)?;
     let scenes = analyze_linked_research(&snapshots, &wishes)?;
-    let latest_runtime = match latest_runtime {
+    let (latest_runtime, latest_triage) = match latest_runtime {
         Some((identity, review)) => {
             let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
-            review.render_runtime_summary(&identity, &half_pairs)
+            let latest_triage = analyze_research_issue_signals_for_runtime(&snapshots, &identity)?;
+            (
+                review.render_runtime_summary(&identity, &half_pairs),
+                Some(latest_triage),
+            )
         }
-        None => "最新运行身份：尚无带版本标识的批次。".to_owned(),
+        None => ("最新运行身份：尚无带版本标识的批次。".to_owned(), None),
     };
     println!(
         "{}\n\n{}\n\n{}\n\n{}",
         latest_runtime,
-        render_issue_triage(&triage),
+        render_scoped_issue_triage(latest_triage.as_ref(), &triage),
         review.render(),
         render_scene_analysis(&scenes)
     );
     Ok(())
 }
 
-fn render_issue_triage(triage: &ResearchIssueTriage) -> String {
+fn render_scoped_issue_triage(
+    latest: Option<&ResearchIssueTriage>,
+    all: &ResearchIssueTriage,
+) -> String {
+    let Some(latest) = latest else {
+        return render_issue_triage("全部已读取批次", all);
+    };
+    if latest.coverage.batches == all.coverage.batches {
+        return format!(
+            "{}\n样本范围：全部已读取批次均属于最新运行身份，不重复列出相同的历史矩阵。",
+            render_issue_triage("最新运行身份", latest)
+        );
+    }
+    format!(
+        "{}\n\n{}\n样本范围：两组批次和事件数量不同；绝对计数只供定位，不能直接判定改善或退化。",
+        render_issue_triage("最新运行身份", latest),
+        render_issue_triage("全部已读取批次", all),
+    )
+}
+
+fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
     let mut output = String::new();
-    writeln!(output, "结构化问题线索（可叠加，只陈述观测，不自动判错）").unwrap();
+    writeln!(
+        output,
+        "{scope}的结构化问题线索（可叠加，只陈述观测，不自动判错）"
+    )
+    .unwrap();
     writeln!(
         output,
         "候选可达性：非首选提交 {}，其中翻页后 {}；候选已到底后原码上屏 {}、取消 {}；仍可加载时原码上屏 {}、取消 {}。",
@@ -3820,8 +3853,10 @@ mod tests {
             },
         };
 
-        let rendered = render_issue_triage(&triage);
-        assert!(rendered.contains("结构化问题线索（可叠加，只陈述观测，不自动判错）"));
+        let rendered = render_issue_triage("公开合成批次", &triage);
+        assert!(
+            rendered.contains("公开合成批次的结构化问题线索（可叠加，只陈述观测，不自动判错）")
+        );
         assert!(rendered.contains("非首选提交 2，其中翻页后 1"));
         assert!(rendered.contains("已有个人证据仍非首选 1"));
         assert!(rendered.contains("实际个人重排首选被绕过 1"));
@@ -3832,5 +3867,59 @@ mod tests {
         for forbidden in ["最佳配置", "下一步建议", "确定缺词", "用户打错"] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn scoped_issue_triage_separates_latest_runtime_without_claiming_a_change() {
+        let latest = ResearchIssueTriage {
+            coverage: ziranma_core::ResearchTriageCoverage {
+                batches: 2,
+                events: 30,
+                ..ziranma_core::ResearchTriageCoverage::default()
+            },
+            reachability: ziranma_core::ResearchCandidateReachabilitySignals {
+                non_top_commits: 1,
+                ..ziranma_core::ResearchCandidateReachabilitySignals::default()
+            },
+            ..ResearchIssueTriage::default()
+        };
+        let all = ResearchIssueTriage {
+            coverage: ziranma_core::ResearchTriageCoverage {
+                batches: 5,
+                events: 90,
+                ..ziranma_core::ResearchTriageCoverage::default()
+            },
+            reachability: ziranma_core::ResearchCandidateReachabilitySignals {
+                non_top_commits: 4,
+                ..ziranma_core::ResearchCandidateReachabilitySignals::default()
+            },
+            ..ResearchIssueTriage::default()
+        };
+
+        let rendered = render_scoped_issue_triage(Some(&latest), &all);
+        assert!(rendered.contains("最新运行身份的结构化问题线索"));
+        assert!(rendered.contains("全部已读取批次的结构化问题线索"));
+        assert!(rendered.contains("读取批次 2、事件 30"));
+        assert!(rendered.contains("读取批次 5、事件 90"));
+        assert!(rendered.contains("不能直接判定改善或退化"));
+        for forbidden in ["已经改善", "已经退化", "根因是", "应该修改"] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn scoped_issue_triage_does_not_repeat_an_identical_latest_cohort() {
+        let triage = ResearchIssueTriage {
+            coverage: ziranma_core::ResearchTriageCoverage {
+                batches: 3,
+                events: 40,
+                ..ziranma_core::ResearchTriageCoverage::default()
+            },
+            ..ResearchIssueTriage::default()
+        };
+
+        let rendered = render_scoped_issue_triage(Some(&triage), &triage);
+        assert_eq!(rendered.matches("结构化问题线索").count(), 1);
+        assert!(rendered.contains("不重复列出相同的历史矩阵"));
     }
 }
