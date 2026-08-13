@@ -92,11 +92,12 @@ CompositionSession
   版本，关闭则从新组合切回核心。活动组合不热换；
 - 更深同码双字的精确短词层使用另一个固定根
   `.local/tsf-alpha/user-data/public-exact-short` 和独立 `exact-short.zcl`。该根由
-  `candidatectl exact-short-status/enable/disable` 显式管理；普通换代不创建或开启它。
-  它复用公开包的内容寻址、来源认证、current 绑定与预检凭据，并额外验证
-  双汉字、双音节、规范顺序和每码深度；只允许在第一页冻结后由候选缓存按页
-  插入。根或状态缺失即关闭，损坏更新保留最后有效目录，活动组合不热换。
-  当前没有准备、启用或状态管理命令，换代脚本也不创建该根；V17 许愿身份已记录
+  `candidatectl exact-short-prepare/status/enable/disable` 显式管理；普通换代不创建或
+  开启它。它复用公开包的内容寻址、来源认证、current 绑定与单包预检凭据，并额外
+  验证双汉字、双音节、规范顺序和每码深度；组合专项凭据还固定核心、补充、精确包
+  摘要、两个上限、页宽和 TSF host。只允许在第一页冻结后由候选缓存按页插入。
+  根或状态缺失即关闭；同一公开组合中的损坏更新保留最后有效目录，核心或补充组合
+  漂移则撤下精确注入，活动输入组合不热换。换代脚本不创建该根；V17 许愿身份已记录
   精确层 revision。专用只读预检已能冻结核心、可选补充和精确目录，在真实系统
   Thread Manager 与合成 Context 中验证第一页不变、PageDown 后精确项成为第二页
   首项并由空格提交；证据仅含 revision、长度和高分辨率分段耗时。固定真实公开包的
@@ -643,8 +644,11 @@ UI、新采集字段仍必须先安全换代 DLL。详细矩阵见
 - 默认关闭的精确短词层另有一个不写状态的库预检边界：它先验证目标只以
   `PublicConsensusExact` 来源位于第二页首项，再经过相同真实合成 Context 路由
   PageDown 与空格。`candidatectl exact-short-tsf-preflight` 只读认证核心、可选补充
-  和精确包，作有界 release 重复并输出无正文的聚合耗时；它不生成预检凭据、不发布
-  或启用状态，也不能替代候选窗绘制、实际宿主和运行时换包安全门。
+  和精确包，作有界 release 重复并输出无正文的聚合耗时；它不生成组合凭据、不发布
+  或启用状态，也不能替代候选窗绘制、实际宿主和运行时换包安全门。发布准备必须另行
+  使用 release-only `exact-short-prepare`：它把核心、补充与上限、精确包与上限、页宽
+  及专项 TSF host 共同写入 `exact-short-preflight.zep`，但仍保持精确层关闭。
+  `exact-short-enable` 只有在这份凭据仍匹配显式公开运行时根时才写启用状态。
 - `candidatectl popup-render-preflight --repetitions <1..20>` 是另一条默认不运行、
   release-only 的隔离视觉预检。它不激活 TSF，而是用 ownerless、nonactivating 的
   进程内临时窗口依次复用生产候选窗的创建、定位、`WM_PAINT`、双缓冲 GDI、

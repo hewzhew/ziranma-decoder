@@ -21,15 +21,17 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::PCWSTR;
 
 use ziranma_core::{
-    CANDIDATE_EXACT_SHORT_STATE_FILE, CANDIDATE_PACKAGE_MANIFEST_FILE,
-    CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGE_PROVENANCE_FILE,
-    CANDIDATE_PACKAGES_DIRECTORY, CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE,
-    CANDIDATE_SNAPSHOT_SCHEMA_V1, CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortState,
-    CandidatePackageManifest, CandidatePackageProvenance, CandidateReleaseSignature,
-    CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor, CandidateSourceMaterial,
-    CandidateSupplementalState, CharacterBigramLanguageModel, ContinuousCompositionProbe, Decoder,
-    DecoderIndexStats, ExactShortWordCatalog, FourCharacterCorrectionDecision,
-    FourCharacterCorrectionKeepReason, LexiconEntry, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
+    CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE, CANDIDATE_EXACT_SHORT_STATE_FILE,
+    CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE,
+    CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_PACKAGES_DIRECTORY,
+    CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CANDIDATE_SNAPSHOT_SCHEMA_V1,
+    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortPreflightReceipt,
+    CandidateExactShortState, CandidatePackageManifest, CandidatePackageProvenance,
+    CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
+    CandidateSourceMaterial, CandidateSupplementalState, CharacterBigramLanguageModel,
+    ContinuousCompositionProbe, Decoder, DecoderIndexStats, ExactShortWordCatalog,
+    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason, LexiconEntry,
+    MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
@@ -257,8 +259,20 @@ enum Options {
     ExactShortStatus {
         root: PathBuf,
     },
+    ExactShortPrepare {
+        root: PathBuf,
+        core_root: PathBuf,
+        supplemental_root: Option<PathBuf>,
+        package: PathBuf,
+        expected_sha256: String,
+        exact_promotions: usize,
+        sample_limit: usize,
+        repetitions: usize,
+    },
     ExactShortEnable {
         root: PathBuf,
+        core_root: PathBuf,
+        supplemental_root: Option<PathBuf>,
         exact_promotions: usize,
     },
     ExactShortDisable {
@@ -704,10 +718,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => supplement_enable(&root, exact_promotions)?,
         Options::SupplementDisable { root } => supplement_disable(&root)?,
         Options::ExactShortStatus { root } => exact_short_status(&root)?,
+        Options::ExactShortPrepare {
+            root,
+            core_root,
+            supplemental_root,
+            package,
+            expected_sha256,
+            exact_promotions,
+            sample_limit,
+            repetitions,
+        } => exact_short_prepare(ExactShortPrepareRequest {
+            root: &root,
+            core_root: &core_root,
+            supplemental_root: supplemental_root.as_deref(),
+            package: &package,
+            expected_sha256: &expected_sha256,
+            exact_promotions,
+            sample_limit,
+            repetitions,
+        })?,
         Options::ExactShortEnable {
             root,
+            core_root,
+            supplemental_root,
             exact_promotions,
-        } => exact_short_enable(&root, exact_promotions)?,
+        } => exact_short_enable(
+            &root,
+            &core_root,
+            supplemental_root.as_deref(),
+            exact_promotions,
+        )?,
         Options::ExactShortDisable { root } => exact_short_disable(&root)?,
         Options::Preflight { package } => preflight(&package)?,
         Options::PackageQuery {
@@ -822,6 +862,7 @@ fn parse_options(
         "exact-short-status" => Ok(Options::ExactShortStatus {
             root: parse_root_only(arguments, "exact-short-status")?,
         }),
+        "exact-short-prepare" => parse_exact_short_prepare(arguments),
         "exact-short-enable" => parse_exact_short_enable(arguments),
         "exact-short-disable" => Ok(Options::ExactShortDisable {
             root: parse_root_only(arguments, "exact-short-disable")?,
@@ -2429,10 +2470,25 @@ fn parse_exact_short_enable(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
     let mut root = None;
+    let mut core_root = None;
+    let mut supplemental_root = None;
+    let mut without_supplement = false;
     let mut exact_promotions = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--core-root" => set_path(&mut core_root, &mut arguments, "--core-root")?,
+            "--supplemental-root" => set_path(
+                &mut supplemental_root,
+                &mut arguments,
+                "--supplemental-root",
+            )?,
+            "--without-supplement" => {
+                if without_supplement {
+                    return Err("--without-supplement can be given only once".into());
+                }
+                without_supplement = true;
+            }
             "--exact-promotions" => {
                 set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
             }
@@ -2444,9 +2500,89 @@ fn parse_exact_short_enable(
     if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
         return Err("exact-short-enable --exact-promotions is outside the fixed bound".into());
     }
+    if supplemental_root.is_some() == without_supplement {
+        return Err(
+            "exact-short-enable requires exactly one of --supplemental-root or --without-supplement"
+                .into(),
+        );
+    }
     Ok(Options::ExactShortEnable {
         root: root.ok_or("exact-short-enable requires --root")?,
+        core_root: core_root.ok_or("exact-short-enable requires --core-root")?,
+        supplemental_root,
         exact_promotions,
+    })
+}
+
+fn parse_exact_short_prepare(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut root = None;
+    let mut core_root = None;
+    let mut supplemental_root = None;
+    let mut without_supplement = false;
+    let mut package = None;
+    let mut expected_sha256 = None;
+    let mut exact_promotions = None;
+    let mut sample_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--core-root" => set_path(&mut core_root, &mut arguments, "--core-root")?,
+            "--supplemental-root" => set_path(
+                &mut supplemental_root,
+                &mut arguments,
+                "--supplemental-root",
+            )?,
+            "--without-supplement" => {
+                if without_supplement {
+                    return Err("--without-supplement can be given only once".into());
+                }
+                without_supplement = true;
+            }
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--expected-sha256" => {
+                set_value(&mut expected_sha256, &mut arguments, "--expected-sha256")?
+            }
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => return Err("unknown exact-short-prepare argument; value was suppressed".into()),
+        }
+    }
+    let exact_promotions =
+        exact_promotions.ok_or("exact-short-prepare requires --exact-promotions")?;
+    if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+        return Err("exact-short-prepare --exact-promotions is outside the fixed bound".into());
+    }
+    let sample_limit = sample_limit.ok_or("exact-short-prepare requires --sample-limit")?;
+    let repetitions = repetitions.ok_or("exact-short-prepare requires --repetitions")?;
+    if !(1..=32).contains(&sample_limit)
+        || !(1..=20).contains(&repetitions)
+        || sample_limit.saturating_mul(repetitions) > 640
+    {
+        return Err("exact-short-prepare workload exceeds the fixed 640-probe bound".into());
+    }
+    if supplemental_root.is_some() == without_supplement {
+        return Err(
+            "exact-short-prepare requires exactly one of --supplemental-root or --without-supplement"
+                .into(),
+        );
+    }
+    Ok(Options::ExactShortPrepare {
+        root: root.ok_or("exact-short-prepare requires --root")?,
+        core_root: core_root.ok_or("exact-short-prepare requires --core-root")?,
+        supplemental_root,
+        package: package.ok_or("exact-short-prepare requires --package")?,
+        expected_sha256: canonical_expected_sha256(
+            &expected_sha256.ok_or("exact-short-prepare requires --expected-sha256")?,
+        )?,
+        exact_promotions,
+        sample_limit,
+        repetitions,
     })
 }
 
@@ -2760,7 +2896,12 @@ fn print_usage() {
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
     eprintln!("  supplement-disable --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  exact-short-status --root <EXACT_SHORT_SLOT_DIR>");
-    eprintln!("  exact-short-enable --root <EXACT_SHORT_SLOT_DIR> --exact-promotions <1..8>");
+    eprintln!(
+        "  exact-short-prepare --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --package <PUBLIC_EXACT_PACKAGE_DIR> --expected-sha256 <SHA256> --exact-promotions <1..8> --sample-limit <1..32> --repetitions <1..20>"
+    );
+    eprintln!(
+        "  exact-short-enable --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --exact-promotions <1..8>"
+    );
     eprintln!("  exact-short-disable --root <EXACT_SHORT_SLOT_DIR>");
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!(
@@ -4639,6 +4780,17 @@ struct ExactShortTsfPreflightRequest<'a> {
     repetitions: usize,
 }
 
+struct ExactShortPrepareRequest<'a> {
+    root: &'a Path,
+    core_root: &'a Path,
+    supplemental_root: Option<&'a Path>,
+    package: &'a Path,
+    expected_sha256: &'a str,
+    exact_promotions: usize,
+    sample_limit: usize,
+    repetitions: usize,
+}
+
 struct ExactShortTsfLayerIdentity {
     revision: String,
     authentication_sha256: String,
@@ -5327,6 +5479,14 @@ fn benchmark_exact_short_layer(
 fn preflight_exact_short_tsf(
     request: ExactShortTsfPreflightRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    run_exact_short_tsf_preflight(request)
+        .map(|summary| render_exact_short_tsf_preflight_report(&summary))
+}
+
+#[cfg(windows)]
+fn run_exact_short_tsf_preflight(
+    request: ExactShortTsfPreflightRequest<'_>,
+) -> Result<ExactShortTsfPreflightSummary, Box<dyn std::error::Error>> {
     if cfg!(debug_assertions) {
         return Err("exact-short-tsf-preflight must run from a release build".into());
     }
@@ -5505,13 +5665,20 @@ fn preflight_exact_short_tsf(
         complete_path: summarize_durations(&mut complete_path_samples)
             .ok_or("exact-short TSF preflight produced no complete-path samples")?,
     };
-    Ok(render_exact_short_tsf_preflight_report(&summary))
+    Ok(summary)
 }
 
 #[cfg(not(windows))]
 fn preflight_exact_short_tsf(
     _request: ExactShortTsfPreflightRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    Err("exact-short TSF preflight requires Windows".into())
+}
+
+#[cfg(not(windows))]
+fn run_exact_short_tsf_preflight(
+    _request: ExactShortTsfPreflightRequest<'_>,
+) -> Result<ExactShortTsfPreflightSummary, Box<dyn std::error::Error>> {
     Err("exact-short TSF preflight requires Windows".into())
 }
 
@@ -10214,8 +10381,14 @@ fn exact_short_status(root: &Path) -> Result<String, Box<dyn std::error::Error>>
         Some(package) => {
             let loaded = load_installed_exact_short_package(root, package)?;
             validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+            validate_exact_short_preflight_identity(
+                root,
+                package,
+                &loaded.authentication_sha256,
+                state.exact_promotions(),
+            )?;
             format!(
-                "公开精确短词层\n状态：启用\n版本：{}\n每码最多补：{} 个双来源确认短词\n分页边界：第一页保持不动；从第二页开头按需注入\n本次操作：只读\n",
+                "公开精确短词层\n状态：启用\n版本：{}\n每码最多补：{} 个双来源确认短词\n分页边界：第一页保持不动；从第二页开头按需注入\n组合凭据：存在；运行时还会复核当前核心与补充层\n本次操作：只读\n",
                 loaded.catalog.revision(),
                 state.exact_promotions(),
             )
@@ -10224,8 +10397,106 @@ fn exact_short_status(root: &Path) -> Result<String, Box<dyn std::error::Error>>
     Ok(status)
 }
 
+fn exact_short_prepare(
+    request: ExactShortPrepareRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let ExactShortPrepareRequest {
+        root,
+        core_root,
+        supplemental_root,
+        package,
+        expected_sha256,
+        exact_promotions,
+        sample_limit,
+        repetitions,
+    } = request;
+    if cfg!(debug_assertions) {
+        return Err("exact-short-prepare must run from a release build".into());
+    }
+    let slots = read_slot_state(root)?;
+    let state = read_exact_short_state(root)?;
+    if state.is_enabled() {
+        return Err("exact-short-prepare refuses an enabled exact-short root".into());
+    }
+    if slots.candidate().is_some() || slots.previous().is_some() {
+        return Err("exact-short-prepare requires an unambiguous exact-short slot".into());
+    }
+
+    let exact_loaded = load_public_package_directory(package)?;
+    verify_expected_sha256(&exact_loaded, expected_sha256)?;
+    let exact_catalog = load_exact_short_package_directory(package)?;
+    if exact_catalog.authentication_sha256 != exact_loaded.authentication_sha256 {
+        return Err("exact-short package authentication changed during preparation".into());
+    }
+    let exact_package_id = candidate_package_storage_id(
+        &exact_loaded.provenance_text,
+        &exact_loaded.manifest_text,
+        &exact_loaded.payload_text,
+    );
+    if slots
+        .current()
+        .is_some_and(|current| current != exact_package_id)
+    {
+        return Err("exact-short-prepare refuses to replace a different current package".into());
+    }
+
+    let public = load_exact_short_public_context(core_root, supplemental_root)?;
+    let summary = run_exact_short_tsf_preflight(ExactShortTsfPreflightRequest {
+        core_package: &public.core_path,
+        supplemental_package: public.supplemental_path.as_deref(),
+        exact_package: package,
+        supplemental_promotions: public.supplemental_promotions,
+        exact_promotions,
+        sample_limit,
+        repetitions,
+    })?;
+    if summary.core.authentication_sha256 != public.core_sha256
+        || summary.exact.authentication_sha256 != exact_loaded.authentication_sha256
+        || summary
+            .supplemental
+            .as_ref()
+            .map(|identity| identity.authentication_sha256.as_str())
+            != public.supplemental_sha256.as_deref()
+    {
+        return Err("exact-short preparation identities changed during TSF preflight".into());
+    }
+
+    prepare_slot_root(root)?;
+    let installed_id = install_package(root, &exact_loaded)?;
+    if installed_id != exact_package_id {
+        return Err("exact-short installed identity changed during preparation".into());
+    }
+    let installed = load_installed_exact_short_package(root, &installed_id)?;
+    preflight_loaded_package(&load_installed_package(root, &installed_id)?)?;
+    write_preflight_receipt(root, &installed_id, &installed.authentication_sha256)?;
+    let receipt = CandidateExactShortPreflightReceipt::new(
+        &installed_id,
+        &installed.authentication_sha256,
+        exact_promotions,
+        &public.core_sha256,
+        public
+            .supplemental_sha256
+            .as_deref()
+            .zip(public.supplemental_promotions),
+    )?;
+    write_exact_short_combined_preflight(root, &receipt)?;
+    if slots.current().is_none() {
+        let mut prepared_slots = slots;
+        prepared_slots.adopt(&installed_id)?;
+        write_slot_state(root, &prepared_slots)?;
+    }
+    write_exact_short_state(root, &CandidateExactShortState::default())?;
+    Ok(format!(
+        "公开精确短词层已准备但未启用\n版本：{}\n每码最多补：{exact_promotions} 个双来源确认短词\nTSF 第二页组合预检：{} 个样本通过\n状态：关闭；日用候选尚未改变\n",
+        installed.catalog.revision(),
+        summary.first_page.samples,
+    ))
+}
+
 fn exact_short_enable(
     root: &Path,
+    core_root: &Path,
+    supplemental_root: Option<&Path>,
     exact_promotions: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let slots = read_slot_state(root)?;
@@ -10234,12 +10505,137 @@ fn exact_short_enable(
         .ok_or("exact-short candidate package is not configured")?;
     let loaded = load_installed_exact_short_package(root, package)?;
     validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+    let public = load_exact_short_public_context(core_root, supplemental_root)?;
+    let receipt = validate_exact_short_preflight_identity(
+        root,
+        package,
+        &loaded.authentication_sha256,
+        exact_promotions,
+    )?;
+    if !receipt.matches_runtime(
+        &public.core_sha256,
+        public
+            .supplemental_sha256
+            .as_deref()
+            .zip(public.supplemental_promotions),
+    ) {
+        return Err("exact-short combined preflight no longer matches the public runtime".into());
+    }
     let state = CandidateExactShortState::enabled(package, exact_promotions)?;
     write_exact_short_state(root, &state)?;
     Ok(format!(
         "公开精确短词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个双来源确认短词\n分页边界：第一页保持不动；从第二页开头按需注入\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
         loaded.catalog.revision(),
     ))
+}
+
+struct ExactShortPublicContext {
+    core_path: PathBuf,
+    core_sha256: String,
+    supplemental_path: Option<PathBuf>,
+    supplemental_sha256: Option<String>,
+    supplemental_promotions: Option<usize>,
+}
+
+fn load_exact_short_public_context(
+    core_root: &Path,
+    supplemental_root: Option<&Path>,
+) -> Result<ExactShortPublicContext, Box<dyn std::error::Error>> {
+    let core_slots = read_slot_state(core_root)?;
+    let core_package = core_slots
+        .current()
+        .ok_or("exact-short operation requires a configured core package")?;
+    let core = load_installed_package(core_root, core_package)?;
+    validate_preflight_receipt(core_root, core_package, &core.authentication_sha256)?;
+    let core_path = core_root
+        .join(CANDIDATE_PACKAGES_DIRECTORY)
+        .join(core_package);
+    let (supplemental_path, supplemental_sha256, supplemental_promotions) = match supplemental_root
+    {
+        None => (None, None, None),
+        Some(root) => {
+            let slots = read_slot_state(root)?;
+            let state = read_supplemental_state(root)?;
+            let package = state
+                .package()
+                .ok_or("the explicit supplemental root is not enabled")?;
+            if slots.current() != Some(package) {
+                return Err("the explicit supplemental root is not current".into());
+            }
+            let loaded = load_installed_package(root, package)?;
+            validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+            (
+                Some(root.join(CANDIDATE_PACKAGES_DIRECTORY).join(package)),
+                Some(loaded.authentication_sha256),
+                Some(state.exact_promotions()),
+            )
+        }
+    };
+    Ok(ExactShortPublicContext {
+        core_path,
+        core_sha256: core.authentication_sha256,
+        supplemental_path,
+        supplemental_sha256,
+        supplemental_promotions,
+    })
+}
+
+fn validate_exact_short_preflight_identity(
+    root: &Path,
+    package: &str,
+    authentication_sha256: &str,
+    exact_promotions: usize,
+) -> Result<CandidateExactShortPreflightReceipt, Box<dyn std::error::Error>> {
+    let text = read_explicit_text(
+        &root.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE),
+        "exact-short combined preflight receipt",
+        MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES,
+    )?;
+    let receipt = CandidateExactShortPreflightReceipt::parse(&text)?;
+    if receipt.exact_package() != package
+        || receipt.exact_sha256() != authentication_sha256
+        || receipt.exact_promotions() != exact_promotions
+    {
+        return Err("exact-short combined preflight receipt does not match its package".into());
+    }
+    Ok(receipt)
+}
+
+fn write_exact_short_combined_preflight(
+    root: &Path,
+    receipt: &CandidateExactShortPreflightReceipt,
+) -> Result<(), Box<dyn std::error::Error>> {
+    prepare_slot_root(root)?;
+    let body = receipt.render();
+    CandidateExactShortPreflightReceipt::parse(&body)?;
+    let destination = root.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            let existing = read_explicit_text(
+                &destination,
+                "exact-short combined preflight receipt",
+                MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES,
+            )?;
+            if existing == body {
+                return Ok(());
+            }
+            return Err("a different exact-short combined preflight receipt already exists".into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("cannot inspect exact-short combined preflight receipt".into()),
+    }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temporary = root.join(format!(
+        ".exact-short-preflight-{}-{stamp}.tmp",
+        std::process::id()
+    ));
+    write_new_synced(&temporary, body.as_bytes())?;
+    let result = fs::rename(&temporary, &destination)
+        .map_err(|_| "cannot publish exact-short combined preflight receipt".into());
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn exact_short_disable(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -11349,6 +11745,27 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            parse_options([
+                "exact-short-prepare".to_owned(),
+                "--root".to_owned(),
+                "exact-root".to_owned(),
+                "--core-root".to_owned(),
+                "core-root".to_owned(),
+                "--package".to_owned(),
+                "exact-package".to_owned(),
+                "--expected-sha256".to_owned(),
+                "a".repeat(64),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+                "--sample-limit".to_owned(),
+                "16".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .is_err(),
+            "absence of a supplemental layer must be explicit"
+        );
     }
 
     #[test]
@@ -11946,6 +12363,52 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn exact_short_prepare_parser_keeps_preparation_explicit_and_bounded() {
+        assert_eq!(
+            parse_options([
+                "exact-short-prepare".to_owned(),
+                "--root".to_owned(),
+                "exact-root".to_owned(),
+                "--core-root".to_owned(),
+                "core-root".to_owned(),
+                "--supplemental-root".to_owned(),
+                "supplement-root".to_owned(),
+                "--package".to_owned(),
+                "exact-package".to_owned(),
+                "--expected-sha256".to_owned(),
+                "a".repeat(64),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+                "--sample-limit".to_owned(),
+                "16".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortPrepare {
+                root: PathBuf::from("exact-root"),
+                core_root: PathBuf::from("core-root"),
+                supplemental_root: Some(PathBuf::from("supplement-root")),
+                package: PathBuf::from("exact-package"),
+                expected_sha256: "a".repeat(64),
+                exact_promotions: 2,
+                sample_limit: 16,
+                repetitions: 5,
+            }
+        );
+        assert!(
+            parse_options([
+                "exact-short-prepare".to_owned(),
+                "--sample-limit".to_owned(),
+                "32".to_owned(),
+                "--repetitions".to_owned(),
+                "21".to_owned(),
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -12724,12 +13187,17 @@ mod tests {
                 "exact-short-enable".to_owned(),
                 "--root".to_owned(),
                 "exact-short".to_owned(),
+                "--core-root".to_owned(),
+                "core".to_owned(),
+                "--without-supplement".to_owned(),
                 "--exact-promotions".to_owned(),
                 "2".to_owned(),
             ])
             .unwrap(),
             Options::ExactShortEnable {
                 root: PathBuf::from("exact-short"),
+                core_root: PathBuf::from("core"),
+                supplemental_root: None,
                 exact_promotions: 2,
             }
         );
@@ -14583,6 +15051,8 @@ ngram 1=3\n\n\
         let base = root.join("base.tsv");
         let package_a = root.join("package-a");
         let package_b = root.join("package-b");
+        let core_package = root.join("core-package");
+        let core_slots = root.join("core-slots");
         let slots = root.join("exact-short");
         fs::create_dir(&root).unwrap();
         fs::write(&source, SHORT_CONSENSUS_SOURCE).unwrap();
@@ -14612,6 +15082,15 @@ ngram 1=3\n\n\
         };
         build(package_a.clone(), "exact-short-a");
         build(package_b.clone(), "exact-short-b");
+        fs::write(root.join("core.tsv"), LEXICON).unwrap();
+        build_public_package(
+            &root.join("core.tsv"),
+            &core_package,
+            "exact-short-core",
+            &test_declaration(LEXICON),
+        )
+        .unwrap();
+        adopt(&core_slots, &core_package, &package_sha256(&core_package)).unwrap();
 
         assert_eq!(
             exact_short_status(&slots).unwrap(),
@@ -14625,7 +15104,29 @@ ngram 1=3\n\n\
                 .contains("已准备：exact-short-a")
         );
 
-        let enabled = exact_short_enable(&slots, 2).unwrap();
+        let write_combined_receipt = |package: &Path, exact_promotions| {
+            let exact_slots = read_slot_state(&slots).unwrap();
+            let exact_package = exact_slots.current().unwrap();
+            let exact = load_installed_exact_short_package(&slots, exact_package).unwrap();
+            let core_state = read_slot_state(&core_slots).unwrap();
+            let core = load_installed_package(&core_slots, core_state.current().unwrap()).unwrap();
+            assert_eq!(exact.authentication_sha256, package_sha256(package));
+            write_exact_short_combined_preflight(
+                &slots,
+                &CandidateExactShortPreflightReceipt::new(
+                    exact_package,
+                    &exact.authentication_sha256,
+                    exact_promotions,
+                    &core.authentication_sha256,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_combined_receipt(&package_a, 2);
+
+        let enabled = exact_short_enable(&slots, &core_slots, None, 2).unwrap();
         assert!(enabled.contains("版本：exact-short-a"));
         assert!(enabled.contains("每码最多补：2"));
         assert!(enabled.contains("第一页保持不动"));
@@ -14646,7 +15147,10 @@ ngram 1=3\n\n\
         let drifted = exact_short_status(&slots).unwrap();
         assert!(drifted.contains("状态：已回退，不注入第二页"));
         assert!(drifted.contains("已准备：exact-short-b"));
-        exact_short_enable(&slots, 1).unwrap();
+        assert!(exact_short_enable(&slots, &core_slots, None, 1).is_err());
+        fs::remove_file(slots.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE)).unwrap();
+        write_combined_receipt(&package_b, 1);
+        exact_short_enable(&slots, &core_slots, None, 1).unwrap();
         assert!(
             exact_short_status(&slots)
                 .unwrap()

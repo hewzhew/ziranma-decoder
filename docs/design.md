@@ -533,11 +533,14 @@ release 观测中，第二页前 12 项核心＋补充解码 median 8.276 ms，�
 前缀；已经启用的层若中途消失，缓存会保留最后页面并停止扩展，而不是闪回基础顺序。
 `SnapshotCandidateProvider` 现已有独立、默认关闭的认证加载边界：安装布局只固定解析
 `user-data/public-exact-short`，开关缺失即关闭；启用选择必须同时绑定 `slots.zcs`
-的 current、严格四行 `exact-short.zcl`、候选包三份认证材料和既有 TSF 预检凭据，
-随后再通过双汉字、双音节、规范顺序与同码深度校验。提供器只在空组合的下一次首键
-前轮询小指针；同一组合不换目录，损坏替换保留最后已知可用目录，显式关闭才卸下。
-同包只改变插入上限时复用索引，换包才重建。代码没有发布/启用 CLI，换代脚本也不
-准备该根，因此当前日用行为仍严格关闭。V17 许愿运行身份已单独记录精确层 revision。
+的 current、严格四行 `exact-short.zcl`、候选包三份认证材料、既有单包 TSF 预检凭据
+和 `exact-short-preflight.zep` 组合专项凭据；后者还固定核心/补充/精确包摘要、两个
+注入上限、页宽 6 和 TSF 第二页 host，随后再通过双汉字、双音节、规范顺序与同码深度
+校验。提供器只在空组合的下一次首键
+前轮询小指针；同一公开组合中的损坏替换保留最后已知可用目录，显式关闭或公开组合
+漂移会卸下精确层。同包只改变插入上限也必须重新取得组合专项凭据，目录索引可在重新
+验证后复用。CLI 只提供显式 prepare/enable/disable，换代脚本仍不准备或开启该根，
+因此当前日用行为仍严格关闭。V17 许愿运行身份已单独记录精确层 revision。
 专用只读 API 现会先验证第一页恰为 6 项、目标不在第一页且以
 `PublicConsensusExact` 来源稳定落在索引 6，再让真实系统 Thread Manager 与合成
 Context 输入完整码、PageDown 并用空格提交第二页首项；它可同时冻结核心、可选补充层
@@ -552,6 +555,11 @@ Context 输入完整码、PageDown 并用空格提交第二页首项；它可同
 状态，不包含候选窗绘制、桌面合成或实际宿主呈现，因此不能称为首帧通过。下一门槛
 此前无法继续复用该合成 Context：`SyntheticHost` 明确关闭 `CandidateUiController`，
 所以它既没有宿主 HWND，也不会触发候选窗 `WM_PAINT`。
+
+`candidatectl exact-short-prepare` 是唯一把上述专项结果发布到独立运行时根的入口：它
+必须在 release 构建中完成真实 Context 工作负载，先验证现行核心槽和显式补充槽，再
+写组合凭据，最后保持精确层关闭。`exact-short-enable` 不再只凭精确包自身的普通
+`.zpf` 开启；核心、补充、上限或页宽任一漂移都要求重新 prepare。
 
 现已新增相互独立的 `candidatectl popup-render-preflight`，只在显式 release 命令中
 创建 ownerless、nonactivating 的临时窗口，并同步驱动生产候选窗过程。阶段模型依次为

@@ -127,10 +127,14 @@ pub use candidate_lab::{
     MAX_CANDIDATE_LAB_TOP_K, analyze_candidate_lab,
 };
 pub use candidate_layers::{
-    CANDIDATE_EXACT_SHORT_STATE_FILE, CANDIDATE_EXACT_SHORT_STATE_SCHEMA_V1,
-    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CANDIDATE_SUPPLEMENTAL_STATE_SCHEMA_V1,
-    CandidateExactShortState, CandidateExactShortStateError, CandidateSupplementalState,
-    CandidateSupplementalStateError, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
+    CANDIDATE_EXACT_SHORT_PREFLIGHT_HOST_V1, CANDIDATE_EXACT_SHORT_PREFLIGHT_PAGE_SIZE,
+    CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE,
+    CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_SCHEMA_V1, CANDIDATE_EXACT_SHORT_STATE_FILE,
+    CANDIDATE_EXACT_SHORT_STATE_SCHEMA_V1, CANDIDATE_SUPPLEMENTAL_STATE_FILE,
+    CANDIDATE_SUPPLEMENTAL_STATE_SCHEMA_V1, CandidateExactShortPreflightReceipt,
+    CandidateExactShortPreflightReceiptError, CandidateExactShortState,
+    CandidateExactShortStateError, CandidateSupplementalState, CandidateSupplementalStateError,
+    MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
 };
 pub use candidate_package::{
@@ -152,9 +156,10 @@ pub use candidate_runtime::{
     CandidateRuntimeSnapshots, CandidateRuntimeSupplemental, CandidateRuntimeSupplementalSelection,
     MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, candidate_package_storage_id,
     candidate_preflight_receipt_body, load_candidate_runtime_exact_short,
-    load_candidate_runtime_exact_short_selection, load_candidate_runtime_snapshots,
-    load_candidate_runtime_snapshots_with_layers, load_candidate_runtime_supplemental,
-    load_candidate_runtime_supplemental_selection, load_current_candidate_snapshot,
+    load_candidate_runtime_exact_short_preflight, load_candidate_runtime_exact_short_selection,
+    load_candidate_runtime_snapshots, load_candidate_runtime_snapshots_with_layers,
+    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
+    load_current_candidate_snapshot,
 };
 pub use candidate_signature::{
     CANDIDATE_RELEASE_SIGNATURE_ALGORITHM_ED25519, CANDIDATE_RELEASE_SIGNATURE_SCHEMA_V1,

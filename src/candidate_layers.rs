@@ -24,6 +24,17 @@ pub const CANDIDATE_EXACT_SHORT_STATE_FILE: &str = "exact-short.zcl";
 pub const CANDIDATE_EXACT_SHORT_STATE_SCHEMA_V1: &str = "ziranma-candidate-exact-short-v1";
 /// Maximum accepted size of one exact-short layer state file.
 pub const MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES: usize = 512;
+/// Fixed receipt written only after the combined TSF second-page path passes.
+pub const CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE: &str = "exact-short-preflight.zep";
+/// First combined exact-short preflight receipt schema.
+pub const CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_SCHEMA_V1: &str =
+    "ziranma-candidate-exact-short-preflight-v1";
+/// Synthetic TSF path exercised by the combined exact-short preflight.
+pub const CANDIDATE_EXACT_SHORT_PREFLIGHT_HOST_V1: &str = "tsf-exact-short-second-page-context-v1";
+/// Page width authenticated by the combined exact-short preflight.
+pub const CANDIDATE_EXACT_SHORT_PREFLIGHT_PAGE_SIZE: usize = 6;
+/// Maximum accepted size of one combined exact-short preflight receipt.
+pub const MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES: usize = 1024;
 
 /// Explicit activation state for one public supplemental exact-word package.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -260,6 +271,198 @@ impl fmt::Display for CandidateExactShortStateError {
 
 impl Error for CandidateExactShortStateError {}
 
+/// Immutable evidence that one exact-short package and its complete public
+/// runtime context passed the real TSF second-page path together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateExactShortPreflightReceipt {
+    exact_package: String,
+    exact_sha256: String,
+    exact_promotions: usize,
+    core_sha256: String,
+    supplemental_sha256: Option<String>,
+    supplemental_promotions: usize,
+}
+
+impl CandidateExactShortPreflightReceipt {
+    pub fn new(
+        exact_package: &str,
+        exact_sha256: &str,
+        exact_promotions: usize,
+        core_sha256: &str,
+        supplemental: Option<(&str, usize)>,
+    ) -> Result<Self, CandidateExactShortPreflightReceiptError> {
+        validate_candidate_package_id(exact_package)
+            .map_err(|_| CandidateExactShortPreflightReceiptError::InvalidPackageId)?;
+        if !exact_short_sha256(exact_sha256) || !exact_short_sha256(core_sha256) {
+            return Err(CandidateExactShortPreflightReceiptError::InvalidSha256);
+        }
+        if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+            return Err(CandidateExactShortPreflightReceiptError::InvalidPromotionLimit);
+        }
+        let (supplemental_sha256, supplemental_promotions) = match supplemental {
+            Some((sha256, promotions))
+                if exact_short_sha256(sha256)
+                    && (1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&promotions) =>
+            {
+                (Some(sha256.to_owned()), promotions)
+            }
+            Some((sha256, _)) if !exact_short_sha256(sha256) => {
+                return Err(CandidateExactShortPreflightReceiptError::InvalidSha256);
+            }
+            Some(_) => {
+                return Err(CandidateExactShortPreflightReceiptError::InvalidPromotionLimit);
+            }
+            None => (None, 0),
+        };
+        Ok(Self {
+            exact_package: exact_package.to_owned(),
+            exact_sha256: exact_sha256.to_owned(),
+            exact_promotions,
+            core_sha256: core_sha256.to_owned(),
+            supplemental_sha256,
+            supplemental_promotions,
+        })
+    }
+
+    pub fn parse(contents: &str) -> Result<Self, CandidateExactShortPreflightReceiptError> {
+        if contents.is_empty() || contents.len() > MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES
+        {
+            return Err(CandidateExactShortPreflightReceiptError::InvalidReceiptSize);
+        }
+        if contents.contains('\r') || !contents.ends_with('\n') {
+            return Err(CandidateExactShortPreflightReceiptError::InvalidStructure);
+        }
+        let lines = contents.split('\n').collect::<Vec<_>>();
+        if lines.len() != 10 || !lines[9].is_empty() {
+            return Err(CandidateExactShortPreflightReceiptError::InvalidStructure);
+        }
+        if exact_short_receipt_field(lines[0], "schema")?
+            != CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_SCHEMA_V1
+            || exact_short_receipt_field(lines[7], "page_size")?
+                != CANDIDATE_EXACT_SHORT_PREFLIGHT_PAGE_SIZE.to_string()
+            || exact_short_receipt_field(lines[8], "host")?
+                != CANDIDATE_EXACT_SHORT_PREFLIGHT_HOST_V1
+        {
+            return Err(CandidateExactShortPreflightReceiptError::UnsupportedProfile);
+        }
+        let exact_package = exact_short_receipt_field(lines[1], "exact_package")?;
+        let exact_sha256 = exact_short_receipt_field(lines[2], "exact_sha256")?;
+        let exact_promotions =
+            exact_short_receipt_usize(exact_short_receipt_field(lines[3], "exact_promotions")?)?;
+        let core_sha256 = exact_short_receipt_field(lines[4], "core_sha256")?;
+        let supplemental_sha256 = exact_short_receipt_field(lines[5], "supplemental_sha256")?;
+        let supplemental_promotions = exact_short_receipt_usize(exact_short_receipt_field(
+            lines[6],
+            "supplemental_promotions",
+        )?)?;
+        let supplemental = match (supplemental_sha256, supplemental_promotions) {
+            ("-", 0) => None,
+            (sha256, promotions) => Some((sha256, promotions)),
+        };
+        Self::new(
+            exact_package,
+            exact_sha256,
+            exact_promotions,
+            core_sha256,
+            supplemental,
+        )
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "schema={CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_SCHEMA_V1}\nexact_package={}\nexact_sha256={}\nexact_promotions={}\ncore_sha256={}\nsupplemental_sha256={}\nsupplemental_promotions={}\npage_size={CANDIDATE_EXACT_SHORT_PREFLIGHT_PAGE_SIZE}\nhost={CANDIDATE_EXACT_SHORT_PREFLIGHT_HOST_V1}\n",
+            self.exact_package,
+            self.exact_sha256,
+            self.exact_promotions,
+            self.core_sha256,
+            self.supplemental_sha256.as_deref().unwrap_or("-"),
+            self.supplemental_promotions,
+        )
+    }
+
+    pub fn exact_package(&self) -> &str {
+        &self.exact_package
+    }
+
+    pub fn exact_sha256(&self) -> &str {
+        &self.exact_sha256
+    }
+
+    pub fn exact_promotions(&self) -> usize {
+        self.exact_promotions
+    }
+
+    pub fn matches_runtime(&self, core_sha256: &str, supplemental: Option<(&str, usize)>) -> bool {
+        self.core_sha256 == core_sha256
+            && match (self.supplemental_sha256.as_deref(), supplemental) {
+                (None, None) => true,
+                (Some(expected), Some((actual, promotions))) => {
+                    expected == actual && self.supplemental_promotions == promotions
+                }
+                _ => false,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateExactShortPreflightReceiptError {
+    InvalidReceiptSize,
+    InvalidStructure,
+    InvalidField,
+    UnsupportedProfile,
+    InvalidPackageId,
+    InvalidSha256,
+    InvalidPromotionLimit,
+}
+
+impl fmt::Display for CandidateExactShortPreflightReceiptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidReceiptSize => "精确短词专项预检凭据大小无效",
+            Self::InvalidStructure => "精确短词专项预检凭据结构无效",
+            Self::InvalidField => "精确短词专项预检凭据字段无效",
+            Self::UnsupportedProfile => "精确短词专项预检配置不受支持",
+            Self::InvalidPackageId => "精确短词专项预检包标识无效",
+            Self::InvalidSha256 => "精确短词专项预检摘要无效",
+            Self::InvalidPromotionLimit => "精确短词专项预检影响上限无效",
+        })
+    }
+}
+
+impl Error for CandidateExactShortPreflightReceiptError {}
+
+fn exact_short_receipt_field<'a>(
+    line: &'a str,
+    expected_key: &str,
+) -> Result<&'a str, CandidateExactShortPreflightReceiptError> {
+    let Some((key, value)) = line.split_once('=') else {
+        return Err(CandidateExactShortPreflightReceiptError::InvalidField);
+    };
+    if key != expected_key || value.is_empty() || value.contains('=') {
+        return Err(CandidateExactShortPreflightReceiptError::InvalidField);
+    }
+    Ok(value)
+}
+
+fn exact_short_receipt_usize(
+    value: &str,
+) -> Result<usize, CandidateExactShortPreflightReceiptError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| CandidateExactShortPreflightReceiptError::InvalidField)?;
+    if parsed.to_string() != value {
+        return Err(CandidateExactShortPreflightReceiptError::InvalidField);
+    }
+    Ok(parsed)
+}
+
+fn exact_short_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn exact_short_field<'a>(
     line: &'a str,
     expected_key: &str,
@@ -425,5 +628,52 @@ mod tests {
             CandidateExactShortStateError::InvalidPromotionLimit
         );
         assert!(CandidateExactShortState::parse(&valid.replace('\n', "\r\n")).is_err());
+    }
+
+    #[test]
+    fn exact_short_preflight_receipt_binds_every_runtime_layer_and_cap() {
+        let receipt = CandidateExactShortPreflightReceipt::new(
+            PACKAGE,
+            &"1".repeat(64),
+            2,
+            &"2".repeat(64),
+            Some((&"3".repeat(64), 1)),
+        )
+        .unwrap();
+        let rendered = receipt.render();
+        assert_eq!(
+            CandidateExactShortPreflightReceipt::parse(&rendered).unwrap(),
+            receipt
+        );
+        assert!(receipt.matches_runtime(&"2".repeat(64), Some((&"3".repeat(64), 1))));
+        assert!(!receipt.matches_runtime(&"4".repeat(64), Some((&"3".repeat(64), 1))));
+        assert!(!receipt.matches_runtime(&"2".repeat(64), Some((&"3".repeat(64), 2))));
+        assert!(!receipt.matches_runtime(&"2".repeat(64), None));
+        assert!(
+            CandidateExactShortPreflightReceipt::parse(
+                &rendered.replace("page_size=6", "page_size=7")
+            )
+            .is_err()
+        );
+        assert!(
+            CandidateExactShortPreflightReceipt::parse(
+                &rendered.replace("exact_promotions=2", "exact_promotions=0")
+            )
+            .is_err()
+        );
+
+        let no_supplement = CandidateExactShortPreflightReceipt::new(
+            PACKAGE,
+            &"1".repeat(64),
+            1,
+            &"2".repeat(64),
+            None,
+        )
+        .unwrap();
+        assert!(no_supplement.matches_runtime(&"2".repeat(64), None));
+        assert_eq!(
+            CandidateExactShortPreflightReceipt::parse(&no_supplement.render()).unwrap(),
+            no_supplement
+        );
     }
 }

@@ -13,12 +13,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_EXACT_SHORT_STATE_FILE,
-    CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortState,
+    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE,
+    CANDIDATE_EXACT_SHORT_STATE_FILE, CANDIDATE_PACKAGE_PROVENANCE_FILE,
+    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortPreflightReceipt,
+    CandidateExactShortPreflightReceiptError, CandidateExactShortState,
     CandidateExactShortStateError, CandidatePackageError, CandidatePackageManifest,
     CandidatePackageProvenance, CandidateProvenanceError, CandidateSlotError, CandidateSlotState,
     CandidateSnapshot, CandidateSupplementalState, CandidateSupplementalStateError,
-    ExactShortWordCatalog, ExactShortWordCatalogError, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
+    ExactShortWordCatalog, ExactShortWordCatalogError,
+    MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, SupplementalCandidateLayerConfig,
@@ -49,6 +52,7 @@ pub const MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES: usize = 512;
 #[derive(Clone, Debug)]
 pub struct CandidateRuntimeSnapshots {
     core: Arc<CandidateSnapshot>,
+    core_authentication_sha256: String,
     supplemental: Option<CandidateRuntimeSupplemental>,
     supplemental_fell_back: bool,
     exact_short: Option<CandidateRuntimeExactShort>,
@@ -59,6 +63,11 @@ impl CandidateRuntimeSnapshots {
     /// Returns the required core candidate snapshot.
     pub fn core(&self) -> &Arc<CandidateSnapshot> {
         &self.core
+    }
+
+    /// Returns the authentication digest of the immutable core package.
+    pub fn core_authentication_sha256(&self) -> &str {
+        &self.core_authentication_sha256
     }
 
     /// Returns the enabled, validated supplement when one is available.
@@ -87,6 +96,7 @@ impl CandidateRuntimeSnapshots {
 pub struct CandidateRuntimeSupplemental {
     package_id: String,
     snapshot: Arc<CandidateSnapshot>,
+    authentication_sha256: String,
     config: SupplementalCandidateLayerConfig,
 }
 
@@ -101,6 +111,11 @@ impl CandidateRuntimeSupplemental {
         &self.snapshot
     }
 
+    /// Returns the authentication digest of the immutable supplemental package.
+    pub fn authentication_sha256(&self) -> &str {
+        &self.authentication_sha256
+    }
+
     /// Returns the exact-word merge configuration bound by local state.
     pub fn config(&self) -> SupplementalCandidateLayerConfig {
         self.config
@@ -112,6 +127,7 @@ impl CandidateRuntimeSupplemental {
 pub struct CandidateRuntimeExactShort {
     package_id: String,
     catalog: Arc<ExactShortWordCatalog>,
+    authentication_sha256: String,
     exact_promotions: usize,
 }
 
@@ -124,6 +140,11 @@ impl CandidateRuntimeExactShort {
     /// Returns the strictly validated two-character catalog.
     pub fn catalog(&self) -> &Arc<ExactShortWordCatalog> {
         &self.catalog
+    }
+
+    /// Returns the authentication digest of the immutable exact-short package.
+    pub fn authentication_sha256(&self) -> &str {
+        &self.authentication_sha256
     }
 
     /// Returns the maximum number of page-guarded insertions per code.
@@ -164,12 +185,14 @@ pub enum CandidateRuntimeExactShortSelection {
 struct LoadedRuntimeCandidate {
     package_id: String,
     snapshot: Arc<CandidateSnapshot>,
+    authentication_sha256: String,
 }
 
 struct LoadedRuntimePackage {
     package_id: String,
     manifest: CandidatePackageManifest,
     payload: String,
+    authentication_sha256: String,
 }
 
 /// Computes the internal immutable-package identifier from all exact package bytes.
@@ -246,16 +269,37 @@ pub fn load_candidate_runtime_snapshots_with_layers(
         None => (None, false),
     };
     let (exact_short, exact_short_fell_back) = match exact_short_root {
-        Some(root) => match load_candidate_runtime_exact_short_selection(root)
-            .and_then(|selection| load_candidate_runtime_exact_short(root, &selection))
-        {
-            Ok(exact_short) => (exact_short, false),
-            Err(_) => (None, true),
-        },
+        Some(root) => {
+            let loaded = (|| {
+                let selection = load_candidate_runtime_exact_short_selection(root)?;
+                let exact_short = load_candidate_runtime_exact_short(root, &selection)?;
+                if exact_short.is_some() {
+                    let receipt =
+                        load_candidate_runtime_exact_short_preflight(root, &selection)?
+                            .ok_or(CandidateRuntimeError::ExactShortCombinedPreflightUnavailable)?;
+                    let supplemental_identity = supplemental.as_ref().map(|layer| {
+                        (
+                            layer.authentication_sha256(),
+                            layer.config().exact_promotions,
+                        )
+                    });
+                    if !receipt.matches_runtime(&core.authentication_sha256, supplemental_identity)
+                    {
+                        return Err(CandidateRuntimeError::ExactShortCombinedPreflightMismatch);
+                    }
+                }
+                Ok(exact_short)
+            })();
+            match loaded {
+                Ok(exact_short) => (exact_short, false),
+                Err(_) => (None, true),
+            }
+        }
         None => (None, false),
     };
     Ok(Some(CandidateRuntimeSnapshots {
         core: core.snapshot,
+        core_authentication_sha256: core.authentication_sha256,
         supplemental,
         supplemental_fell_back,
         exact_short,
@@ -336,6 +380,7 @@ pub fn load_candidate_runtime_supplemental(
             Some(CandidateRuntimeSupplemental {
                 package_id: loaded.package_id,
                 snapshot: loaded.snapshot,
+                authentication_sha256: loaded.authentication_sha256,
                 config: *config,
             })
         }
@@ -420,6 +465,7 @@ pub fn load_candidate_runtime_exact_short(
             Some(CandidateRuntimeExactShort {
                 package_id: loaded.package_id,
                 catalog: Arc::new(catalog),
+                authentication_sha256: loaded.authentication_sha256,
                 exact_promotions: *exact_promotions,
             })
         }
@@ -428,6 +474,44 @@ pub fn load_candidate_runtime_exact_short(
         return Err(CandidateRuntimeError::ExactShortSelectionChanged);
     }
     Ok(loaded)
+}
+
+/// Loads the immutable combined-path receipt for an enabled exact-short lane.
+pub fn load_candidate_runtime_exact_short_preflight(
+    root: &Path,
+    expected: &CandidateRuntimeExactShortSelection,
+) -> Result<Option<CandidateExactShortPreflightReceipt>, CandidateRuntimeError> {
+    let receipt = match expected {
+        CandidateRuntimeExactShortSelection::Disabled => None,
+        CandidateRuntimeExactShortSelection::Enabled {
+            package_id,
+            exact_promotions,
+        } => {
+            let loaded = load_current_runtime_package(root)?
+                .ok_or(CandidateRuntimeError::ExactShortPackageMismatch)?;
+            if loaded.package_id != *package_id {
+                return Err(CandidateRuntimeError::ExactShortPackageMismatch);
+            }
+            let text = read_regular_utf8(
+                &root.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE),
+                MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES,
+                CandidateRuntimeError::ExactShortCombinedPreflightUnavailable,
+            )?;
+            let receipt = CandidateExactShortPreflightReceipt::parse(&text)
+                .map_err(CandidateRuntimeError::ExactShortCombinedPreflight)?;
+            if receipt.exact_package() != package_id
+                || receipt.exact_sha256() != loaded.authentication_sha256
+                || receipt.exact_promotions() != *exact_promotions
+            {
+                return Err(CandidateRuntimeError::ExactShortCombinedPreflightMismatch);
+            }
+            Some(receipt)
+        }
+    };
+    if load_candidate_runtime_exact_short_selection(root)? != *expected {
+        return Err(CandidateRuntimeError::ExactShortSelectionChanged);
+    }
+    Ok(receipt)
 }
 
 fn load_current_candidate_package(
@@ -443,6 +527,7 @@ fn load_current_candidate_package(
     Ok(Some(LoadedRuntimeCandidate {
         package_id: loaded.package_id,
         snapshot: Arc::new(snapshot),
+        authentication_sha256: loaded.authentication_sha256,
     }))
 }
 
@@ -519,6 +604,7 @@ fn load_current_runtime_package(
         package_id: package_id.to_owned(),
         manifest,
         payload: payload_text,
+        authentication_sha256: package_authentication_sha256,
     }))
 }
 
@@ -625,6 +711,12 @@ pub enum CandidateRuntimeError {
     ExactShortPackageMismatch,
     /// The exact-short payload did not satisfy the strict two-character profile.
     ExactShortCatalog(ExactShortWordCatalogError),
+    /// The combined exact-short TSF preflight receipt is absent or unreadable.
+    ExactShortCombinedPreflightUnavailable,
+    /// The combined exact-short TSF preflight receipt is malformed.
+    ExactShortCombinedPreflight(CandidateExactShortPreflightReceiptError),
+    /// The combined receipt does not bind the enabled package and cap.
+    ExactShortCombinedPreflightMismatch,
     /// The exact-short selection changed while its immutable package was loading.
     ExactShortSelectionChanged,
 }
@@ -661,6 +753,9 @@ impl fmt::Display for CandidateRuntimeError {
             Self::ExactShortState(_) => "精确短词层状态无效",
             Self::ExactShortPackageMismatch => "精确短词层状态与当前候选包不符",
             Self::ExactShortCatalog(_) => "精确短词层载荷校验失败",
+            Self::ExactShortCombinedPreflightUnavailable => "精确短词层缺少专项预检凭据",
+            Self::ExactShortCombinedPreflight(_) => "精确短词层专项预检凭据无效",
+            Self::ExactShortCombinedPreflightMismatch => "精确短词层专项预检凭据不符",
             Self::ExactShortSelectionChanged => "精确短词层在载入期间发生变化",
         };
         formatter.write_str(message)
@@ -676,6 +771,7 @@ impl Error for CandidateRuntimeError {
             Self::SupplementalState(error) => Some(error),
             Self::ExactShortState(error) => Some(error),
             Self::ExactShortCatalog(error) => Some(error),
+            Self::ExactShortCombinedPreflight(error) => Some(error),
             _ => None,
         }
     }
@@ -757,6 +853,37 @@ mod tests {
         )
         .unwrap();
         package_id
+    }
+
+    fn write_exact_short_test_preflight(
+        exact_root: &Path,
+        exact_package: &str,
+        exact_promotions: usize,
+        core_root: &Path,
+        supplemental: Option<(&Path, usize)>,
+    ) {
+        let core = load_current_runtime_package(core_root).unwrap().unwrap();
+        let exact = load_current_runtime_package(exact_root).unwrap().unwrap();
+        assert_eq!(exact.package_id, exact_package);
+        let supplemental_identity = supplemental.map(|(root, promotions)| {
+            let loaded = load_current_runtime_package(root).unwrap().unwrap();
+            (loaded.authentication_sha256, promotions)
+        });
+        let receipt = CandidateExactShortPreflightReceipt::new(
+            exact_package,
+            &exact.authentication_sha256,
+            exact_promotions,
+            &core.authentication_sha256,
+            supplemental_identity
+                .as_ref()
+                .map(|(sha256, promotions)| (sha256.as_str(), *promotions)),
+        )
+        .unwrap();
+        fs::write(
+            exact_root.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE),
+            receipt.render(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1074,6 +1201,16 @@ mod tests {
                 .render(),
         )
         .unwrap();
+        let missing_receipt = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            None,
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(missing_receipt.exact_short().is_none());
+        assert!(missing_receipt.exact_short_fell_back());
+        write_exact_short_test_preflight(exact_root.path(), &exact_id, 2, core_root.path(), None);
         let enabled = load_candidate_runtime_snapshots_with_layers(
             core_root.path(),
             None,
@@ -1091,6 +1228,135 @@ mod tests {
         );
         assert!(!enabled.exact_short_fell_back());
         assert_eq!(enabled.core().revision(), "runtime-exact-core");
+    }
+
+    #[test]
+    fn exact_short_combined_receipt_rejects_runtime_layer_and_cap_drift() {
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n属于\tshu yu\t100\n";
+        const EXACT: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t90\n";
+        let (core_root, _) = configured_root("runtime-bound-core", false);
+        let (different_core_root, _) = configured_root("runtime-different-core", false);
+        let supplemental_root = TestDirectory::new();
+        let supplemental_id = install_test_package(
+            supplemental_root.path(),
+            "runtime-bound-supplemental",
+            false,
+            SUPPLEMENTAL,
+        );
+        let mut supplemental_slots = CandidateSlotState::default();
+        supplemental_slots.adopt(&supplemental_id).unwrap();
+        fs::write(
+            supplemental_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            supplemental_slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            CandidateSupplementalState::enabled(&supplemental_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+
+        let exact_root = TestDirectory::new();
+        let exact_id = install_test_package(exact_root.path(), "runtime-bound-exact", false, EXACT);
+        let mut exact_slots = CandidateSlotState::default();
+        exact_slots.adopt(&exact_id).unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            exact_slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_EXACT_SHORT_STATE_FILE),
+            CandidateExactShortState::enabled(&exact_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        write_exact_short_test_preflight(
+            exact_root.path(),
+            &exact_id,
+            1,
+            core_root.path(),
+            Some((supplemental_root.path(), 1)),
+        );
+
+        let valid = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(valid.supplemental().is_some());
+        assert!(valid.exact_short().is_some());
+
+        let wrong_core = load_candidate_runtime_snapshots_with_layers(
+            different_core_root.path(),
+            Some(supplemental_root.path()),
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(wrong_core.supplemental().is_some());
+        assert!(wrong_core.exact_short().is_none());
+        assert!(wrong_core.exact_short_fell_back());
+
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            CandidateSupplementalState::enabled(&supplemental_id, 2)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let wrong_supplemental_cap = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            wrong_supplemental_cap
+                .supplemental()
+                .unwrap()
+                .config()
+                .exact_promotions,
+            2
+        );
+        assert!(wrong_supplemental_cap.exact_short().is_none());
+        assert!(wrong_supplemental_cap.exact_short_fell_back());
+
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            CandidateSupplementalState::enabled(&supplemental_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        fs::write(
+            exact_root.path().join(CANDIDATE_EXACT_SHORT_STATE_FILE),
+            CandidateExactShortState::enabled(&exact_id, 2)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let wrong_exact_cap = load_candidate_runtime_snapshots_with_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            Some(exact_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(wrong_exact_cap.exact_short().is_none());
+        assert!(wrong_exact_cap.exact_short_fell_back());
     }
 
     #[test]

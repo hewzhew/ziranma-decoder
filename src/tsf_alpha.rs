@@ -55,13 +55,13 @@ use crate::{
     WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
     WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
     WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_exact_short,
-    load_candidate_runtime_exact_short_selection, load_candidate_runtime_snapshots_with_layers,
-    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
-    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
-    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
-    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
-    save_personal_ranking_batch, save_personal_ranking_checkpoint,
-    save_personal_ranking_suppression_action, save_wish_snapshot,
+    load_candidate_runtime_exact_short_preflight, load_candidate_runtime_exact_short_selection,
+    load_candidate_runtime_snapshots_with_layers, load_candidate_runtime_supplemental,
+    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
+    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
+    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -929,7 +929,7 @@ impl SnapshotCandidateProvider {
         Self {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(supplemental),
-            exact_short: PublicExactShortRuntime::managed(None, None),
+            exact_short: PublicExactShortRuntime::managed(None, None, None, None),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -939,16 +939,28 @@ impl SnapshotCandidateProvider {
 
     fn new_with_runtime(
         snapshot: Arc<CandidateSnapshot>,
+        core_authentication_sha256: Option<String>,
         supplemental: Option<CandidateRuntimeSupplemental>,
         supplemental_root: Option<PathBuf>,
         exact_short: Option<CandidateRuntimeExactShort>,
         exact_short_root: Option<PathBuf>,
         alias_root: Option<PathBuf>,
     ) -> Self {
+        let supplemental_identity = supplemental.as_ref().map(|layer| {
+            (
+                layer.authentication_sha256().to_owned(),
+                layer.config().exact_promotions,
+            )
+        });
         Self {
             snapshot,
-            supplemental: PublicSupplementRuntime::managed(supplemental_root, supplemental),
-            exact_short: PublicExactShortRuntime::managed(exact_short_root, exact_short),
+            supplemental: PublicSupplementRuntime::managed(supplemental_root.clone(), supplemental),
+            exact_short: PublicExactShortRuntime::managed(
+                exact_short_root,
+                exact_short,
+                core_authentication_sha256,
+                supplemental_identity,
+            ),
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -1001,7 +1013,12 @@ impl SnapshotCandidateProvider {
             .as_ref()
             .is_some_and(ExplicitAliasRuntime::refresh);
         let supplemental_changed = self.supplemental.refresh();
-        let exact_short_changed = self.exact_short.refresh();
+        let supplemental_identity = self.supplemental.authentication_identity();
+        let exact_short_changed = self.exact_short.refresh(
+            supplemental_identity
+                .as_ref()
+                .map(|(sha256, promotions)| (sha256.as_str(), *promotions)),
+        );
         aliases_changed || supplemental_changed || exact_short_changed
     }
 
@@ -1182,6 +1199,7 @@ fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidat
 #[derive(Clone)]
 struct CandidateProviderBlueprint {
     snapshot: Arc<CandidateSnapshot>,
+    core_authentication_sha256: Option<String>,
     supplemental: Option<CandidateRuntimeSupplemental>,
     supplemental_root: Option<PathBuf>,
     static_supplemental: Option<(Arc<CandidateSnapshot>, SupplementalCandidateLayerConfig)>,
@@ -1195,6 +1213,7 @@ impl CandidateProviderBlueprint {
     fn build(&self) -> Arc<dyn CandidateProvider> {
         let mut provider = SnapshotCandidateProvider::new_with_runtime(
             Arc::clone(&self.snapshot),
+            self.core_authentication_sha256.clone(),
             self.supplemental.clone(),
             self.supplemental_root.clone(),
             self.exact_short.clone(),
@@ -1219,6 +1238,7 @@ struct PublicSupplementRuntime {
 struct PublicSupplementRuntimeState {
     package_id: Option<String>,
     snapshot: Option<Arc<CandidateSnapshot>>,
+    authentication_sha256: Option<String>,
     config: Option<crate::SupplementalCandidateLayerConfig>,
 }
 
@@ -1237,6 +1257,7 @@ impl PublicSupplementRuntime {
             state: Mutex::new(PublicSupplementRuntimeState {
                 package_id: None,
                 snapshot,
+                authentication_sha256: None,
                 config,
             }),
         }
@@ -1247,11 +1268,13 @@ impl PublicSupplementRuntime {
             Some(supplemental) => PublicSupplementRuntimeState {
                 package_id: Some(supplemental.package_id().to_owned()),
                 snapshot: Some(Arc::clone(supplemental.snapshot())),
+                authentication_sha256: Some(supplemental.authentication_sha256().to_owned()),
                 config: Some(supplemental.config()),
             },
             None => PublicSupplementRuntimeState {
                 package_id: None,
                 snapshot: None,
+                authentication_sha256: None,
                 config: None,
             },
         };
@@ -1284,6 +1307,15 @@ impl PublicSupplementRuntime {
         })
     }
 
+    fn authentication_identity(&self) -> Option<(String, usize)> {
+        self.state.lock().ok().and_then(|state| {
+            Some((
+                state.authentication_sha256.clone()?,
+                state.config?.exact_promotions,
+            ))
+        })
+    }
+
     fn refresh(&self) -> bool {
         let Some(root) = self.root.as_deref() else {
             return false;
@@ -1296,6 +1328,7 @@ impl PublicSupplementRuntime {
             Ok(state) => (
                 state.package_id.clone(),
                 state.snapshot.clone(),
+                state.authentication_sha256.clone(),
                 state.config,
             ),
             Err(_) => return false,
@@ -1308,13 +1341,15 @@ impl PublicSupplementRuntime {
                 PublicSupplementRuntimeState {
                     package_id: None,
                     snapshot: None,
+                    authentication_sha256: None,
                     config: None,
                 }
             }
             CandidateRuntimeSupplementalSelection::Enabled { package_id, config } => {
                 if current.0.as_deref() == Some(package_id)
                     && current.1.is_some()
-                    && current.2 == Some(*config)
+                    && current.2.is_some()
+                    && current.3 == Some(*config)
                 {
                     return false;
                 }
@@ -1322,6 +1357,7 @@ impl PublicSupplementRuntime {
                     PublicSupplementRuntimeState {
                         package_id: Some(package_id.clone()),
                         snapshot: current.1,
+                        authentication_sha256: current.2,
                         config: Some(*config),
                     }
                 } else {
@@ -1332,6 +1368,7 @@ impl PublicSupplementRuntime {
                     PublicSupplementRuntimeState {
                         package_id: Some(loaded.package_id().to_owned()),
                         snapshot: Some(Arc::clone(loaded.snapshot())),
+                        authentication_sha256: Some(loaded.authentication_sha256().to_owned()),
                         config: Some(loaded.config()),
                     }
                 }
@@ -1342,6 +1379,7 @@ impl PublicSupplementRuntime {
         };
         state.package_id = next_state.package_id;
         state.snapshot = next_state.snapshot;
+        state.authentication_sha256 = next_state.authentication_sha256;
         state.config = next_state.config;
         true
     }
@@ -1349,6 +1387,7 @@ impl PublicSupplementRuntime {
 
 struct PublicExactShortRuntime {
     root: Option<PathBuf>,
+    core_sha256: Option<String>,
     state: Mutex<PublicExactShortRuntimeState>,
 }
 
@@ -1356,6 +1395,7 @@ struct PublicExactShortRuntimeState {
     package_id: Option<String>,
     catalog: Option<Arc<ExactShortWordCatalog>>,
     exact_promotions: Option<usize>,
+    authenticated_supplemental: Option<(String, usize)>,
 }
 
 impl PublicExactShortRuntime {
@@ -1365,33 +1405,41 @@ impl PublicExactShortRuntime {
             .unwrap_or_default();
         Self {
             root: None,
+            core_sha256: None,
             state: Mutex::new(PublicExactShortRuntimeState {
                 package_id: None,
                 catalog,
                 exact_promotions,
+                authenticated_supplemental: None,
             }),
         }
     }
 
-    fn managed(root: Option<PathBuf>, exact_short: Option<CandidateRuntimeExactShort>) -> Self {
+    fn managed(
+        root: Option<PathBuf>,
+        exact_short: Option<CandidateRuntimeExactShort>,
+        core_sha256: Option<String>,
+        supplemental_identity: Option<(String, usize)>,
+    ) -> Self {
         let state = match exact_short {
             Some(exact_short) => PublicExactShortRuntimeState {
                 package_id: Some(exact_short.package_id().to_owned()),
                 catalog: Some(Arc::clone(exact_short.catalog())),
                 exact_promotions: Some(exact_short.exact_promotions()),
+                authenticated_supplemental: supplemental_identity,
             },
             None => PublicExactShortRuntimeState {
                 package_id: None,
                 catalog: None,
                 exact_promotions: None,
+                authenticated_supplemental: None,
             },
         };
-        let runtime = Self {
+        Self {
             root,
+            core_sha256,
             state: Mutex::new(state),
-        };
-        let _ = runtime.refresh();
-        runtime
+        }
     }
 
     fn current(&self) -> Option<ExactShortCandidateLayer> {
@@ -1412,7 +1460,7 @@ impl PublicExactShortRuntime {
         })
     }
 
-    fn refresh(&self) -> bool {
+    fn refresh(&self, supplemental: Option<(&str, usize)>) -> bool {
         let Some(root) = self.root.as_deref() else {
             return false;
         };
@@ -1425,9 +1473,57 @@ impl PublicExactShortRuntime {
                 state.package_id.clone(),
                 state.catalog.clone(),
                 state.exact_promotions,
+                state.authenticated_supplemental.clone(),
             ),
             Err(_) => return false,
         };
+        if let CandidateRuntimeExactShortSelection::Enabled { .. } = &next {
+            let Some(core_sha256) = self.core_sha256.as_deref() else {
+                return false;
+            };
+            let receipt = match load_candidate_runtime_exact_short_preflight(root, &next) {
+                Ok(Some(receipt)) => receipt,
+                _ => {
+                    if current.1.is_some()
+                        && current
+                            .3
+                            .as_ref()
+                            .map(|(sha256, promotions)| (sha256.as_str(), *promotions))
+                            != supplemental
+                    {
+                        let Ok(mut state) = self.state.lock() else {
+                            return false;
+                        };
+                        state.package_id = None;
+                        state.catalog = None;
+                        state.exact_promotions = None;
+                        state.authenticated_supplemental = None;
+                        return true;
+                    }
+                    return false;
+                }
+            };
+            if !receipt.matches_runtime(core_sha256, supplemental) {
+                if current.1.is_some()
+                    && current
+                        .3
+                        .as_ref()
+                        .map(|(sha256, promotions)| (sha256.as_str(), *promotions))
+                        == supplemental
+                {
+                    return false;
+                }
+                let Ok(mut state) = self.state.lock() else {
+                    return false;
+                };
+                let changed = state.package_id.is_some() || state.catalog.is_some();
+                state.package_id = None;
+                state.catalog = None;
+                state.exact_promotions = None;
+                state.authenticated_supplemental = None;
+                return changed;
+            }
+        }
         let next_state = match &next {
             CandidateRuntimeExactShortSelection::Disabled => {
                 if current.0.is_none() && current.1.is_none() {
@@ -1437,6 +1533,7 @@ impl PublicExactShortRuntime {
                     package_id: None,
                     catalog: None,
                     exact_promotions: None,
+                    authenticated_supplemental: None,
                 }
             }
             CandidateRuntimeExactShortSelection::Enabled {
@@ -1446,6 +1543,11 @@ impl PublicExactShortRuntime {
                 if current.0.as_deref() == Some(package_id)
                     && current.1.is_some()
                     && current.2 == Some(*exact_promotions)
+                    && current
+                        .3
+                        .as_ref()
+                        .map(|(sha256, promotions)| (sha256.as_str(), *promotions))
+                        == supplemental
                 {
                     return false;
                 }
@@ -1454,6 +1556,8 @@ impl PublicExactShortRuntime {
                         package_id: Some(package_id.clone()),
                         catalog: current.1,
                         exact_promotions: Some(*exact_promotions),
+                        authenticated_supplemental: supplemental
+                            .map(|(sha256, promotions)| (sha256.to_owned(), promotions)),
                     }
                 } else {
                     let loaded = match load_candidate_runtime_exact_short(root, &next) {
@@ -1464,6 +1568,8 @@ impl PublicExactShortRuntime {
                         package_id: Some(loaded.package_id().to_owned()),
                         catalog: Some(Arc::clone(loaded.catalog())),
                         exact_promotions: Some(loaded.exact_promotions()),
+                        authenticated_supplemental: supplemental
+                            .map(|(sha256, promotions)| (sha256.to_owned(), promotions)),
                     }
                 }
             }
@@ -1474,6 +1580,7 @@ impl PublicExactShortRuntime {
         state.package_id = next_state.package_id;
         state.catalog = next_state.catalog;
         state.exact_promotions = next_state.exact_promotions;
+        state.authenticated_supplemental = next_state.authenticated_supplemental;
         true
     }
 }
@@ -2238,6 +2345,7 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
             );
             Ok(CandidateProviderBlueprint {
                 snapshot,
+                core_authentication_sha256: None,
                 supplemental: None,
                 supplemental_root: None,
                 static_supplemental: None,
@@ -2275,6 +2383,7 @@ fn candidate_provider_for_roots(
     {
         Some(runtime) => Ok(CandidateProviderBlueprint {
             snapshot: Arc::clone(runtime.core()),
+            core_authentication_sha256: Some(runtime.core_authentication_sha256().to_owned()),
             supplemental: runtime.supplemental().cloned(),
             supplemental_root: supplemental_root.map(Path::to_path_buf),
             static_supplemental: None,
@@ -2738,6 +2847,7 @@ pub fn preflight_candidate_snapshot(
     let result = run_candidate_preflight(
         CandidateProviderBlueprint {
             snapshot,
+            core_authentication_sha256: None,
             supplemental: None,
             supplemental_root: None,
             static_supplemental: None,
@@ -2811,6 +2921,7 @@ pub fn preflight_exact_short_candidate_layers(
     let exact_short_revision = exact_short.revision().to_owned();
     let blueprint = CandidateProviderBlueprint {
         snapshot: core,
+        core_authentication_sha256: None,
         supplemental: None,
         supplemental_root: None,
         static_supplemental: supplemental,
@@ -12301,6 +12412,32 @@ mod tests {
         .unwrap();
     }
 
+    fn write_exact_short_runtime_test_preflight(
+        root: &Path,
+        package_id: &str,
+        exact_promotions: usize,
+        core_sha256: &str,
+    ) {
+        let selection = load_candidate_runtime_exact_short_selection(root).unwrap();
+        let exact = load_candidate_runtime_exact_short(root, &selection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.package_id(), package_id);
+        let receipt = crate::CandidateExactShortPreflightReceipt::new(
+            package_id,
+            exact.authentication_sha256(),
+            exact_promotions,
+            core_sha256,
+            None,
+        )
+        .unwrap();
+        fs::write(
+            root.join(crate::CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE),
+            receipt.render(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn candidate_promotion_mirrors_existing_personal_markers_by_position() {
         let mut batch = CandidateBatch {
@@ -12923,7 +13060,7 @@ mod tests {
         let provider = SnapshotCandidateProvider {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(None),
-            exact_short: PublicExactShortRuntime::managed(None, None),
+            exact_short: PublicExactShortRuntime::managed(None, None, None, None),
             aliases: Some(runtime),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -14990,6 +15127,7 @@ mod tests {
             .unwrap();
         let provider = SnapshotCandidateProvider::new_with_runtime(
             load_core(),
+            None,
             Some(initial),
             Some(root.clone()),
             None,
@@ -15119,6 +15257,7 @@ mod tests {
         const FIRST: &str = "text\tpinyin\tfrequency\n收束\tshou shu\t100\n";
         const SECOND: &str = "text\tpinyin\tfrequency\n手术\tshou shu\t100\n";
         const BROKEN: &str = "text\tpinyin\tfrequency\n首数\tshou shu\t100\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n属于\tshu yu\t100\n";
         let core = Arc::new(
             CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
                 schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
@@ -15135,15 +15274,24 @@ mod tests {
         let first = install_candidate_runtime_test_package(&root, "tsf-exact-first-v1", FIRST);
         let second = install_candidate_runtime_test_package(&root, "tsf-exact-second-v1", SECOND);
         let broken = install_candidate_runtime_test_package(&root, "tsf-exact-broken-v1", BROKEN);
+        let supplemental_root = candidate_runtime_test_root("exact-short-supplement-refresh");
+        let supplemental = install_candidate_runtime_test_package(
+            &supplemental_root,
+            "tsf-exact-supplement-v1",
+            SUPPLEMENTAL,
+        );
+        let core_sha256 = "a".repeat(64);
         select_exact_short_runtime_test_package(&root, &first, 1);
+        write_exact_short_runtime_test_preflight(&root, &first, 1, &core_sha256);
         let selection = load_candidate_runtime_exact_short_selection(&root).unwrap();
         let initial = load_candidate_runtime_exact_short(&root, &selection)
             .unwrap()
             .unwrap();
         let provider = SnapshotCandidateProvider::new_with_runtime(
             core,
+            Some(core_sha256.clone()),
             None,
-            None,
+            Some(supplemental_root.clone()),
             Some(initial),
             Some(root.clone()),
             None,
@@ -15178,6 +15326,7 @@ mod tests {
         assert!(provider.is_exact_full_code_candidate("ubuu", "收束"));
 
         select_exact_short_runtime_test_package(&root, &second, 1);
+        write_exact_short_runtime_test_preflight(&root, &second, 1, &core_sha256);
         let mut before_refresh = CandidateCache::default();
         let unchanged = before_refresh.load(
             &provider,
@@ -15209,19 +15358,48 @@ mod tests {
         assert!(!provider.is_exact_full_code_candidate("ubuu", "收束"));
 
         let second_catalog = provider.exact_short.current().unwrap().catalog;
+        write_exact_short_runtime_test_preflight(&root, &second, 1, &"b".repeat(64));
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(!provider.refresh_at_safe_boundary_at(refresh_at));
+        assert!(Arc::ptr_eq(
+            &second_catalog,
+            &provider.exact_short.current().unwrap().catalog
+        ));
+        write_exact_short_runtime_test_preflight(&root, &second, 1, &core_sha256);
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(!provider.refresh_at_safe_boundary_at(refresh_at));
+        assert!(provider.is_exact_full_code_candidate("ubuu", "手术"));
+
         select_exact_short_runtime_test_package(&root, &second, 2);
+        write_exact_short_runtime_test_preflight(&root, &second, 2, &core_sha256);
         refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
         assert!(provider.refresh_at_safe_boundary_at(refresh_at));
         let reconfigured = provider.exact_short.current().unwrap();
         assert!(Arc::ptr_eq(&second_catalog, &reconfigured.catalog));
         assert_eq!(reconfigured.exact_promotions, 2);
 
+        select_candidate_runtime_test_package(&supplemental_root, &supplemental, 1);
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
+        assert!(provider.supplemental.current().is_some());
+        assert!(provider.exact_short_layer().is_none());
+        fs::write(
+            supplemental_root.join(crate::CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            crate::CandidateSupplementalState::default().render(),
+        )
+        .unwrap();
+        refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
+        assert!(provider.refresh_at_safe_boundary_at(refresh_at));
+        assert!(provider.supplemental.current().is_none());
+        assert!(provider.is_exact_full_code_candidate("ubuu", "手术"));
+
+        select_exact_short_runtime_test_package(&root, &broken, 1);
+        write_exact_short_runtime_test_preflight(&root, &broken, 1, &core_sha256);
         fs::remove_file(
             root.join(crate::CANDIDATE_PREFLIGHTS_DIRECTORY)
                 .join(format!("{broken}.zpf")),
         )
         .unwrap();
-        select_exact_short_runtime_test_package(&root, &broken, 1);
         refresh_at += CANDIDATE_RUNTIME_REFRESH_INTERVAL;
         assert!(!provider.refresh_at_safe_boundary_at(refresh_at));
         assert_eq!(
@@ -15245,6 +15423,7 @@ mod tests {
         assert!(provider.exact_short_layer().is_none());
 
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(supplemental_root).unwrap();
     }
 
     #[test]
