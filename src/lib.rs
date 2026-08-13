@@ -356,7 +356,8 @@ pub use research_feedback::{
     set_research_feedback_enabled,
 };
 pub use research_triage::{
-    RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchCandidateReachabilitySignals, ResearchIssueTriage,
+    RESEARCH_CANDIDATE_LENGTH_BUCKET_COUNT, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS,
+    ResearchCandidateDisplaySignals, ResearchCandidateReachabilitySignals, ResearchIssueTriage,
     ResearchLatencySignals, ResearchPersonalPhraseSignals, ResearchRankingSignals,
     ResearchRecoverySignals, ResearchSlowKeyPhaseSignals, ResearchTriageCapabilityCoverage,
     ResearchTriageCoverage, ResearchTriageError, analyze_research_issue_signals,

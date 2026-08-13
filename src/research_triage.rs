@@ -15,6 +15,7 @@ use crate::{
 
 /// One 60 Hz frame, used as the fixed threshold for visible latency signals.
 pub const RESEARCH_TRIAGE_VISIBLE_LATENCY_MS: u32 = 16;
+pub const RESEARCH_CANDIDATE_LENGTH_BUCKET_COUNT: usize = 5;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchTriageCoverage {
@@ -165,6 +166,56 @@ pub struct ResearchLatencySignals {
     pub dominant_phases: ResearchSlowKeyPhaseSignals,
 }
 
+/// Character-count pressure in presented candidate pages. These aggregates
+/// deliberately retain neither candidate text nor one frame's exact length
+/// pattern. They are a layout proxy, not a claim that GDI actually elided a
+/// particular item.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResearchCandidateDisplaySignals {
+    pub frames: usize,
+    pub candidates: usize,
+    pub first_candidates: usize,
+    pub candidate_length_buckets: [usize; RESEARCH_CANDIDATE_LENGTH_BUCKET_COUNT],
+    pub first_candidate_length_buckets: [usize; RESEARCH_CANDIDATE_LENGTH_BUCKET_COUNT],
+    pub frames_with_any_over_eight: usize,
+    pub frames_with_multiple_over_eight: usize,
+}
+
+impl ResearchCandidateDisplaySignals {
+    fn observe(&mut self, candidates: &[String]) {
+        if candidates.is_empty() {
+            return;
+        }
+        self.frames += 1;
+        self.candidates += candidates.len();
+        self.first_candidates += 1;
+        self.first_candidate_length_buckets[candidate_length_bucket(&candidates[0])] += 1;
+
+        let mut over_eight = 0;
+        for candidate in candidates {
+            let length = candidate.chars().count();
+            self.candidate_length_buckets[candidate_length_bucket_for_count(length)] += 1;
+            over_eight += usize::from(length > 8);
+        }
+        self.frames_with_any_over_eight += usize::from(over_eight > 0);
+        self.frames_with_multiple_over_eight += usize::from(over_eight > 1);
+    }
+}
+
+fn candidate_length_bucket(candidate: &str) -> usize {
+    candidate_length_bucket_for_count(candidate.chars().count())
+}
+
+fn candidate_length_bucket_for_count(length: usize) -> usize {
+    match length {
+        0..=2 => 0,
+        3..=4 => 1,
+        5..=8 => 2,
+        9..=16 => 3,
+        _ => 4,
+    }
+}
+
 /// Aggregate structural evidence. Every group may overlap with every other
 /// group; none of the counts is an automatic correctness judgment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -176,6 +227,7 @@ pub struct ResearchIssueTriage {
     pub recovery: ResearchRecoverySignals,
     pub personal_phrase: ResearchPersonalPhraseSignals,
     pub latency: ResearchLatencySignals,
+    pub display: ResearchCandidateDisplaySignals,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,9 +360,10 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                 code,
                 view,
                 page_start,
+                candidates,
                 may_have_more,
-                ..
             } => {
+                report.display.observe(candidates);
                 frame = Some(PresentedFrame::next(
                     PresentedFrameUpdate {
                         code,
@@ -328,12 +381,14 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                 code,
                 view,
                 page_start,
+                candidates,
                 provenance,
                 automatic_transposition,
                 tab_assembly,
                 may_have_more,
                 ..
             } => {
+                report.display.observe(candidates);
                 let recovery_text = automatic_transposition
                     .as_ref()
                     .and_then(|decision| decision.recovered_text());
@@ -641,6 +696,50 @@ mod tests {
         assert_eq!(report.ranking.precise_ranking_non_top_commits, 1);
         assert_eq!(report.ranking.reranked_top_bypassed_commits, 1);
         assert_eq!(report.ranking.nonreranked_top_bypassed_commits, 0);
+    }
+
+    #[test]
+    fn candidate_length_pressure_is_aggregated_without_retaining_text() {
+        let report = analyze_research_issue_signals(&[snapshot(vec![
+            (
+                10,
+                NativeFeedbackEvent::CandidatesPresented {
+                    code: "abcd".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec![
+                        "甲乙".to_owned(),
+                        "甲乙丙".to_owned(),
+                        "甲乙丙丁戊".to_owned(),
+                        "甲乙丙丁戊己庚辛壬".to_owned(),
+                        "甲".repeat(17),
+                    ],
+                    may_have_more: false,
+                },
+            ),
+            (
+                20,
+                NativeFeedbackEvent::CandidatesPresented {
+                    code: "abcdef".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["甲".repeat(9)],
+                    may_have_more: false,
+                },
+            ),
+        ])])
+        .unwrap();
+
+        assert_eq!(report.display.frames, 2);
+        assert_eq!(report.display.candidates, 6);
+        assert_eq!(report.display.first_candidates, 2);
+        assert_eq!(report.display.candidate_length_buckets, [1, 1, 1, 2, 1]);
+        assert_eq!(
+            report.display.first_candidate_length_buckets,
+            [1, 0, 0, 1, 0]
+        );
+        assert_eq!(report.display.frames_with_any_over_eight, 2);
+        assert_eq!(report.display.frames_with_multiple_over_eight, 1);
     }
 
     #[test]

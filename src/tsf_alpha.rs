@@ -4152,8 +4152,10 @@ const POPUP_SELECTED_TEXT_INSET_LOGICAL: i32 = 13;
 const POPUP_RANK_WIDTH_LOGICAL: i32 = 16;
 const POPUP_RANK_GAP_LOGICAL: i32 = 4;
 const POPUP_FOOTER_CONTENT_INSET_LOGICAL: i32 = 10;
-const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 640;
-const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 54;
+const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 760;
+const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 70;
+const POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL: i32 = 144;
+const POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL: i32 = 288;
 const POPUP_ACTION_MIN_WIDTH_LOGICAL: i32 = 210;
 const POPUP_ACTION_DETAIL_GAP_LOGICAL: i32 = 12;
 const POPUP_NOTICE_ICON_SIZE_LOGICAL: i32 = 24;
@@ -4201,13 +4203,18 @@ fn candidate_popup_border_geometry(client: RECT, dpi: u32) -> Option<CandidatePo
 }
 
 fn horizontal_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
+    let maximum_text_width = if selected {
+        POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL
+    } else {
+        POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL
+    };
     let text_width = candidate
         .chars()
         .take(CANDIDATE_DISPLAY_MAX_CHARS)
         .fold(0_i32, |width, character| {
             width.saturating_add(if character.is_ascii() { 9 } else { 18 })
         })
-        .clamp(18, 144);
+        .clamp(18, maximum_text_width);
     let leading_inset = if selected {
         POPUP_SELECTED_TEXT_INSET_LOGICAL
     } else {
@@ -23385,6 +23392,60 @@ mod tests {
                 - POPUP_RANK_GAP_LOGICAL
                 - POPUP_TEXT_PADDING_LOGICAL;
             assert!(text_width >= i32::try_from(candidate.chars().count()).unwrap() * 18);
+        }
+    }
+
+    #[test]
+    fn selected_long_phrase_gets_more_horizontal_room_than_secondary_phrases() {
+        let selected = "甲".repeat(16);
+        let secondary = "乙".repeat(16);
+        assert_eq!(
+            horizontal_candidate_logical_width(&selected, true)
+                - horizontal_candidate_logical_width(&selected, false),
+            POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL
+                - POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL
+                + POPUP_SELECTED_TEXT_INSET_LOGICAL
+                - POPUP_TEXT_PADDING_LOGICAL,
+        );
+        assert_eq!(
+            horizontal_candidate_logical_width(&secondary, false),
+            POPUP_TEXT_PADDING_LOGICAL
+                + POPUP_RANK_WIDTH_LOGICAL
+                + POPUP_RANK_GAP_LOGICAL
+                + POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL
+                + POPUP_TEXT_PADDING_LOGICAL,
+        );
+    }
+
+    #[test]
+    fn six_four_character_candidates_fit_even_with_a_page_footer() {
+        let display = CandidateDisplay::from_candidates(
+            [
+                "甲乙丙丁",
+                "戊己庚辛",
+                "壬癸子丑",
+                "寅卯辰巳",
+                "午未申酉",
+                "戌亥天地",
+                "玄黄宇宙",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            0,
+        );
+        assert_eq!(display.visible().len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(display.page_starts().len(), 2);
+
+        let metrics = candidate_popup_metrics(&display, 96, 1_920);
+        let widths = horizontal_candidate_widths(&display, 96, metrics.width);
+        assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
+        assert!(metrics.width < POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
+        for (index, (candidate, width)) in display.visible().iter().zip(widths).enumerate() {
+            assert_eq!(
+                width,
+                horizontal_candidate_logical_width(candidate, index == 0),
+            );
         }
     }
 

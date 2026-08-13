@@ -252,6 +252,24 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
         triage.reachability.unpaired_cancellations(),
     )
     .unwrap();
+    writeln!(
+        output,
+        "候选显示长度（字符数代理，不等同实际省略）：候选 {} 项，1–2 字 {}、3–4 字 {}、5–8 字 {}、9–16 字 {}、17 字及以上 {}；当前页首项 {} 个，其中 9–16 字 {}、17 字及以上 {}；含至少一个 9 字及以上候选的帧 {}/{}，含多个的帧 {}/{}。",
+        triage.display.candidates,
+        triage.display.candidate_length_buckets[0],
+        triage.display.candidate_length_buckets[1],
+        triage.display.candidate_length_buckets[2],
+        triage.display.candidate_length_buckets[3],
+        triage.display.candidate_length_buckets[4],
+        triage.display.first_candidates,
+        triage.display.first_candidate_length_buckets[3],
+        triage.display.first_candidate_length_buckets[4],
+        triage.display.frames_with_any_over_eight,
+        triage.display.frames,
+        triage.display.frames_with_multiple_over_eight,
+        triage.display.frames,
+    )
+    .unwrap();
     let personalization_coverage = render_triage_capability(
         "V11 精确个人证据字段",
         triage.capabilities.precise_personalization_batches,
@@ -4054,6 +4072,15 @@ mod tests {
                 },
                 ..ziranma_core::ResearchLatencySignals::default()
             },
+            display: ziranma_core::ResearchCandidateDisplaySignals {
+                frames: 2,
+                candidates: 7,
+                first_candidates: 2,
+                candidate_length_buckets: [1, 2, 3, 1, 0],
+                first_candidate_length_buckets: [1, 0, 0, 1, 0],
+                frames_with_any_over_eight: 1,
+                frames_with_multiple_over_eight: 0,
+            },
         };
 
         let rendered = render_issue_triage("公开合成批次", &triage);
@@ -4063,6 +4090,7 @@ mod tests {
         assert!(rendered.contains("候选提交中的非首选 2/5，其中翻页后 1"));
         assert!(rendered.contains("原码上屏可配对 1/2"));
         assert!(rendered.contains("取消可配对 1/2"));
+        assert!(rendered.contains("候选 7 项，1–2 字 1、3–4 字 2、5–8 字 3、9–16 字 1"));
         assert!(rendered.contains("V11 精确个人证据字段：字段支持（2/2 批）"));
         assert!(rendered.contains("已有个人证据 1、无个人证据 1、来源缺失 0（合计 2/2）"));
         assert!(rendered.contains("首选实际经个人重排但被绕过 1"));
