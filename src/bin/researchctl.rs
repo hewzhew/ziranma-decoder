@@ -10,19 +10,20 @@ use ziranma_core::{
     NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
     NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
-    ResearchHalfPairAnalysis, ResearchIssueTriage, ResearchSceneAnalysis, ResearchWishEpisodeKind,
-    ResearchWishEvidenceKind, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
-    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
-    analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
-    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
-    repository_root_for_user_tool_executable, research_feedback_enabled,
-    set_research_feedback_enabled,
+    ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage, ResearchSceneAnalysis,
+    ResearchWishEpisodeKind, ResearchWishEvidenceKind, TranspositionCalibrationLabel,
+    WishCaptureScope, WishJournalContext, WishPublicCandidateOrderPolicy, WishRuntimeIdentity,
+    WishSnapshot, analyze_linked_research, analyze_research_issue_signals,
+    analyze_research_issue_signals_for_runtime, analyze_runtime_half_pairs, list_wish_packages,
+    native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+    research_feedback_enabled, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
 
 const MAX_REVIEW_BATCHES: usize = 4_096;
 const MAX_REVIEW_ITEMS: usize = 12;
+const MAX_RUNTIME_INPUT_SCENES: usize = 24;
 const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
 const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
@@ -186,30 +187,116 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
     let latest_runtime = latest_runtime_review(&snapshots)?;
     let wishes = load_linkable_wishes(root)?;
     let scenes = analyze_linked_research(&snapshots, &wishes)?;
-    let (latest_runtime, latest_triage, latest_private_review) = match latest_runtime {
-        Some((identity, review)) => {
-            let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
-            let latest_triage = analyze_research_issue_signals_for_runtime(&snapshots, &identity)?;
-            (
-                review.render_runtime_summary(&identity, &half_pairs),
-                Some(latest_triage),
-                Some(review),
-            )
-        }
-        None => (
-            "最新运行身份：尚无带版本标识的批次。".to_owned(),
-            None,
-            None,
-        ),
-    };
+    let (latest_runtime, latest_triage, latest_private_review, latest_input_scenes) =
+        match latest_runtime {
+            Some((identity, review)) => {
+                let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
+                let latest_triage =
+                    analyze_research_issue_signals_for_runtime(&snapshots, &identity)?;
+                let latest_snapshots = snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.runtime_identity() == Some(&identity))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let latest_scenes = analyze_linked_research(&latest_snapshots, &[])?;
+                (
+                    review.render_runtime_summary(&identity, &half_pairs),
+                    Some(latest_triage),
+                    Some(review),
+                    Some(render_runtime_input_scenes(&latest_scenes)),
+                )
+            }
+            None => (
+                "最新运行身份：尚无带版本标识的批次。".to_owned(),
+                None,
+                None,
+                None,
+            ),
+        };
     println!(
-        "{}\n\n{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
         latest_runtime,
         render_scoped_issue_triage(latest_triage.as_ref(), &triage),
+        latest_input_scenes.unwrap_or_else(|| {
+            "当前运行身份的自然输入片段：暂无带版本标识的连续记录。".to_owned()
+        }),
         render_scoped_private_review(latest_private_review.as_ref(), &review),
         render_scene_analysis(&scenes)
     );
     Ok(())
+}
+
+fn render_runtime_input_scenes(analysis: &ResearchSceneAnalysis) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "当前运行身份的自然输入片段（包含私人输入；不按加密批次切段）"
+    )
+    .unwrap();
+    let scenes = analysis.input_scenes();
+    if scenes.is_empty() {
+        output.push_str("- 暂无可重建的连续片段。");
+        return output;
+    }
+    let omitted = scenes.len().saturating_sub(MAX_RUNTIME_INPUT_SCENES);
+    if omitted != 0 {
+        writeln!(
+            output,
+            "- 另有 {omitted} 个片段未展开；下面按稳定连续流顺序显示其余片段。"
+        )
+        .unwrap();
+    }
+    for (index, scene) in scenes.iter().skip(omitted).enumerate() {
+        write!(
+            output,
+            "- 片段 {}（{} 次完成输入）：",
+            omitted + index + 1,
+            scene.episodes().len()
+        )
+        .unwrap();
+        render_input_scene_episodes(&mut output, scene);
+        output.push('\n');
+    }
+    output.push_str(
+        "口径：显示当前运行身份的真实完成输入、实际名次和可核对首选；同一片段内部顺序可靠，不为不同宿主流伪造全局时间顺序；只在本机当前终端生成，不另行写盘。",
+    );
+    output
+}
+
+fn render_input_scene_episodes(output: &mut String, scene: &ResearchInputScene) {
+    for (index, episode) in scene.episodes().iter().enumerate() {
+        if index != 0 {
+            output.push_str(" ｜ ");
+        }
+        match episode.kind() {
+            ResearchWishEpisodeKind::CandidateCommit => {
+                write!(
+                    output,
+                    "{} → “{}”（第 {}",
+                    episode.code(),
+                    episode.text().unwrap_or(""),
+                    episode.rank().unwrap_or(0),
+                )
+                .unwrap();
+                if episode.rank().is_some_and(|rank| rank > 1) {
+                    match episode.top_candidate() {
+                        Some(top) => write!(output, "；当时首选“{top}”").unwrap(),
+                        None => output.push_str("；当时首选证据缺失"),
+                    }
+                }
+                output.push('）');
+                if episode.post_commit_backspace_routed() {
+                    output.push_str("〔随后 Backspace 已交给宿主〕");
+                }
+            }
+            ResearchWishEpisodeKind::RawCodeCommit => {
+                write!(output, "{}〔原码上屏〕", episode.code()).unwrap();
+            }
+            ResearchWishEpisodeKind::Cancellation => {
+                write!(output, "{}〔取消〕", episode.code()).unwrap();
+            }
+        }
+    }
 }
 
 fn render_scoped_private_review(latest: Option<&ResearchReview>, all: &ResearchReview) -> String {

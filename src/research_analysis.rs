@@ -224,6 +224,61 @@ pub struct ResearchSceneAnalysis {
     habit_clues: Vec<ResearchHabitClue>,
     wish_contexts: Vec<ResearchWishContext>,
     retype_clues: Vec<ResearchRetypeClue>,
+    input_scenes: Vec<ResearchInputScene>,
+}
+
+/// One completed input retained inside a reconstructed natural scene.
+///
+/// This type intentionally omits `Debug` because it contains real input,
+/// committed text, and the directly observed first candidate.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchInputEpisode {
+    kind: ResearchWishEpisodeKind,
+    code: String,
+    text: Option<String>,
+    rank: Option<usize>,
+    top_candidate: Option<String>,
+    post_commit_backspace_routed: bool,
+}
+
+impl ResearchInputEpisode {
+    pub fn kind(&self) -> ResearchWishEpisodeKind {
+        self.kind
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    pub fn rank(&self) -> Option<usize> {
+        self.rank
+    }
+
+    pub fn top_candidate(&self) -> Option<&str> {
+        self.top_candidate.as_deref()
+    }
+
+    pub fn post_commit_backspace_routed(&self) -> bool {
+        self.post_commit_backspace_routed
+    }
+}
+
+/// One process-local natural input scene. Storage batch boundaries are not
+/// represented here. This type intentionally omits `Debug` because its
+/// episodes contain private text.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchInputScene {
+    episodes: Vec<ResearchInputEpisode>,
+}
+
+impl ResearchInputScene {
+    pub fn episodes(&self) -> &[ResearchInputEpisode] {
+        &self.episodes
+    }
 }
 
 /// Aggregate, text-free evidence for an odd double-pinyin frame followed by
@@ -359,6 +414,10 @@ impl ResearchSceneAnalysis {
     pub fn retype_clues(&self) -> &[ResearchRetypeClue] {
         &self.retype_clues
     }
+
+    pub fn input_scenes(&self) -> &[ResearchInputScene] {
+        &self.input_scenes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -400,6 +459,8 @@ struct PendingEpisode {
     previous_code: Option<String>,
     revision_from: Option<String>,
     recovery: Option<RecoveryEvidence>,
+    top_candidate_code: Option<String>,
+    top_candidate: Option<String>,
 }
 
 impl PendingEpisode {
@@ -410,22 +471,41 @@ impl PendingEpisode {
             previous_code: None,
             revision_from: None,
             recovery: None,
+            top_candidate_code: None,
+            top_candidate: None,
         }
     }
 
     fn observe_candidates(&mut self, event: &NativeFeedbackEvent) {
-        let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
-            code,
-            automatic_transposition,
-            ..
-        } = event
-        else {
-            if let NativeFeedbackEvent::CandidatesPresented { code, .. } = event {
-                self.observe_code(code);
-            }
-            return;
+        let (code, page_start, candidates, automatic_transposition) = match event {
+            NativeFeedbackEvent::CandidatesPresented {
+                code,
+                page_start,
+                candidates,
+                ..
+            } => (code, page_start, candidates, None),
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code,
+                page_start,
+                candidates,
+                automatic_transposition,
+                ..
+            } => (
+                code,
+                page_start,
+                candidates,
+                automatic_transposition.as_ref(),
+            ),
+            _ => return,
         };
         self.observe_code(code);
+        if *page_start == 0 {
+            self.top_candidate_code = Some(code.clone());
+            self.top_candidate = candidates.first().cloned();
+        } else if self.top_candidate_code.as_deref() != Some(code) {
+            self.top_candidate_code = None;
+            self.top_candidate = None;
+        }
         if let Some(decision) = automatic_transposition
             && decision.outcome() == NativeAutomaticTranspositionOutcome::RecoveryAvailable
             && decision.visible_rank().is_some()
@@ -461,6 +541,7 @@ struct Episode {
     revision: Option<(String, String, String)>,
     outcome: EpisodeOutcome,
     post_commit_backspace_routed: bool,
+    top_candidate: Option<String>,
 }
 
 enum EpisodeOutcome {
@@ -607,6 +688,7 @@ pub fn analyze_linked_research(
     let habit_clues = collect_habit_clues(stream_episodes.values().flatten());
     let wish_contexts = collect_wish_contexts(&stream_episodes, &scenes, &anchor_requests);
     let retype_clues = collect_retype_clues(stream_episodes.values());
+    let input_scenes = collect_input_scenes(&stream_episodes, &scenes);
     let mut episode_counts = scenes
         .iter()
         .map(|scene| scene.episodes)
@@ -633,6 +715,7 @@ pub fn analyze_linked_research(
         habit_clues,
         wish_contexts,
         retype_clues,
+        input_scenes,
     })
 }
 
@@ -1019,6 +1102,9 @@ fn observe_event(
                     rank: *absolute_rank,
                 },
                 post_commit_backspace_routed: false,
+                top_candidate: (episode.top_candidate_code.as_deref() == Some(code.as_str()))
+                    .then_some(episode.top_candidate)
+                    .flatten(),
             });
         }
         NativeFeedbackEvent::RawCodeCommitted { code } => {
@@ -1037,6 +1123,7 @@ fn observe_event(
                 revision: None,
                 outcome: EpisodeOutcome::RawCodeCommit { code: code.clone() },
                 post_commit_backspace_routed: false,
+                top_candidate: None,
             });
         }
         NativeFeedbackEvent::CompositionCancelled { code, source } => {
@@ -1058,6 +1145,7 @@ fn observe_event(
                 revision: None,
                 outcome: EpisodeOutcome::Cancellation { code: code.clone() },
                 post_commit_backspace_routed: false,
+                top_candidate: None,
             });
         }
     }
@@ -1207,6 +1295,66 @@ impl Episode {
             followed_by_retype,
         }
     }
+
+    fn as_input_episode(&self) -> ResearchInputEpisode {
+        let (kind, code, text, rank) = match &self.outcome {
+            EpisodeOutcome::CandidateCommit { code, text, rank } => (
+                ResearchWishEpisodeKind::CandidateCommit,
+                code.clone(),
+                Some(text.clone()),
+                Some(*rank),
+            ),
+            EpisodeOutcome::RawCodeCommit { code } => (
+                ResearchWishEpisodeKind::RawCodeCommit,
+                code.clone(),
+                None,
+                None,
+            ),
+            EpisodeOutcome::Cancellation { code } => (
+                ResearchWishEpisodeKind::Cancellation,
+                code.clone(),
+                None,
+                None,
+            ),
+        };
+        ResearchInputEpisode {
+            kind,
+            code,
+            text,
+            rank,
+            top_candidate: self.top_candidate.clone(),
+            post_commit_backspace_routed: self.post_commit_backspace_routed,
+        }
+    }
+}
+
+fn collect_input_scenes(
+    stream_episodes: &HashMap<String, Vec<Episode>>,
+    scenes: &[Scene],
+) -> Vec<ResearchInputScene> {
+    let mut ordered = scenes.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.stream_id
+            .cmp(&right.stream_id)
+            .then_with(|| left.chain.cmp(&right.chain))
+            .then_with(|| left.first_ordinal.cmp(&right.first_ordinal))
+    });
+    ordered
+        .into_iter()
+        .filter_map(|scene| {
+            let episodes = stream_episodes
+                .get(&scene.stream_id)?
+                .iter()
+                .filter(|episode| {
+                    episode.chain == scene.chain
+                        && episode.first_ordinal >= scene.first_ordinal
+                        && episode.last_ordinal <= scene.last_ordinal
+                })
+                .map(Episode::as_input_episode)
+                .collect::<Vec<_>>();
+            (!episodes.is_empty()).then_some(ResearchInputScene { episodes })
+        })
+        .collect()
 }
 
 fn is_bounded_retype_pair(previous: &Episode, next: &Episode) -> bool {
@@ -1618,6 +1766,53 @@ mod tests {
         let report =
             analyze_linked_research(&[snapshot(&stream, 0, 0, None, events)], &[]).unwrap();
         assert_eq!(report.scenes(), 3);
+    }
+
+    #[test]
+    fn natural_input_scenes_retain_completed_text_rank_and_observed_top() {
+        let stream = "89".repeat(32);
+        let events = vec![
+            (
+                10,
+                frame(
+                    "aa",
+                    &["甲", "乙"],
+                    &[
+                        NativeCandidateSource::CoreExact,
+                        NativeCandidateSource::CoreExact,
+                    ],
+                ),
+            ),
+            (20, committed_at_rank("aa", "乙", 2)),
+            (30, NativeFeedbackEvent::PostCommitBackspaceRouted),
+            (
+                40,
+                NativeFeedbackEvent::RawCodeCommitted {
+                    code: "tool".to_owned(),
+                },
+            ),
+            (
+                50,
+                NativeFeedbackEvent::CompositionCancelled {
+                    code: "bb".to_owned(),
+                    source: NativeCancellationSource::Escape,
+                },
+            ),
+        ];
+        let report =
+            analyze_linked_research(&[snapshot(&stream, 0, 0, None, events)], &[]).unwrap();
+        assert_eq!(report.input_scenes().len(), 1);
+        let episodes = report.input_scenes()[0].episodes();
+        assert_eq!(episodes.len(), 3);
+        assert_eq!(episodes[0].kind(), ResearchWishEpisodeKind::CandidateCommit);
+        assert_eq!(episodes[0].code(), "aa");
+        assert_eq!(episodes[0].text(), Some("乙"));
+        assert_eq!(episodes[0].rank(), Some(2));
+        assert_eq!(episodes[0].top_candidate(), Some("甲"));
+        assert!(episodes[0].post_commit_backspace_routed());
+        assert_eq!(episodes[1].kind(), ResearchWishEpisodeKind::RawCodeCommit);
+        assert_eq!(episodes[1].top_candidate(), None);
+        assert_eq!(episodes[2].kind(), ResearchWishEpisodeKind::Cancellation);
     }
 
     #[test]
