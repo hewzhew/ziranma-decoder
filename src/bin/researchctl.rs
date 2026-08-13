@@ -186,25 +186,49 @@ fn print_review(root: &Path) -> Result<(), Box<dyn Error>> {
     let latest_runtime = latest_runtime_review(&snapshots)?;
     let wishes = load_linkable_wishes(root)?;
     let scenes = analyze_linked_research(&snapshots, &wishes)?;
-    let (latest_runtime, latest_triage) = match latest_runtime {
+    let (latest_runtime, latest_triage, latest_private_review) = match latest_runtime {
         Some((identity, review)) => {
             let half_pairs = analyze_runtime_half_pairs(&snapshots, &identity)?;
             let latest_triage = analyze_research_issue_signals_for_runtime(&snapshots, &identity)?;
             (
                 review.render_runtime_summary(&identity, &half_pairs),
                 Some(latest_triage),
+                Some(review),
             )
         }
-        None => ("最新运行身份：尚无带版本标识的批次。".to_owned(), None),
+        None => (
+            "最新运行身份：尚无带版本标识的批次。".to_owned(),
+            None,
+            None,
+        ),
     };
     println!(
         "{}\n\n{}\n\n{}\n\n{}",
         latest_runtime,
         render_scoped_issue_triage(latest_triage.as_ref(), &triage),
-        review.render(),
+        render_scoped_private_review(latest_private_review.as_ref(), &review),
         render_scene_analysis(&scenes)
     );
     Ok(())
+}
+
+fn render_scoped_private_review(latest: Option<&ResearchReview>, all: &ResearchReview) -> String {
+    let Some(latest) = latest else {
+        return all.render();
+    };
+    if latest.batches == all.batches {
+        return format!(
+            "最新运行身份的明文问题卡（全部已读取批次均属于这一身份）\n{}",
+            latest.render()
+        );
+    }
+    format!(
+        "最新运行身份的明文问题卡（与旧批次分开，优先用于判断当前版本）\n{}\n\n\
+         全部已读取批次的历史背景（可能包含旧版行为，不用于直接归因当前版本）\n{}\n\
+         样本范围：两组批次不同；当前身份卡优先，历史卡只用于寻找长期重复模式。",
+        latest.render(),
+        all.render(),
+    )
 }
 
 fn render_scoped_issue_triage(
@@ -4248,6 +4272,39 @@ mod tests {
         assert!(!latest_summary.contains("dago"));
         assert!(!latest_summary.contains("大国"));
         assert!(!latest_summary.contains("打过"));
+    }
+
+    #[test]
+    fn scoped_private_review_keeps_latest_runtime_cards_ahead_of_history() {
+        let mut latest = ResearchReview {
+            batches: 2,
+            available_batches: 2,
+            ..ResearchReview::default()
+        };
+        latest.cancelled_codes.insert("latest-code".to_owned(), 1);
+        let mut all = ResearchReview {
+            batches: 5,
+            available_batches: 5,
+            ..ResearchReview::default()
+        };
+        all.cancelled_codes.insert("latest-code".to_owned(), 1);
+        all.cancelled_codes.insert("legacy-code".to_owned(), 4);
+
+        let rendered = render_scoped_private_review(Some(&latest), &all);
+        assert!(rendered.contains("最新运行身份的明文问题卡"));
+        assert!(rendered.contains("全部已读取批次的历史背景"));
+        assert!(rendered.contains("可能包含旧版行为，不用于直接归因当前版本"));
+        let latest_position = rendered.find("latest-code").unwrap();
+        let legacy_position = rendered.find("legacy-code").unwrap();
+        assert!(latest_position < legacy_position);
+
+        let one_scope = render_scoped_private_review(Some(&all), &all);
+        assert!(one_scope.contains("全部已读取批次均属于这一身份"));
+        assert!(!one_scope.contains("历史背景"));
+
+        let unidentified = render_scoped_private_review(None, &all);
+        assert!(!unidentified.contains("最新运行身份的明文问题卡"));
+        assert!(unidentified.contains("legacy-code"));
     }
 
     #[test]
