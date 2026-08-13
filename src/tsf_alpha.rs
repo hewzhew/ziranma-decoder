@@ -13096,6 +13096,25 @@ mod tests {
     }
 
     #[test]
+    fn local_selection_cancels_a_stale_background_refresh_result() {
+        let mut runtime = PersonalRankingRuntime::memory_only();
+        let (sender, receiver) = mpsc::channel();
+        runtime.pending_refresh = Some(receiver);
+        sender
+            .send(PersonalRankingRefreshResult::new(
+                LoadedPersonalRanking::default(),
+                LoadedPersonalRankingSuppressions::default(),
+                &[],
+            ))
+            .unwrap();
+
+        assert!(runtime.record("ab", "乙"));
+        assert!(runtime.pending_refresh.is_none());
+        assert!(!runtime.apply_completed_refresh());
+        assert_eq!(runtime.snapshot.preferred_text("ab"), Some("乙"));
+    }
+
+    #[test]
     fn full_background_queue_rejects_without_waiting_for_capacity() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let health = Arc::new(BackgroundPersistenceHealth::default());
