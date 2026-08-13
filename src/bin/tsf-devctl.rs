@@ -3163,7 +3163,15 @@ mod tests {
         assert!(contents.contains("set \"repository_root=%~dp0\""));
         assert!(contents.contains("scripts\\resolve-user-tool.cmd"));
         assert!(contents.contains("if \"%action%\"==\"\" set \"action=status\""));
-        assert!(contents.contains("exact-short-status --root \"%exact_root%\""));
+        assert!(contents.contains("exact-short-readiness ^"));
+        assert!(contents.contains("--core-root \"%core_root%\" ^"));
+        assert!(contents.contains("--supplemental-root \"%supplemental_root%\" ^"));
+        assert_eq!(
+            contents
+                .matches("--expected-sha256 \"%expected_sha256%\" ^")
+                .count(),
+            3
+        );
         assert!(contents.contains("if /i \"%action%\"==\"prepare\" goto prepare"));
         assert!(contents.contains("exact-short-prepare ^"));
         assert!(contents.contains(

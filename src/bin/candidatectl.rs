@@ -259,6 +259,14 @@ enum Options {
     ExactShortStatus {
         root: PathBuf,
     },
+    ExactShortReadiness {
+        root: PathBuf,
+        core_root: PathBuf,
+        supplemental_root: Option<PathBuf>,
+        package: PathBuf,
+        expected_sha256: String,
+        exact_promotions: usize,
+    },
     ExactShortPrepare {
         root: PathBuf,
         core_root: PathBuf,
@@ -718,6 +726,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => supplement_enable(&root, exact_promotions)?,
         Options::SupplementDisable { root } => supplement_disable(&root)?,
         Options::ExactShortStatus { root } => exact_short_status(&root)?,
+        Options::ExactShortReadiness {
+            root,
+            core_root,
+            supplemental_root,
+            package,
+            expected_sha256,
+            exact_promotions,
+        } => exact_short_readiness(ExactShortReadinessRequest {
+            root: &root,
+            core_root: &core_root,
+            supplemental_root: supplemental_root.as_deref(),
+            package: &package,
+            expected_sha256: &expected_sha256,
+            exact_promotions,
+        })?,
         Options::ExactShortPrepare {
             root,
             core_root,
@@ -862,6 +885,7 @@ fn parse_options(
         "exact-short-status" => Ok(Options::ExactShortStatus {
             root: parse_root_only(arguments, "exact-short-status")?,
         }),
+        "exact-short-readiness" => parse_exact_short_readiness(arguments),
         "exact-short-prepare" => parse_exact_short_prepare(arguments),
         "exact-short-enable" => parse_exact_short_enable(arguments),
         "exact-short-disable" => Ok(Options::ExactShortDisable {
@@ -2514,6 +2538,64 @@ fn parse_exact_short_enable(
     })
 }
 
+fn parse_exact_short_readiness(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut root = None;
+    let mut core_root = None;
+    let mut supplemental_root = None;
+    let mut without_supplement = false;
+    let mut package = None;
+    let mut expected_sha256 = None;
+    let mut exact_promotions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--core-root" => set_path(&mut core_root, &mut arguments, "--core-root")?,
+            "--supplemental-root" => set_path(
+                &mut supplemental_root,
+                &mut arguments,
+                "--supplemental-root",
+            )?,
+            "--without-supplement" => {
+                if without_supplement {
+                    return Err("--without-supplement can be given only once".into());
+                }
+                without_supplement = true;
+            }
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--expected-sha256" => {
+                set_value(&mut expected_sha256, &mut arguments, "--expected-sha256")?
+            }
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            _ => return Err("unknown exact-short-readiness argument; value was suppressed".into()),
+        }
+    }
+    let exact_promotions =
+        exact_promotions.ok_or("exact-short-readiness requires --exact-promotions")?;
+    if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+        return Err("exact-short-readiness --exact-promotions is outside the fixed bound".into());
+    }
+    if supplemental_root.is_some() == without_supplement {
+        return Err(
+            "exact-short-readiness requires exactly one of --supplemental-root or --without-supplement"
+                .into(),
+        );
+    }
+    Ok(Options::ExactShortReadiness {
+        root: root.ok_or("exact-short-readiness requires --root")?,
+        core_root: core_root.ok_or("exact-short-readiness requires --core-root")?,
+        supplemental_root,
+        package: package.ok_or("exact-short-readiness requires --package")?,
+        expected_sha256: canonical_expected_sha256(
+            &expected_sha256.ok_or("exact-short-readiness requires --expected-sha256")?,
+        )?,
+        exact_promotions,
+    })
+}
+
 fn parse_exact_short_prepare(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -2896,6 +2978,9 @@ fn print_usage() {
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
     eprintln!("  supplement-disable --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  exact-short-status --root <EXACT_SHORT_SLOT_DIR>");
+    eprintln!(
+        "  exact-short-readiness --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --package <PUBLIC_EXACT_PACKAGE_DIR> --expected-sha256 <SHA256> --exact-promotions <1..8>"
+    );
     eprintln!(
         "  exact-short-prepare --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --package <PUBLIC_EXACT_PACKAGE_DIR> --expected-sha256 <SHA256> --exact-promotions <1..8> --sample-limit <1..32> --repetitions <1..20>"
     );
@@ -10397,6 +10482,187 @@ fn exact_short_status(root: &Path) -> Result<String, Box<dyn std::error::Error>>
     Ok(status)
 }
 
+struct ExactShortReadinessRequest<'a> {
+    root: &'a Path,
+    core_root: &'a Path,
+    supplemental_root: Option<&'a Path>,
+    package: &'a Path,
+    expected_sha256: &'a str,
+    exact_promotions: usize,
+}
+
+fn exact_short_readiness(
+    request: ExactShortReadinessRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let ExactShortReadinessRequest {
+        root,
+        core_root,
+        supplemental_root,
+        package,
+        expected_sha256,
+        exact_promotions,
+    } = request;
+    let exact_public = match load_public_package_directory(package) {
+        Ok(loaded) if verify_expected_sha256(&loaded, expected_sha256).is_ok() => loaded,
+        _ => {
+            return Ok(
+                "公开精确短词准备度\n公开材料：不可用或可信摘要不匹配\n核心与补充层：未检查\n专项准备：不能确认\n日用状态：本次未改变\n下一步：恢复固定公开材料后重新只读体检\n本次操作：只读\n"
+                    .to_owned(),
+            );
+        }
+    };
+    let exact_catalog = match load_exact_short_package_directory(package) {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            return Ok(
+                "公开精确短词准备度\n公开材料：格式不适用于精确短词层\n核心与补充层：未检查\n专项准备：不能确认\n日用状态：本次未改变\n下一步：恢复固定公开材料后重新只读体检\n本次操作：只读\n"
+                    .to_owned(),
+            );
+        }
+    };
+    if exact_catalog.authentication_sha256 != exact_public.authentication_sha256 {
+        return Ok(
+            "公开精确短词准备度\n公开材料：检查期间发生变化\n核心与补充层：未检查\n专项准备：不能确认\n日用状态：本次未改变\n下一步：保持材料静止后重新只读体检\n本次操作：只读\n"
+                .to_owned(),
+        );
+    }
+    let expected_package = candidate_package_storage_id(
+        &exact_public.provenance_text,
+        &exact_public.manifest_text,
+        &exact_public.payload_text,
+    );
+    let public = match load_exact_short_public_context(core_root, supplemental_root) {
+        Ok(public) => public,
+        Err(_) => {
+            return Ok(format!(
+                "公开精确短词准备度\n公开材料：通过；版本 {}\n核心与补充层：不可用、未启用或凭据无效\n专项准备：不能确认\n日用状态：本次未改变；运行时会按认证结果失败关闭\n下一步：先恢复当前公开运行时组合，再重新只读体检\n本次操作：只读\n",
+                exact_catalog.catalog.revision(),
+            ));
+        }
+    };
+    let (slots, state) = match (read_slot_state(root), read_exact_short_state(root)) {
+        (Ok(slots), Ok(state)) => (slots, state),
+        _ => {
+            return Ok(format!(
+                "公开精确短词准备度\n公开材料：通过；版本 {}\n核心与补充层：通过\n专项准备：独立根损坏，不能启用\n日用状态：本次未改变；运行时将停止注入\n下一步：保留现场并只读诊断\n本次操作：只读\n",
+                exact_catalog.catalog.revision(),
+            ));
+        }
+    };
+
+    let Some(current) = slots.current() else {
+        if state.is_enabled() {
+            return Ok(render_unusable_exact_short_readiness(
+                exact_catalog.catalog.revision(),
+                &state,
+            ));
+        }
+        return Ok(format!(
+            "公开精确短词准备度\n公开材料：通过；版本 {}\n核心与补充层：通过\n专项准备：尚未进行\n日用状态：关闭；候选未改变\n下一步：可显式准备；会写入独立精确短词根，但不会启用\n本次操作：只读\n",
+            exact_catalog.catalog.revision(),
+        ));
+    };
+    if current != expected_package {
+        let daily_state = match state.package() {
+            None => "关闭；候选未改变",
+            Some(package) if Some(package) == slots.current() => {
+                "状态指向另一版本；本次未认证或改变"
+            }
+            Some(_) => "已回退；当前准备包不会注入第二页",
+        };
+        return Ok(format!(
+            "公开精确短词准备度\n公开材料：通过\n核心与补充层：通过\n专项准备：独立根指向另一版本，未按本组合认证\n日用状态：{daily_state}\n下一步：需要独立审计与迁移，固定准备入口不会覆盖\n本次操作：只读\n"
+        ));
+    }
+
+    let installed = match load_installed_exact_short_package(root, current) {
+        Ok(installed) => installed,
+        Err(_) => {
+            return Ok(render_unusable_exact_short_readiness(
+                exact_catalog.catalog.revision(),
+                &state,
+            ));
+        }
+    };
+    if validate_preflight_receipt(root, current, &installed.authentication_sha256).is_err() {
+        return Ok(render_unusable_exact_short_readiness(
+            exact_catalog.catalog.revision(),
+            &state,
+        ));
+    }
+    if installed.authentication_sha256 != exact_public.authentication_sha256 {
+        return Ok(render_unusable_exact_short_readiness(
+            exact_catalog.catalog.revision(),
+            &state,
+        ));
+    }
+    let receipt = match validate_exact_short_preflight_identity(
+        root,
+        current,
+        &installed.authentication_sha256,
+        exact_promotions,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            return Ok(render_unusable_exact_short_readiness(
+                exact_catalog.catalog.revision(),
+                &state,
+            ));
+        }
+    };
+    let supplemental = public
+        .supplemental_sha256
+        .as_deref()
+        .zip(public.supplemental_promotions);
+    if !receipt.matches_runtime(&public.core_sha256, supplemental) {
+        return Ok(format!(
+            "公开精确短词准备度\n公开材料：通过；版本 {}\n核心与补充层：通过，但已偏离专项凭据\n专项准备：已失效，不能启用\n日用状态：{}；本次未改变\n下一步：需要为当前公开组合重新预检；固定准备入口不会覆盖旧组合\n本次操作：只读\n",
+            installed.catalog.revision(),
+            if state.is_enabled() {
+                "凭据漂移，运行时将停止注入"
+            } else {
+                "关闭"
+            },
+        ));
+    }
+
+    let (daily_state, next_step) =
+        if state.package() == Some(current) && state.exact_promotions() == exact_promotions {
+            (
+                "已启用；运行时仍会逐次复核组合凭据",
+                "无需写入；如需回退可显式关闭",
+            )
+        } else if state.is_enabled() {
+            (
+                "已回退；当前准备包不会注入第二页",
+                "需先审计现有状态；不能直接复用启用",
+            )
+        } else {
+            (
+                "关闭；候选未改变",
+                "已可启用；启用会写一个小状态文件并从下一组合生效",
+            )
+        };
+    Ok(format!(
+        "公开精确短词准备度\n公开材料：通过；版本 {}\n核心与补充层：通过\n专项准备：通过；组合凭据匹配\n日用状态：{daily_state}\n下一步：{next_step}\n本次操作：只读\n",
+        installed.catalog.revision(),
+    ))
+}
+
+fn render_unusable_exact_short_readiness(
+    expected_revision: &str,
+    state: &CandidateExactShortState,
+) -> String {
+    let daily_state = if state.is_enabled() {
+        "凭据无效；运行时将停止注入"
+    } else {
+        "关闭；候选未改变"
+    };
+    format!(
+        "公开精确短词准备度\n公开材料：通过；版本 {expected_revision}\n核心与补充层：通过\n专项准备：损坏或凭据不完整；不能启用\n日用状态：{daily_state}\n下一步：保留现场并只读诊断；固定准备入口不会覆盖\n本次操作：只读\n"
+    )
+}
+
 fn exact_short_prepare(
     request: ExactShortPrepareRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -12406,6 +12672,45 @@ mod tests {
                 "32".to_owned(),
                 "--repetitions".to_owned(),
                 "21".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_short_readiness_parser_binds_the_complete_public_context() {
+        assert_eq!(
+            parse_options([
+                "exact-short-readiness".to_owned(),
+                "--root".to_owned(),
+                "exact-root".to_owned(),
+                "--core-root".to_owned(),
+                "core-root".to_owned(),
+                "--supplemental-root".to_owned(),
+                "supplement-root".to_owned(),
+                "--package".to_owned(),
+                "exact-package".to_owned(),
+                "--expected-sha256".to_owned(),
+                "a".repeat(64),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortReadiness {
+                root: PathBuf::from("exact-root"),
+                core_root: PathBuf::from("core-root"),
+                supplemental_root: Some(PathBuf::from("supplement-root")),
+                package: PathBuf::from("exact-package"),
+                expected_sha256: "a".repeat(64),
+                exact_promotions: 2,
+            }
+        );
+        assert!(
+            parse_options([
+                "exact-short-readiness".to_owned(),
+                "--without-supplement".to_owned(),
+                "--supplemental-root".to_owned(),
+                "supplement-root".to_owned(),
             ])
             .is_err()
         );
@@ -15052,6 +15357,7 @@ ngram 1=3\n\n\
         let package_a = root.join("package-a");
         let package_b = root.join("package-b");
         let core_package = root.join("core-package");
+        let core_package_b = root.join("core-package-b");
         let core_slots = root.join("core-slots");
         let slots = root.join("exact-short");
         fs::create_dir(&root).unwrap();
@@ -15090,7 +15396,28 @@ ngram 1=3\n\n\
             &test_declaration(LEXICON),
         )
         .unwrap();
+        build_public_package(
+            &root.join("core.tsv"),
+            &core_package_b,
+            "exact-short-core-b",
+            &test_declaration(LEXICON),
+        )
+        .unwrap();
         adopt(&core_slots, &core_package, &package_sha256(&core_package)).unwrap();
+
+        let unprepared = exact_short_readiness(ExactShortReadinessRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
+        assert!(unprepared.contains("专项准备：尚未进行"));
+        assert!(unprepared.contains("日用状态：关闭；候选未改变"));
+        assert!(unprepared.contains("本次操作：只读"));
+        assert!(!slots.exists());
 
         assert_eq!(
             exact_short_status(&slots).unwrap(),
@@ -15098,6 +15425,17 @@ ngram 1=3\n\n\
         );
         assert!(!slots.exists());
         adopt(&slots, &package_a, &package_sha256(&package_a)).unwrap();
+        let incomplete = exact_short_readiness(ExactShortReadinessRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
+        assert!(incomplete.contains("专项准备：损坏或凭据不完整；不能启用"));
+        assert!(incomplete.contains("固定准备入口不会覆盖"));
         assert!(
             exact_short_status(&slots)
                 .unwrap()
@@ -15126,6 +15464,40 @@ ngram 1=3\n\n\
         };
         write_combined_receipt(&package_a, 2);
 
+        let ready = exact_short_readiness(ExactShortReadinessRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
+        assert!(ready.contains("专项准备：通过；组合凭据匹配"));
+        assert!(ready.contains("已可启用"));
+        assert!(ready.contains("日用状态：关闭；候选未改变"));
+
+        stage(
+            &core_slots,
+            &core_package_b,
+            &package_sha256(&core_package_b),
+        )
+        .unwrap();
+        promote(&core_slots).unwrap();
+        let drifted_context = exact_short_readiness(ExactShortReadinessRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
+        assert!(drifted_context.contains("已偏离专项凭据"));
+        assert!(drifted_context.contains("专项准备：已失效，不能启用"));
+        assert!(drifted_context.contains("固定准备入口不会覆盖旧组合"));
+        rollback(&core_slots).unwrap();
+
         let enabled = exact_short_enable(&slots, &core_slots, None, 2).unwrap();
         assert!(enabled.contains("版本：exact-short-a"));
         assert!(enabled.contains("每码最多补：2"));
@@ -15141,12 +15513,34 @@ ngram 1=3\n\n\
             .unwrap();
         assert_eq!(loaded.catalog().revision(), "exact-short-a");
         assert_eq!(loaded.exact_promotions(), 2);
+        let active = exact_short_readiness(ExactShortReadinessRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
+        assert!(active.contains("日用状态：已启用"));
+        assert!(active.contains("下一步：无需写入"));
 
         stage(&slots, &package_b, &package_sha256(&package_b)).unwrap();
         promote(&slots).unwrap();
         let drifted = exact_short_status(&slots).unwrap();
         assert!(drifted.contains("状态：已回退，不注入第二页"));
         assert!(drifted.contains("已准备：exact-short-b"));
+        let other_version = exact_short_readiness(ExactShortReadinessRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
+        assert!(other_version.contains("指向另一版本，未按本组合认证"));
+        assert!(other_version.contains("固定准备入口不会覆盖"));
         assert!(exact_short_enable(&slots, &core_slots, None, 1).is_err());
         fs::remove_file(slots.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE)).unwrap();
         write_combined_receipt(&package_b, 1);

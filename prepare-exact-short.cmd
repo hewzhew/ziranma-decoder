@@ -28,15 +28,25 @@ for /f "usebackq delims=" %%P in (`call "%resolver%" candidatectl`) do set "cand
 if not defined candidatectl goto tool_unavailable
 if not exist "%candidatectl%" goto tool_unavailable
 
-set "required_command=exact-short-status"
-if /i "%action%"=="prepare" set "required_command=exact-short-prepare"
+set "required_command=exact-short-readiness"
 "%candidatectl%" 2>&1 | "%SystemRoot%\System32\findstr.exe" /l /c:"%required_command%" >nul
 if errorlevel 1 goto tool_outdated
+if /i "%action%"=="prepare" (
+    set "required_command=exact-short-prepare"
+    "%candidatectl%" 2>&1 | "%SystemRoot%\System32\findstr.exe" /l /c:"exact-short-prepare" >nul
+    if errorlevel 1 goto tool_outdated
+)
 
 if /i "%action%"=="prepare" goto prepare
 
 :status
-"%candidatectl%" exact-short-status --root "%exact_root%"
+"%candidatectl%" exact-short-readiness ^
+    --root "%exact_root%" ^
+    --core-root "%core_root%" ^
+    --supplemental-root "%supplemental_root%" ^
+    --package "%package%" ^
+    --expected-sha256 "%expected_sha256%" ^
+    --exact-promotions 2
 exit /b %ERRORLEVEL%
 
 :prepare
@@ -63,7 +73,13 @@ if not "%prepare_exit_code%"=="0" (
 )
 
 echo.
-"%candidatectl%" exact-short-status --root "%exact_root%"
+"%candidatectl%" exact-short-readiness ^
+    --root "%exact_root%" ^
+    --core-root "%core_root%" ^
+    --supplemental-root "%supplemental_root%" ^
+    --package "%package%" ^
+    --expected-sha256 "%expected_sha256%" ^
+    --exact-promotions 2
 set "status_exit_code=%ERRORLEVEL%"
 if not "%status_exit_code%"=="0" (
     echo Preparation completed, but the final read-only status check failed.
