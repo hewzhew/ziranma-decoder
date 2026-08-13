@@ -7439,16 +7439,27 @@ const LANGUAGE_BAR_ICON_ROW_BYTES: usize = 2;
 const LANGUAGE_BAR_ICON_BYTES: usize =
     LANGUAGE_BAR_ICON_SIZE as usize * LANGUAGE_BAR_ICON_ROW_BYTES;
 
-// Hand-tuned monochrome 16 px glyphs keep the modern taskbar item crisp
-// without adding a resource compiler or a theme-specific bitmap. The system
-// recolors their black pixels through TF_LBI_STYLE_TEXTCOLORICON.
-const LANGUAGE_BAR_CHINESE_ICON_ROWS: [u16; LANGUAGE_BAR_ICON_SIZE as usize] = [
-    0x0300, 0x0600, 0x3ff8, 0x2008, 0x2008, 0x3ff8, 0x2008, 0x2008, 0x3ff8, 0x2008, 0x2008, 0x2008,
-    0x3ff8, 0x0000, 0x0000, 0x0000,
+// A hand-tuned monochrome 16 px composite mark keeps the language-bar item
+// crisp without adding theme-specific bitmap resources. The cat face at the
+// left is the stable product identity; only the separate 5 px `中`/`A` badge
+// at the right changes with the input mode. Windows recolors all ink through
+// TF_LBI_STYLE_TEXTCOLORICON, so the same mask remains legible in light, dark,
+// and high-contrast themes.
+#[cfg(test)]
+const LANGUAGE_BAR_CAT_REGION_MASK: u16 = 0xff80;
+#[cfg(test)]
+const LANGUAGE_BAR_MODE_REGION_MASK: u16 = 0x003e;
+const LANGUAGE_BAR_CAT_ICON_ROWS: [u16; LANGUAGE_BAR_ICON_SIZE as usize] = [
+    0x0000, 0x0000, 0x4100, 0x6300, 0x9c80, 0x8080, 0xa280, 0x8080, 0x8880, 0x9480, 0x6300, 0x3e00,
+    0x0000, 0x0000, 0x0000, 0x0000,
 ];
-const LANGUAGE_BAR_ENGLISH_ICON_ROWS: [u16; LANGUAGE_BAR_ICON_SIZE as usize] = [
-    0x0000, 0x0600, 0x0600, 0x1980, 0x1980, 0x6060, 0x6060, 0x6060, 0x6060, 0x7fe0, 0x7fe0, 0x6060,
-    0x6060, 0x6060, 0x6060, 0x0000,
+const LANGUAGE_BAR_CHINESE_BADGE_ROWS: [u16; LANGUAGE_BAR_ICON_SIZE as usize] = [
+    0x0000, 0x0000, 0x0008, 0x003e, 0x002a, 0x002a, 0x002a, 0x003e, 0x0008, 0x0008, 0x0008, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000,
+];
+const LANGUAGE_BAR_ENGLISH_BADGE_ROWS: [u16; LANGUAGE_BAR_ICON_SIZE as usize] = [
+    0x0000, 0x0000, 0x0008, 0x0014, 0x0014, 0x0022, 0x0022, 0x003e, 0x0022, 0x0022, 0x0022, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000,
 ];
 const LANGUAGE_BAR_RECORDING_DOT: u16 = 0x0006;
 
@@ -7456,10 +7467,11 @@ fn feedback_language_bar_icon_rows(
     mode: InputMode,
     summary: NativeFeedbackSummary,
 ) -> [u16; LANGUAGE_BAR_ICON_SIZE as usize] {
-    let mut rows = match mode {
-        InputMode::Chinese => LANGUAGE_BAR_CHINESE_ICON_ROWS,
-        InputMode::English => LANGUAGE_BAR_ENGLISH_ICON_ROWS,
+    let badge = match mode {
+        InputMode::Chinese => LANGUAGE_BAR_CHINESE_BADGE_ROWS,
+        InputMode::English => LANGUAGE_BAR_ENGLISH_BADGE_ROWS,
     };
+    let mut rows = std::array::from_fn(|row| LANGUAGE_BAR_CAT_ICON_ROWS[row] | badge[row]);
     if summary.lifecycle == NativeFeedbackLifecycle::Recording {
         rows[13] |= LANGUAGE_BAR_RECORDING_DOT;
         rows[14] |= LANGUAGE_BAR_RECORDING_DOT;
@@ -7779,7 +7791,7 @@ impl NativeFeedbackLanguageBarState {
 fn feedback_language_bar_text(mode: InputMode, summary: NativeFeedbackSummary) -> String {
     let mode = match mode {
         InputMode::Chinese => "中",
-        InputMode::English => "英",
+        InputMode::English => "A",
     };
     if summary.lifecycle == NativeFeedbackLifecycle::Recording {
         format!("{mode} ●")
@@ -18898,7 +18910,8 @@ mod tests {
         let (disabled_and, disabled_xor) =
             feedback_language_bar_icon_masks(InputMode::Chinese, disabled);
         assert!(disabled_xor.iter().all(|byte| *byte == 0));
-        let top_transparent = !LANGUAGE_BAR_CHINESE_ICON_ROWS[0];
+        let chinese = feedback_language_bar_icon_rows(InputMode::Chinese, disabled);
+        let top_transparent = !chinese[0];
         assert_eq!(disabled_and[0], (top_transparent >> 8) as u8);
         assert_eq!(disabled_and[1], top_transparent as u8);
 
@@ -18911,9 +18924,35 @@ mod tests {
         assert_eq!(recording_xor, disabled_xor);
         assert_ne!(recording_and, disabled_and);
 
-        let chinese = feedback_language_bar_icon_rows(InputMode::Chinese, disabled);
         let english = feedback_language_bar_icon_rows(InputMode::English, disabled);
         assert_ne!(chinese, english);
+        for row in 0..LANGUAGE_BAR_ICON_SIZE as usize {
+            assert_eq!(
+                chinese[row] & LANGUAGE_BAR_CAT_REGION_MASK,
+                LANGUAGE_BAR_CAT_ICON_ROWS[row],
+                "the cat identity must stay unchanged in Chinese mode at row {row}"
+            );
+            assert_eq!(
+                english[row] & LANGUAGE_BAR_CAT_REGION_MASK,
+                LANGUAGE_BAR_CAT_ICON_ROWS[row],
+                "the cat identity must stay unchanged in English mode at row {row}"
+            );
+            assert_eq!(
+                chinese[row] & LANGUAGE_BAR_MODE_REGION_MASK,
+                LANGUAGE_BAR_CHINESE_BADGE_ROWS[row],
+                "the Chinese badge must remain in its separate region at row {row}"
+            );
+            assert_eq!(
+                english[row] & LANGUAGE_BAR_MODE_REGION_MASK,
+                LANGUAGE_BAR_ENGLISH_BADGE_ROWS[row],
+                "the English badge must remain in its separate region at row {row}"
+            );
+            assert_eq!(
+                chinese[row] & !(LANGUAGE_BAR_CAT_REGION_MASK | LANGUAGE_BAR_MODE_REGION_MASK),
+                0,
+                "the one-pixel gap and outer margin must remain transparent at row {row}"
+            );
+        }
         assert_eq!(chinese[13] & LANGUAGE_BAR_RECORDING_DOT, 0);
         assert_eq!(
             feedback_language_bar_icon_rows(InputMode::Chinese, recording)[13]
@@ -18991,16 +19030,21 @@ mod tests {
         assert_ne!(flags.load(Ordering::Acquire) & TF_LBI_ICON as usize, 0);
         assert_ne!(flags.load(Ordering::Acquire) & TF_LBI_TEXT as usize, 0);
 
+        flags.store(0, Ordering::Release);
         mode.set(InputMode::English);
         state.notify();
-        assert_eq!(unsafe { button.GetText() }.unwrap().to_string(), "英 ●");
+        let mode_update_flags = flags.load(Ordering::Acquire);
+        assert_ne!(mode_update_flags & TF_LBI_ICON as usize, 0);
+        assert_ne!(mode_update_flags & TF_LBI_TEXT as usize, 0);
+        assert_ne!(mode_update_flags & TF_LBI_TOOLTIP as usize, 0);
+        assert_eq!(unsafe { button.GetText() }.unwrap().to_string(), "A ●");
 
         unsafe { button.OnMenuSelect(FEEDBACK_MENU_STOP) }.unwrap();
         assert_eq!(
             feedback.lock().unwrap().summary().lifecycle,
             NativeFeedbackLifecycle::Stopped
         );
-        assert_eq!(unsafe { button.GetText() }.unwrap().to_string(), "英");
+        assert_eq!(unsafe { button.GetText() }.unwrap().to_string(), "A");
         unsafe { button.OnMenuSelect(FEEDBACK_MENU_START) }.unwrap();
         assert_eq!(
             feedback.lock().unwrap().summary().lifecycle,
