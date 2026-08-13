@@ -50,14 +50,14 @@ use ziranma_core::{
     candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
     candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
-    load_candidate_runtime_snapshots, load_current_candidate_snapshot, parse_lexicon_tsv,
-    parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_public_short_word_consensus,
-    parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
-    select_public_bigram_training_sequences, select_public_character_training_texts,
-    select_public_continuous_composition_cases, select_public_lexicon_rank_probes,
-    select_public_single_character_context_cases, select_public_static_context_cases,
-    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    load_candidate_runtime_snapshots, load_candidate_runtime_snapshots_with_layers,
+    load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_phrase_allowlist,
+    parse_public_rime_slice, parse_public_short_word_consensus, parse_rime_lexicon,
+    parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    select_public_character_training_texts, select_public_continuous_composition_cases,
+    select_public_lexicon_rank_probes, select_public_single_character_context_cases,
+    select_public_static_context_cases, select_public_supplemental_composition_cases,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 #[cfg(windows)]
@@ -281,6 +281,8 @@ enum Options {
         root: PathBuf,
         core_root: PathBuf,
         supplemental_root: Option<PathBuf>,
+        package: PathBuf,
+        expected_sha256: String,
         exact_promotions: usize,
     },
     ExactShortDisable {
@@ -764,13 +766,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             core_root,
             supplemental_root,
+            package,
+            expected_sha256,
             exact_promotions,
-        } => exact_short_enable(
-            &root,
-            &core_root,
-            supplemental_root.as_deref(),
+        } => exact_short_enable(ExactShortEnableRequest {
+            root: &root,
+            core_root: &core_root,
+            supplemental_root: supplemental_root.as_deref(),
+            package: &package,
+            expected_sha256: &expected_sha256,
             exact_promotions,
-        )?,
+        })?,
         Options::ExactShortDisable { root } => exact_short_disable(&root)?,
         Options::Preflight { package } => preflight(&package)?,
         Options::PackageQuery {
@@ -2497,6 +2503,8 @@ fn parse_exact_short_enable(
     let mut core_root = None;
     let mut supplemental_root = None;
     let mut without_supplement = false;
+    let mut package = None;
+    let mut expected_sha256 = None;
     let mut exact_promotions = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -2512,6 +2520,10 @@ fn parse_exact_short_enable(
                     return Err("--without-supplement can be given only once".into());
                 }
                 without_supplement = true;
+            }
+            "--package" => set_path(&mut package, &mut arguments, "--package")?,
+            "--expected-sha256" => {
+                set_value(&mut expected_sha256, &mut arguments, "--expected-sha256")?
             }
             "--exact-promotions" => {
                 set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
@@ -2534,6 +2546,10 @@ fn parse_exact_short_enable(
         root: root.ok_or("exact-short-enable requires --root")?,
         core_root: core_root.ok_or("exact-short-enable requires --core-root")?,
         supplemental_root,
+        package: package.ok_or("exact-short-enable requires --package")?,
+        expected_sha256: canonical_expected_sha256(
+            &expected_sha256.ok_or("exact-short-enable requires --expected-sha256")?,
+        )?,
         exact_promotions,
     })
 }
@@ -2985,7 +3001,7 @@ fn print_usage() {
         "  exact-short-prepare --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --package <PUBLIC_EXACT_PACKAGE_DIR> --expected-sha256 <SHA256> --exact-promotions <1..8> --sample-limit <1..32> --repetitions <1..20>"
     );
     eprintln!(
-        "  exact-short-enable --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --exact-promotions <1..8>"
+        "  exact-short-enable --root <EXACT_SHORT_SLOT_DIR> --core-root <CORE_SLOT_DIR> (--supplemental-root <ENABLED_SUPPLEMENTAL_SLOT_DIR> | --without-supplement) --package <PUBLIC_EXACT_PACKAGE_DIR> --expected-sha256 <SHA256> --exact-promotions <1..8>"
     );
     eprintln!("  exact-short-disable --root <EXACT_SHORT_SLOT_DIR>");
     eprintln!("  preflight --package <PACKAGE_DIR>");
@@ -10759,17 +10775,55 @@ fn exact_short_prepare(
     ))
 }
 
-fn exact_short_enable(
-    root: &Path,
-    core_root: &Path,
-    supplemental_root: Option<&Path>,
+struct ExactShortEnableRequest<'a> {
+    root: &'a Path,
+    core_root: &'a Path,
+    supplemental_root: Option<&'a Path>,
+    package: &'a Path,
+    expected_sha256: &'a str,
     exact_promotions: usize,
+}
+
+type ExactShortRuntimeVerifier = fn(&Path, Option<&Path>, &Path, &str, &str, usize) -> bool;
+
+fn exact_short_enable(
+    request: ExactShortEnableRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    exact_short_enable_with_runtime_verifier(request, verify_enabled_exact_short_runtime)
+}
+
+fn exact_short_enable_with_runtime_verifier(
+    request: ExactShortEnableRequest<'_>,
+    runtime_verifier: ExactShortRuntimeVerifier,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let ExactShortEnableRequest {
+        root,
+        core_root,
+        supplemental_root,
+        package: public_package,
+        expected_sha256,
+        exact_promotions,
+    } = request;
+    let exact_public = load_public_package_directory(public_package)?;
+    verify_expected_sha256(&exact_public, expected_sha256)?;
+    let expected_package = candidate_package_storage_id(
+        &exact_public.provenance_text,
+        &exact_public.manifest_text,
+        &exact_public.payload_text,
+    );
     let slots = read_slot_state(root)?;
     let package = slots
         .current()
         .ok_or("exact-short candidate package is not configured")?;
+    if package != expected_package {
+        return Err(
+            "prepared exact-short package does not match the explicit public package".into(),
+        );
+    }
     let loaded = load_installed_exact_short_package(root, package)?;
+    if loaded.authentication_sha256 != exact_public.authentication_sha256 {
+        return Err("prepared exact-short authentication does not match the public package".into());
+    }
     validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
     let public = load_exact_short_public_context(core_root, supplemental_root)?;
     let receipt = validate_exact_short_preflight_identity(
@@ -10789,10 +10843,53 @@ fn exact_short_enable(
     }
     let state = CandidateExactShortState::enabled(package, exact_promotions)?;
     write_exact_short_state(root, &state)?;
+
+    if !runtime_verifier(
+        core_root,
+        supplemental_root,
+        root,
+        package,
+        &loaded.authentication_sha256,
+        exact_promotions,
+    ) {
+        return match write_exact_short_state(root, &CandidateExactShortState::default()) {
+            Ok(()) => Err(
+                "exact-short runtime verification failed; activation was rolled back to disabled"
+                    .into(),
+            ),
+            Err(_) => Err(
+                "exact-short runtime verification failed and rollback could not be confirmed"
+                    .into(),
+            ),
+        };
+    }
     Ok(format!(
-        "公开精确短词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个双来源确认短词\n分页边界：第一页保持不动；从第二页开头按需注入\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
+        "公开精确短词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个双来源确认短词\n运行时复读：通过；同一包、同一上限、无分层回退\n分页边界：第一页保持不动；从第二页开头按需注入\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
         loaded.catalog.revision(),
     ))
+}
+
+fn verify_enabled_exact_short_runtime(
+    core_root: &Path,
+    supplemental_root: Option<&Path>,
+    exact_root: &Path,
+    package: &str,
+    authentication_sha256: &str,
+    exact_promotions: usize,
+) -> bool {
+    load_candidate_runtime_snapshots_with_layers(core_root, supplemental_root, Some(exact_root))
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .is_some_and(|snapshots| {
+            !snapshots.supplemental_fell_back()
+                && !snapshots.exact_short_fell_back()
+                && snapshots.exact_short().is_some_and(|exact| {
+                    exact.package_id() == package
+                        && exact.authentication_sha256() == authentication_sha256
+                        && exact.exact_promotions() == exact_promotions
+                })
+        })
 }
 
 struct ExactShortPublicContext {
@@ -13495,6 +13592,10 @@ mod tests {
                 "--core-root".to_owned(),
                 "core".to_owned(),
                 "--without-supplement".to_owned(),
+                "--package".to_owned(),
+                "exact-package".to_owned(),
+                "--expected-sha256".to_owned(),
+                "a".repeat(64),
                 "--exact-promotions".to_owned(),
                 "2".to_owned(),
             ])
@@ -13503,6 +13604,8 @@ mod tests {
                 root: PathBuf::from("exact-short"),
                 core_root: PathBuf::from("core"),
                 supplemental_root: None,
+                package: PathBuf::from("exact-package"),
+                expected_sha256: "a".repeat(64),
                 exact_promotions: 2,
             }
         );
@@ -15477,6 +15580,28 @@ ngram 1=3\n\n\
         assert!(ready.contains("已可启用"));
         assert!(ready.contains("日用状态：关闭；候选未改变"));
 
+        let forced_failure = exact_short_enable_with_runtime_verifier(
+            ExactShortEnableRequest {
+                root: &slots,
+                core_root: &core_slots,
+                supplemental_root: None,
+                package: &package_a,
+                expected_sha256: &package_sha256(&package_a),
+                exact_promotions: 2,
+            },
+            |_, _, _, _, _, _| false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(forced_failure.contains("activation was rolled back to disabled"));
+        assert_eq!(
+            CandidateExactShortState::parse(
+                &fs::read_to_string(slots.join(CANDIDATE_EXACT_SHORT_STATE_FILE)).unwrap()
+            )
+            .unwrap(),
+            CandidateExactShortState::default(),
+        );
+
         stage(
             &core_slots,
             &core_package_b,
@@ -15498,9 +15623,18 @@ ngram 1=3\n\n\
         assert!(drifted_context.contains("固定准备入口不会覆盖旧组合"));
         rollback(&core_slots).unwrap();
 
-        let enabled = exact_short_enable(&slots, &core_slots, None, 2).unwrap();
+        let enabled = exact_short_enable(ExactShortEnableRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_a,
+            expected_sha256: &package_sha256(&package_a),
+            exact_promotions: 2,
+        })
+        .unwrap();
         assert!(enabled.contains("版本：exact-short-a"));
         assert!(enabled.contains("每码最多补：2"));
+        assert!(enabled.contains("运行时复读：通过"));
         assert!(enabled.contains("第一页保持不动"));
         let state = CandidateExactShortState::parse(
             &fs::read_to_string(slots.join(CANDIDATE_EXACT_SHORT_STATE_FILE)).unwrap(),
@@ -15541,10 +15675,28 @@ ngram 1=3\n\n\
         .unwrap();
         assert!(other_version.contains("指向另一版本，未按本组合认证"));
         assert!(other_version.contains("固定准备入口不会覆盖"));
-        assert!(exact_short_enable(&slots, &core_slots, None, 1).is_err());
+        assert!(
+            exact_short_enable(ExactShortEnableRequest {
+                root: &slots,
+                core_root: &core_slots,
+                supplemental_root: None,
+                package: &package_b,
+                expected_sha256: &package_sha256(&package_b),
+                exact_promotions: 1,
+            })
+            .is_err()
+        );
         fs::remove_file(slots.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE)).unwrap();
         write_combined_receipt(&package_b, 1);
-        exact_short_enable(&slots, &core_slots, None, 1).unwrap();
+        exact_short_enable(ExactShortEnableRequest {
+            root: &slots,
+            core_root: &core_slots,
+            supplemental_root: None,
+            package: &package_b,
+            expected_sha256: &package_sha256(&package_b),
+            exact_promotions: 1,
+        })
+        .unwrap();
         assert!(
             exact_short_status(&slots)
                 .unwrap()

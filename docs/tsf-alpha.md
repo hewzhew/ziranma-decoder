@@ -648,7 +648,9 @@ UI、新采集字段仍必须先安全换代 DLL。详细矩阵见
   或启用状态，也不能替代候选窗绘制、实际宿主和运行时换包安全门。发布准备必须另行
   使用 release-only `exact-short-prepare`：它把核心、补充与上限、精确包与上限、页宽
   及专项 TSF host 共同写入 `exact-short-preflight.zep`，但仍保持精确层关闭。
-  `exact-short-enable` 只有在这份凭据仍匹配显式公开运行时根时才写启用状态。
+  `exact-short-enable` 只有在这份凭据仍匹配显式公开运行时根与显式可信精确包时才写
+  启用状态；写入后还必须由生产运行时三层加载器复读为同一包、同一上限且无回退，
+  否则立即写回关闭并报告失败。
 - `candidatectl popup-render-preflight --repetitions <1..20>` 是另一条默认不运行、
   release-only 的隔离视觉预检。它不激活 TSF，而是用 ownerless、nonactivating 的
   进程内临时窗口依次复用生产候选窗的创建、定位、`WM_PAINT`、双缓冲 GDI、

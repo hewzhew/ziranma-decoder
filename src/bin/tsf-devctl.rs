@@ -3191,6 +3191,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_short_activation_wrapper_is_explicit_fixed_and_read_only_by_default() {
+        let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("exact-short-ime.cmd");
+        let contents = fs::read_to_string(wrapper).unwrap();
+        let normalized = contents.replace("\r\n", "\n");
+
+        assert!(contents.contains("set \"repository_root=%~dp0\""));
+        assert!(contents.contains("scripts\\resolve-user-tool.cmd"));
+        assert!(contents.contains("if \"%action%\"==\"\" set \"action=status\""));
+        assert!(contents.contains("if /i \"%action%\"==\"enable\" goto enable"));
+        assert!(contents.contains("if /i \"%action%\"==\"disable\" goto disable"));
+        assert!(normalized.contains(":status\ncall :readiness"));
+        assert!(contents.contains("exact-short-enable ^"));
+        assert!(contents.contains("exact-short-disable --root \"%exact_root%\""));
+        assert!(contents.contains("exact-short-readiness ^"));
+        assert!(contents.contains("--package \"%package%\" ^"));
+        assert!(contents.contains("--expected-sha256 \"%expected_sha256%\" ^"));
+        assert!(
+            contents.contains("2cd80edd03f2c420e8b54b37db32576dc73c7f63e787df1c82ba99980c0ddec3")
+        );
+        assert!(!contents.contains("exact-short-prepare"));
+        assert!(!contents.contains("update-ime.cmd"));
+        assert!(!contents.contains("-Verb RunAs"));
+    }
+
+    #[test]
     fn user_tool_refresh_is_isolated_versioned_and_never_replaces_tsf() {
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let wrapper = fs::read_to_string(repository.join("refresh-ime.cmd")).unwrap();
@@ -3268,6 +3293,7 @@ mod tests {
         for wrapper in [
             "alias-ime.cmd",
             "candidate-data.cmd",
+            "exact-short-ime.cmd",
             "personal-ime.cmd",
             "prepare-exact-short.cmd",
             "research-ime.cmd",
@@ -3359,6 +3385,13 @@ mod tests {
         );
         assert!(exact_short.contains(
             "set \"supplemental_root=%repository_root%.local\\tsf-alpha\\user-data\\public-supplement\""
+        ));
+
+        let exact_short_activation =
+            fs::read_to_string(repository.join("exact-short-ime.cmd")).unwrap();
+        assert!(exact_short_activation.contains("set \"repository_root=%~dp0\""));
+        assert!(exact_short_activation.contains(
+            "set \"exact_root=%repository_root%.local\\tsf-alpha\\user-data\\public-exact-short\""
         ));
     }
 
