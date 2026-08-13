@@ -516,6 +516,51 @@ fn mirror_candidate_promotion(
     }
 }
 
+fn demote_immediately_retracted_candidate(batch: &mut CandidateBatch, text: &str) -> bool {
+    let protected_prefix = batch.protected_prefix_len.min(batch.candidates.len());
+    let Some(source_index) = batch
+        .candidates
+        .iter()
+        .position(|candidate| candidate == text)
+    else {
+        return false;
+    };
+    if source_index != 0 || source_index < protected_prefix || batch.candidates.len() < 2 {
+        return false;
+    }
+    let candidate = batch.candidates.remove(source_index);
+    batch.candidates.insert(1, candidate);
+    mirror_candidate_promotion(
+        batch,
+        CandidateTextPromotion {
+            index: 1,
+            source_index: Some(source_index),
+            changed: true,
+        },
+        NativeCandidatePersonalization::NONE,
+    );
+    if let Some(decision) = batch.automatic_transposition.take() {
+        let visible_rank = decision.visible_rank().map(|rank| match rank {
+            1 => 2,
+            2 => 1,
+            other => other,
+        });
+        batch.automatic_transposition = Some(NativeAutomaticTranspositionDecision::new_span(
+            decision.syllable_index()
+                ..decision
+                    .syllable_index()
+                    .saturating_add(decision.syllable_count()),
+            decision.pair_gap_ms(),
+            decision.cold_tier(),
+            decision.tier(),
+            decision.outcome(),
+            decision.recovered_text().map(str::to_owned),
+            visible_rank,
+        ));
+    }
+    true
+}
+
 #[derive(Default)]
 struct CandidateCache {
     code: String,
@@ -3683,6 +3728,17 @@ struct PendingPersonalSelection {
     previous_phrase_components: Vec<PersonalPhraseComponent>,
     previous_phrase_document: PersonalPhraseDocumentSnapshot,
     previous_left_context: Option<String>,
+}
+
+/// One process-local correction hint created only when an immediately
+/// retractable candidate commit is withdrawn with Backspace.
+///
+/// The text is private, so this type intentionally omits `Debug`. The hint is
+/// never persisted and survives only while the user rebuilds the same code.
+struct ImmediateRetypeCorrection {
+    code: String,
+    text: String,
+    activated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9143,6 +9199,7 @@ struct TsfTextService {
     candidate_cache: RefCell<CandidateCache>,
     selection_memory: RefCell<SessionSelectionMemory>,
     pending_personal_selection: RefCell<Option<PendingPersonalSelection>>,
+    immediate_retype_correction: RefCell<Option<ImmediateRetypeCorrection>>,
     personal_phrase_composer: Rc<RefCell<PersonalPhraseComposer>>,
     personal_phrase_document_tracker: Rc<RefCell<PersonalPhraseDocumentTracker>>,
     personal_context_ranking: RefCell<PersonalContextRanking>,
@@ -9630,6 +9687,7 @@ impl TsfTextService {
             candidate_cache: RefCell::new(CandidateCache::default()),
             selection_memory: RefCell::new(SessionSelectionMemory::default()),
             pending_personal_selection: RefCell::new(None),
+            immediate_retype_correction: RefCell::new(None),
             personal_phrase_composer: Rc::new(RefCell::new(PersonalPhraseComposer::default())),
             personal_phrase_document_tracker: Rc::new(RefCell::new(
                 PersonalPhraseDocumentTracker::default(),
@@ -9993,14 +10051,79 @@ impl TsfTextService_Impl {
                 }
             }
         }
+        self.apply_immediate_retype_correction(code, view, &mut batch)?;
         if batch.candidates.len() > limit {
             batch.may_have_more = true;
             batch.candidates.truncate(limit);
+            batch.resolved_shape_codes.truncate(batch.candidates.len());
             batch.provenance.truncate(batch.candidates.len());
             batch.personalized.truncate(batch.candidates.len());
         }
         batch.protected_prefix_len = batch.protected_prefix_len.min(batch.candidates.len());
         Ok(batch)
+    }
+
+    fn apply_immediate_retype_correction(
+        &self,
+        code: &str,
+        view: InteractiveCandidateView,
+        batch: &mut CandidateBatch,
+    ) -> Result<()> {
+        let mut slot = self
+            .immediate_retype_correction
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+        let Some(correction) = slot.as_mut() else {
+            return Ok(());
+        };
+        if view != InteractiveCandidateView::Primary
+            || (correction.activated && code != correction.code)
+            || (!correction.activated && !correction.code.starts_with(code))
+        {
+            *slot = None;
+            return Ok(());
+        }
+        if code != correction.code {
+            return Ok(());
+        }
+        correction.activated = true;
+        let _ = demote_immediately_retracted_candidate(batch, &correction.text);
+        Ok(())
+    }
+
+    fn clear_immediate_retype_correction(&self) {
+        if let Ok(mut slot) = self.immediate_retype_correction.try_borrow_mut() {
+            *slot = None;
+        }
+    }
+
+    fn retain_immediate_retype_correction_for_idle_key(
+        &self,
+        vkey: u16,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        if self.has_active_logical_composition()? {
+            return Ok(());
+        }
+        let expected_prefix = self
+            .immediate_retype_correction
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .as_ref()
+            .and_then(|correction| {
+                (!correction.activated)
+                    .then(|| correction.code.chars().next())
+                    .flatten()
+            });
+        let keeps_window = expected_prefix.is_some_and(|expected| {
+            decode_virtual_key(vkey, modifiers, InputMode::Chinese).is_some_and(|input| {
+                matches!(input, CompositionInput::Letters(ref letters) if letters.chars().eq([expected]))
+            })
+        });
+        if !keeps_window {
+            self.clear_immediate_retype_correction();
+        }
+        Ok(())
     }
 
     fn restore_session_selection(
@@ -10212,6 +10335,13 @@ impl TsfTextService_Impl {
         if let Ok(mut context) = self.personal_left_context.try_borrow_mut() {
             *context = pending.previous_left_context;
         }
+        if let Ok(mut correction) = self.immediate_retype_correction.try_borrow_mut() {
+            *correction = Some(ImmediateRetypeCorrection {
+                code: pending.selection.code,
+                text: pending.selection.text,
+                activated: false,
+            });
+        }
         true
     }
 
@@ -10353,6 +10483,7 @@ impl TsfTextService_Impl {
         // preceding transaction, even if an unusual host skipped the key that
         // began the new composition.
         let _ = self.confirm_pending_personal_selection();
+        self.clear_immediate_retype_correction();
         let previous_left_context = (learning_context == NativeFeedbackContext::Eligible)
             .then(|| {
                 self.personal_left_context
@@ -10546,6 +10677,7 @@ impl TsfTextService_Impl {
         }
         self.commit_active_composition(context)?;
         let _ = self.confirm_pending_personal_selection();
+        self.clear_immediate_retype_correction();
         self.clear_personal_phrase_composer();
         self.clear_personal_left_context();
         self.input_mode.set(self.input_mode.get().toggled());
@@ -10763,6 +10895,7 @@ impl TsfTextService_Impl {
             *state = CandidateForgetState::Inactive;
         }
         let _ = self.confirm_pending_personal_selection();
+        self.clear_immediate_retype_correction();
         self.clear_personal_phrase_composer();
         self.clear_personal_left_context();
         if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
@@ -11910,6 +12043,16 @@ impl TsfTextService_Impl {
                 None => self.clear_personal_left_context(),
             }
         }
+        if feedback_after_success.as_ref().is_some_and(|event| {
+            matches!(
+                event,
+                NativeFeedbackEvent::CandidateCommitted { .. }
+                    | NativeFeedbackEvent::RawCodeCommitted { .. }
+                    | NativeFeedbackEvent::CompositionCancelled { .. }
+            )
+        }) {
+            self.clear_immediate_retype_correction();
+        }
         if let Some(PlannedAction::Wish(operation)) = action_after_success {
             let status = self
                 .native_feedback_language_bar_state
@@ -11973,6 +12116,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             *state = CandidateForgetState::Inactive;
         }
         let _ = self.confirm_pending_personal_selection();
+        self.clear_immediate_retype_correction();
         self.clear_personal_phrase_composer();
         self.clear_personal_left_context();
         if let Ok(mut context_ranking) = self.personal_context_ranking.try_borrow_mut() {
@@ -12095,6 +12239,7 @@ impl ITfKeyEventSink_Impl for TsfTextService_Impl {
             return Ok(false.into());
         };
         let mut modifiers = self.observed_key_modifiers();
+        self.retain_immediate_retype_correction_for_idle_key(vkey, modifiers)?;
         if vkey == VK_SHIFT.0 {
             return Ok(self.can_handle_shift_tap(modifiers).into());
         }
@@ -12476,6 +12621,81 @@ mod tests {
                 .ranking_personalization()
                 .contains(NativeCandidatePersonalization::SESSION_EXACT)
         );
+    }
+
+    #[test]
+    fn immediate_retraction_demotion_keeps_all_parallel_candidate_metadata_aligned() {
+        let mut batch = CandidateBatch {
+            candidates: vec!["甲".to_owned(), "乙".to_owned(), "丙".to_owned()],
+            resolved_shape_codes: vec![
+                Some("1".to_owned()),
+                Some("2".to_owned()),
+                Some("3".to_owned()),
+            ],
+            provenance: vec![
+                NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
+                NativeCandidateProvenance::new(NativeCandidateSource::SupplementalExact, false),
+                NativeCandidateProvenance::new(NativeCandidateSource::Decoder, false),
+            ],
+            personalized: vec![true, false, false],
+            protected_prefix_len: 0,
+            automatic_transposition: Some(NativeAutomaticTranspositionDecision::new(
+                0,
+                20,
+                NativeAutomaticTranspositionTier::Secondary,
+                NativeAutomaticTranspositionTier::Secondary,
+                NativeAutomaticTranspositionOutcome::RecoveryAvailable,
+                Some("甲".to_owned()),
+                Some(1),
+            )),
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+        };
+
+        assert!(demote_immediately_retracted_candidate(&mut batch, "甲"));
+        assert_eq!(batch.candidates, ["乙", "甲", "丙"]);
+        assert_eq!(
+            batch.resolved_shape_codes,
+            [
+                Some("2".to_owned()),
+                Some("1".to_owned()),
+                Some("3".to_owned())
+            ]
+        );
+        assert_eq!(
+            batch.provenance[0].source(),
+            NativeCandidateSource::SupplementalExact
+        );
+        assert_eq!(
+            batch.provenance[1].source(),
+            NativeCandidateSource::CoreExact
+        );
+        assert_eq!(batch.personalized, [false, true, false]);
+        assert_eq!(
+            batch
+                .automatic_transposition
+                .as_ref()
+                .and_then(NativeAutomaticTranspositionDecision::visible_rank),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn immediate_retraction_never_demotes_a_protected_top_candidate() {
+        let mut batch = CandidateBatch {
+            candidates: vec!["甲".to_owned(), "乙".to_owned()],
+            resolved_shape_codes: vec![None; 2],
+            provenance: vec![NativeCandidateProvenance::default(); 2],
+            personalized: vec![true, false],
+            protected_prefix_len: 1,
+            automatic_transposition: None,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+        };
+
+        assert!(!demote_immediately_retracted_candidate(&mut batch, "甲"));
+        assert_eq!(batch.candidates, ["甲", "乙"]);
+        assert_eq!(batch.personalized, [true, false]);
     }
 
     #[test]
@@ -22617,6 +22837,129 @@ mod tests {
                 .preferred_text("ab"),
             None
         );
+        assert!(
+            service
+                .immediate_retype_correction
+                .borrow()
+                .as_ref()
+                .is_some_and(|correction| correction.code == "ab"
+                    && correction.text == "乙"
+                    && !correction.activated)
+        );
+        let corrected = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(corrected.candidates, ["丙", "甲", "乙"]);
+        assert!(
+            service
+                .immediate_retype_correction
+                .borrow()
+                .as_ref()
+                .is_some_and(|correction| correction.code == "ab"
+                    && correction.text == "乙"
+                    && correction.activated)
+        );
+    }
+
+    #[test]
+    fn immediate_retype_correction_demotes_old_persistent_top_once_then_clears_on_selection() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        assert!(service.personal_ranking.borrow_mut().record("ab", "乙"));
+        service
+            .native_feedback_context
+            .lock()
+            .unwrap()
+            .remember("ab", NativeFeedbackContext::Eligible);
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+
+        assert!(service.retract_pending_personal_selection());
+        let first_retype = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(first_retype.candidates, ["甲", "乙", "丙"]);
+        assert!(first_retype.personalized[1]);
+
+        service.remember_selection_after_success(PlannedSelection {
+            code: "ab".to_owned(),
+            text: "甲".to_owned(),
+            retractable_by_immediate_backspace: true,
+        });
+        assert!(service.immediate_retype_correction.borrow().is_none());
+    }
+
+    #[test]
+    fn immediate_retype_correction_clears_when_retyping_diverges_or_enters_shape_view() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        *service.immediate_retype_correction.borrow_mut() = Some(ImmediateRetypeCorrection {
+            code: "ab".to_owned(),
+            text: "甲".to_owned(),
+            activated: false,
+        });
+
+        let _ = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "x",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert!(service.immediate_retype_correction.borrow().is_none());
+
+        *service.immediate_retype_correction.borrow_mut() = Some(ImmediateRetypeCorrection {
+            code: "ab".to_owned(),
+            text: "甲".to_owned(),
+            activated: false,
+        });
+        let _ = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::TranspositionRecovery,
+            )
+            .unwrap();
+        assert!(service.immediate_retype_correction.borrow().is_none());
+    }
+
+    #[test]
+    fn ordinary_composition_backspace_never_creates_an_immediate_retype_correction() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("ab".to_owned()));
+
+        assert_eq!(
+            service
+                .resolve_pending_personal_selection_for_key(VK_BACK.0, KeyModifiers::default())
+                .unwrap(),
+            PendingPersonalKeyResolution::None
+        );
+        assert!(service.immediate_retype_correction.borrow().is_none());
     }
 
     #[test]
