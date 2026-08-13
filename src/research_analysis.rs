@@ -21,11 +21,121 @@ const MIN_SCENE_GAP_MS: u64 = 20_000;
 const MAX_SCENE_GAP_MS: u64 = 90_000;
 const MAX_SCENE_EPISODES: usize = 128;
 const MAX_SCENE_SPAN_MS: u64 = 10 * 60_000;
+const MAX_WISH_CONTEXT_EPISODES: usize = 6;
+const RETYPE_MAX_GAP_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResearchHabitKind {
     AcceptedTransposition,
     RepeatedCodeRevision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResearchWishEpisodeKind {
+    CandidateCommit,
+    RawCodeCommit,
+    Cancellation,
+}
+
+/// One completed input immediately preceding an explicitly anchored wish.
+///
+/// This type intentionally omits `Debug` because it contains real input and
+/// committed text.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchWishEpisode {
+    kind: ResearchWishEpisodeKind,
+    code: String,
+    text: Option<String>,
+    rank: Option<usize>,
+    post_commit_backspace_routed: bool,
+}
+
+impl ResearchWishEpisode {
+    pub fn kind(&self) -> ResearchWishEpisodeKind {
+        self.kind
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    pub fn rank(&self) -> Option<usize> {
+        self.rank
+    }
+
+    pub fn post_commit_backspace_routed(&self) -> bool {
+        self.post_commit_backspace_routed
+    }
+}
+
+/// Bounded private context attached to one explicit wish anchor.
+///
+/// Only completed inputs in the same natural scene and at or before the
+/// anchor are retained. This type deliberately omits `Debug`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchWishContext {
+    category: crate::WishCategory,
+    preceding_episodes: usize,
+    episodes: Vec<ResearchWishEpisode>,
+}
+
+impl ResearchWishContext {
+    pub fn category(&self) -> crate::WishCategory {
+        self.category
+    }
+
+    pub fn preceding_episodes(&self) -> usize {
+        self.preceding_episodes
+    }
+
+    pub fn episodes(&self) -> &[ResearchWishEpisode] {
+        &self.episodes
+    }
+}
+
+/// One evidence-bounded sequence where a committed candidate was followed by
+/// the TSF post-commit Backspace route and then a different candidate commit.
+///
+/// The host document result is not observable, so this remains a retyping
+/// clue rather than a claimed correction. Private strings prevent `Debug`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchRetypeClue {
+    previous_code: String,
+    previous_text: String,
+    next_code: String,
+    next_text: String,
+    observations: usize,
+    median_gap_ms: u64,
+}
+
+impl ResearchRetypeClue {
+    pub fn previous_code(&self) -> &str {
+        &self.previous_code
+    }
+
+    pub fn previous_text(&self) -> &str {
+        &self.previous_text
+    }
+
+    pub fn next_code(&self) -> &str {
+        &self.next_code
+    }
+
+    pub fn next_text(&self) -> &str {
+        &self.next_text
+    }
+
+    pub fn observations(&self) -> usize {
+        self.observations
+    }
+
+    pub fn median_gap_ms(&self) -> u64 {
+        self.median_gap_ms
+    }
 }
 
 /// One private, evidence-bounded hand-habit clue.
@@ -86,6 +196,8 @@ pub struct ResearchSceneAnalysis {
     linked_wishes: usize,
     unanchored_wishes: usize,
     habit_clues: Vec<ResearchHabitClue>,
+    wish_contexts: Vec<ResearchWishContext>,
+    retype_clues: Vec<ResearchRetypeClue>,
 }
 
 /// Aggregate, text-free evidence for an odd double-pinyin frame followed by
@@ -213,6 +325,14 @@ impl ResearchSceneAnalysis {
     pub fn habit_clues(&self) -> &[ResearchHabitClue] {
         &self.habit_clues
     }
+
+    pub fn wish_contexts(&self) -> &[ResearchWishContext] {
+        &self.wish_contexts
+    }
+
+    pub fn retype_clues(&self) -> &[ResearchRetypeClue] {
+        &self.retype_clues
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,6 +433,22 @@ struct Episode {
     hard_boundary_after: bool,
     accepted_recovery: Option<RecoveryEvidence>,
     revision: Option<(String, String, String)>,
+    outcome: EpisodeOutcome,
+    post_commit_backspace_routed: bool,
+}
+
+enum EpisodeOutcome {
+    CandidateCommit {
+        code: String,
+        text: String,
+        rank: usize,
+    },
+    RawCodeCommit {
+        code: String,
+    },
+    Cancellation {
+        code: String,
+    },
 }
 
 struct Scene {
@@ -337,6 +473,14 @@ struct RevisionKey {
     from: String,
     to: String,
     text: String,
+}
+
+#[derive(Hash, Eq, PartialEq)]
+struct RetypeKey {
+    previous_code: String,
+    previous_text: String,
+    next_code: String,
+    next_text: String,
 }
 
 /// Reconstructs process-local natural scenes without treating encrypted file
@@ -365,6 +509,7 @@ pub fn analyze_linked_research(
     }
 
     let mut anchors: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut anchor_requests = Vec::new();
     let mut unanchored_wishes = 0;
     for wish in wishes {
         if let Some(WishJournalContext::WishAnchor(anchor)) = wish.journal_context() {
@@ -372,6 +517,11 @@ pub fn analyze_linked_research(
                 .entry(anchor.stream_id().to_owned())
                 .or_default()
                 .push(anchor.event_ordinal());
+            anchor_requests.push((
+                anchor.stream_id().to_owned(),
+                anchor.event_ordinal(),
+                wish.category(),
+            ));
         } else {
             unanchored_wishes += 1;
         }
@@ -429,6 +579,8 @@ pub fn analyze_linked_research(
     }
 
     let habit_clues = collect_habit_clues(stream_episodes.values().flatten());
+    let wish_contexts = collect_wish_contexts(&stream_episodes, &scenes, &anchor_requests);
+    let retype_clues = collect_retype_clues(stream_episodes.values());
     let mut episode_counts = scenes
         .iter()
         .map(|scene| scene.episodes)
@@ -453,6 +605,8 @@ pub fn analyze_linked_research(
         linked_wishes,
         unanchored_wishes,
         habit_clues,
+        wish_contexts,
+        retype_clues,
     })
 }
 
@@ -795,10 +949,24 @@ fn observe_event(
         }
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
-        | NativeFeedbackEvent::PostCommitBackspaceRouted
         | NativeFeedbackEvent::CandidateSuppressionChanged { .. }
         | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
-        NativeFeedbackEvent::CandidateCommitted { code, text, .. } => {
+        NativeFeedbackEvent::PostCommitBackspaceRouted => {
+            if pending.is_none()
+                && let Some(previous) = episodes.last_mut()
+                && matches!(previous.outcome, EpisodeOutcome::CandidateCommit { .. })
+            {
+                previous.post_commit_backspace_routed = true;
+                previous.last_ordinal = ordinal;
+                previous.end_ms = at_ms;
+            }
+        }
+        NativeFeedbackEvent::CandidateCommitted {
+            code,
+            text,
+            absolute_rank,
+            ..
+        } => {
             let mut episode = pending
                 .take()
                 .unwrap_or_else(|| PendingEpisode::new(at_ms, ordinal));
@@ -819,6 +987,12 @@ fn observe_event(
                 hard_boundary_after: false,
                 accepted_recovery,
                 revision,
+                outcome: EpisodeOutcome::CandidateCommit {
+                    code: code.clone(),
+                    text: text.clone(),
+                    rank: *absolute_rank,
+                },
+                post_commit_backspace_routed: false,
             });
         }
         NativeFeedbackEvent::RawCodeCommitted { code } => {
@@ -835,6 +1009,8 @@ fn observe_event(
                 hard_boundary_after: false,
                 accepted_recovery: None,
                 revision: None,
+                outcome: EpisodeOutcome::RawCodeCommit { code: code.clone() },
+                post_commit_backspace_routed: false,
             });
         }
         NativeFeedbackEvent::CompositionCancelled { code, source } => {
@@ -854,6 +1030,8 @@ fn observe_event(
                 ),
                 accepted_recovery: None,
                 revision: None,
+                outcome: EpisodeOutcome::Cancellation { code: code.clone() },
+                post_commit_backspace_routed: false,
             });
         }
     }
@@ -908,6 +1086,153 @@ fn build_scenes(
     if let Some(scene) = current {
         output.push(scene);
     }
+}
+
+fn collect_wish_contexts(
+    stream_episodes: &HashMap<String, Vec<Episode>>,
+    scenes: &[Scene],
+    anchors: &[(String, u64, crate::WishCategory)],
+) -> Vec<ResearchWishContext> {
+    let mut contexts = Vec::new();
+    for (stream_id, ordinal, category) in anchors {
+        let Some(episodes) = stream_episodes.get(stream_id) else {
+            continue;
+        };
+        let mut stream_scenes = scenes
+            .iter()
+            .filter(|scene| scene.stream_id == *stream_id)
+            .collect::<Vec<_>>();
+        stream_scenes.sort_by_key(|scene| scene.last_ordinal);
+        let Some(scene) = stream_scenes
+            .iter()
+            .rev()
+            .find(|scene| scene.first_ordinal <= *ordinal)
+        else {
+            continue;
+        };
+        let matching = episodes
+            .iter()
+            .filter(|episode| {
+                episode.chain == scene.chain
+                    && episode.first_ordinal >= scene.first_ordinal
+                    && episode.last_ordinal <= *ordinal
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        let start = matching.len().saturating_sub(MAX_WISH_CONTEXT_EPISODES);
+        contexts.push(ResearchWishContext {
+            category: *category,
+            preceding_episodes: matching.len(),
+            episodes: matching[start..]
+                .iter()
+                .map(|episode| episode.as_wish_episode())
+                .collect(),
+        });
+    }
+    contexts
+}
+
+impl Episode {
+    fn as_wish_episode(&self) -> ResearchWishEpisode {
+        let (kind, code, text, rank) = match &self.outcome {
+            EpisodeOutcome::CandidateCommit { code, text, rank } => (
+                ResearchWishEpisodeKind::CandidateCommit,
+                code.clone(),
+                Some(text.clone()),
+                Some(*rank),
+            ),
+            EpisodeOutcome::RawCodeCommit { code } => (
+                ResearchWishEpisodeKind::RawCodeCommit,
+                code.clone(),
+                None,
+                None,
+            ),
+            EpisodeOutcome::Cancellation { code } => (
+                ResearchWishEpisodeKind::Cancellation,
+                code.clone(),
+                None,
+                None,
+            ),
+        };
+        ResearchWishEpisode {
+            kind,
+            code,
+            text,
+            rank,
+            post_commit_backspace_routed: self.post_commit_backspace_routed,
+        }
+    }
+}
+
+fn collect_retype_clues<'a>(
+    streams: impl Iterator<Item = &'a Vec<Episode>>,
+) -> Vec<ResearchRetypeClue> {
+    let mut evidence: HashMap<RetypeKey, Vec<u64>> = HashMap::new();
+    for episodes in streams {
+        for pair in episodes.windows(2) {
+            let [previous, next] = pair else {
+                continue;
+            };
+            if previous.chain != next.chain || !previous.post_commit_backspace_routed {
+                continue;
+            }
+            let gap_ms = next.start_ms.saturating_sub(previous.end_ms);
+            if gap_ms > RETYPE_MAX_GAP_MS {
+                continue;
+            }
+            let (
+                EpisodeOutcome::CandidateCommit {
+                    code: previous_code,
+                    text: previous_text,
+                    ..
+                },
+                EpisodeOutcome::CandidateCommit {
+                    code: next_code,
+                    text: next_text,
+                    ..
+                },
+            ) = (&previous.outcome, &next.outcome)
+            else {
+                continue;
+            };
+            if previous_code == next_code && previous_text == next_text {
+                continue;
+            }
+            evidence
+                .entry(RetypeKey {
+                    previous_code: previous_code.clone(),
+                    previous_text: previous_text.clone(),
+                    next_code: next_code.clone(),
+                    next_text: next_text.clone(),
+                })
+                .or_default()
+                .push(gap_ms);
+        }
+    }
+    let mut clues = evidence
+        .into_iter()
+        .map(|(key, mut gaps)| {
+            gaps.sort_unstable();
+            ResearchRetypeClue {
+                previous_code: key.previous_code,
+                previous_text: key.previous_text,
+                next_code: key.next_code,
+                next_text: key.next_text,
+                observations: gaps.len(),
+                median_gap_ms: nearest_rank(&gaps, 50).unwrap_or(0),
+            }
+        })
+        .collect::<Vec<_>>();
+    clues.sort_by(|left, right| {
+        right
+            .observations
+            .cmp(&left.observations)
+            .then_with(|| left.previous_code.cmp(&right.previous_code))
+            .then_with(|| left.next_code.cmp(&right.next_code))
+    });
+    clues
 }
 
 fn collect_habit_clues<'a>(episodes: impl Iterator<Item = &'a Episode>) -> Vec<ResearchHabitClue> {
@@ -1288,6 +1613,69 @@ mod tests {
     }
 
     #[test]
+    fn post_commit_backspace_and_next_commit_form_bounded_retype_evidence() {
+        let stream = "56".repeat(32);
+        let report = analyze_linked_research(
+            &[snapshot(
+                &stream,
+                0,
+                0,
+                None,
+                vec![
+                    (10, committed("abdc", "旧词")),
+                    (
+                        11,
+                        NativeFeedbackEvent::CandidatePopupTiming {
+                            first_frame_ms: 1,
+                            fully_visible_ms: 1,
+                            initial_show: false,
+                        },
+                    ),
+                    (12, NativeFeedbackEvent::PostCommitBackspaceRouted),
+                    (40, committed("abcd", "新词")),
+                    (50, committed("efgh", "后文")),
+                ],
+            )],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.retype_clues().len(), 1);
+        let clue = &report.retype_clues()[0];
+        assert_eq!(clue.previous_code(), "abdc");
+        assert_eq!(clue.previous_text(), "旧词");
+        assert_eq!(clue.next_code(), "abcd");
+        assert_eq!(clue.next_text(), "新词");
+        assert_eq!(clue.observations(), 1);
+        assert_eq!(clue.median_gap_ms(), 28);
+    }
+
+    #[test]
+    fn retype_evidence_never_crosses_streams_or_chain_breaks() {
+        let first_stream = "57".repeat(32);
+        let second_stream = "58".repeat(32);
+        let first = snapshot(
+            &first_stream,
+            0,
+            0,
+            None,
+            vec![
+                (10, committed("aaaa", "甲")),
+                (11, NativeFeedbackEvent::PostCommitBackspaceRouted),
+            ],
+        );
+        let second = snapshot(
+            &second_stream,
+            0,
+            0,
+            None,
+            vec![(12, committed("bbbb", "乙"))],
+        );
+        let report = analyze_linked_research(&[first, second], &[]).unwrap();
+        assert!(report.retype_clues().is_empty());
+    }
+
+    #[test]
     fn wish_anchor_attaches_to_the_nearest_preceding_scene() {
         let stream = "45".repeat(32);
         let research = snapshot(
@@ -1332,5 +1720,79 @@ mod tests {
         assert_eq!(report.anchored_wishes(), 1);
         assert_eq!(report.linked_wishes(), 1);
         assert_eq!(report.unanchored_wishes(), 0);
+        assert_eq!(report.wish_contexts().len(), 1);
+        let context = &report.wish_contexts()[0];
+        assert_eq!(context.category(), WishCategory::Other);
+        assert_eq!(context.preceding_episodes(), 2);
+        assert_eq!(context.episodes().len(), 2);
+        assert_eq!(context.episodes()[0].code(), "aa");
+        assert_eq!(context.episodes()[0].text(), Some("甲"));
+        assert_eq!(context.episodes()[1].code(), "bb");
+        assert_eq!(context.episodes()[1].text(), Some("乙"));
+    }
+
+    #[test]
+    fn wish_context_is_bounded_to_six_completed_inputs_before_the_anchor() {
+        let stream = "59".repeat(32);
+        let research = snapshot(
+            &stream,
+            0,
+            0,
+            None,
+            ["aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, code)| {
+                    (
+                        u64::try_from(index).unwrap() + 1,
+                        committed(code, &format!("词{index}")),
+                    )
+                })
+                .collect(),
+        );
+        let mut feedback = NativeFeedbackSession::default();
+        feedback.start_memory(
+            crate::NativeFeedbackAuthorization::explicit_memory_only(),
+            crate::NativeFeedbackLimits::default(),
+        );
+        feedback.record_at(
+            crate::NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "xuy".to_owned(),
+            },
+            1,
+        );
+        let frozen = feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                2,
+                10,
+                8,
+            )
+            .unwrap();
+        let wish = WishSnapshot::from_frozen_with_context(
+            &frozen,
+            WishCaptureScope::RecentWindow,
+            WishCategory::Ranking,
+            None,
+            Some(WishJournalContext::WishAnchor(
+                WishJournalAnchor::new(stream, 6).unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let report = analyze_linked_research(&[research], &[wish]).unwrap();
+        let context = &report.wish_contexts()[0];
+        assert_eq!(context.category(), WishCategory::Ranking);
+        assert_eq!(context.preceding_episodes(), 7);
+        assert_eq!(context.episodes().len(), 6);
+        assert_eq!(context.episodes()[0].code(), "bb");
+        assert_eq!(context.episodes()[5].code(), "gg");
+        assert!(
+            context
+                .episodes()
+                .iter()
+                .all(|episode| episode.code() != "hh")
+        );
     }
 }

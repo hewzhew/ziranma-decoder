@@ -10,7 +10,7 @@ use ziranma_core::{
     NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
     NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
-    ResearchHalfPairAnalysis, ResearchIssueTriage, ResearchSceneAnalysis,
+    ResearchHalfPairAnalysis, ResearchIssueTriage, ResearchSceneAnalysis, ResearchWishEpisodeKind,
     TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
     analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
@@ -2663,6 +2663,81 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
     )
     .unwrap();
 
+    output.push_str("许愿前的本机现场（每条最多显示同一自然片段末尾 6 次完成输入）：\n");
+    if analysis.wish_contexts().is_empty() {
+        output.push_str("- 暂无可还原的锚定现场。\n");
+    }
+    for (index, context) in analysis
+        .wish_contexts()
+        .iter()
+        .rev()
+        .take(MAX_REVIEW_ITEMS)
+        .enumerate()
+    {
+        let omitted = context
+            .preceding_episodes()
+            .saturating_sub(context.episodes().len());
+        write!(
+            output,
+            "- 许愿 {}（{}）{}：",
+            index + 1,
+            wish_category_label(context.category()),
+            if omitted == 0 {
+                String::new()
+            } else {
+                format!("，前面另有 {omitted} 次完成输入未展开")
+            }
+        )
+        .unwrap();
+        for (episode_index, episode) in context.episodes().iter().enumerate() {
+            if episode_index != 0 {
+                output.push_str(" → ");
+            }
+            match episode.kind() {
+                ResearchWishEpisodeKind::CandidateCommit => {
+                    write!(
+                        output,
+                        "{} → “{}”（第 {}）{}",
+                        episode.code(),
+                        episode.text().unwrap_or(""),
+                        episode.rank().unwrap_or(0),
+                        if episode.post_commit_backspace_routed() {
+                            "〔随后 Backspace 已交给宿主〕"
+                        } else {
+                            ""
+                        }
+                    )
+                    .unwrap();
+                }
+                ResearchWishEpisodeKind::RawCodeCommit => {
+                    write!(output, "{}〔原码上屏〕", episode.code()).unwrap();
+                }
+                ResearchWishEpisodeKind::Cancellation => {
+                    write!(output, "{}〔取消〕", episode.code()).unwrap();
+                }
+            }
+        }
+        output.push('\n');
+    }
+
+    output.push_str("提交后退格再输入线索（不是自动判错）：\n");
+    if analysis.retype_clues().is_empty() {
+        output.push_str("- 暂无。\n");
+    }
+    for clue in analysis.retype_clues().iter().take(MAX_REVIEW_ITEMS) {
+        writeln!(
+            output,
+            "- {} → “{}” → Backspace → {} → “{}”：{} 次；后续输入间隔中位 {} ms。宿主最终删除结果不可见，因此只称为重输线索。",
+            clue.previous_code(),
+            clue.previous_text(),
+            clue.next_code(),
+            clue.next_text(),
+            clue.observations(),
+            clue.median_gap_ms(),
+        )
+        .unwrap();
+    }
+
     output.push_str("手癖线索（不是自动判错）：\n");
     if analysis.habit_clues().is_empty() {
         output.push_str("- 暂无达到证据门槛的线索。\n");
@@ -2697,6 +2772,18 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
         "口径：失焦/宿主结束是硬边界；停顿是按本批证据自适应的软边界；单次改码不形成手癖结论。",
     );
     output
+}
+
+fn wish_category_label(category: ziranma_core::WishCategory) -> &'static str {
+    match category {
+        ziranma_core::WishCategory::Candidates => "候选",
+        ziranma_core::WishCategory::Ranking => "候选排序",
+        ziranma_core::WishCategory::Display => "显示界面",
+        ziranma_core::WishCategory::Latency => "卡顿延迟",
+        ziranma_core::WishCategory::InputMode => "按键模式",
+        ziranma_core::WishCategory::Compatibility => "兼容性",
+        ziranma_core::WishCategory::Other => "未分类",
+    }
 }
 
 fn candidate_source_index(source: NativeCandidateSource) -> usize {
