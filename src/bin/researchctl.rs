@@ -556,7 +556,9 @@ struct PresentedFrame {
     code: String,
     view: NativeCandidateView,
     page_start: usize,
+    candidates: Vec<String>,
     provenance: Vec<NativeCandidateProvenance>,
+    global_top_text: Option<String>,
     global_top_provenance: Option<NativeCandidateProvenance>,
 }
 
@@ -565,9 +567,17 @@ impl PresentedFrame {
         code: &str,
         view: NativeCandidateView,
         page_start: usize,
+        candidates: Vec<String>,
         provenance: Vec<NativeCandidateProvenance>,
         previous: Option<&Self>,
     ) -> Self {
+        let global_top_text = if page_start == 0 {
+            candidates.first().cloned()
+        } else {
+            previous
+                .filter(|frame| frame.code == code && frame.view == view)
+                .and_then(|frame| frame.global_top_text.clone())
+        };
         let global_top_provenance = if page_start == 0 {
             provenance.first().copied()
         } else {
@@ -579,8 +589,27 @@ impl PresentedFrame {
             code: code.to_owned(),
             view,
             page_start,
+            candidates,
             provenance,
+            global_top_text,
             global_top_provenance,
+        }
+    }
+
+    fn candidate_for_rank(&self, absolute_rank: usize) -> Option<&str> {
+        let index = absolute_rank.checked_sub(self.page_start.saturating_add(1))?;
+        self.candidates.get(index).map(String::as_str)
+    }
+
+    fn candidate_text_evidence(
+        &self,
+        absolute_rank: usize,
+        committed_text: &str,
+    ) -> CandidateTextEvidence {
+        match self.candidate_for_rank(absolute_rank) {
+            Some(candidate) if candidate == committed_text => CandidateTextEvidence::Verified,
+            Some(_) => CandidateTextEvidence::Mismatched,
+            None => CandidateTextEvidence::Unavailable,
         }
     }
 
@@ -654,6 +683,9 @@ struct SelectionPattern {
     first_rank: Option<usize>,
     first_provenance: Option<NativeCandidateProvenance>,
     first_global_top_provenance: Option<NativeCandidateProvenance>,
+    first_global_top_text: Option<String>,
+    first_candidate_text_evidence: CandidateTextEvidence,
+    first_precise_ranking_personalization: bool,
     first_precise_personalization: bool,
     awaiting_first_global_top: bool,
     first_top_selection: Option<usize>,
@@ -661,9 +693,13 @@ struct SelectionPattern {
     last_top_provenance: Option<NativeCandidateProvenance>,
     last_top_precise_personalization: bool,
     first_post_top_regression_boundary: Option<TopRegressionBoundary>,
+    first_regression_rank: Option<usize>,
     first_regression_prior_top_provenance: Option<NativeCandidateProvenance>,
     first_regression_target_provenance: Option<NativeCandidateProvenance>,
     first_regression_global_top_provenance: Option<NativeCandidateProvenance>,
+    first_regression_global_top_text: Option<String>,
+    first_regression_candidate_text_evidence: CandidateTextEvidence,
+    first_regression_precise_ranking_personalization: bool,
     first_regression_precise_personalization_pair: bool,
     awaiting_first_regression_global_top: bool,
     last_rank: Option<usize>,
@@ -677,6 +713,14 @@ struct SelectionPattern {
     sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
     top_provenance_observations: usize,
     top_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum CandidateTextEvidence {
+    #[default]
+    Unavailable,
+    Verified,
+    Mismatched,
 }
 
 impl SelectionPattern {
@@ -714,6 +758,7 @@ impl SelectionPattern {
                         TopRegressionBoundary::between(previous, location)
                     }),
             );
+            self.first_regression_rank = Some(rank);
             self.first_regression_prior_top_provenance = self.last_top_provenance;
             self.first_regression_target_provenance = provenance;
             self.first_regression_precise_personalization_pair =
@@ -752,6 +797,31 @@ impl SelectionPattern {
         if let Some(provenance) = provenance {
             self.top_provenance_observations += 1;
             self.top_sources[candidate_source_index(provenance.source())] += 1;
+        }
+    }
+
+    fn observe_candidate_context(
+        &mut self,
+        rank: usize,
+        committed_text: &str,
+        frame: Option<&PresentedFrame>,
+        precise_ranking_personalization: bool,
+    ) {
+        let evidence = frame.map_or(CandidateTextEvidence::Unavailable, |frame| {
+            frame.candidate_text_evidence(rank, committed_text)
+        });
+        let blocker = (evidence == CandidateTextEvidence::Verified)
+            .then(|| frame.and_then(|frame| frame.global_top_text.clone()))
+            .flatten();
+        if self.awaiting_first_global_top {
+            self.first_candidate_text_evidence = evidence;
+            self.first_global_top_text = blocker.clone();
+            self.first_precise_ranking_personalization = precise_ranking_personalization;
+        }
+        if self.awaiting_first_regression_global_top {
+            self.first_regression_candidate_text_evidence = evidence;
+            self.first_regression_global_top_text = blocker;
+            self.first_regression_precise_ranking_personalization = precise_ranking_personalization;
         }
     }
 
@@ -978,6 +1048,9 @@ struct ResearchReview {
     omitted_events: usize,
     candidate_frames: usize,
     candidate_commits: usize,
+    candidate_text_verified_commits: usize,
+    candidate_text_unavailable_commits: usize,
+    candidate_text_mismatched_commits: usize,
     top_one_commits: usize,
     non_top_commits: usize,
     paged_commits: usize,
@@ -1089,6 +1162,7 @@ impl ResearchReview {
                         code,
                         *view,
                         *page_start,
+                        candidates.clone(),
                         Vec::new(),
                         frame.as_ref(),
                     ));
@@ -1097,7 +1171,7 @@ impl ResearchReview {
                     code,
                     view,
                     page_start,
-                    candidates: _,
+                    candidates,
                     provenance,
                     loaded_candidates,
                     tab_assembly,
@@ -1115,6 +1189,7 @@ impl ResearchReview {
                         code,
                         *view,
                         *page_start,
+                        candidates.clone(),
                         provenance.clone(),
                         frame.as_ref(),
                     ));
@@ -1140,6 +1215,21 @@ impl ResearchReview {
                         matching_frame.and_then(|frame| frame.provenance_for_rank(*absolute_rank));
                     let global_top_provenance =
                         matching_frame.and_then(|frame| frame.global_top_provenance);
+                    let candidate_text_evidence = matching_frame
+                        .map_or(CandidateTextEvidence::Unavailable, |frame| {
+                            frame.candidate_text_evidence(*absolute_rank, text)
+                        });
+                    match candidate_text_evidence {
+                        CandidateTextEvidence::Verified => {
+                            self.candidate_text_verified_commits += 1;
+                        }
+                        CandidateTextEvidence::Unavailable => {
+                            self.candidate_text_unavailable_commits += 1;
+                        }
+                        CandidateTextEvidence::Mismatched => {
+                            self.candidate_text_mismatched_commits += 1;
+                        }
+                    }
                     self.unpaired_commits += usize::from(
                         frame
                             .as_ref()
@@ -1161,6 +1251,12 @@ impl ResearchReview {
                         provenance,
                         snapshot.supports_precise_candidate_personalization(),
                         &observation_location,
+                    );
+                    pattern.observe_candidate_context(
+                        *absolute_rank,
+                        text,
+                        matching_frame,
+                        snapshot.supports_precise_candidate_ranking_personalization(),
                     );
                     pattern.observe_global_top_provenance(global_top_provenance);
                     frame = None;
@@ -2058,9 +2154,91 @@ impl ResearchReview {
             output.push_str("- 暂无。\n");
         }
         for ((code, text), pattern) in non_top.into_iter().take(MAX_REVIEW_ITEMS) {
+            let initial_non_top = pattern.first_rank.is_some_and(|rank| rank > 1);
+            let (
+                context_evidence,
+                blocker_text,
+                context_rank,
+                blocker_provenance,
+                precise_ranking_personalization,
+                context_label,
+            ) = if initial_non_top {
+                (
+                    pattern.first_candidate_text_evidence,
+                    pattern.first_global_top_text.as_deref(),
+                    pattern.first_rank,
+                    pattern.first_global_top_provenance,
+                    pattern.first_precise_ranking_personalization,
+                    "首次",
+                )
+            } else {
+                (
+                    pattern.first_regression_candidate_text_evidence,
+                    pattern.first_regression_global_top_text.as_deref(),
+                    pattern.first_regression_rank,
+                    pattern.first_regression_global_top_provenance,
+                    pattern.first_regression_precise_ranking_personalization,
+                    "回落时",
+                )
+            };
+            let ranking_reason = if precise_ranking_personalization {
+                match blocker_provenance {
+                    Some(top) if !top.ranking_personalization().is_empty() => {
+                        format!(
+                            "首选实际受个人重排（{}）",
+                            render_candidate_personalization(top.ranking_personalization(),)
+                        )
+                    }
+                    Some(_) => "首选没有实际个人重排".to_owned(),
+                    None => "首选来源证据缺失".to_owned(),
+                }
+            } else {
+                "旧批次未记录实际重排原因".to_owned()
+            };
+            let trajectory = if !initial_non_top {
+                format!(
+                    "此前曾为首选，后来出现非首选；共选择 {} 次",
+                    pattern.selections
+                )
+            } else if pattern.selections == 1 {
+                "尚无后续选择，不能判断是否学会".to_owned()
+            } else if pattern.first_top_selection.is_some() {
+                format!(
+                    "后续第 {} 次选择时到达首选{}",
+                    pattern.first_top_selection.unwrap_or(1),
+                    if pattern.first_post_top_regression_boundary.is_some() {
+                        "，此后又出现过回落"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!("已有 {} 次后续选择，仍未到过首选", pattern.selections - 1)
+            };
+            let blocker = match (context_evidence, blocker_text, context_rank) {
+                (CandidateTextEvidence::Verified, Some(blocker), Some(rank)) => {
+                    format!(
+                        "{context_label}第 {rank}，当时首选“{blocker}”（来源 {}；{ranking_reason}）",
+                        blocker_provenance
+                            .map_or("缺失", |source| candidate_source_label(source.source()))
+                    )
+                }
+                (CandidateTextEvidence::Verified, None, Some(rank)) => {
+                    format!("{context_label}第 {rank}；目标候选已核对，但缺少首页首选")
+                }
+                (CandidateTextEvidence::Mismatched, _, Some(rank)) => {
+                    format!(
+                        "{context_label}记录为第 {rank}，但提交文字与该位置候选不一致，不猜测阻挡项"
+                    )
+                }
+                (_, _, Some(rank)) => {
+                    format!("{context_label}第 {rank}；旧批次或分页现场没有足够候选文字证据")
+                }
+                _ => "非首选名次证据缺失".to_owned(),
+            };
             writeln!(
                 output,
-                "- {code} → “{text}”：非首选 {}/{} 次；名次 {}–{}；显式选择 {} 次；翻页 {} 次；来源 {}；个性化机制 {}。",
+                "- {code} → “{text}”：{blocker}；{trajectory}。非首选 {}/{} 次；名次 {}–{}；显式选择 {} 次；翻页 {} 次；目标来源 {}；目标个性化 {}。",
                 pattern.non_top_selections,
                 pattern.selections,
                 pattern.minimum_rank,
@@ -2072,6 +2250,15 @@ impl ResearchReview {
             )
             .unwrap();
         }
+
+        writeln!(
+            output,
+            "候选文字配对证据：已核对 {}；旧批次/现场缺失 {}；位置不一致 {}（不据此猜测阻挡项）。",
+            self.candidate_text_verified_commits,
+            self.candidate_text_unavailable_commits,
+            self.candidate_text_mismatched_commits,
+        )
+        .unwrap();
 
         let mut learned = self
             .selections
@@ -2111,6 +2298,7 @@ impl ResearchReview {
         render_code_counts(&mut output, "原码上屏", &self.raw_codes);
         output.push_str(
             "\n口径：只读解密本地持续批次；没有写模型、修改排序、联网或导出文件。\n\
+             回顾会显示诊断所需的真实短片段及与之直接竞争的首选，不整段回显无关输入。\n\
              非首选、取消和原码上屏只是待复查线索，不自动等于输入错误。",
         );
         output
@@ -2703,6 +2891,19 @@ fn render_candidate_personalization_counts(
         .collect::<Vec<_>>();
     if rendered.is_empty() {
         "未观察到".to_owned()
+    } else {
+        rendered.join("、")
+    }
+}
+
+fn render_candidate_personalization(personalization: NativeCandidatePersonalization) -> String {
+    let rendered = CANDIDATE_PERSONALIZATION_KINDS
+        .into_iter()
+        .filter(|(reason, _)| personalization.contains(*reason))
+        .map(|(_, label)| label)
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "无".to_owned()
     } else {
         rendered.join("、")
     }
@@ -3529,42 +3730,102 @@ mod tests {
             "code",
             NativeCandidateView::Ordinary,
             0,
+            vec!["first".to_owned(), "second".to_owned()],
             vec![alias, core],
             None,
         );
+        assert_eq!(first.global_top_text.as_deref(), Some("first"));
+        assert_eq!(first.candidate_for_rank(2), Some("second"));
         assert_eq!(first.global_top_provenance, Some(alias));
         let second = PresentedFrame::next(
             "code",
             NativeCandidateView::Ordinary,
             6,
+            vec!["seventh".to_owned()],
             vec![core],
             Some(&first),
         );
+        assert_eq!(second.global_top_text.as_deref(), Some("first"));
+        assert_eq!(second.candidate_for_rank(7), Some("seventh"));
         assert_eq!(second.global_top_provenance, Some(alias));
         let changed_code = PresentedFrame::next(
             "other",
             NativeCandidateView::Ordinary,
             6,
+            vec!["other-seventh".to_owned()],
             vec![core],
             Some(&second),
         );
+        assert_eq!(changed_code.global_top_text, None);
         assert_eq!(changed_code.global_top_provenance, None);
         let changed_view = PresentedFrame::next(
             "code",
             NativeCandidateView::Shape,
             6,
+            vec!["shape-seventh".to_owned()],
             vec![core],
             Some(&second),
         );
+        assert_eq!(changed_view.global_top_text, None);
         assert_eq!(changed_view.global_top_provenance, None);
         let refreshed_first = PresentedFrame::next(
             "code",
             NativeCandidateView::Ordinary,
             0,
+            vec!["refreshed".to_owned()],
             vec![core],
             Some(&second),
         );
+        assert_eq!(
+            refreshed_first.global_top_text.as_deref(),
+            Some("refreshed")
+        );
         assert_eq!(refreshed_first.global_top_provenance, Some(core));
+    }
+
+    #[test]
+    fn private_review_refuses_to_invent_a_blocker_when_candidate_text_mismatches() {
+        let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let frame = PresentedFrame::next(
+            "public-code",
+            NativeCandidateView::Ordinary,
+            0,
+            vec![
+                "public-blocker".to_owned(),
+                "different-candidate".to_owned(),
+            ],
+            vec![core, core],
+            None,
+        );
+        let mut pattern = SelectionPattern::default();
+        pattern.observe(
+            2,
+            NativeSelectionSource::Numeric,
+            Some(core),
+            true,
+            &SelectionObservationLocation::default(),
+        );
+        pattern.observe_candidate_context(2, "public-target", Some(&frame), true);
+        pattern.observe_global_top_provenance(Some(core));
+
+        let mut review = ResearchReview {
+            candidate_commits: 1,
+            non_top_commits: 1,
+            manual_commits: 1,
+            candidate_text_mismatched_commits: 1,
+            ..ResearchReview::default()
+        };
+        review.selections.insert(
+            ("public-code".to_owned(), "public-target".to_owned()),
+            pattern,
+        );
+        let rendered = review.render();
+        assert!(rendered.contains(
+            "public-code → “public-target”：首次记录为第 2，但提交文字与该位置候选不一致，不猜测阻挡项"
+        ));
+        assert!(rendered.contains("位置不一致 1"));
+        assert!(!rendered.contains("public-blocker"));
+        assert!(!rendered.contains("different-candidate"));
     }
 
     #[test]
@@ -3690,13 +3951,14 @@ mod tests {
                 code: "dago".to_owned(),
                 view: NativeCandidateView::Ordinary,
                 page_start: 0,
-                candidates: vec!["大国".to_owned(), "打过".to_owned()],
+                candidates: vec!["大国".to_owned(), "打过".to_owned(), "大锅".to_owned()],
                 provenance: vec![
+                    NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
                     NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
                     NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
                 ],
                 automatic_transposition: None,
-                loaded_candidates: 2,
+                loaded_candidates: 3,
                 tab_assembly: None,
                 may_have_more: false,
             },
@@ -3822,13 +4084,19 @@ mod tests {
             .unwrap();
         assert_eq!(pattern.first_rank, Some(2));
         assert_eq!(pattern.last_rank, Some(1));
+        assert_eq!(pattern.first_global_top_text.as_deref(), Some("大国"));
+        assert!(pattern.first_candidate_text_evidence == CandidateTextEvidence::Verified);
         assert_eq!(pattern.personalization_frames[3], 1);
         assert_eq!(pattern.top_provenance_observations, 2);
         assert_eq!(
             pattern.top_sources[candidate_source_index(NativeCandidateSource::CoreExact)],
             2
         );
-        assert!(review.render().contains("首次第 2，最近第 1"));
+        let rendered = review.render();
+        assert!(rendered.contains("dago → “打过”：首次第 2，当时首选“大国”"));
+        assert!(rendered.contains("后续第 2 次选择时到达首选"));
+        assert!(rendered.contains("候选文字配对证据：已核对 2；旧批次/现场缺失 0；位置不一致 0"));
+        assert!(!rendered.contains("大锅"));
         let aggregate = review.render_aggregate();
         assert!(aggregate.contains("持续研究摘要（不显示输入原文）"));
         assert!(!aggregate.contains("dago"));
