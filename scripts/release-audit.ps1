@@ -316,6 +316,7 @@ $requiredFiles = @(
     'CONTRIBUTING.md',
     'check-ime.cmd',
     'LICENSE',
+    'prepare-exact-short.cmd',
     'prepare-ime.cmd',
     'personal-ime.cmd',
     'refresh-ime.cmd',

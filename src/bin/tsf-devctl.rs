@@ -3156,6 +3156,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_short_preparation_wrapper_is_fixed_explicit_and_never_enables() {
+        let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prepare-exact-short.cmd");
+        let contents = fs::read_to_string(wrapper).unwrap();
+
+        assert!(contents.contains("set \"repository_root=%~dp0\""));
+        assert!(contents.contains("scripts\\resolve-user-tool.cmd"));
+        assert!(contents.contains("if \"%action%\"==\"\" set \"action=status\""));
+        assert!(contents.contains("exact-short-status --root \"%exact_root%\""));
+        assert!(contents.contains("if /i \"%action%\"==\"prepare\" goto prepare"));
+        assert!(contents.contains("exact-short-prepare ^"));
+        assert!(contents.contains(
+            ".local\\public-audit\\wanxiang-fdda7afb\\package-exact-short-consensus-depth2-v1"
+        ));
+        assert!(
+            contents.contains("2cd80edd03f2c420e8b54b37db32576dc73c7f63e787df1c82ba99980c0ddec3")
+        );
+        assert!(contents.contains("--exact-promotions 2 ^"));
+        assert!(contents.contains("--sample-limit 16 ^"));
+        assert!(contents.contains("--repetitions 5"));
+        assert!(contents.contains("The exact-short layer remains disabled."));
+        assert!(!contents.contains("exact-short-enable"));
+        assert!(!contents.contains("update-ime.cmd"));
+        assert!(!contents.contains("-Verb RunAs"));
+        assert!(!contents.contains("call \"%repository_root%refresh-ime.cmd\""));
+    }
+
+    #[test]
     fn user_tool_refresh_is_isolated_versioned_and_never_replaces_tsf() {
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let wrapper = fs::read_to_string(repository.join("refresh-ime.cmd")).unwrap();
@@ -3234,6 +3261,7 @@ mod tests {
             "alias-ime.cmd",
             "candidate-data.cmd",
             "personal-ime.cmd",
+            "prepare-exact-short.cmd",
             "research-ime.cmd",
             "wish-ime.cmd",
         ] {
@@ -3311,6 +3339,19 @@ mod tests {
 
         let candidate = fs::read_to_string(repository.join("candidate-data.cmd")).unwrap();
         assert!(candidate.contains("set \"resolver=%~dp0scripts\\resolve-user-tool.cmd\""));
+
+        let exact_short = fs::read_to_string(repository.join("prepare-exact-short.cmd")).unwrap();
+        assert!(exact_short.contains("set \"repository_root=%~dp0\""));
+        assert!(exact_short.contains(
+            "set \"exact_root=%repository_root%.local\\tsf-alpha\\user-data\\public-exact-short\""
+        ));
+        assert!(
+            exact_short
+                .contains("set \"core_root=%repository_root%target\\release\\candidate-data\"")
+        );
+        assert!(exact_short.contains(
+            "set \"supplemental_root=%repository_root%.local\\tsf-alpha\\user-data\\public-supplement\""
+        ));
     }
 
     #[test]
