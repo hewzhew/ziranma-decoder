@@ -11,7 +11,7 @@ use ziranma_core::{
     NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
     ResearchHalfPairAnalysis, ResearchIssueTriage, ResearchSceneAnalysis, ResearchWishEpisodeKind,
-    TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    ResearchWishEvidenceKind, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
     analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
     analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
@@ -2663,7 +2663,9 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
     )
     .unwrap();
 
-    output.push_str("许愿前的本机现场（每条最多显示同一自然片段末尾 6 次完成输入）：\n");
+    output.push_str(
+        "许愿证据卡片（每条最多显示同一自然片段末尾 6 次完成输入；线索，不自动判错）：\n",
+    );
     if analysis.wish_contexts().is_empty() {
         output.push_str("- 暂无可还原的锚定现场。\n");
     }
@@ -2695,13 +2697,23 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
             }
             match episode.kind() {
                 ResearchWishEpisodeKind::CandidateCommit => {
+                    let evidence = match episode.evidence_kind() {
+                        ResearchWishEvidenceKind::TopCandidate => "首选提交",
+                        ResearchWishEvidenceKind::VisibleNonTopCandidate => "第一页非首选",
+                        ResearchWishEvidenceKind::DeepCandidate => "第二页或更深",
+                        ResearchWishEvidenceKind::RawCodeCommit
+                        | ResearchWishEvidenceKind::Cancellation => unreachable!(),
+                    };
                     write!(
                         output,
-                        "{} → “{}”（第 {}）{}",
+                        "{} → “{}”（第 {}；{}）{}",
                         episode.code(),
                         episode.text().unwrap_or(""),
                         episode.rank().unwrap_or(0),
-                        if episode.post_commit_backspace_routed() {
+                        evidence,
+                        if episode.followed_by_retype() {
+                            "〔随后 Backspace 后出现不同提交〕"
+                        } else if episode.post_commit_backspace_routed() {
                             "〔随后 Backspace 已交给宿主〕"
                         } else {
                             ""
@@ -4354,8 +4366,16 @@ mod tests {
         let rendered = render_scene_analysis(&analysis);
 
         assert!(rendered.contains("现有批次尚无连续链"));
+        assert!(rendered.contains("许愿证据卡片"));
+        assert!(rendered.contains("线索，不自动判错"));
         assert!(rendered.contains("单次改码不形成手癖结论"));
-        for forbidden in ["最佳配置", "下一步建议", "应该采用", "用户打错"] {
+        for forbidden in [
+            "最佳配置",
+            "下一步建议",
+            "应该采用",
+            "用户打错",
+            "自动判为排序错误",
+        ] {
             assert!(!rendered.contains(forbidden));
         }
     }

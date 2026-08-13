@@ -21,14 +21,15 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::PCWSTR;
 
 use ziranma_core::{
-    CANDIDATE_PACKAGE_MANIFEST_FILE, CANDIDATE_PACKAGE_PAYLOAD_FILE,
-    CANDIDATE_PACKAGE_PROVENANCE_FILE, CANDIDATE_PACKAGES_DIRECTORY,
-    CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE, CANDIDATE_SNAPSHOT_SCHEMA_V1,
-    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidatePackageManifest, CandidatePackageProvenance,
-    CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
-    CandidateSourceMaterial, CandidateSupplementalState, CharacterBigramLanguageModel,
-    ContinuousCompositionProbe, Decoder, DecoderIndexStats, ExactShortWordCatalog,
-    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason, LexiconEntry,
+    CANDIDATE_EXACT_SHORT_STATE_FILE, CANDIDATE_PACKAGE_MANIFEST_FILE,
+    CANDIDATE_PACKAGE_PAYLOAD_FILE, CANDIDATE_PACKAGE_PROVENANCE_FILE,
+    CANDIDATE_PACKAGES_DIRECTORY, CANDIDATE_PREFLIGHTS_DIRECTORY, CANDIDATE_SLOT_STATE_FILE,
+    CANDIDATE_SNAPSHOT_SCHEMA_V1, CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortState,
+    CandidatePackageManifest, CandidatePackageProvenance, CandidateReleaseSignature,
+    CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor, CandidateSourceMaterial,
+    CandidateSupplementalState, CharacterBigramLanguageModel, ContinuousCompositionProbe, Decoder,
+    DecoderIndexStats, ExactShortWordCatalog, FourCharacterCorrectionDecision,
+    FourCharacterCorrectionKeepReason, LexiconEntry, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
     MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
@@ -251,6 +252,16 @@ enum Options {
         exact_promotions: usize,
     },
     SupplementDisable {
+        root: PathBuf,
+    },
+    ExactShortStatus {
+        root: PathBuf,
+    },
+    ExactShortEnable {
+        root: PathBuf,
+        exact_promotions: usize,
+    },
+    ExactShortDisable {
         root: PathBuf,
     },
     Preflight {
@@ -692,6 +703,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             exact_promotions,
         } => supplement_enable(&root, exact_promotions)?,
         Options::SupplementDisable { root } => supplement_disable(&root)?,
+        Options::ExactShortStatus { root } => exact_short_status(&root)?,
+        Options::ExactShortEnable {
+            root,
+            exact_promotions,
+        } => exact_short_enable(&root, exact_promotions)?,
+        Options::ExactShortDisable { root } => exact_short_disable(&root)?,
         Options::Preflight { package } => preflight(&package)?,
         Options::PackageQuery {
             package,
@@ -801,6 +818,13 @@ fn parse_options(
         "supplement-enable" => parse_supplement_enable(arguments),
         "supplement-disable" => Ok(Options::SupplementDisable {
             root: parse_root_only(arguments, "supplement-disable")?,
+        }),
+        "exact-short-status" => Ok(Options::ExactShortStatus {
+            root: parse_root_only(arguments, "exact-short-status")?,
+        }),
+        "exact-short-enable" => parse_exact_short_enable(arguments),
+        "exact-short-disable" => Ok(Options::ExactShortDisable {
+            root: parse_root_only(arguments, "exact-short-disable")?,
         }),
         "preflight" => Ok(Options::Preflight {
             package: parse_package_only(arguments, "preflight")?,
@@ -2401,6 +2425,31 @@ fn parse_supplement_enable(
     })
 }
 
+fn parse_exact_short_enable(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut root = None;
+    let mut exact_promotions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--root" => set_path(&mut root, &mut arguments, "--root")?,
+            "--exact-promotions" => {
+                set_usize(&mut exact_promotions, &mut arguments, "--exact-promotions")?
+            }
+            _ => return Err("unknown exact-short-enable argument; value was suppressed".into()),
+        }
+    }
+    let exact_promotions =
+        exact_promotions.ok_or("exact-short-enable requires --exact-promotions")?;
+    if !(1..=MAX_EXACT_SHORT_WORDS_PER_CODE).contains(&exact_promotions) {
+        return Err("exact-short-enable --exact-promotions is outside the fixed bound".into());
+    }
+    Ok(Options::ExactShortEnable {
+        root: root.ok_or("exact-short-enable requires --root")?,
+        exact_promotions,
+    })
+}
+
 fn parse_root_only(
     mut arguments: impl Iterator<Item = String>,
     command: &str,
@@ -2710,6 +2759,9 @@ fn print_usage() {
     eprintln!("  supplement-status --root <SUPPLEMENTAL_SLOT_DIR>");
     eprintln!("  supplement-enable --root <SUPPLEMENTAL_SLOT_DIR> --exact-promotions <1..50>");
     eprintln!("  supplement-disable --root <SUPPLEMENTAL_SLOT_DIR>");
+    eprintln!("  exact-short-status --root <EXACT_SHORT_SLOT_DIR>");
+    eprintln!("  exact-short-enable --root <EXACT_SHORT_SLOT_DIR> --exact-promotions <1..8>");
+    eprintln!("  exact-short-disable --root <EXACT_SHORT_SLOT_DIR>");
     eprintln!("  preflight --package <PACKAGE_DIR>");
     eprintln!(
         "  package-query --package <PUBLIC_PACKAGE_DIR> --code <LOWERCASE_KEYS> --limit <1..50>"
@@ -10146,6 +10198,59 @@ fn supplement_disable(root: &Path) -> Result<String, Box<dyn std::error::Error>>
     Ok("公开补充词层已关闭\n候选包：保留，可再次启用\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n".to_owned())
 }
 
+fn exact_short_status(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let slots = read_slot_state(root)?;
+    let state = read_exact_short_state(root)?;
+    let prepared_revision = exact_short_slot_revision(root, slots.current())?;
+    let status = match state.package() {
+        None => format!(
+            "公开精确短词层\n状态：关闭\n已准备：{}\n本次操作：只读\n",
+            prepared_revision.as_deref().unwrap_or("未配置")
+        ),
+        Some(package) if Some(package) != slots.current() => format!(
+            "公开精确短词层\n状态：已回退，不注入第二页\n已准备：{}\n原因：当前包尚未重新确认\n本次操作：只读\n",
+            prepared_revision.as_deref().unwrap_or("未配置")
+        ),
+        Some(package) => {
+            let loaded = load_installed_exact_short_package(root, package)?;
+            validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+            format!(
+                "公开精确短词层\n状态：启用\n版本：{}\n每码最多补：{} 个双来源确认短词\n分页边界：第一页保持不动；从第二页开头按需注入\n本次操作：只读\n",
+                loaded.catalog.revision(),
+                state.exact_promotions(),
+            )
+        }
+    };
+    Ok(status)
+}
+
+fn exact_short_enable(
+    root: &Path,
+    exact_promotions: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let slots = read_slot_state(root)?;
+    let package = slots
+        .current()
+        .ok_or("exact-short candidate package is not configured")?;
+    let loaded = load_installed_exact_short_package(root, package)?;
+    validate_preflight_receipt(root, package, &loaded.authentication_sha256)?;
+    let state = CandidateExactShortState::enabled(package, exact_promotions)?;
+    write_exact_short_state(root, &state)?;
+    Ok(format!(
+        "公开精确短词层已启用\n版本：{}\n每码最多补：{exact_promotions} 个双来源确认短词\n分页边界：第一页保持不动；从第二页开头按需注入\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n",
+        loaded.catalog.revision(),
+    ))
+}
+
+fn exact_short_disable(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let state = read_exact_short_state(root)?;
+    if !state.is_enabled() {
+        return Ok("公开精确短词层已经关闭\n写入：0 个文件\n现有输入法宿主：未改动\n".to_owned());
+    }
+    write_exact_short_state(root, &CandidateExactShortState::default())?;
+    Ok("公开精确短词层已关闭\n候选包：保留，可再次启用\n生效：支持热刷新的宿主从下一个组合开始；旧版宿主需重新打开\n".to_owned())
+}
+
 fn preflight(package: &Path) -> Result<String, Box<dyn std::error::Error>> {
     preflight_with(package, preflight_loaded_package)
 }
@@ -10476,6 +10581,21 @@ fn slot_revision(
     }
 }
 
+fn exact_short_slot_revision(
+    root: &Path,
+    package_id: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match package_id {
+        Some(package_id) => Ok(Some(
+            load_installed_exact_short_package(root, package_id)?
+                .catalog
+                .revision()
+                .to_owned(),
+        )),
+        None => Ok(None),
+    }
+}
+
 fn load_public_package_directory(
     package: &Path,
 ) -> Result<LoadedPackage, Box<dyn std::error::Error>> {
@@ -10628,6 +10748,19 @@ fn load_installed_package(
         return Err("installed candidate package no longer matches its storage identifier".into());
     }
     Ok(loaded)
+}
+
+fn load_installed_exact_short_package(
+    root: &Path,
+    package_id: &str,
+) -> Result<LoadedExactShortPackage, Box<dyn std::error::Error>> {
+    let path = root.join(CANDIDATE_PACKAGES_DIRECTORY).join(package_id);
+    let ordinary = load_installed_package(root, package_id)?;
+    let exact = load_exact_short_package_directory(&path)?;
+    if exact.authentication_sha256 != ordinary.authentication_sha256 {
+        return Err("installed exact-short package authentication changed".into());
+    }
+    Ok(exact)
 }
 
 fn install_package(
@@ -10824,6 +10957,33 @@ fn read_supplemental_state(
     }
 }
 
+fn read_exact_short_state(
+    root: &Path,
+) -> Result<CandidateExactShortState, Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => ensure_regular_directory(root, "exact-short candidate slot root")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateExactShortState::default());
+        }
+        Err(_) => return Err("cannot inspect exact-short candidate slot root".into()),
+    }
+    let path = root.join(CANDIDATE_EXACT_SHORT_STATE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let contents = read_explicit_text(
+                &path,
+                "exact-short candidate state",
+                MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
+            )?;
+            Ok(CandidateExactShortState::parse(&contents)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CandidateExactShortState::default())
+        }
+        Err(_) => Err("cannot inspect exact-short candidate state".into()),
+    }
+}
+
 fn write_slot_state(
     root: &Path,
     state: &CandidateSlotState,
@@ -10852,6 +11012,23 @@ fn write_supplemental_state(
     let temporary = root.join(format!(".supplemental-{}-{stamp}.tmp", std::process::id()));
     write_new_synced(&temporary, body.as_bytes())?;
     let result = move_replace(&temporary, &root.join(CANDIDATE_SUPPLEMENTAL_STATE_FILE));
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_exact_short_state(
+    root: &Path,
+    state: &CandidateExactShortState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    prepare_slot_root(root)?;
+    let body = state.render();
+    CandidateExactShortState::parse(&body)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temporary = root.join(format!(".exact-short-{}-{stamp}.tmp", std::process::id()));
+    write_new_synced(&temporary, body.as_bytes())?;
+    let result = move_replace(&temporary, &root.join(CANDIDATE_EXACT_SHORT_STATE_FILE));
     if result.is_err() && temporary.exists() {
         let _ = fs::remove_file(&temporary);
     }
@@ -12533,6 +12710,42 @@ mod tests {
         );
         assert_eq!(
             parse_options([
+                "exact-short-status".to_owned(),
+                "--root".to_owned(),
+                "exact-short".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortStatus {
+                root: PathBuf::from("exact-short"),
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "exact-short-enable".to_owned(),
+                "--root".to_owned(),
+                "exact-short".to_owned(),
+                "--exact-promotions".to_owned(),
+                "2".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortEnable {
+                root: PathBuf::from("exact-short"),
+                exact_promotions: 2,
+            }
+        );
+        assert_eq!(
+            parse_options([
+                "exact-short-disable".to_owned(),
+                "--root".to_owned(),
+                "exact-short".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactShortDisable {
+                root: PathBuf::from("exact-short"),
+            }
+        );
+        assert_eq!(
+            parse_options([
                 "runtime-check".to_owned(),
                 "--root".to_owned(),
                 "slots".to_owned(),
@@ -12580,6 +12793,16 @@ mod tests {
                 "supplement-enable".to_owned(),
                 "--root".to_owned(),
                 "supplement".to_owned(),
+                "--exact-promotions".to_owned(),
+                "0".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options([
+                "exact-short-enable".to_owned(),
+                "--root".to_owned(),
+                "exact-short".to_owned(),
                 "--exact-promotions".to_owned(),
                 "0".to_owned(),
             ])
@@ -14345,6 +14568,108 @@ ngram 1=3\n\n\
         );
         assert!(
             supplement_disable(&slots)
+                .unwrap()
+                .contains("写入：0 个文件")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_short_activation_is_strict_page_guarded_and_reversible() {
+        let root = temporary_test_root();
+        let source = root.join("source.yaml");
+        let confirmation = root.join("words.txt");
+        let base = root.join("base.tsv");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        let slots = root.join("exact-short");
+        fs::create_dir(&root).unwrap();
+        fs::write(&source, SHORT_CONSENSUS_SOURCE).unwrap();
+        fs::write(&confirmation, SHORT_CONSENSUS_CONFIRMATION).unwrap();
+        fs::write(&base, SHORT_CONSENSUS_BASE).unwrap();
+
+        let build = |output: PathBuf, revision: &str| {
+            build_short_consensus_layer_public_package(ShortConsensusLayerBuildOptions {
+                source: source.clone(),
+                confirmation: confirmation.clone(),
+                base_payload: base.clone(),
+                output,
+                revision: revision.to_owned(),
+                per_code_depth: 2,
+                entry_limit: 50_000,
+                source_declaration: phrase_material_declaration(
+                    "dictionary",
+                    SHORT_CONSENSUS_SOURCE,
+                ),
+                confirmation_declaration: phrase_material_declaration(
+                    "confirmation",
+                    SHORT_CONSENSUS_CONFIRMATION,
+                ),
+                base_declaration: phrase_material_declaration("base-payload", SHORT_CONSENSUS_BASE),
+            })
+            .unwrap();
+        };
+        build(package_a.clone(), "exact-short-a");
+        build(package_b.clone(), "exact-short-b");
+
+        assert_eq!(
+            exact_short_status(&slots).unwrap(),
+            "公开精确短词层\n状态：关闭\n已准备：未配置\n本次操作：只读\n"
+        );
+        assert!(!slots.exists());
+        adopt(&slots, &package_a, &package_sha256(&package_a)).unwrap();
+        assert!(
+            exact_short_status(&slots)
+                .unwrap()
+                .contains("已准备：exact-short-a")
+        );
+
+        let enabled = exact_short_enable(&slots, 2).unwrap();
+        assert!(enabled.contains("版本：exact-short-a"));
+        assert!(enabled.contains("每码最多补：2"));
+        assert!(enabled.contains("第一页保持不动"));
+        let state = CandidateExactShortState::parse(
+            &fs::read_to_string(slots.join(CANDIDATE_EXACT_SHORT_STATE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.exact_promotions(), 2);
+        let selection = ziranma_core::load_candidate_runtime_exact_short_selection(&slots).unwrap();
+        let loaded = ziranma_core::load_candidate_runtime_exact_short(&slots, &selection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.catalog().revision(), "exact-short-a");
+        assert_eq!(loaded.exact_promotions(), 2);
+
+        stage(&slots, &package_b, &package_sha256(&package_b)).unwrap();
+        promote(&slots).unwrap();
+        let drifted = exact_short_status(&slots).unwrap();
+        assert!(drifted.contains("状态：已回退，不注入第二页"));
+        assert!(drifted.contains("已准备：exact-short-b"));
+        exact_short_enable(&slots, 1).unwrap();
+        assert!(
+            exact_short_status(&slots)
+                .unwrap()
+                .contains("版本：exact-short-b")
+        );
+
+        let package_count = fs::read_dir(slots.join(CANDIDATE_PACKAGES_DIRECTORY))
+            .unwrap()
+            .count();
+        assert!(
+            exact_short_disable(&slots)
+                .unwrap()
+                .contains("候选包：保留")
+        );
+        assert!(exact_short_status(&slots).unwrap().contains("状态：关闭"));
+        assert_eq!(
+            fs::read_dir(slots.join(CANDIDATE_PACKAGES_DIRECTORY))
+                .unwrap()
+                .count(),
+            package_count
+        );
+        assert!(
+            exact_short_disable(&slots)
                 .unwrap()
                 .contains("写入：0 个文件")
         );

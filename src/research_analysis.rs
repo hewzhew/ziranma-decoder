@@ -23,6 +23,7 @@ const MAX_SCENE_EPISODES: usize = 128;
 const MAX_SCENE_SPAN_MS: u64 = 10 * 60_000;
 const MAX_WISH_CONTEXT_EPISODES: usize = 6;
 const RETYPE_MAX_GAP_MS: u64 = 10_000;
+const RECORDED_CANDIDATE_PAGE_SIZE: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResearchHabitKind {
@@ -33,6 +34,19 @@ pub enum ResearchHabitKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResearchWishEpisodeKind {
     CandidateCommit,
+    RawCodeCommit,
+    Cancellation,
+}
+
+/// Evidence-only classification of one completed input near a wish anchor.
+///
+/// These labels describe what the journal directly observed. They do not
+/// decide whether a candidate was correct, useful, or linguistically odd.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResearchWishEvidenceKind {
+    TopCandidate,
+    VisibleNonTopCandidate,
+    DeepCandidate,
     RawCodeCommit,
     Cancellation,
 }
@@ -48,6 +62,8 @@ pub struct ResearchWishEpisode {
     text: Option<String>,
     rank: Option<usize>,
     post_commit_backspace_routed: bool,
+    evidence_kind: ResearchWishEvidenceKind,
+    followed_by_retype: bool,
 }
 
 impl ResearchWishEpisode {
@@ -69,6 +85,16 @@ impl ResearchWishEpisode {
 
     pub fn post_commit_backspace_routed(&self) -> bool {
         self.post_commit_backspace_routed
+    }
+
+    pub fn evidence_kind(&self) -> ResearchWishEvidenceKind {
+        self.evidence_kind
+    }
+
+    /// Whether this commit was followed by the bounded, same-chain
+    /// Backspace-then-different-commit sequence used for retyping clues.
+    pub fn followed_by_retype(&self) -> bool {
+        self.followed_by_retype
     }
 }
 
@@ -1127,7 +1153,13 @@ fn collect_wish_contexts(
             preceding_episodes: matching.len(),
             episodes: matching[start..]
                 .iter()
-                .map(|episode| episode.as_wish_episode())
+                .enumerate()
+                .map(|(index, episode)| {
+                    let followed_by_retype = matching
+                        .get(start + index + 1)
+                        .is_some_and(|next| is_bounded_retype_pair(episode, next));
+                    episode.as_wish_episode(followed_by_retype)
+                })
                 .collect(),
         });
     }
@@ -1135,25 +1167,34 @@ fn collect_wish_contexts(
 }
 
 impl Episode {
-    fn as_wish_episode(&self) -> ResearchWishEpisode {
-        let (kind, code, text, rank) = match &self.outcome {
+    fn as_wish_episode(&self, followed_by_retype: bool) -> ResearchWishEpisode {
+        let (kind, code, text, rank, evidence_kind) = match &self.outcome {
             EpisodeOutcome::CandidateCommit { code, text, rank } => (
                 ResearchWishEpisodeKind::CandidateCommit,
                 code.clone(),
                 Some(text.clone()),
                 Some(*rank),
+                match *rank {
+                    1 => ResearchWishEvidenceKind::TopCandidate,
+                    2..=RECORDED_CANDIDATE_PAGE_SIZE => {
+                        ResearchWishEvidenceKind::VisibleNonTopCandidate
+                    }
+                    _ => ResearchWishEvidenceKind::DeepCandidate,
+                },
             ),
             EpisodeOutcome::RawCodeCommit { code } => (
                 ResearchWishEpisodeKind::RawCodeCommit,
                 code.clone(),
                 None,
                 None,
+                ResearchWishEvidenceKind::RawCodeCommit,
             ),
             EpisodeOutcome::Cancellation { code } => (
                 ResearchWishEpisodeKind::Cancellation,
                 code.clone(),
                 None,
                 None,
+                ResearchWishEvidenceKind::Cancellation,
             ),
         };
         ResearchWishEpisode {
@@ -1162,7 +1203,33 @@ impl Episode {
             text,
             rank,
             post_commit_backspace_routed: self.post_commit_backspace_routed,
+            evidence_kind,
+            followed_by_retype,
         }
+    }
+}
+
+fn is_bounded_retype_pair(previous: &Episode, next: &Episode) -> bool {
+    if previous.chain != next.chain || !previous.post_commit_backspace_routed {
+        return false;
+    }
+    if next.start_ms.saturating_sub(previous.end_ms) > RETYPE_MAX_GAP_MS {
+        return false;
+    }
+    match (&previous.outcome, &next.outcome) {
+        (
+            EpisodeOutcome::CandidateCommit {
+                code: previous_code,
+                text: previous_text,
+                ..
+            },
+            EpisodeOutcome::CandidateCommit {
+                code: next_code,
+                text: next_text,
+                ..
+            },
+        ) => previous_code != next_code || previous_text != next_text,
+        _ => false,
     }
 }
 
@@ -1175,13 +1242,10 @@ fn collect_retype_clues<'a>(
             let [previous, next] = pair else {
                 continue;
             };
-            if previous.chain != next.chain || !previous.post_commit_backspace_routed {
+            if !is_bounded_retype_pair(previous, next) {
                 continue;
             }
             let gap_ms = next.start_ms.saturating_sub(previous.end_ms);
-            if gap_ms > RETYPE_MAX_GAP_MS {
-                continue;
-            }
             let (
                 EpisodeOutcome::CandidateCommit {
                     code: previous_code,
@@ -1355,13 +1419,21 @@ mod tests {
     }
 
     fn committed(code: &str, text: &str) -> NativeFeedbackEvent {
+        committed_at_rank(code, text, 1)
+    }
+
+    fn committed_at_rank(code: &str, text: &str, rank: usize) -> NativeFeedbackEvent {
         NativeFeedbackEvent::CandidateCommitted {
             code: code.to_owned(),
             text: text.to_owned(),
             view: NativeCandidateView::Ordinary,
-            source: NativeSelectionSource::FirstCandidate,
-            absolute_rank: 1,
-            visible_rank: 1,
+            source: if rank == 1 {
+                NativeSelectionSource::FirstCandidate
+            } else {
+                NativeSelectionSource::Numeric
+            },
+            absolute_rank: rank,
+            visible_rank: (rank.saturating_sub(1) % RECORDED_CANDIDATE_PAGE_SIZE) + 1,
         }
     }
 
@@ -1793,6 +1865,97 @@ mod tests {
                 .episodes()
                 .iter()
                 .all(|episode| episode.code() != "hh")
+        );
+    }
+
+    #[test]
+    fn wish_evidence_cards_classify_rank_raw_cancel_and_bounded_retype_without_guessing() {
+        let stream = "5a".repeat(32);
+        let research = snapshot(
+            &stream,
+            0,
+            0,
+            None,
+            vec![
+                (10, committed_at_rank("aa", "甲", 1)),
+                (20, committed_at_rank("bb", "乙", 6)),
+                (30, committed_at_rank("cc", "丙", 7)),
+                (31, NativeFeedbackEvent::PostCommitBackspaceRouted),
+                (40, committed("dd", "丁")),
+                (
+                    50,
+                    NativeFeedbackEvent::RawCodeCommitted {
+                        code: "raw".to_owned(),
+                    },
+                ),
+                (
+                    60,
+                    NativeFeedbackEvent::CompositionCancelled {
+                        code: "esc".to_owned(),
+                        source: NativeCancellationSource::Escape,
+                    },
+                ),
+            ],
+        );
+        let mut feedback = NativeFeedbackSession::default();
+        feedback.start_memory(
+            crate::NativeFeedbackAuthorization::explicit_memory_only(),
+            crate::NativeFeedbackLimits::default(),
+        );
+        feedback.record_at(
+            crate::NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "xuy".to_owned(),
+            },
+            1,
+        );
+        let frozen = feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                2,
+                10,
+                8,
+            )
+            .unwrap();
+        let wish = WishSnapshot::from_frozen_with_context(
+            &frozen,
+            WishCaptureScope::RecentWindow,
+            WishCategory::Ranking,
+            None,
+            Some(WishJournalContext::WishAnchor(
+                WishJournalAnchor::new(stream, 6).unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let report = analyze_linked_research(&[research], &[wish]).unwrap();
+        let episodes = report.wish_contexts()[0].episodes();
+        assert_eq!(episodes.len(), 6);
+        assert_eq!(
+            episodes[0].evidence_kind(),
+            ResearchWishEvidenceKind::TopCandidate
+        );
+        assert_eq!(
+            episodes[1].evidence_kind(),
+            ResearchWishEvidenceKind::VisibleNonTopCandidate
+        );
+        assert_eq!(
+            episodes[2].evidence_kind(),
+            ResearchWishEvidenceKind::DeepCandidate
+        );
+        assert!(episodes[2].followed_by_retype());
+        assert_eq!(
+            episodes[4].evidence_kind(),
+            ResearchWishEvidenceKind::RawCodeCommit
+        );
+        assert_eq!(
+            episodes[5].evidence_kind(),
+            ResearchWishEvidenceKind::Cancellation
+        );
+        assert!(
+            episodes[3..]
+                .iter()
+                .all(|episode| !episode.followed_by_retype())
         );
     }
 }

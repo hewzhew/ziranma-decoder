@@ -91,7 +91,8 @@ CompositionSession
   不重读大词典，新包完整验证成功后才替换自己的补充快照，损坏更新保留最后有效
   版本，关闭则从新组合切回核心。活动组合不热换；
 - 更深同码双字的精确短词层使用另一个固定根
-  `.local/tsf-alpha/user-data/public-exact-short` 和独立 `exact-short.zcl`。
+  `.local/tsf-alpha/user-data/public-exact-short` 和独立 `exact-short.zcl`。该根由
+  `candidatectl exact-short-status/enable/disable` 显式管理；普通换代不创建或开启它。
   它复用公开包的内容寻址、来源认证、current 绑定与预检凭据，并额外验证
   双汉字、双音节、规范顺序和每码深度；只允许在第一页冻结后由候选缓存按页
   插入。根或状态缺失即关闭，损坏更新保留最后有效目录，活动组合不热换。
