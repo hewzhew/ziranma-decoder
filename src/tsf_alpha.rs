@@ -178,6 +178,7 @@ const AUTOMATIC_TRANSPOSITION_SHADOW_UPPER_GAP_MS: u64 = 96;
 const PERSONAL_RANKING_FLUSH_SELECTIONS: usize = 8;
 const BACKGROUND_PERSISTENCE_QUEUE_CAPACITY: usize = 16;
 const CANDIDATE_RUNTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const PERSONAL_RANKING_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SLOW_KEY_PATH_THRESHOLD_MS: u32 = 16;
 const INLINE_WISH_TRIGGER_CODE: &str = "xuy";
 const INLINE_WISH_NOTICE_TIMER_ID: usize = 1;
@@ -940,9 +941,13 @@ struct RefreshThrottle {
 
 impl RefreshThrottle {
     fn allow(&mut self, now: Instant) -> bool {
+        self.allow_with_interval(now, CANDIDATE_RUNTIME_REFRESH_INTERVAL)
+    }
+
+    fn allow_with_interval(&mut self, now: Instant, interval: Duration) -> bool {
         if self.last_check.is_some_and(|previous| {
             now.checked_duration_since(previous)
-                .is_some_and(|elapsed| elapsed < CANDIDATE_RUNTIME_REFRESH_INTERVAL)
+                .is_some_and(|elapsed| elapsed < interval)
         }) {
             return false;
         }
@@ -8666,6 +8671,14 @@ enum BackgroundPersistenceCommand {
         root: PathBuf,
         batch: PersonalRankingBatch,
     },
+    PersonalRankingRefresh {
+        root: PathBuf,
+        suppression_root: Option<PathBuf>,
+        previous: Arc<LoadedPersonalRanking>,
+        previous_suppressions: Arc<LoadedPersonalRankingSuppressions>,
+        local_overlay: Vec<PersonalRankingSelection>,
+        refreshed: mpsc::Sender<Option<PersonalRankingRefreshResult>>,
+    },
     Barrier(mpsc::Sender<()>),
     Shutdown,
 }
@@ -8731,6 +8744,31 @@ impl BackgroundPersistenceHandle {
         }
     }
 
+    fn enqueue_personal_ranking_refresh(
+        &self,
+        root: PathBuf,
+        suppression_root: Option<PathBuf>,
+        previous: Arc<LoadedPersonalRanking>,
+        previous_suppressions: Arc<LoadedPersonalRankingSuppressions>,
+        local_overlay: Vec<PersonalRankingSelection>,
+    ) -> Option<mpsc::Receiver<Option<PersonalRankingRefreshResult>>> {
+        if self.health.personal_ranking_failed.load(Ordering::Acquire) {
+            return None;
+        }
+        let (refreshed, receiver) = mpsc::channel();
+        self.sender
+            .try_send(BackgroundPersistenceCommand::PersonalRankingRefresh {
+                root,
+                suppression_root,
+                previous,
+                previous_suppressions,
+                local_overlay,
+                refreshed,
+            })
+            .ok()
+            .map(|()| receiver)
+    }
+
     fn wait_for_personal_ranking_idle(&self) -> bool {
         let (acknowledge, acknowledged) = mpsc::channel();
         if self
@@ -8787,6 +8825,40 @@ impl BackgroundPersistence {
                                     .store(true, Ordering::Release);
                             }
                         }
+                        BackgroundPersistenceCommand::PersonalRankingRefresh {
+                            root,
+                            suppression_root,
+                            previous,
+                            previous_suppressions,
+                            local_overlay,
+                            refreshed,
+                        } => {
+                            let loaded = refresh_personal_ranking(
+                                &root,
+                                &WindowsUserDataProtector,
+                                &previous,
+                            );
+                            let loaded_suppressions = suppression_root.as_deref().map_or_else(
+                                || Ok(previous_suppressions.as_ref().clone()),
+                                |root| {
+                                    refresh_personal_ranking_suppressions(
+                                        root,
+                                        &WindowsUserDataProtector,
+                                        &previous_suppressions,
+                                    )
+                                },
+                            );
+                            let result = loaded.ok().zip(loaded_suppressions.ok()).and_then(
+                                |(loaded, loaded_suppressions)| {
+                                    PersonalRankingRefreshResult::new(
+                                        loaded,
+                                        loaded_suppressions,
+                                        &local_overlay,
+                                    )
+                                },
+                            );
+                            let _ = refreshed.send(result);
+                        }
                         BackgroundPersistenceCommand::Barrier(acknowledge) => {
                             let _ = acknowledge.send(());
                         }
@@ -8835,17 +8907,46 @@ impl Drop for BackgroundPersistence {
     }
 }
 
+struct PersonalRankingRefreshResult {
+    loaded: LoadedPersonalRanking,
+    loaded_suppressions: LoadedPersonalRankingSuppressions,
+    snapshot: PersonalRankingSnapshot,
+    suppressions: PersonalRankingSuppressionSnapshot,
+}
+
+impl PersonalRankingRefreshResult {
+    fn new(
+        loaded: LoadedPersonalRanking,
+        loaded_suppressions: LoadedPersonalRankingSuppressions,
+        local_overlay: &[PersonalRankingSelection],
+    ) -> Option<Self> {
+        let mut snapshot = loaded.snapshot().clone();
+        for selection in local_overlay {
+            snapshot.record(selection.code(), selection.text()).ok()?;
+        }
+        let suppressions = loaded_suppressions.snapshot().clone();
+        Some(Self {
+            loaded,
+            loaded_suppressions,
+            snapshot,
+            suppressions,
+        })
+    }
+}
+
 struct PersonalRankingRuntime {
     root: Option<PathBuf>,
     suppression_root: Option<PathBuf>,
-    persisted: LoadedPersonalRanking,
-    persisted_suppressions: LoadedPersonalRankingSuppressions,
+    persisted: Arc<LoadedPersonalRanking>,
+    persisted_suppressions: Arc<LoadedPersonalRankingSuppressions>,
     snapshot: PersonalRankingSnapshot,
     suppressions: PersonalRankingSuppressionSnapshot,
     unflushed: Vec<PersonalRankingSelection>,
     next_sequence: u64,
     next_suppression_sequence: u64,
     persistence: Option<BackgroundPersistenceHandle>,
+    refresh_throttle: RefreshThrottle,
+    pending_refresh: Option<mpsc::Receiver<Option<PersonalRankingRefreshResult>>>,
 }
 
 impl PersonalRankingRuntime {
@@ -8896,14 +8997,16 @@ impl PersonalRankingRuntime {
                 Self {
                     root: Some(root),
                     suppression_root,
-                    persisted: loaded,
-                    persisted_suppressions: loaded_suppressions,
+                    persisted: Arc::new(loaded),
+                    persisted_suppressions: Arc::new(loaded_suppressions),
                     next_sequence,
                     snapshot,
                     suppressions,
                     unflushed: Vec::new(),
                     next_suppression_sequence,
                     persistence,
+                    refresh_throttle: RefreshThrottle::default(),
+                    pending_refresh: None,
                 }
             }
             _ => Self::memory_only(),
@@ -8914,14 +9017,16 @@ impl PersonalRankingRuntime {
         Self {
             root: None,
             suppression_root: None,
-            persisted: LoadedPersonalRanking::default(),
-            persisted_suppressions: LoadedPersonalRankingSuppressions::default(),
+            persisted: Arc::new(LoadedPersonalRanking::default()),
+            persisted_suppressions: Arc::new(LoadedPersonalRankingSuppressions::default()),
             snapshot: PersonalRankingSnapshot::default(),
             suppressions: PersonalRankingSuppressionSnapshot::default(),
             unflushed: Vec::new(),
             next_sequence: 0,
             next_suppression_sequence: 0,
             persistence: None,
+            refresh_throttle: RefreshThrottle::default(),
+            pending_refresh: None,
         }
     }
 
@@ -8933,6 +9038,50 @@ impl PersonalRankingRuntime {
         {
             return false;
         }
+        self.pending_refresh = None;
+        self.refresh_verified_state()
+    }
+
+    fn refresh_at_safe_boundary_at(&mut self, now: Instant) -> bool {
+        let changed = self.apply_completed_refresh();
+        if self.pending_refresh.is_some()
+            || !self
+                .refresh_throttle
+                .allow_with_interval(now, PERSONAL_RANKING_REFRESH_INTERVAL)
+        {
+            return changed;
+        }
+        if let (Some(root), Some(persistence)) = (self.root.as_ref(), self.persistence.as_ref()) {
+            self.pending_refresh = persistence.enqueue_personal_ranking_refresh(
+                root.clone(),
+                self.suppression_root.clone(),
+                Arc::clone(&self.persisted),
+                Arc::clone(&self.persisted_suppressions),
+                self.unflushed.clone(),
+            );
+            return changed;
+        }
+        self.refresh_verified_state() || changed
+    }
+
+    fn refresh_at_safe_boundary(&mut self) -> bool {
+        self.refresh_at_safe_boundary_at(Instant::now())
+    }
+
+    fn apply_completed_refresh(&mut self) -> bool {
+        let Some(receiver) = self.pending_refresh.as_ref() else {
+            return false;
+        };
+        let completed = match receiver.try_recv() {
+            Ok(completed) => completed,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.pending_refresh = None;
+        completed.is_some_and(|refreshed| self.apply_prepared_refresh(refreshed))
+    }
+
+    fn refresh_verified_state(&mut self) -> bool {
         let Some(root) = self.root.as_ref() else {
             return false;
         };
@@ -8946,7 +9095,7 @@ impl PersonalRankingRuntime {
                 &WindowsUserDataProtector,
                 &self.persisted_suppressions,
             ),
-            None => Ok(self.persisted_suppressions.clone()),
+            None => Ok(self.persisted_suppressions.as_ref().clone()),
         };
         let Ok(loaded_suppressions) = loaded_suppressions else {
             return false;
@@ -8957,10 +9106,30 @@ impl PersonalRankingRuntime {
                 return false;
             }
         }
-        self.persisted = loaded;
-        self.persisted_suppressions = loaded_suppressions;
+        self.apply_refreshed_state_with_snapshot(loaded, loaded_suppressions, snapshot)
+    }
+
+    fn apply_refreshed_state_with_snapshot(
+        &mut self,
+        loaded: LoadedPersonalRanking,
+        loaded_suppressions: LoadedPersonalRankingSuppressions,
+        snapshot: PersonalRankingSnapshot,
+    ) -> bool {
+        self.persisted = Arc::new(loaded);
+        self.persisted_suppressions = Arc::new(loaded_suppressions);
         self.snapshot = snapshot;
         self.suppressions = self.persisted_suppressions.snapshot().clone();
+        self.next_suppression_sequence = self
+            .next_suppression_sequence
+            .max(u64::try_from(self.persisted_suppressions.action_count()).unwrap_or(u64::MAX));
+        true
+    }
+
+    fn apply_prepared_refresh(&mut self, refreshed: PersonalRankingRefreshResult) -> bool {
+        self.persisted = Arc::new(refreshed.loaded);
+        self.persisted_suppressions = Arc::new(refreshed.loaded_suppressions);
+        self.snapshot = refreshed.snapshot;
+        self.suppressions = refreshed.suppressions;
         self.next_suppression_sequence = self
             .next_suppression_sequence
             .max(u64::try_from(self.persisted_suppressions.action_count()).unwrap_or(u64::MAX));
@@ -8974,6 +9143,7 @@ impl PersonalRankingRuntime {
         if self.snapshot.record(code, text).is_err() {
             return false;
         }
+        self.pending_refresh = None;
         if self.root.is_none() {
             return true;
         }
@@ -9152,6 +9322,7 @@ impl PersonalRankingRuntime {
         }
         self.suppressions = updated_suppressions;
         self.next_suppression_sequence = self.next_suppression_sequence.saturating_add(1);
+        self.pending_refresh = None;
         true
     }
 
@@ -11860,12 +12031,18 @@ impl TsfTextService_Impl {
         };
         let key_started_at = Instant::now();
         let refresh_started_at = Instant::now();
-        if self.input_mode.get() == InputMode::Chinese
+        let begins_chinese_composition = self.input_mode.get() == InputMode::Chinese
             && !self.has_active_logical_composition()?
             && u16::try_from(wparam.0)
                 .ok()
                 .and_then(|vkey| decode_virtual_key(vkey, modifiers, self.input_mode.get()))
-                .is_some_and(|input| matches!(input, CompositionInput::Letters(_)))
+                .is_some_and(|input| matches!(input, CompositionInput::Letters(_)));
+        if begins_chinese_composition
+            && let Ok(mut ranking) = self.personal_ranking.try_borrow_mut()
+        {
+            let _ = ranking.refresh_at_safe_boundary();
+        }
+        if begins_chinese_composition
             && let Some(provider) = self.candidate_provider.as_ref()
             && provider.refresh_at_safe_boundary()
         {
@@ -12820,6 +12997,44 @@ mod tests {
     }
 
     #[test]
+    fn stale_personal_ranking_runtime_refreshes_at_a_throttled_composition_boundary() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-personal-boundary-refresh-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+        let mut stale_host = PersonalRankingRuntime::new(Some(root.clone()));
+        let refresh_at = Instant::now();
+
+        let mut writer_host = PersonalRankingRuntime::new(Some(root.clone()));
+        assert!(writer_host.record("ab", "乙"));
+        assert!(writer_host.flush());
+        assert_eq!(stale_host.snapshot.preferred_text("ab"), None);
+
+        assert!(stale_host.refresh_at_safe_boundary_at(refresh_at));
+        assert_eq!(stale_host.snapshot.preferred_text("ab"), Some("乙"));
+
+        assert!(writer_host.record("ab", "丙"));
+        assert!(writer_host.record("ab", "丙"));
+        assert!(writer_host.flush());
+        assert!(
+            !stale_host.refresh_at_safe_boundary_at(refresh_at + Duration::from_millis(500)),
+            "a second composition inside the polling interval must retain the verified snapshot"
+        );
+        assert_eq!(stale_host.snapshot.preferred_text("ab"), Some("乙"));
+
+        assert!(
+            stale_host.refresh_at_safe_boundary_at(refresh_at + PERSONAL_RANKING_REFRESH_INTERVAL)
+        );
+        assert_eq!(stale_host.snapshot.preferred_text("ab"), Some("丙"));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn background_persistence_drains_personal_ranking_before_shutdown() {
         let parent = candidate_runtime_test_root("background-ranking");
         let root = parent.join("ranking");
@@ -12844,6 +13059,38 @@ mod tests {
         assert_eq!(reloaded.snapshot.preferred_text("ab"), Some("乙"));
 
         drop(runtime);
+        persistence.shutdown();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn background_safe_boundary_refresh_never_waits_and_applies_on_a_later_boundary() {
+        let parent = candidate_runtime_test_root("background-ranking-refresh");
+        let root = parent.join("ranking");
+        let mut persistence = BackgroundPersistence::start();
+        let handle = persistence.handle();
+        let mut stale_host = PersonalRankingRuntime::new_with_roots_and_persistence(
+            Some(root.clone()),
+            None,
+            Some(handle.clone()),
+        );
+
+        let mut writer_host = PersonalRankingRuntime::new(Some(root));
+        assert!(writer_host.record("ab", "乙"));
+        assert!(writer_host.flush());
+
+        let refresh_at = Instant::now();
+        assert!(
+            !stale_host.refresh_at_safe_boundary_at(refresh_at),
+            "the first boundary should only enqueue the background refresh"
+        );
+        assert_eq!(stale_host.snapshot.preferred_text("ab"), None);
+        assert!(handle.wait_for_personal_ranking_idle());
+        assert!(stale_host.refresh_at_safe_boundary_at(refresh_at));
+        assert_eq!(stale_host.snapshot.preferred_text("ab"), Some("乙"));
+
+        drop(stale_host);
+        drop(writer_host);
         persistence.shutdown();
         fs::remove_dir_all(parent).unwrap();
     }
