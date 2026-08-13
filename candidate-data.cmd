@@ -10,7 +10,7 @@ if not exist "%resolver%" (
 set "candidatectl="
 for /f "usebackq delims=" %%P in (`call "%resolver%" candidatectl`) do set "candidatectl=%%P"
 if not defined candidatectl (
-    echo Candidate data manager is unavailable. Run refresh-ime.cmd first.
+    echo Candidate data manager is unavailable. Run refresh-ime.cmd refresh first.
     exit /b 1
 )
 if not exist "%candidatectl%" (

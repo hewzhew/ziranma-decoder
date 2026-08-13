@@ -4,7 +4,7 @@
 
 TSF DLL 被 Codex、Typora 等宿主加载后，Windows 不允许安全地原地覆盖或强制
 卸载它。许愿管理、反馈分析、别名管理等独立程序却不需要跟着 DLL 一起换代。
-`refresh-ime.cmd` 因此只更新这些用户态工具，不注册输入法、不改变当前用户
+`refresh-ime.cmd refresh` 因此只更新这些用户态工具，不注册输入法、不改变当前用户
 TSF 状态，也不要求关闭正在输入的宿主。
 
 仓库根目录的维护入口都以脚本自身位置解析仓库和固定数据目录，不依赖调用者的
@@ -14,14 +14,15 @@ TSF 状态，也不要求关闭正在输入的宿主。
 其他工程或用户主目录。
 
 ```powershell
-.\refresh-ime.cmd
+.\refresh-ime.cmd refresh
 .\refresh-ime.cmd status
 .\refresh-ime.cmd space
 .\refresh-ime.cmd cleanup
 .\refresh-ime.cmd rollback
 ```
 
-默认命令使用 `Cargo.lock` 和 `--offline`，在
+不带参数与显式 `status` 都只读；发布必须显式写出 `refresh`，防止遗漏动作词时
+意外构建或切换工具槽。`refresh` 使用 `Cargo.lock` 和 `--offline`，在
 `.local/tsf-alpha/user-tools/cargo-target` 隔离构建：
 
 - `aliasctl`、`aliaspad`；
@@ -74,7 +75,7 @@ builds 条目的逻辑大小。“潜在可回收”只统计未引用包，但�
 `.local/tsf-alpha/desktop-launcher`，再切换 current。固定文件使桌面快捷方式不必
 追随内容寻址目录；复制失败时 current 保持不变。启动器的 `wish` 和 `alias` 模式
 重新验证槽、完整清单、每个 EXE 摘要和包内文件集合，再直接打开 GUI，因此不会
-闪出批处理窗口；`update` 只打开仓库固定的 `update-ime.cmd`，仍使用可见控制台。
+闪出批处理窗口；`update` 只打开仓库固定的 `update-ime.cmd update`，仍使用可见控制台。
 它不接受任意程序或路径。回退只交换工具槽，稳定启动器保持新版并兼容旧的七工具
 清单，因而桌面入口不会随回退失效。
 
@@ -89,7 +90,7 @@ builds 条目的逻辑大小。“潜在可回收”只统计未引用包，但�
 | 个人排序与忘记动作 | 仍按既有焦点/输入边界刷新；这里只更新管理工具程序 |
 | 核心候选快照 | 当前类工厂已冻结，宿主重新加载 DLL 后才读取 |
 | 公开补充候选快照 | 装入热刷新能力后，空组合的下一次首键前检查小指针；坏包保留最后有效版本 |
-| 按键、候选窗 UI、新采集字段 | 必须经过明确的 `update-ime.cmd` DLL 换代 |
+| 按键、候选窗 UI、新采集字段 | 必须经过明确的 `update-ime.cmd update` DLL 换代 |
 
 因此，这个入口解决的是“分析和管理程序不必等待所有宿主退出”，不把 Windows
 不支持的 DLL 热卸载伪装成已经完成。公开补充层的数据指针可由已经装入对应能力

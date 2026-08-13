@@ -14,7 +14,7 @@ if "%~1"=="" goto launch_wishpad
 set "wishctl="
 for /f "usebackq delims=" %%P in (`call "%resolver%" wishctl`) do set "wishctl=%%P"
 if not defined wishctl (
-    echo Wish manager is unavailable. Run refresh-ime.cmd first.
+    echo Wish manager is unavailable. Run refresh-ime.cmd refresh first.
     exit /b 1
 )
 if not exist "%wishctl%" (
@@ -29,7 +29,7 @@ exit /b %ERRORLEVEL%
 set "wishpad="
 for /f "usebackq delims=" %%P in (`call "%resolver%" wishpad`) do set "wishpad=%%P"
 if not defined wishpad (
-    echo Wish manager is unavailable. Run refresh-ime.cmd first.
+    echo Wish manager is unavailable. Run refresh-ime.cmd refresh first.
     exit /b 1
 )
 if not exist "%wishpad%" (

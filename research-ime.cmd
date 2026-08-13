@@ -12,7 +12,7 @@ if not exist "%resolver%" (
 set "researchctl="
 for /f "usebackq delims=" %%P in (`call "%resolver%" researchctl`) do set "researchctl=%%P"
 if not defined researchctl (
-    echo Research settings are unavailable. Run refresh-ime.cmd first.
+    echo Research settings are unavailable. Run refresh-ime.cmd refresh first.
     exit /b 1
 )
 if not exist "%researchctl%" (

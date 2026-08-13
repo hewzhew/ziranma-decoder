@@ -393,9 +393,9 @@ function Write-UpdateStatus {
     } elseif ($UpdateState -eq 'already current') {
         Write-Host 'Next: no installation or host restart needed.'
     } elseif ($null -eq $InstalledDigest) {
-        Write-Host 'Next: run update-ime.cmd when a machine-wide first install is wanted.'
+        Write-Host 'Next: run update-ime.cmd update when a machine-wide first install is wanted.'
     } else {
-        Write-Host 'Next: run update-ime.cmd when convenient; existing hosts need not close first.'
+        Write-Host 'Next: run update-ime.cmd update when convenient; existing hosts need not close first.'
     }
     Write-Host (
         'Timing: {0} ms total ({1})' -f

@@ -207,7 +207,7 @@ fail closed。V8 起的批次用进程内连续流、批次序号和事件序号
 
 ```powershell
 cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchctl
-.\update-ime.cmd
+.\update-ime.cmd update
 .\research-ime.cmd on
 .\research-ime.cmd status
 .\research-ime.cmd review
@@ -241,16 +241,17 @@ Typora 等进程使用的旧 DLL。
 日常工具还可以完全避开 `target/release` 与 TSF DLL：
 
 ```powershell
-.\refresh-ime.cmd
+.\refresh-ime.cmd refresh
 .\refresh-ime.cmd status
 .\refresh-ime.cmd rollback
 ```
 
-三个入口都从脚本自身位置定位仓库和 `Cargo.toml`，可以在任意当前目录中使用绝对路径
+这些入口都从脚本自身位置定位仓库和 `Cargo.toml`，可以在任意当前目录中使用绝对路径
 调用，不要求先执行 `Set-Location`。
 
-默认命令离线、锁定依赖地构建八个别名、候选、个人排序、研究、许愿和桌面启动 EXE，
-并发布到 Git 忽略的不可变 `current / previous` 用户工具槽。现有工具进程不被
+显式 `refresh` 离线、锁定依赖地构建八个别名、候选、个人排序、研究、许愿和桌面启动
+EXE，并发布到 Git 忽略的不可变 `current / previous` 用户工具槽；不带参数和显式
+`status` 都只读，避免调用者漏写动作时发布工具。现有工具进程不被
 关闭，新打开的 `aliaspad` / `wishpad` 和下一次管理命令使用 current；状态只读，
 回退先复核完整摘要。这个入口不构建 `--lib`，不生成或替换 TSF DLL，也不读取
 私人数据根。`candidate-data.cmd` 可调用当前候选管理器，`personal-ime.cmd` 则把
@@ -295,7 +296,7 @@ cargo build --release --bin wishctl --bin wishpad
 说明；摘要来自 DPAPI 密文，不包含说明原文。关闭窗口后缓存即消失。“回收站”可以把完整性校验通过的记录及其说明恢复到许愿列表；恢复不会覆盖
 已有同名记录。回收站清单本身只读取密文文件的编号、大小和时间，不解密现场。普通记录页的“移入回收站”会先
 说明影响并以“否”为默认选择；确认后保留相邻选择，仍可从回收站恢复。关闭窗口即
-退出，不设置开机启动或全局快捷键。成功执行 `update-ime.cmd` 后也会打开或唤回管理器。
+退出，不设置开机启动或全局快捷键。成功执行 `update-ime.cmd update` 后也会打开或唤回管理器。
 在输入法内也可以精确输入 `xuy` 后按 `Tab`。候选栏只提供“记录刚才的情况”和
 “记录更多内容”两项：空格确认自动分段的默认现场，数字 `2` 选择近 30 秒兜底。
 分类和文字说明留到之后审阅，保存后会短暂显示结果；退格、Esc 或再次 Tab 返回，
@@ -309,7 +310,8 @@ cargo build --release --bin wishctl --bin wishpad
 
 ```powershell
 .\prepare-ime.cmd
-.\update-ime.cmd
+.\check-ime.cmd
+.\update-ime.cmd update
 .\update-ime.cmd status
 ```
 
@@ -317,11 +319,12 @@ cargo build --release --bin wishctl --bin wishpad
 及日用候选、别名、个人学习、持续研究和许愿工具，然后自动执行只读 `status`。
 它只更新仓库的 `target/release`，不禁用、注册、启用或安装输入法；构建失败和候选
 数据验证失败都保持现有系统版本不变。开发可以先完成这一步，真正换代仍由宝宝以后
-方便时单独运行不带参数的 `update-ime.cmd`。
+方便时显式运行 `update-ime.cmd update`。
 
-不带参数才执行换代；`status` 只读比较 release 与已安装 DLL、验证候选槽和当前用户
+不带参数与 `status` 都只读比较 release 与已安装 DLL、验证候选槽和当前用户
 状态，并报告相对 release 的新旧宿主数量，不弹 UAC、不打开管理器、不写文件。
-默认入口只定位并调用仓库内既有的安全换代脚本；真正换代仍会显示 Windows 管理员确认，
+`check-ime.cmd` 还会依次汇总 TSF 与独立用户工具状态，且不接受任何动作参数。
+只有显式 `update` 才调用仓库内既有的安全换代脚本；真正换代仍会显示 Windows 管理员确认，
 不会自行编译、联网或更改默认输入法。已安装版本的 DLL 摘要与候选槽完全相同
 时走只读快路径，不再注销、注册或弹出管理员确认；真正的新版本仍保留完整的
 安全换代事务。`tsf-devctl inspect` 会额外汇总可见宿主正在加载的同版与旧版

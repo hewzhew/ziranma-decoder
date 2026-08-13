@@ -314,6 +314,7 @@ $requiredFiles = @(
     'Cargo.lock',
     'Cargo.toml',
     'CONTRIBUTING.md',
+    'check-ime.cmd',
     'LICENSE',
     'prepare-ime.cmd',
     'personal-ime.cmd',

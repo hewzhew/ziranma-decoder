@@ -3098,10 +3098,12 @@ mod tests {
         let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("update-ime.cmd");
         let contents = fs::read_to_string(wrapper).unwrap();
 
-        assert!(contents.contains("Usage: update-ime.cmd [status]"));
+        assert!(contents.contains("Usage: update-ime.cmd [status^|update]"));
         assert!(contents.contains("-StatusOnly"));
         assert!(contents.contains("-EnableCurrentUserAfterReplace"));
+        assert!(contents.contains("if \"%update_mode%\"==\"\" set \"update_mode=status\""));
         assert!(contents.contains("if /i \"%update_mode%\"==\"status\" goto status"));
+        assert!(contents.contains("if /i \"%update_mode%\"==\"update\" goto update"));
         assert!(contents.contains("call \"%~dp0wish-ime.cmd\""));
         assert!(!contents.contains("target\\release\\wishpad.exe"));
 
@@ -3161,8 +3163,9 @@ mod tests {
             fs::read_to_string(repository.join("scripts").join("refresh-user-tools.ps1")).unwrap();
 
         assert!(
-            wrapper.contains("Usage: refresh-ime.cmd [refresh^|status^|space^|cleanup^|rollback]")
+            wrapper.contains("Usage: refresh-ime.cmd [status^|refresh^|space^|cleanup^|rollback]")
         );
+        assert!(wrapper.contains("if \"%action%\"==\"\" set \"action=status\""));
         assert!(wrapper.contains("-StatusOnly"));
         assert!(wrapper.contains("-SpaceOnly"));
         assert!(wrapper.contains("-Cleanup -ConfirmCleanupUnreferencedBundles"));
@@ -3171,6 +3174,7 @@ mod tests {
         assert!(wrapper.contains("if /i \"%action%\"==\"space\" goto space"));
         assert!(wrapper.contains("if /i \"%action%\"==\"cleanup\" goto cleanup"));
         assert!(wrapper.contains("if /i \"%action%\"==\"rollback\" goto rollback"));
+        assert!(wrapper.contains("if /i \"%action%\"==\"refresh\" goto refresh"));
         for tool in [
             "aliasctl",
             "aliaspad",
@@ -3273,6 +3277,13 @@ mod tests {
             fs::read_to_string(repository.join("scripts").join("replace-tsf-alpha.ps1")).unwrap();
         assert!(update_script.contains("Join-Path $PSScriptRoot '..'"));
         assert!(update_script.contains("Set-Location -LiteralPath $repositoryRoot"));
+
+        let check = fs::read_to_string(repository.join("check-ime.cmd")).unwrap();
+        assert!(check.contains("set \"repository_root=%~dp0\""));
+        assert!(check.contains("replace-tsf-alpha.ps1"));
+        assert!(check.contains("refresh-user-tools.ps1"));
+        assert_eq!(check.matches("-StatusOnly").count(), 2);
+        assert!(!check.contains("-EnableCurrentUserAfterReplace"));
 
         let resolver =
             fs::read_to_string(repository.join("scripts").join("resolve-user-tool.cmd")).unwrap();

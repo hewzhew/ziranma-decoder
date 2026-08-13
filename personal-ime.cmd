@@ -11,7 +11,7 @@ if not exist "%resolver%" (
 set "personalctl="
 for /f "usebackq delims=" %%P in (`call "%resolver%" personalctl`) do set "personalctl=%%P"
 if not defined personalctl (
-    echo Personal ranking manager is unavailable. Run refresh-ime.cmd first.
+    echo Personal ranking manager is unavailable. Run refresh-ime.cmd refresh first.
     exit /b 1
 )
 if not exist "%personalctl%" (

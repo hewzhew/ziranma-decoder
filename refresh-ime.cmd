@@ -4,7 +4,7 @@ setlocal
 if not "%~2"=="" goto usage
 
 set "action=%~1"
-if "%action%"=="" set "action=refresh"
+if "%action%"=="" set "action=status"
 if /i not "%action%"=="refresh" if /i not "%action%"=="status" if /i not "%action%"=="space" if /i not "%action%"=="cleanup" if /i not "%action%"=="rollback" goto usage
 
 set "refresh_script=%~dp0scripts\refresh-user-tools.ps1"
@@ -23,7 +23,9 @@ if /i "%action%"=="status" goto status
 if /i "%action%"=="space" goto space
 if /i "%action%"=="cleanup" goto cleanup
 if /i "%action%"=="rollback" goto rollback
+if /i "%action%"=="refresh" goto refresh
 
+:refresh
 "%windows_powershell%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%refresh_script%"
 exit /b %ERRORLEVEL%
 
@@ -44,5 +46,6 @@ exit /b %ERRORLEVEL%
 exit /b %ERRORLEVEL%
 
 :usage
-echo Usage: refresh-ime.cmd [refresh^|status^|space^|cleanup^|rollback]
+echo Usage: refresh-ime.cmd [status^|refresh^|space^|cleanup^|rollback]
+echo Default: status ^(read only^). Publishing tools requires the explicit refresh action.
 exit /b 2

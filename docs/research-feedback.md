@@ -95,7 +95,7 @@ fail closed；缓冲会被丢弃或停止，不改变候选、上屏和宿主稳
 
 ```powershell
 cargo build --release --lib --bin tsf-devctl --bin candidatectl --bin researchctl
-.\update-ime.cmd
+.\update-ime.cmd update
 ```
 
 根目录脚本把持续授权与本地分析缩成五个动作：

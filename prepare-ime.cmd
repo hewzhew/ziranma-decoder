@@ -47,5 +47,5 @@ if not "%status_exit_code%"=="0" (
 
 echo.
 echo IME release preparation completed. Nothing was installed.
-echo Run update-ime.cmd later only when a machine replacement is convenient.
+echo Run update-ime.cmd update later only when a machine replacement is convenient.
 exit /b 0

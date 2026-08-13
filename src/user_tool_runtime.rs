@@ -77,7 +77,7 @@ impl fmt::Display for UserToolRuntimeError {
         let message = match self {
             Self::LayoutUnavailable => "用户工具目录不可用",
             Self::ReparsePoint => "用户工具路径不能是重解析点",
-            Self::SlotUnavailable => "用户工具版本槽不可用，请先运行 refresh-ime.cmd",
+            Self::SlotUnavailable => "用户工具版本槽不可用，请先运行 refresh-ime.cmd refresh",
             Self::InvalidSlotState => "用户工具版本槽格式无效，请运行 refresh-ime.cmd status",
             Self::BundleUnavailable => "当前用户工具包不可用",
             Self::ManifestUnavailable => "当前用户工具清单不可用",

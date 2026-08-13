@@ -81,7 +81,7 @@ mod windows_launcher {
             return Err("项目中的 update-ime.cmd 不可用".into());
         }
         let command_prompt = system_command_prompt()?;
-        let command_line = format!("call \"{}\"", update.display());
+        let command_line = update_command_line(&update);
         Command::new(command_prompt)
             .args(["/d", "/s", "/c"])
             .arg(command_line)
@@ -90,6 +90,10 @@ mod windows_launcher {
             .spawn()
             .map(|_| ())
             .map_err(|_| "无法打开自然码换代窗口".into())
+    }
+
+    fn update_command_line(update: &Path) -> String {
+        format!("call \"{}\" update", update.display())
     }
 
     fn system_command_prompt() -> Result<PathBuf, Box<dyn Error>> {
@@ -132,6 +136,14 @@ mod windows_launcher {
             assert!(parse_action(Vec::new()).is_err());
             assert!(parse_action(["wish".into(), "extra".into()]).is_err());
             assert!(parse_action([r"C:\Windows\System32\cmd.exe".into()]).is_err());
+        }
+
+        #[test]
+        fn desktop_update_passes_the_explicit_mutating_action() {
+            assert_eq!(
+                update_command_line(Path::new(r"project\update-ime.cmd")),
+                r#"call "project\update-ime.cmd" update"#
+            );
         }
     }
 }

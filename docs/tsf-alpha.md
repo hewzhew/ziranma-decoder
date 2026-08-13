@@ -513,9 +513,11 @@ Weasel 则同时声明按钮与菜单并在点击路径主动弹出菜单；Alph
 
 ## 安装、升级与回退边界
 
-日常本地开发换代使用仓库根目录的 `update-ime.cmd`。它按自身位置寻找底层
+日常本地开发换代使用仓库根目录的 `update-ime.cmd update`。它按自身位置寻找底层
 `scripts/replace-tsf-alpha.ps1`，因此可以从任意当前目录运行，也可以由资源
-管理器双击；不接受额外参数，不自行编译或下载内容。PowerShell 执行策略参数
+管理器或桌面启动器打开；只接受固定的 `status` / `update` 动作，不自行编译或下载内容。
+不带参数安全地等同于只读 `status`；新版桌面启动器固定显式传 `update`，因此桌面
+换代仍保留明确的变更动作。PowerShell 执行策略参数
 和重新启用开关由包装入口固定传入。底层脚本先验证 release DLL 相邻的公开
 候选槽，把它复制到 DLL SHA-256 对应的不可变构建目录并再次只读检查，然后
 禁用当前用户配置、在单独管理员阶段完成注销和注册，最后重新启用。候选槽
@@ -566,17 +568,19 @@ stderr 的 `NativeCommandError` 包装由脚本先完整捕获，再按真实进
 在任意 PowerShell 当前目录中均可运行：
 
 ```powershell
-.\refresh-ime.cmd
+.\check-ime.cmd
+.\refresh-ime.cmd refresh
 .\refresh-ime.cmd status
 .\refresh-ime.cmd space
 .\refresh-ime.cmd cleanup
 .\refresh-ime.cmd rollback
 .\prepare-ime.cmd
-.\update-ime.cmd
+.\update-ime.cmd update
 .\update-ime.cmd status
 ```
 
-`refresh-ime.cmd` 不进入安装路径。它在独立 Cargo target 中离线构建八个用户态
+`refresh-ime.cmd` 不进入安装路径。只有显式 `refresh` 才在独立 Cargo target 中
+离线构建八个用户态
 管理、分析与桌面启动 EXE，以清单 SHA-256 建立不可变 `current / previous` 槽，
 并让别名、
 研究和许愿入口解析 current。失败时原指针不变，回退先验证两个包；已运行程序
@@ -585,6 +589,11 @@ stderr 的 `NativeCommandError` 包装由脚本先完整捕获，再按真实进
 装入本轮能力后的宿主可在组合之间安全刷新公开补充层，但这项能力本身和按键、
 UI、新采集字段仍必须先安全换代 DLL。详细矩阵见
 [用户态工具独立刷新](user-tool-refresh.md)。
+
+无参数 `refresh-ime.cmd`、无参数 `update-ime.cmd` 与各自 `status` 都严格只读；
+`check-ime.cmd` 则直接调用两个底层 `-StatusOnly` 分支并拒绝任何动作参数。发布用户
+工具必须显式写出 `refresh`，安装 DLL 必须显式写出 `update`，因此调用者漏写动作词
+只会得到状态，不会产生更改。
 
 经验证的桌面启动器另有固定副本，桌面快捷方式只向它传入 `wish`、`alias` 或
 `update`。许愿和自定义短语直接打开 current GUI 而不经过批处理窗口；换代仍打开
