@@ -821,6 +821,7 @@ struct SelectionPattern {
     first_global_top_text: Option<String>,
     first_candidate_text_evidence: CandidateTextEvidence,
     first_precise_ranking_personalization: bool,
+    first_precise_ranking_movement: bool,
     first_precise_personalization: bool,
     awaiting_first_global_top: bool,
     first_top_selection: Option<usize>,
@@ -835,6 +836,7 @@ struct SelectionPattern {
     first_regression_global_top_text: Option<String>,
     first_regression_candidate_text_evidence: CandidateTextEvidence,
     first_regression_precise_ranking_personalization: bool,
+    first_regression_precise_ranking_movement: bool,
     first_regression_precise_personalization_pair: bool,
     awaiting_first_regression_global_top: bool,
     last_rank: Option<usize>,
@@ -941,6 +943,7 @@ impl SelectionPattern {
         committed_text: &str,
         frame: Option<&PresentedFrame>,
         precise_ranking_personalization: bool,
+        precise_ranking_movement: bool,
     ) {
         let evidence = frame.map_or(CandidateTextEvidence::Unavailable, |frame| {
             frame.candidate_text_evidence(rank, committed_text)
@@ -952,11 +955,13 @@ impl SelectionPattern {
             self.first_candidate_text_evidence = evidence;
             self.first_global_top_text = blocker.clone();
             self.first_precise_ranking_personalization = precise_ranking_personalization;
+            self.first_precise_ranking_movement = precise_ranking_movement;
         }
         if self.awaiting_first_regression_global_top {
             self.first_regression_candidate_text_evidence = evidence;
             self.first_regression_global_top_text = blocker;
             self.first_regression_precise_ranking_personalization = precise_ranking_personalization;
+            self.first_regression_precise_ranking_movement = precise_ranking_movement;
         }
     }
 
@@ -1419,6 +1424,7 @@ impl ResearchReview {
                         text,
                         matching_frame,
                         snapshot.supports_precise_candidate_ranking_personalization(),
+                        snapshot.supports_candidate_ranking_movement(),
                     );
                     pattern.observe_global_top_provenance(global_top_provenance);
                     frame = None;
@@ -2337,6 +2343,7 @@ impl ResearchReview {
                 context_rank,
                 blocker_provenance,
                 precise_ranking_personalization,
+                precise_ranking_movement,
                 context_label,
             ) = if initial_non_top {
                 (
@@ -2345,6 +2352,7 @@ impl ResearchReview {
                     pattern.first_rank,
                     pattern.first_global_top_provenance,
                     pattern.first_precise_ranking_personalization,
+                    pattern.first_precise_ranking_movement,
                     "首次",
                 )
             } else {
@@ -2354,15 +2362,21 @@ impl ResearchReview {
                     pattern.first_regression_rank,
                     pattern.first_regression_global_top_provenance,
                     pattern.first_regression_precise_ranking_personalization,
+                    pattern.first_regression_precise_ranking_movement,
                     "回落时",
                 )
             };
             let ranking_reason = if precise_ranking_personalization {
                 match blocker_provenance {
                     Some(top) if !top.ranking_personalization().is_empty() => {
+                        let movement = if precise_ranking_movement {
+                            render_candidate_ranking_movement(top.ranking_movement())
+                        } else {
+                            "原位次未记录".to_owned()
+                        };
                         format!(
-                            "首选实际受个人重排（{}）",
-                            render_candidate_personalization(top.ranking_personalization(),)
+                            "首选实际受个人重排（{}；{movement}）",
+                            render_candidate_personalization(top.ranking_personalization())
                         )
                     }
                     Some(_) => "首选没有实际个人重排".to_owned(),
@@ -3181,6 +3195,17 @@ fn render_candidate_personalization(personalization: NativeCandidatePersonalizat
         "无".to_owned()
     } else {
         rendered.join("、")
+    }
+}
+
+fn render_candidate_ranking_movement(movement: NativeCandidateRankingMovement) -> String {
+    match movement {
+        NativeCandidateRankingMovement::Unrecorded => "原位次未记录".to_owned(),
+        NativeCandidateRankingMovement::Unchanged => "未发生位移".to_owned(),
+        NativeCandidateRankingMovement::MovedFrom { absolute_rank } => {
+            format!("原第 {absolute_rank} 位")
+        }
+        NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool => "候选池外召回".to_owned(),
     }
 }
 
@@ -4127,7 +4152,7 @@ mod tests {
             true,
             &SelectionObservationLocation::default(),
         );
-        pattern.observe_candidate_context(2, "public-target", Some(&frame), true);
+        pattern.observe_candidate_context(2, "public-target", Some(&frame), true, false);
         pattern.observe_global_top_provenance(Some(core));
 
         let mut review = ResearchReview {
@@ -4148,6 +4173,50 @@ mod tests {
         assert!(rendered.contains("位置不一致 1"));
         assert!(!rendered.contains("public-blocker"));
         assert!(!rendered.contains("different-candidate"));
+    }
+
+    #[test]
+    fn private_review_explains_v18_reranked_blocker_source_depth() {
+        let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let blocker = NativeCandidateProvenance::with_personalization_ranking_and_movement(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidateRankingMovement::MovedFrom { absolute_rank: 8 },
+        )
+        .unwrap();
+        let frame = PresentedFrame::next(
+            "public-code",
+            NativeCandidateView::Ordinary,
+            0,
+            vec!["public-blocker".to_owned(), "public-target".to_owned()],
+            vec![blocker, plain],
+            None,
+        );
+        let mut pattern = SelectionPattern::default();
+        pattern.observe(
+            2,
+            NativeSelectionSource::Numeric,
+            Some(plain),
+            true,
+            &SelectionObservationLocation::default(),
+        );
+        pattern.observe_candidate_context(2, "public-target", Some(&frame), true, true);
+        pattern.observe_global_top_provenance(Some(blocker));
+
+        let mut review = ResearchReview {
+            candidate_commits: 1,
+            non_top_commits: 1,
+            manual_commits: 1,
+            candidate_text_verified_commits: 1,
+            ..ResearchReview::default()
+        };
+        review.selections.insert(
+            ("public-code".to_owned(), "public-target".to_owned()),
+            pattern,
+        );
+        let rendered = review.render();
+        assert!(rendered.contains("首选实际受个人重排（持久精确；原第 8 位）"));
     }
 
     #[test]

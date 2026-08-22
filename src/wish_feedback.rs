@@ -3941,6 +3941,50 @@ mod tests {
         bytes
     }
 
+    fn v18_ranking_movement_fixture(
+        personalization_bits: u8,
+        ranking_bits: u8,
+        movement_tag: u8,
+        source_rank: Option<usize>,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WISH_PLAINTEXT_MAGIC_V18);
+        bytes.push(WishCaptureScope::RecentWindow.encoded());
+        bytes.push(WishCategory::Other.encoded());
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        bytes.push(0);
+        bytes.push(WishPublicCandidateOrderPolicy::Unrecorded.encoded());
+        bytes.push(0);
+        put_u32(&mut bytes, 1_000);
+        bytes.push(1);
+        put_usize(&mut bytes, 1).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_u32(&mut bytes, 0);
+        bytes.push(12);
+        put_string(&mut bytes, "ab").unwrap();
+        bytes.push(view_tag(NativeCandidateView::Ordinary));
+        put_usize(&mut bytes, 0).unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        put_string(&mut bytes, "甲").unwrap();
+        put_usize(&mut bytes, 1).unwrap();
+        bytes.push(candidate_source_tag(NativeCandidateSource::CoreExact));
+        bytes.push(personalization_bits);
+        bytes.push(ranking_bits);
+        bytes.push(movement_tag);
+        if let Some(source_rank) = source_rank {
+            put_usize(&mut bytes, source_rank).unwrap();
+        }
+        bytes.push(0);
+        put_usize(&mut bytes, 1).unwrap();
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
     #[test]
     fn v3_rejects_misaligned_or_unknown_candidate_provenance() {
         assert!(WishSnapshot::parse(&v3_provenance_fixture(0, None)).is_err());
@@ -3951,6 +3995,24 @@ mod tests {
     fn v11_rejects_unknown_candidate_personalization_bits() {
         assert!(WishSnapshot::parse(&v11_provenance_fixture(1 << 7)).is_err());
         assert!(WishSnapshot::parse(&v11_provenance_fixture(0)).is_ok());
+    }
+
+    #[test]
+    fn v18_rejects_unknown_or_inconsistent_candidate_ranking_movements() {
+        let exact = NativeCandidatePersonalization::PERSISTENT_EXACT.bits();
+        assert!(WishSnapshot::parse(&v18_ranking_movement_fixture(0, 0, 1, None)).is_ok());
+        assert!(
+            WishSnapshot::parse(&v18_ranking_movement_fixture(exact, exact, 2, Some(2))).is_ok()
+        );
+        assert!(WishSnapshot::parse(&v18_ranking_movement_fixture(exact, exact, 3, None)).is_ok());
+        assert!(
+            WishSnapshot::parse(&v18_ranking_movement_fixture(exact, exact, 255, None)).is_err()
+        );
+        assert!(
+            WishSnapshot::parse(&v18_ranking_movement_fixture(exact, exact, 2, Some(0))).is_err()
+        );
+        assert!(WishSnapshot::parse(&v18_ranking_movement_fixture(exact, exact, 1, None)).is_err());
+        assert!(WishSnapshot::parse(&v18_ranking_movement_fixture(0, 0, 3, None)).is_err());
     }
 
     #[test]
