@@ -1183,6 +1183,34 @@ enum WindowExclusionReason {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersonalLeftContextMovementStats {
+    pub preferences: u64,
+    pub already_first: u64,
+    pub promotions: u64,
+    pub target_promotions: u64,
+    pub competing_promotions: u64,
+}
+
+impl PersonalLeftContextMovementStats {
+    fn observe(&mut self, rerank: PersonalLeftContextRerankObservation, preferred_is_target: bool) {
+        let Some(rank) = rerank.preferred_rank_after_exact else {
+            return;
+        };
+        self.preferences = self.preferences.saturating_add(1);
+        if rank == 0 {
+            self.already_first = self.already_first.saturating_add(1);
+            return;
+        }
+        self.promotions = self.promotions.saturating_add(1);
+        if preferred_is_target {
+            self.target_promotions = self.target_promotions.saturating_add(1);
+        } else {
+            self.competing_promotions = self.competing_promotions.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CapsuleReplayReport {
     window_gap_limit_ms: Option<u64>,
     public_context_kind: Option<PublicContextKind>,
@@ -1350,6 +1378,8 @@ pub struct CapsuleReplayReport {
     pub personal_left_context_causal_any_evidence_commits: u64,
     pub personal_left_context_causal_target_evidence_commits: u64,
     pub personal_left_context_causal_competing_evidence_commits: u64,
+    pub personal_left_context_frozen_movement: PersonalLeftContextMovementStats,
+    pub personal_left_context_causal_movement: PersonalLeftContextMovementStats,
 }
 
 impl CapsuleReplayReport {
@@ -2317,24 +2347,38 @@ impl CapsuleReplayReport {
             &commit.target,
             &causal_exact_candidates[..causal_exact_candidates.len().min(REPLAY_TOP_K)],
         );
-        let frozen_context_candidates = personal_left_context_candidates_from_pool(
-            &pool,
-            frozen_state,
-            frozen_state,
-            &previous.target,
-            &commit.observed,
+        let (frozen_context_candidates, frozen_context_rerank) =
+            personal_left_context_candidates_from_pool(
+                &pool,
+                frozen_state,
+                frozen_state,
+                &previous.target,
+                &commit.observed,
+            );
+        self.personal_left_context_frozen_movement.observe(
+            frozen_context_rerank,
+            frozen_context_candidates
+                .first()
+                .is_some_and(|candidate| candidate.text == commit.target),
         );
         let frozen_context_rank = self.personal_left_context_frozen_context.observe(
             &commit.observed,
             &commit.target,
             &frozen_context_candidates[..frozen_context_candidates.len().min(REPLAY_TOP_K)],
         );
-        let causal_context_candidates = personal_left_context_candidates_from_pool(
-            &pool,
-            causal_state,
-            causal_state,
-            &previous.target,
-            &commit.observed,
+        let (causal_context_candidates, causal_context_rerank) =
+            personal_left_context_candidates_from_pool(
+                &pool,
+                causal_state,
+                causal_state,
+                &previous.target,
+                &commit.observed,
+            );
+        self.personal_left_context_causal_movement.observe(
+            causal_context_rerank,
+            causal_context_candidates
+                .first()
+                .is_some_and(|candidate| candidate.text == commit.target),
         );
         let causal_context_rank = self.personal_left_context_causal_context.observe(
             &commit.observed,
@@ -3988,7 +4032,7 @@ impl CapsuleReplayReport {
         [
             format!(
                 "PERSONAL_LEFT_CONTEXT_COMPARISON \
-                 schema=ziranma-personal-left-context-comparison-v1 contains_text=false \
+                 schema=ziranma-personal-left-context-comparison-v2 contains_text=false \
                  contains_behavioral_metadata=true writes=false network=false \
                  candidate_pool_code=canonical target_identity_code=observed \
                  context_identity=previous_committed_text_and_observed_code_and_selected_text \
@@ -4055,6 +4099,25 @@ impl CapsuleReplayReport {
                 self.personal_left_context_causal_any_evidence_commits,
                 self.personal_left_context_causal_target_evidence_commits,
                 self.personal_left_context_causal_competing_evidence_commits
+            ),
+            format!(
+                "LEFT_CONTEXT_MOVEMENT frozen_preferences={} frozen_already_first={} \
+                 frozen_promotions={} frozen_target_promotions={} \
+                 frozen_competing_promotions={} causal_preferences={} \
+                 causal_already_first={} causal_promotions={} \
+                 causal_target_promotions={} causal_competing_promotions={}",
+                self.personal_left_context_frozen_movement.preferences,
+                self.personal_left_context_frozen_movement.already_first,
+                self.personal_left_context_frozen_movement.promotions,
+                self.personal_left_context_frozen_movement.target_promotions,
+                self.personal_left_context_frozen_movement
+                    .competing_promotions,
+                self.personal_left_context_causal_movement.preferences,
+                self.personal_left_context_causal_movement.already_first,
+                self.personal_left_context_causal_movement.promotions,
+                self.personal_left_context_causal_movement.target_promotions,
+                self.personal_left_context_causal_movement
+                    .competing_promotions
             ),
             compact_strategy_line(
                 "commit_public",
@@ -4629,7 +4692,7 @@ fn personal_left_context_candidates_from_pool(
     context_state: &PersonalCacheReplayState,
     previous_text: &str,
     code: &str,
-) -> Vec<SentenceCandidate> {
+) -> (Vec<SentenceCandidate>, PersonalLeftContextRerankObservation) {
     let mut candidates = personal_ranked_candidates_from_pool(
         pool,
         exact_state,
@@ -4643,19 +4706,29 @@ fn personal_left_context_candidates_from_pool(
     let Some(preferred) =
         context_state.preferred_left_context_text(previous_text, code, searchable_texts)
     else {
-        return candidates;
+        return (candidates, PersonalLeftContextRerankObservation::default());
     };
     let Some(index) = candidates
         .iter()
         .position(|candidate| candidate.text == preferred)
     else {
-        return candidates;
+        return (candidates, PersonalLeftContextRerankObservation::default());
     };
     if index > 0 {
         let candidate = candidates.remove(index);
         candidates.insert(0, candidate);
     }
-    candidates
+    (
+        candidates,
+        PersonalLeftContextRerankObservation {
+            preferred_rank_after_exact: Some(index),
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PersonalLeftContextRerankObservation {
+    preferred_rank_after_exact: Option<usize>,
 }
 
 fn personal_hybrid_evidence(
@@ -6526,14 +6599,36 @@ text\tpinyin\tfrequency
         );
         assert_eq!(report.personal_cache_history_code_text_tokens, 2);
         assert_eq!(report.personal_cache_history_left_context_tokens, 1);
+        assert_eq!(report.personal_left_context_frozen_movement.preferences, 1);
+        assert_eq!(
+            report.personal_left_context_frozen_movement.already_first,
+            0
+        );
+        assert_eq!(report.personal_left_context_frozen_movement.promotions, 1);
+        assert_eq!(
+            report
+                .personal_left_context_frozen_movement
+                .target_promotions,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_left_context_frozen_movement
+                .competing_promotions,
+            0
+        );
         assert_eq!(format!("{frozen_state:?}"), frozen_before);
 
         let compact = report.personal_left_context_comparison_terminal_report();
-        assert!(compact.contains("schema=ziranma-personal-left-context-comparison-v1"));
+        assert!(compact.contains("schema=ziranma-personal-left-context-comparison-v2"));
         assert!(compact.contains("candidate_pool_code=canonical"));
         assert!(compact.contains("target_identity_code=observed"));
         assert!(compact.contains("selection_rejections=unavailable"));
         assert!(compact.contains("frozen_target_evidence_commits=1"));
+        assert!(compact.contains("frozen_preferences=1"));
+        assert!(compact.contains("frozen_promotions=1"));
+        assert!(compact.contains("frozen_target_promotions=1"));
+        assert!(compact.contains("frozen_competing_promotions=0"));
         assert!(compact.contains("context=personal_left_context_frozen_vs_exact_frozen"));
         assert!(!compact.contains("请"));
         assert!(!compact.contains("把"));
@@ -6579,6 +6674,14 @@ text\tpinyin\tfrequency
         );
         assert_eq!(report.personal_cache_learning_code_text_tokens, 4);
         assert_eq!(report.personal_cache_learning_left_context_tokens, 2);
+        assert_eq!(report.personal_left_context_causal_movement.preferences, 1);
+        assert_eq!(report.personal_left_context_causal_movement.promotions, 1);
+        assert_eq!(
+            report
+                .personal_left_context_causal_movement
+                .target_promotions,
+            1
+        );
     }
 
     #[test]
