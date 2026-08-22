@@ -46,6 +46,7 @@ enum Options {
     Help,
     Inputs {
         history_inputs: Vec<InputSelector>,
+        recent_history_inputs: Vec<InputSelector>,
         inputs: Vec<InputSelector>,
         window_gap_ms: Option<u64>,
         compact: bool,
@@ -59,6 +60,7 @@ enum Options {
         personal_word_comparison: bool,
         personal_code_comparison: bool,
         personal_left_context_comparison: bool,
+        personal_tiered_code_comparison: bool,
         shape_audit: bool,
         health_only: bool,
     },
@@ -69,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Options::Help => print_usage(),
         Options::Inputs {
             history_inputs,
+            recent_history_inputs,
             inputs,
             window_gap_ms,
             compact,
@@ -82,12 +85,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             personal_word_comparison,
             personal_code_comparison,
             personal_left_context_comparison,
+            personal_tiered_code_comparison,
             shape_audit,
             health_only,
         } => {
             let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
             let history_inputs =
                 expand_input_selectors(manifest_dir, &history_inputs).map_err(|_| {
+                    RedactedPrivateSelectorError {
+                        phase: ReplayInputPhase::History,
+                    }
+                })?;
+            let recent_history_inputs =
+                expand_input_selectors(manifest_dir, &recent_history_inputs).map_err(|_| {
                     RedactedPrivateSelectorError {
                         phase: ReplayInputPhase::History,
                     }
@@ -104,7 +114,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     || personal_pair_comparison
                     || personal_word_comparison
                     || personal_code_comparison
-                    || personal_left_context_comparison,
+                    || personal_left_context_comparison
+                    || personal_tiered_code_comparison,
             );
             if health_only {
                 let mut health = CaptureHealthReport::default();
@@ -183,7 +194,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let mut report = CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
             let mut report_health = CaptureHealthReport::default();
-            if human_report {
+            if personal_tiered_code_comparison {
+                let mut all_state = PersonalCacheReplayState::new();
+                let mut recent_state = PersonalCacheReplayState::new();
+                let mut all_history_report =
+                    CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &history_inputs,
+                    ReplayInputPhase::History,
+                    |capsule| {
+                        redact_private_analysis_error(
+                            all_history_report.learn_capsule_for_personal_left_context_comparison(
+                                &decoder,
+                                &mut all_state,
+                                capsule,
+                            ),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                let mut recent_history_report =
+                    CapsuleReplayReport::with_window_gap_limit(window_gap_ms)?;
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &recent_history_inputs,
+                    ReplayInputPhase::History,
+                    |capsule| {
+                        redact_private_analysis_error(
+                            all_history_report.learn_capsule_for_personal_left_context_comparison(
+                                &decoder,
+                                &mut all_state,
+                                capsule,
+                            ),
+                        )?;
+                        redact_private_analysis_error(
+                            recent_history_report
+                                .learn_capsule_for_personal_left_context_comparison(
+                                    &decoder,
+                                    &mut recent_state,
+                                    capsule,
+                                ),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                report.record_personal_tiered_code_history(
+                    &all_history_report,
+                    &all_state,
+                    &recent_history_report,
+                    &recent_state,
+                );
+                let frozen_all_state = all_state.fork_for_frozen_evaluation();
+                let frozen_recent_state = recent_state.fork_for_frozen_evaluation();
+                visit_private_inputs(
+                    &mut loader,
+                    &mut metadata_guard,
+                    &inputs,
+                    ReplayInputPhase::Evaluation,
+                    |capsule| {
+                        redact_private_analysis_error(
+                            report.observe_capsule_with_personal_tiered_code_comparison(
+                                &decoder,
+                                &frozen_all_state,
+                                &frozen_recent_state,
+                                &mut all_state,
+                                &mut recent_state,
+                                capsule,
+                            ),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+            } else if human_report {
                 visit_private_loaded_inputs(
                     &mut loader,
                     &mut metadata_guard,
@@ -386,6 +471,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if human_report {
                 println!("{}", render_human_report(&report, &report_health));
+            } else if personal_tiered_code_comparison {
+                println!(
+                    "{}",
+                    report.personal_tiered_code_comparison_terminal_report()
+                );
             } else if personal_left_context_comparison {
                 println!(
                     "{}",
@@ -412,6 +502,7 @@ fn parse_options(
 ) -> Result<Options, Box<dyn std::error::Error>> {
     let mut arguments = arguments.into_iter();
     let mut history_inputs = Vec::new();
+    let mut recent_history_inputs = Vec::new();
     let mut inputs = Vec::new();
     let mut window_gap_ms = None;
     let mut compact = false;
@@ -425,6 +516,7 @@ fn parse_options(
     let mut personal_word_comparison = false;
     let mut personal_code_comparison = false;
     let mut personal_left_context_comparison = false;
+    let mut personal_tiered_code_comparison = false;
     let mut shape_audit = false;
     let mut health_only = false;
     while let Some(argument) = arguments.next() {
@@ -439,6 +531,19 @@ fn parse_options(
                     .ok_or("--history-session requires a session id")?;
                 validate_session_selector(&value)?;
                 history_inputs.push(InputSelector::Session(value));
+            }
+            "--recent-history-input" => {
+                let value = arguments
+                    .next()
+                    .ok_or("--recent-history-input requires a path")?;
+                recent_history_inputs.push(InputSelector::Path(PathBuf::from(value)));
+            }
+            "--recent-history-session" => {
+                let value = arguments
+                    .next()
+                    .ok_or("--recent-history-session requires a session id")?;
+                validate_session_selector(&value)?;
+                recent_history_inputs.push(InputSelector::Session(value));
             }
             "--input" => {
                 let value = arguments.next().ok_or("--input requires a path")?;
@@ -528,6 +633,12 @@ fn parse_options(
                 }
                 personal_left_context_comparison = true;
             }
+            "--personal-tiered-code-comparison" => {
+                if personal_tiered_code_comparison {
+                    return Err("--personal-tiered-code-comparison can be given only once".into());
+                }
+                personal_tiered_code_comparison = true;
+            }
             "--shape-audit" => {
                 if shape_audit {
                     return Err("--shape-audit can be given only once".into());
@@ -542,6 +653,7 @@ fn parse_options(
             }
             "--help" | "-h"
                 if history_inputs.is_empty()
+                    && recent_history_inputs.is_empty()
                     && inputs.is_empty()
                     && window_gap_ms.is_none()
                     && !compact
@@ -555,6 +667,7 @@ fn parse_options(
                     && !personal_word_comparison
                     && !personal_code_comparison
                     && !personal_left_context_comparison
+                    && !personal_tiered_code_comparison
                     && !shape_audit
                     && !health_only
                     && arguments.next().is_none() =>
@@ -634,6 +747,29 @@ fn parse_options(
     if personal_left_context_comparison && !compact {
         return Err("--personal-left-context-comparison requires --compact".into());
     }
+    if personal_tiered_code_comparison && window_gap_ms.is_none() {
+        return Err("--personal-tiered-code-comparison requires --window-gap-ms".into());
+    }
+    if personal_tiered_code_comparison && history_inputs.is_empty() {
+        return Err(
+            "--personal-tiered-code-comparison requires at least one older --history-input or \
+             --history-session"
+                .into(),
+        );
+    }
+    if personal_tiered_code_comparison && recent_history_inputs.is_empty() {
+        return Err("--personal-tiered-code-comparison requires at least one \
+             --recent-history-input or --recent-history-session"
+            .into());
+    }
+    if personal_tiered_code_comparison && !compact {
+        return Err("--personal-tiered-code-comparison requires --compact".into());
+    }
+    if !recent_history_inputs.is_empty() && !personal_tiered_code_comparison {
+        return Err("--recent-history-input/--recent-history-session requires \
+             --personal-tiered-code-comparison"
+            .into());
+    }
     if human_report && window_gap_ms.is_none() {
         return Err("--report requires --window-gap-ms".into());
     }
@@ -648,14 +784,15 @@ fn parse_options(
         + usize::from(personal_word_comparison)
         + usize::from(personal_code_comparison)
         + usize::from(personal_left_context_comparison)
+        + usize::from(personal_tiered_code_comparison)
         + usize::from(shape_audit)
         > 1
     {
         return Err(
             "--public-context, --public-character-context, --personal-cache, \
              --personal-pair-cache, --personal-pair-comparison, --personal-word-comparison, \
-             --personal-code-comparison, --personal-left-context-comparison, and --shape-audit \
-             are mutually exclusive"
+             --personal-code-comparison, --personal-left-context-comparison, \
+             --personal-tiered-code-comparison, and --shape-audit are mutually exclusive"
                 .into(),
         );
     }
@@ -666,17 +803,19 @@ fn parse_options(
         && !personal_word_comparison
         && !personal_code_comparison
         && !personal_left_context_comparison
+        && !personal_tiered_code_comparison
     {
         return Err(
             "--history-input/--history-session requires --personal-cache or \
              --personal-pair-cache, --personal-pair-comparison, \
              --personal-word-comparison, --personal-code-comparison, or \
-             --personal-left-context-comparison"
+             --personal-left-context-comparison or --personal-tiered-code-comparison"
                 .into(),
         );
     }
     if health_only
         && (!history_inputs.is_empty()
+            || !recent_history_inputs.is_empty()
             || window_gap_ms.is_some()
             || compact
             || public_context
@@ -687,6 +826,7 @@ fn parse_options(
             || personal_word_comparison
             || personal_code_comparison
             || personal_left_context_comparison
+            || personal_tiered_code_comparison
             || shape_audit)
     {
         return Err(
@@ -694,7 +834,12 @@ fn parse_options(
                 .into(),
         );
     }
-    if shape_audit && (!history_inputs.is_empty() || window_gap_ms.is_some() || compact) {
+    if shape_audit
+        && (!history_inputs.is_empty()
+            || !recent_history_inputs.is_empty()
+            || window_gap_ms.is_some()
+            || compact)
+    {
         return Err(
             "--shape-audit cannot be combined with history, window, or compact options".into(),
         );
@@ -702,6 +847,7 @@ fn parse_options(
     if human_report
         && (compact
             || !history_inputs.is_empty()
+            || !recent_history_inputs.is_empty()
             || public_context
             || public_character_context
             || personal_cache
@@ -710,6 +856,7 @@ fn parse_options(
             || personal_word_comparison
             || personal_code_comparison
             || personal_left_context_comparison
+            || personal_tiered_code_comparison
             || shape_audit
             || health_only
             || ranking_report)
@@ -723,6 +870,7 @@ fn parse_options(
         && (compact
             || human_report
             || !history_inputs.is_empty()
+            || !recent_history_inputs.is_empty()
             || public_context
             || public_character_context
             || personal_cache
@@ -731,6 +879,7 @@ fn parse_options(
             || personal_word_comparison
             || personal_code_comparison
             || personal_left_context_comparison
+            || personal_tiered_code_comparison
             || shape_audit
             || health_only)
     {
@@ -741,6 +890,7 @@ fn parse_options(
     }
     Ok(Options::Inputs {
         history_inputs,
+        recent_history_inputs,
         inputs,
         window_gap_ms,
         compact,
@@ -754,6 +904,7 @@ fn parse_options(
         personal_word_comparison,
         personal_code_comparison,
         personal_left_context_comparison,
+        personal_tiered_code_comparison,
         shape_audit,
         health_only,
     })
@@ -791,6 +942,9 @@ fn print_usage() {
         "Usage (exact left-context comparison): cargo run --bin capsule-replay -- \\\n         <--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION>> ... \\\n         <--input <NEWER.zic|NEWER.zcs>|--session <NEWER_SESSION>> ... \\\n         --window-gap-ms <POSITIVE_MS> --personal-left-context-comparison --compact"
     );
     eprintln!(
+        "Usage (tiered exact-code comparison): cargo run --bin capsule-replay -- \\\n         <--history-input <OLDER.zic|OLDER.zcs>|--history-session <OLDER_SESSION>> ... \\\n         <--recent-history-input <RECENT.zic|RECENT.zcs>|--recent-history-session <RECENT_SESSION>> ... \\\n         <--input <NEWER.zic|NEWER.zcs>|--session <NEWER_SESSION>> ... \\\n         --window-gap-ms <POSITIVE_MS> --personal-tiered-code-comparison --compact"
+    );
+    eprintln!(
         "Reads explicitly named private .zic capsules or current-user-protected .zcs segments, \
          prints redacted aggregates, and writes nothing."
     );
@@ -801,7 +955,8 @@ fn print_usage() {
     eprintln!(
         "History selectors require --window-gap-ms plus --personal-cache, \
          --personal-pair-cache, --personal-pair-comparison, --personal-word-comparison, \
-         --personal-code-comparison, or --personal-left-context-comparison."
+         --personal-code-comparison, --personal-left-context-comparison, or \
+         --personal-tiered-code-comparison."
     );
     eprintln!("{CAPTURE_HEALTH_PRIVACY_NOTICE}");
 }
@@ -2672,6 +2827,7 @@ mod tests {
         .unwrap();
         let Options::Inputs {
             history_inputs,
+            recent_history_inputs,
             inputs,
             window_gap_ms,
             compact,
@@ -2685,6 +2841,7 @@ mod tests {
             personal_word_comparison,
             personal_code_comparison,
             personal_left_context_comparison,
+            personal_tiered_code_comparison,
             shape_audit,
             health_only,
         } = options
@@ -2692,6 +2849,7 @@ mod tests {
             panic!("expected inputs");
         };
         assert!(history_inputs.is_empty());
+        assert!(recent_history_inputs.is_empty());
         assert_eq!(inputs.len(), 2);
         assert_eq!(window_gap_ms, None);
         assert!(!compact);
@@ -2705,6 +2863,7 @@ mod tests {
         assert!(!personal_word_comparison);
         assert!(!personal_code_comparison);
         assert!(!personal_left_context_comparison);
+        assert!(!personal_tiered_code_comparison);
         assert!(!shape_audit);
         assert!(!health_only);
 
@@ -3066,6 +3225,77 @@ mod tests {
             panic!("expected inputs");
         };
         assert!(personal_left_context_comparison);
+        let tiered_code_comparison = parse_options(vec![
+            "--history-session".to_owned(),
+            "1000-1".to_owned(),
+            "--recent-history-session".to_owned(),
+            "1500-1".to_owned(),
+            "--session".to_owned(),
+            "2000-2".to_owned(),
+            "--window-gap-ms".to_owned(),
+            "5000".to_owned(),
+            "--personal-tiered-code-comparison".to_owned(),
+            "--compact".to_owned(),
+        ])
+        .unwrap();
+        let Options::Inputs {
+            history_inputs,
+            recent_history_inputs,
+            personal_tiered_code_comparison,
+            ..
+        } = tiered_code_comparison
+        else {
+            panic!("expected inputs");
+        };
+        assert_eq!(
+            history_inputs,
+            vec![InputSelector::Session("1000-1".to_owned())]
+        );
+        assert_eq!(
+            recent_history_inputs,
+            vec![InputSelector::Session("1500-1".to_owned())]
+        );
+        assert!(personal_tiered_code_comparison);
+        assert!(
+            parse_options(vec![
+                "--history-session".to_owned(),
+                "1000-1".to_owned(),
+                "--session".to_owned(),
+                "2000-2".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "5000".to_owned(),
+                "--personal-tiered-code-comparison".to_owned(),
+                "--compact".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--recent-history-session".to_owned(),
+                "1500-1".to_owned(),
+                "--session".to_owned(),
+                "2000-2".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "5000".to_owned(),
+                "--personal-tiered-code-comparison".to_owned(),
+                "--compact".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--history-session".to_owned(),
+                "1000-1".to_owned(),
+                "--recent-history-session".to_owned(),
+                "1500-1".to_owned(),
+                "--session".to_owned(),
+                "2000-2".to_owned(),
+                "--window-gap-ms".to_owned(),
+                "5000".to_owned(),
+                "--personal-tiered-code-comparison".to_owned(),
+            ])
+            .is_err()
+        );
         assert!(
             parse_options(vec![
                 "--session".to_owned(),

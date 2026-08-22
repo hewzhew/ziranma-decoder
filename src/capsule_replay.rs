@@ -51,6 +51,13 @@ enum PersonalCacheWindowMode<'a> {
     },
 }
 
+struct PersonalTieredCodeStates<'a> {
+    frozen_all: &'a PersonalCacheReplayState,
+    frozen_recent: &'a PersonalCacheReplayState,
+    causal_all: &'a mut PersonalCacheReplayState,
+    causal_recent: &'a mut PersonalCacheReplayState,
+}
+
 impl<'a> PersonalCacheWindowMode<'a> {
     fn kind(self) -> PersonalCacheKind {
         match self {
@@ -1275,6 +1282,28 @@ impl PersonalExactCodeEvidenceStats {
             }
         }
     }
+
+    fn terminal_line(&self, scope: &str) -> String {
+        format!(
+            "TIERED_CODE_MOVEMENT scope={} any_evidence_commits={} \
+             target_evidence_commits={} competing_evidence_commits={} top_changes={} \
+             target_top_changes={} lost_target_top_changes={} neutral_top_changes={} \
+             target_top_changes_once={} target_top_changes_repeated={} \
+             lost_target_top_changes_once={} lost_target_top_changes_repeated={}",
+            scope,
+            self.any_evidence,
+            self.target_evidence,
+            self.competing_evidence,
+            self.top_changes,
+            self.target_top_changes,
+            self.lost_target_top_changes,
+            self.neutral_top_changes,
+            self.target_top_changes_once,
+            self.target_top_changes_repeated,
+            self.lost_target_top_changes_once,
+            self.lost_target_top_changes_repeated
+        )
+    }
 }
 
 impl PersonalLeftContextMovementStats {
@@ -1468,6 +1497,31 @@ pub struct CapsuleReplayReport {
     pub personal_left_context_causal_exact_evidence: PersonalExactCodeEvidenceStats,
     pub personal_left_context_frozen_movement: PersonalLeftContextMovementStats,
     pub personal_left_context_causal_movement: PersonalLeftContextMovementStats,
+    pub personal_tiered_code_comparison_commits: u64,
+    pub personal_tiered_code_public: ReplayStrategyStats,
+    pub personal_tiered_code_frozen_all: ReplayStrategyStats,
+    pub personal_tiered_code_frozen_recent: ReplayStrategyStats,
+    pub personal_tiered_code_causal_all: ReplayStrategyStats,
+    pub personal_tiered_code_causal_recent: ReplayStrategyStats,
+    pub personal_tiered_code_frozen_all_vs_public: RankingReplayComparisonStats,
+    pub personal_tiered_code_frozen_recent_vs_public: RankingReplayComparisonStats,
+    pub personal_tiered_code_frozen_recent_vs_all: RankingReplayComparisonStats,
+    pub personal_tiered_code_causal_recent_vs_all: RankingReplayComparisonStats,
+    pub personal_tiered_code_causal_recent_vs_frozen: RankingReplayComparisonStats,
+    pub personal_tiered_code_frozen_recent_active_commits: u64,
+    pub personal_tiered_code_causal_recent_active_commits: u64,
+    pub personal_tiered_code_history_recent_capsules: u64,
+    pub personal_tiered_code_history_recent_events: u64,
+    pub personal_tiered_code_history_recent_tokens: u64,
+    pub personal_tiered_code_history_recent_types: u64,
+    pub personal_tiered_code_learning_recent_tokens: u64,
+    pub personal_tiered_code_retained_recent_tokens: u64,
+    pub personal_tiered_code_recent_types: u64,
+    pub personal_tiered_code_reversed_recent_tokens: u64,
+    pub personal_tiered_code_frozen_recent_active_evidence: PersonalExactCodeEvidenceStats,
+    pub personal_tiered_code_frozen_fallback_all_evidence: PersonalExactCodeEvidenceStats,
+    pub personal_tiered_code_causal_recent_active_evidence: PersonalExactCodeEvidenceStats,
+    pub personal_tiered_code_causal_fallback_all_evidence: PersonalExactCodeEvidenceStats,
 }
 
 impl CapsuleReplayReport {
@@ -1697,6 +1751,40 @@ impl CapsuleReplayReport {
         Ok(())
     }
 
+    pub fn observe_capsule_with_personal_tiered_code_comparison(
+        &mut self,
+        decoder: &Decoder,
+        frozen_all_state: &PersonalCacheReplayState,
+        frozen_recent_state: &PersonalCacheReplayState,
+        causal_all_state: &mut PersonalCacheReplayState,
+        causal_recent_state: &mut PersonalCacheReplayState,
+        capsule: &EventCapsuleV1,
+    ) -> Result<(), PersonalCacheReplayError> {
+        if self.window_gap_limit_ms.is_none() {
+            return Err(PersonalCacheReplayError::MissingWindowGap);
+        }
+        let prepared_commits = self.observe_capsule_internal(decoder, None, capsule, false)?;
+        self.observe_personal_tiered_code_capsule(
+            decoder,
+            PersonalTieredCodeStates {
+                frozen_all: frozen_all_state,
+                frozen_recent: frozen_recent_state,
+                causal_all: causal_all_state,
+                causal_recent: causal_recent_state,
+            },
+            capsule,
+            &prepared_commits,
+        )?;
+        self.personal_cache_learned_code_text_types =
+            u64::try_from(causal_all_state.learned_code_text_types()).unwrap_or(u64::MAX);
+        self.personal_cache_retained_code_text_tokens = causal_all_state.learned_code_text_tokens();
+        self.personal_tiered_code_retained_recent_tokens =
+            causal_recent_state.learned_code_text_tokens();
+        self.personal_tiered_code_recent_types =
+            u64::try_from(causal_recent_state.learned_code_text_types()).unwrap_or(u64::MAX);
+        Ok(())
+    }
+
     pub fn observe_capsule_with_personal_pair_comparison(
         &mut self,
         decoder: &Decoder,
@@ -1759,6 +1847,21 @@ impl CapsuleReplayReport {
         self.personal_cache_history_left_context_tokens = state.learned_left_context_tokens();
         self.personal_cache_history_left_context_types =
             u64::try_from(state.learned_left_context_types()).unwrap_or(u64::MAX);
+    }
+
+    pub fn record_personal_tiered_code_history(
+        &mut self,
+        all_history_report: &CapsuleReplayReport,
+        all_state: &PersonalCacheReplayState,
+        recent_history_report: &CapsuleReplayReport,
+        recent_state: &PersonalCacheReplayState,
+    ) {
+        self.record_personal_cache_history(all_history_report, all_state);
+        self.personal_tiered_code_history_recent_capsules = recent_history_report.capsules;
+        self.personal_tiered_code_history_recent_events = recent_history_report.events;
+        self.personal_tiered_code_history_recent_tokens = recent_state.learned_code_text_tokens();
+        self.personal_tiered_code_history_recent_types =
+            u64::try_from(recent_state.learned_code_text_types()).unwrap_or(u64::MAX);
     }
 
     pub fn learn_capsule_for_personal_cache(
@@ -2273,6 +2376,235 @@ impl CapsuleReplayReport {
             run.push(commit);
         }
         self.finish_personal_left_context_run(decoder, frozen_state, causal_state, &mut run)
+    }
+
+    fn observe_personal_tiered_code_capsule(
+        &mut self,
+        decoder: &Decoder,
+        states: PersonalTieredCodeStates<'_>,
+        capsule: &EventCapsuleV1,
+        prepared_commits: &HashMap<usize, WindowCommit>,
+    ) -> Result<(), KeySequenceError> {
+        let PersonalTieredCodeStates {
+            frozen_all: frozen_all_state,
+            frozen_recent: frozen_recent_state,
+            causal_all: causal_all_state,
+            causal_recent: causal_recent_state,
+        } = states;
+        causal_all_state.start_document();
+        causal_recent_state.start_document();
+        for (event_index, event) in capsule.events().iter().enumerate() {
+            let TrackerOutput::Commit(record) = &event.output else {
+                let TrackerOutput::Revision(revision) = &event.output else {
+                    unreachable!("tracker output has only commit and revision variants");
+                };
+                self.apply_personal_tiered_code_delta(
+                    causal_all_state,
+                    causal_recent_state,
+                    revision.change.start,
+                    revision.change.deleted.chars().count(),
+                    revision.change.inserted.chars().count(),
+                    revision.change.position_evidence,
+                    true,
+                );
+                continue;
+            };
+            let Some(commit) = prepared_commits.get(&event_index) else {
+                self.apply_personal_tiered_code_delta(
+                    causal_all_state,
+                    causal_recent_state,
+                    record.document_change.start,
+                    record.document_change.deleted.chars().count(),
+                    record.document_change.inserted.chars().count(),
+                    record.document_change.position_evidence,
+                    false,
+                );
+                continue;
+            };
+            self.observe_personal_tiered_code_commit(
+                decoder,
+                frozen_all_state,
+                frozen_recent_state,
+                causal_all_state,
+                causal_recent_state,
+                commit,
+            )?;
+            self.apply_personal_tiered_code_delta(
+                causal_all_state,
+                causal_recent_state,
+                commit.document_start,
+                0,
+                commit.document_inserted_chars,
+                crate::DeltaPositionEvidence::UniqueText,
+                false,
+            );
+            causal_all_state.learn_code_text(
+                commit.document_start,
+                commit.document_end(),
+                commit.observed.clone(),
+                commit.target.clone(),
+            );
+            causal_recent_state.learn_code_text(
+                commit.document_start,
+                commit.document_end(),
+                commit.observed.clone(),
+                commit.target.clone(),
+            );
+            self.personal_cache_learning_code_text_tokens = self
+                .personal_cache_learning_code_text_tokens
+                .saturating_add(1);
+            self.personal_tiered_code_learning_recent_tokens = self
+                .personal_tiered_code_learning_recent_tokens
+                .saturating_add(1);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_personal_tiered_code_delta(
+        &mut self,
+        all_state: &mut PersonalCacheReplayState,
+        recent_state: &mut PersonalCacheReplayState,
+        start: usize,
+        deleted_chars: usize,
+        inserted_chars: usize,
+        position_evidence: crate::DeltaPositionEvidence,
+        is_revision: bool,
+    ) {
+        let all_outcome =
+            all_state.apply_document_delta(start, deleted_chars, inserted_chars, position_evidence);
+        self.observe_personal_cache_edit(all_outcome, is_revision);
+        let recent_outcome = recent_state.apply_document_delta(
+            start,
+            deleted_chars,
+            inserted_chars,
+            position_evidence,
+        );
+        self.personal_tiered_code_reversed_recent_tokens = self
+            .personal_tiered_code_reversed_recent_tokens
+            .saturating_add(recent_outcome.invalidated_code_text_tokens);
+    }
+
+    fn observe_personal_tiered_code_commit(
+        &mut self,
+        decoder: &Decoder,
+        frozen_all_state: &PersonalCacheReplayState,
+        frozen_recent_state: &PersonalCacheReplayState,
+        causal_all_state: &PersonalCacheReplayState,
+        causal_recent_state: &PersonalCacheReplayState,
+        commit: &WindowCommit,
+    ) -> Result<(), KeySequenceError> {
+        let pool = decoder.decode_sentence(&commit.canonical_full, PERSONAL_CACHE_POOL_DEPTH)?;
+        let public_rank = self.personal_tiered_code_public.observe(
+            &commit.observed,
+            &commit.target,
+            &pool[..pool.len().min(REPLAY_TOP_K)],
+        );
+        let frozen_all_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            frozen_all_state,
+            PersonalCacheKind::ExactCodeText,
+            &commit.observed,
+        );
+        let frozen_all_rank = self.personal_tiered_code_frozen_all.observe(
+            &commit.observed,
+            &commit.target,
+            &frozen_all_candidates[..frozen_all_candidates.len().min(REPLAY_TOP_K)],
+        );
+        let (frozen_recent_candidates, frozen_recent_active) =
+            personal_tiered_exact_candidates_from_pool(
+                &pool,
+                frozen_all_state,
+                frozen_recent_state,
+                &commit.observed,
+            );
+        let frozen_recent_rank = self.personal_tiered_code_frozen_recent.observe(
+            &commit.observed,
+            &commit.target,
+            &frozen_recent_candidates[..frozen_recent_candidates.len().min(REPLAY_TOP_K)],
+        );
+        if frozen_recent_active {
+            self.personal_tiered_code_frozen_recent_active_evidence
+                .observe(
+                    &pool,
+                    &frozen_recent_candidates,
+                    frozen_recent_state,
+                    &commit.observed,
+                    &commit.target,
+                );
+        } else {
+            self.personal_tiered_code_frozen_fallback_all_evidence
+                .observe(
+                    &pool,
+                    &frozen_all_candidates,
+                    frozen_all_state,
+                    &commit.observed,
+                    &commit.target,
+                );
+        }
+        let causal_all_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            causal_all_state,
+            PersonalCacheKind::ExactCodeText,
+            &commit.observed,
+        );
+        let causal_all_rank = self.personal_tiered_code_causal_all.observe(
+            &commit.observed,
+            &commit.target,
+            &causal_all_candidates[..causal_all_candidates.len().min(REPLAY_TOP_K)],
+        );
+        let (causal_recent_candidates, causal_recent_active) =
+            personal_tiered_exact_candidates_from_pool(
+                &pool,
+                causal_all_state,
+                causal_recent_state,
+                &commit.observed,
+            );
+        let causal_recent_rank = self.personal_tiered_code_causal_recent.observe(
+            &commit.observed,
+            &commit.target,
+            &causal_recent_candidates[..causal_recent_candidates.len().min(REPLAY_TOP_K)],
+        );
+        if causal_recent_active {
+            self.personal_tiered_code_causal_recent_active_evidence
+                .observe(
+                    &pool,
+                    &causal_recent_candidates,
+                    causal_recent_state,
+                    &commit.observed,
+                    &commit.target,
+                );
+        } else {
+            self.personal_tiered_code_causal_fallback_all_evidence
+                .observe(
+                    &pool,
+                    &causal_all_candidates,
+                    causal_all_state,
+                    &commit.observed,
+                    &commit.target,
+                );
+        }
+
+        self.personal_tiered_code_comparison_commits = self
+            .personal_tiered_code_comparison_commits
+            .saturating_add(1);
+        self.personal_tiered_code_frozen_recent_active_commits = self
+            .personal_tiered_code_frozen_recent_active_commits
+            .saturating_add(u64::from(frozen_recent_active));
+        self.personal_tiered_code_causal_recent_active_commits = self
+            .personal_tiered_code_causal_recent_active_commits
+            .saturating_add(u64::from(causal_recent_active));
+        self.personal_tiered_code_frozen_all_vs_public
+            .observe(public_rank, frozen_all_rank);
+        self.personal_tiered_code_frozen_recent_vs_public
+            .observe(public_rank, frozen_recent_rank);
+        self.personal_tiered_code_frozen_recent_vs_all
+            .observe(frozen_all_rank, frozen_recent_rank);
+        self.personal_tiered_code_causal_recent_vs_all
+            .observe(causal_all_rank, causal_recent_rank);
+        self.personal_tiered_code_causal_recent_vs_frozen
+            .observe(frozen_recent_rank, causal_recent_rank);
+        Ok(())
     }
 
     fn learn_personal_left_context_capsule(
@@ -4333,6 +4665,118 @@ impl CapsuleReplayReport {
         .join("\n")
     }
 
+    pub fn personal_tiered_code_comparison_terminal_report(&self) -> String {
+        [
+            format!(
+                "PERSONAL_TIERED_CODE_COMPARISON \
+                 schema=ziranma-personal-tiered-code-comparison-v3 contains_text=false \
+                 contains_behavioral_metadata=true writes=false network=false \
+                 code_identity=exact_observed_code_and_commit_text \
+                 recent_policy=recent_if_any_candidate_evidence_else_all_history_below_public_top \
+                 evaluation_learning=after_scoring frozen_evaluation_updates=0 \
+                 candidate_pool_depth={} max_promotion={}",
+                PERSONAL_CACHE_POOL_DEPTH, PERSONAL_CACHE_MAX_PROMOTION
+            ),
+            format!(
+                "HISTORY all_capsules={} all_events={} all_code_text_tokens={} \
+                 all_code_text_types={} recent_capsules={} recent_events={} \
+                 recent_code_text_tokens={} recent_code_text_types={}",
+                self.personal_cache_history_capsules,
+                self.personal_cache_history_events,
+                self.personal_cache_history_code_text_tokens,
+                self.personal_cache_history_code_text_types,
+                self.personal_tiered_code_history_recent_capsules,
+                self.personal_tiered_code_history_recent_events,
+                self.personal_tiered_code_history_recent_tokens,
+                self.personal_tiered_code_history_recent_types
+            ),
+            format!(
+                "EVALUATION capsules={} events={} commits={} comparison_commits={} \
+                 causal_all_code_text_tokens={} retained_all_code_text_tokens={} \
+                 all_code_text_types={} causal_recent_code_text_tokens={} \
+                 retained_recent_code_text_tokens={} recent_code_text_types={} \
+                 reversed_all_code_text_tokens={} reversed_recent_code_text_tokens={}",
+                self.capsules,
+                self.events,
+                self.commits,
+                self.personal_tiered_code_comparison_commits,
+                self.personal_cache_learning_code_text_tokens,
+                self.personal_cache_retained_code_text_tokens,
+                self.personal_cache_learned_code_text_types,
+                self.personal_tiered_code_learning_recent_tokens,
+                self.personal_tiered_code_retained_recent_tokens,
+                self.personal_tiered_code_recent_types,
+                self.personal_cache_reversed_code_text_tokens,
+                self.personal_tiered_code_reversed_recent_tokens
+            ),
+            format!(
+                "RECENT_GATE frozen_recent_active_commits={} \
+                 causal_recent_active_commits={} frozen_fallback_commits={} \
+                 causal_fallback_commits={}",
+                self.personal_tiered_code_frozen_recent_active_commits,
+                self.personal_tiered_code_causal_recent_active_commits,
+                self.personal_tiered_code_comparison_commits
+                    .saturating_sub(self.personal_tiered_code_frozen_recent_active_commits),
+                self.personal_tiered_code_comparison_commits
+                    .saturating_sub(self.personal_tiered_code_causal_recent_active_commits)
+            ),
+            self.personal_tiered_code_frozen_recent_active_evidence
+                .terminal_line("frozen_recent_active"),
+            self.personal_tiered_code_frozen_fallback_all_evidence
+                .terminal_line("frozen_fallback_all_unprotected"),
+            self.personal_tiered_code_causal_recent_active_evidence
+                .terminal_line("causal_recent_active"),
+            self.personal_tiered_code_causal_fallback_all_evidence
+                .terminal_line("causal_fallback_all_unprotected"),
+            compact_strategy_line(
+                "commit_public",
+                "canonical_pool_observed_identity",
+                &self.personal_tiered_code_public,
+            ),
+            compact_strategy_line(
+                "commit_exact_all_frozen",
+                "canonical_pool_observed_identity",
+                &self.personal_tiered_code_frozen_all,
+            ),
+            compact_strategy_line(
+                "commit_exact_tiered_frozen",
+                "canonical_pool_observed_identity",
+                &self.personal_tiered_code_frozen_recent,
+            ),
+            compact_strategy_line(
+                "commit_exact_all_causal",
+                "canonical_pool_observed_identity",
+                &self.personal_tiered_code_causal_all,
+            ),
+            compact_strategy_line(
+                "commit_exact_tiered_causal",
+                "canonical_pool_observed_identity",
+                &self.personal_tiered_code_causal_recent,
+            ),
+            compact_ranking_comparison_line(
+                "personal_tiered_frozen_all_vs_public",
+                &self.personal_tiered_code_frozen_all_vs_public,
+            ),
+            compact_ranking_comparison_line(
+                "personal_tiered_frozen_recent_vs_public",
+                &self.personal_tiered_code_frozen_recent_vs_public,
+            ),
+            compact_ranking_comparison_line(
+                "personal_tiered_frozen_recent_vs_all",
+                &self.personal_tiered_code_frozen_recent_vs_all,
+            ),
+            compact_ranking_comparison_line(
+                "personal_tiered_causal_recent_vs_all",
+                &self.personal_tiered_code_causal_recent_vs_all,
+            ),
+            compact_ranking_comparison_line(
+                "personal_tiered_causal_recent_vs_frozen",
+                &self.personal_tiered_code_causal_recent_vs_frozen,
+            ),
+        ]
+        .join("\n")
+    }
+
     pub fn compact_terminal_report(&self) -> String {
         let mut lines = vec![
             format!(
@@ -4889,6 +5333,44 @@ fn personal_left_context_candidates_from_pool(
             preferred_rank_after_exact: Some(index),
         },
     )
+}
+
+fn personal_tiered_exact_candidates_from_pool(
+    pool: &[SentenceCandidate],
+    all_state: &PersonalCacheReplayState,
+    recent_state: &PersonalCacheReplayState,
+    code: &str,
+) -> (Vec<SentenceCandidate>, bool) {
+    let recent_active = pool
+        .iter()
+        .any(|candidate| recent_state.code_text_count(code, &candidate.text) > 0);
+    if recent_active {
+        return (
+            personal_ranked_candidates_from_pool(
+                pool,
+                recent_state,
+                PersonalCacheKind::ExactCodeText,
+                code,
+            ),
+            true,
+        );
+    }
+    let mut candidates = personal_ranked_candidates_from_pool(
+        pool,
+        all_state,
+        PersonalCacheKind::ExactCodeText,
+        code,
+    );
+    if let Some(public_top) = pool.first()
+        && let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate.text == public_top.text)
+        && index > 0
+    {
+        let protected = candidates.remove(index);
+        candidates.insert(0, protected);
+    }
+    (candidates, false)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -5528,7 +6010,7 @@ mod tests {
         effective_letter_code, observe_personal_hybrid_strategy_from_pool,
         observe_personal_strategy_from_pool, observe_strategy_with_personal_cache,
         personal_cache_evidence, personal_hybrid_evidence, personal_ranked_candidates_from_pool,
-        personal_reserved_pair_evidence,
+        personal_reserved_pair_evidence, personal_tiered_exact_candidates_from_pool,
     };
     use crate::{
         CommitRecord, DeltaPositionEvidence, EventCapsuleV1, RawKey, TextDelta, TimedTrackerOutput,
@@ -6880,6 +7362,91 @@ text\tpinyin\tfrequency
         repeated_gain.observe(&pool, &repeated_candidates, &repeated_state, "ab", "八");
         assert_eq!(repeated_gain.target_top_changes_once, 0);
         assert_eq!(repeated_gain.target_top_changes_repeated, 1);
+    }
+
+    #[test]
+    fn recent_exact_layer_overrides_conflicting_history_and_falls_back_when_absent() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEFT_CONTEXT_LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("ba", PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        let mut all_state = PersonalCacheReplayState::new();
+        for index in 0..4 {
+            all_state.learn_code_text(index, index + 1, "ab".to_owned(), "八".to_owned());
+        }
+        all_state.learn_code_text(4, 5, "ab".to_owned(), "吧".to_owned());
+        let mut recent_state = PersonalCacheReplayState::new();
+        recent_state.learn_code_text(4, 5, "ab".to_owned(), "吧".to_owned());
+
+        let all_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            &all_state,
+            PersonalCacheKind::ExactCodeText,
+            "ab",
+        );
+        assert_eq!(
+            all_candidates
+                .first()
+                .map(|candidate| candidate.text.as_str()),
+            Some("八")
+        );
+        let (tiered_candidates, recent_active) =
+            personal_tiered_exact_candidates_from_pool(&pool, &all_state, &recent_state, "ab");
+        assert!(recent_active);
+        assert_eq!(
+            tiered_candidates
+                .first()
+                .map(|candidate| candidate.text.as_str()),
+            Some("吧")
+        );
+
+        let (fallback_candidates, recent_active) = personal_tiered_exact_candidates_from_pool(
+            &pool,
+            &all_state,
+            &PersonalCacheReplayState::new(),
+            "ab",
+        );
+        assert!(!recent_active);
+        assert_eq!(
+            fallback_candidates
+                .first()
+                .map(|candidate| candidate.text.as_str()),
+            Some("吧")
+        );
+        assert_ne!(fallback_candidates, all_candidates);
+
+        let frozen_all = all_state.fork_for_frozen_evaluation();
+        let frozen_recent = recent_state.fork_for_frozen_evaluation();
+        let evaluation = EventCapsuleV1::new(vec![commit_event(100, 0, "ab", "ba", "吧")]).unwrap();
+        let mut report = CapsuleReplayReport::with_window_gap_limit(Some(5_000)).unwrap();
+        report
+            .observe_capsule_with_personal_tiered_code_comparison(
+                &decoder,
+                &frozen_all,
+                &frozen_recent,
+                &mut all_state,
+                &mut recent_state,
+                &evaluation,
+            )
+            .unwrap();
+        assert_eq!(report.personal_tiered_code_comparison_commits, 1);
+        assert_eq!(report.personal_tiered_code_public.hits_at_1, 1);
+        assert_eq!(report.personal_tiered_code_frozen_all.hits_at_1, 0);
+        assert_eq!(report.personal_tiered_code_frozen_recent.hits_at_1, 1);
+        assert_eq!(
+            report
+                .personal_tiered_code_frozen_recent_vs_all
+                .gained_top_1,
+            1
+        );
+        assert_eq!(report.personal_tiered_code_frozen_recent_active_commits, 1);
+        let compact = report.personal_tiered_code_comparison_terminal_report();
+        assert!(compact.contains("schema=ziranma-personal-tiered-code-comparison-v3"));
+        assert!(compact.contains("frozen_recent_active_commits=1"));
+        assert!(compact.contains("scope=frozen_recent_active"));
+        assert!(!compact.contains("吧"));
+        assert!(!compact.contains("八"));
+        assert!(!compact.contains("ab"));
     }
 
     #[test]
