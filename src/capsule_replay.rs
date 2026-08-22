@@ -1191,6 +1191,92 @@ pub struct PersonalLeftContextMovementStats {
     pub competing_promotions: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersonalExactCodeEvidenceStats {
+    pub any_evidence: u64,
+    pub target_evidence: u64,
+    pub competing_evidence: u64,
+    pub top_changes: u64,
+    pub target_top_changes: u64,
+    pub competing_top_changes: u64,
+    pub lost_target_top_changes: u64,
+    pub neutral_top_changes: u64,
+    pub target_top_changes_once: u64,
+    pub target_top_changes_repeated: u64,
+    pub lost_target_top_changes_once: u64,
+    pub lost_target_top_changes_repeated: u64,
+}
+
+impl PersonalExactCodeEvidenceStats {
+    fn observe(
+        &mut self,
+        pool: &[SentenceCandidate],
+        reranked: &[SentenceCandidate],
+        state: &PersonalCacheReplayState,
+        code: &str,
+        target: &str,
+    ) {
+        let mut any = false;
+        let mut target_evidence = false;
+        let mut competing = false;
+        for candidate in pool {
+            if state.code_text_count(code, &candidate.text) == 0 {
+                continue;
+            }
+            any = true;
+            if candidate.text == target {
+                target_evidence = true;
+            } else {
+                competing = true;
+            }
+        }
+        self.any_evidence = self.any_evidence.saturating_add(u64::from(any));
+        self.target_evidence = self
+            .target_evidence
+            .saturating_add(u64::from(target_evidence));
+        self.competing_evidence = self.competing_evidence.saturating_add(u64::from(competing));
+
+        let changed_top = pool
+            .first()
+            .zip(reranked.first())
+            .is_some_and(|(public, personal)| public.text != personal.text);
+        if !changed_top {
+            return;
+        }
+        self.top_changes = self.top_changes.saturating_add(1);
+        let Some(winner) = reranked.first() else {
+            return;
+        };
+        let winner_repeated = state.code_text_count(code, &winner.text) >= 2;
+        if winner.text == target {
+            self.target_top_changes = self.target_top_changes.saturating_add(1);
+            if winner_repeated {
+                self.target_top_changes_repeated =
+                    self.target_top_changes_repeated.saturating_add(1);
+            } else {
+                self.target_top_changes_once = self.target_top_changes_once.saturating_add(1);
+            }
+        } else {
+            self.competing_top_changes = self.competing_top_changes.saturating_add(1);
+            if pool
+                .first()
+                .is_some_and(|candidate| candidate.text == target)
+            {
+                self.lost_target_top_changes = self.lost_target_top_changes.saturating_add(1);
+                if winner_repeated {
+                    self.lost_target_top_changes_repeated =
+                        self.lost_target_top_changes_repeated.saturating_add(1);
+                } else {
+                    self.lost_target_top_changes_once =
+                        self.lost_target_top_changes_once.saturating_add(1);
+                }
+            } else {
+                self.neutral_top_changes = self.neutral_top_changes.saturating_add(1);
+            }
+        }
+    }
+}
+
 impl PersonalLeftContextMovementStats {
     fn observe(&mut self, rerank: PersonalLeftContextRerankObservation, preferred_is_target: bool) {
         let Some(rank) = rerank.preferred_rank_after_exact else {
@@ -1378,6 +1464,8 @@ pub struct CapsuleReplayReport {
     pub personal_left_context_causal_any_evidence_commits: u64,
     pub personal_left_context_causal_target_evidence_commits: u64,
     pub personal_left_context_causal_competing_evidence_commits: u64,
+    pub personal_left_context_frozen_exact_evidence: PersonalExactCodeEvidenceStats,
+    pub personal_left_context_causal_exact_evidence: PersonalExactCodeEvidenceStats,
     pub personal_left_context_frozen_movement: PersonalLeftContextMovementStats,
     pub personal_left_context_causal_movement: PersonalLeftContextMovementStats,
 }
@@ -2331,6 +2419,13 @@ impl CapsuleReplayReport {
             PersonalCacheKind::ExactCodeText,
             &commit.observed,
         );
+        self.personal_left_context_frozen_exact_evidence.observe(
+            &pool,
+            &frozen_exact_candidates,
+            frozen_state,
+            &commit.observed,
+            &commit.target,
+        );
         let frozen_exact_rank = self.personal_left_context_frozen_exact.observe(
             &commit.observed,
             &commit.target,
@@ -2341,6 +2436,13 @@ impl CapsuleReplayReport {
             causal_state,
             PersonalCacheKind::ExactCodeText,
             &commit.observed,
+        );
+        self.personal_left_context_causal_exact_evidence.observe(
+            &pool,
+            &causal_exact_candidates,
+            causal_state,
+            &commit.observed,
+            &commit.target,
         );
         let causal_exact_rank = self.personal_left_context_causal_exact.observe(
             &commit.observed,
@@ -4032,7 +4134,7 @@ impl CapsuleReplayReport {
         [
             format!(
                 "PERSONAL_LEFT_CONTEXT_COMPARISON \
-                 schema=ziranma-personal-left-context-comparison-v2 contains_text=false \
+                 schema=ziranma-personal-left-context-comparison-v4 contains_text=false \
                  contains_behavioral_metadata=true writes=false network=false \
                  candidate_pool_code=canonical target_identity_code=observed \
                  context_identity=previous_committed_text_and_observed_code_and_selected_text \
@@ -4086,6 +4188,69 @@ impl CapsuleReplayReport {
                 self.personal_cache_revision_events_with_reversal,
                 self.personal_cache_revisions_not_reversed,
                 self.personal_cache_ambiguous_edits_not_applied
+            ),
+            format!(
+                "EXACT_CODE_EVIDENCE frozen_any_evidence_commits={} \
+                 frozen_target_evidence_commits={} frozen_competing_evidence_commits={} \
+                 frozen_top_changes={} frozen_target_top_changes={} \
+                 frozen_competing_top_changes={} frozen_lost_target_top_changes={} \
+                 frozen_neutral_top_changes={} frozen_target_top_changes_once={} \
+                 frozen_target_top_changes_repeated={} \
+                 frozen_lost_target_top_changes_once={} \
+                 frozen_lost_target_top_changes_repeated={} causal_any_evidence_commits={} \
+                 causal_target_evidence_commits={} causal_competing_evidence_commits={} \
+                 causal_top_changes={} causal_target_top_changes={} \
+                 causal_competing_top_changes={} causal_lost_target_top_changes={} \
+                 causal_neutral_top_changes={} causal_target_top_changes_once={} \
+                 causal_target_top_changes_repeated={} \
+                 causal_lost_target_top_changes_once={} \
+                 causal_lost_target_top_changes_repeated={}",
+                self.personal_left_context_frozen_exact_evidence
+                    .any_evidence,
+                self.personal_left_context_frozen_exact_evidence
+                    .target_evidence,
+                self.personal_left_context_frozen_exact_evidence
+                    .competing_evidence,
+                self.personal_left_context_frozen_exact_evidence.top_changes,
+                self.personal_left_context_frozen_exact_evidence
+                    .target_top_changes,
+                self.personal_left_context_frozen_exact_evidence
+                    .competing_top_changes,
+                self.personal_left_context_frozen_exact_evidence
+                    .lost_target_top_changes,
+                self.personal_left_context_frozen_exact_evidence
+                    .neutral_top_changes,
+                self.personal_left_context_frozen_exact_evidence
+                    .target_top_changes_once,
+                self.personal_left_context_frozen_exact_evidence
+                    .target_top_changes_repeated,
+                self.personal_left_context_frozen_exact_evidence
+                    .lost_target_top_changes_once,
+                self.personal_left_context_frozen_exact_evidence
+                    .lost_target_top_changes_repeated,
+                self.personal_left_context_causal_exact_evidence
+                    .any_evidence,
+                self.personal_left_context_causal_exact_evidence
+                    .target_evidence,
+                self.personal_left_context_causal_exact_evidence
+                    .competing_evidence,
+                self.personal_left_context_causal_exact_evidence.top_changes,
+                self.personal_left_context_causal_exact_evidence
+                    .target_top_changes,
+                self.personal_left_context_causal_exact_evidence
+                    .competing_top_changes,
+                self.personal_left_context_causal_exact_evidence
+                    .lost_target_top_changes,
+                self.personal_left_context_causal_exact_evidence
+                    .neutral_top_changes,
+                self.personal_left_context_causal_exact_evidence
+                    .target_top_changes_once,
+                self.personal_left_context_causal_exact_evidence
+                    .target_top_changes_repeated,
+                self.personal_left_context_causal_exact_evidence
+                    .lost_target_top_changes_once,
+                self.personal_left_context_causal_exact_evidence
+                    .lost_target_top_changes_repeated
             ),
             format!(
                 "LEFT_CONTEXT_EVIDENCE target_in_pool_commits={} \
@@ -5356,12 +5521,13 @@ fn shortened_code(
 #[cfg(test)]
 mod tests {
     use super::{
-        CapsuleReplayReport, ContextReplayComparisonStats, PairedReplayStrategyStats,
-        PersonalCacheKind, PersonalCacheReplayError, PersonalCacheReplayState,
-        RankingReplayComparisonStats, ReplayStrategyStats, candidate_has_pair_with_minimum_count,
-        decode_personal_pool_memoized, effective_letter_code,
-        observe_personal_hybrid_strategy_from_pool, observe_personal_strategy_from_pool,
-        observe_strategy_with_personal_cache, personal_cache_evidence, personal_hybrid_evidence,
+        CapsuleReplayReport, ContextReplayComparisonStats, PERSONAL_CACHE_POOL_DEPTH,
+        PairedReplayStrategyStats, PersonalCacheKind, PersonalCacheReplayError,
+        PersonalCacheReplayState, PersonalExactCodeEvidenceStats, RankingReplayComparisonStats,
+        ReplayStrategyStats, candidate_has_pair_with_minimum_count, decode_personal_pool_memoized,
+        effective_letter_code, observe_personal_hybrid_strategy_from_pool,
+        observe_personal_strategy_from_pool, observe_strategy_with_personal_cache,
+        personal_cache_evidence, personal_hybrid_evidence, personal_ranked_candidates_from_pool,
         personal_reserved_pair_evidence,
     };
     use crate::{
@@ -6599,6 +6765,30 @@ text\tpinyin\tfrequency
         );
         assert_eq!(report.personal_cache_history_code_text_tokens, 2);
         assert_eq!(report.personal_cache_history_left_context_tokens, 1);
+        assert_eq!(
+            report
+                .personal_left_context_frozen_exact_evidence
+                .any_evidence,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_left_context_frozen_exact_evidence
+                .target_evidence,
+            1
+        );
+        assert_eq!(
+            report
+                .personal_left_context_frozen_exact_evidence
+                .competing_evidence,
+            0
+        );
+        assert_eq!(
+            report
+                .personal_left_context_frozen_exact_evidence
+                .top_changes,
+            0
+        );
         assert_eq!(report.personal_left_context_frozen_movement.preferences, 1);
         assert_eq!(
             report.personal_left_context_frozen_movement.already_first,
@@ -6620,10 +6810,12 @@ text\tpinyin\tfrequency
         assert_eq!(format!("{frozen_state:?}"), frozen_before);
 
         let compact = report.personal_left_context_comparison_terminal_report();
-        assert!(compact.contains("schema=ziranma-personal-left-context-comparison-v2"));
+        assert!(compact.contains("schema=ziranma-personal-left-context-comparison-v4"));
         assert!(compact.contains("candidate_pool_code=canonical"));
         assert!(compact.contains("target_identity_code=observed"));
         assert!(compact.contains("selection_rejections=unavailable"));
+        assert!(compact.contains("EXACT_CODE_EVIDENCE frozen_any_evidence_commits=1"));
+        assert!(compact.contains("frozen_competing_top_changes=0"));
         assert!(compact.contains("frozen_target_evidence_commits=1"));
         assert!(compact.contains("frozen_preferences=1"));
         assert!(compact.contains("frozen_promotions=1"));
@@ -6633,6 +6825,61 @@ text\tpinyin\tfrequency
         assert!(!compact.contains("请"));
         assert!(!compact.contains("把"));
         assert!(!compact.contains("qing"));
+    }
+
+    #[test]
+    fn exact_code_top_movement_separates_once_gains_from_once_losses() {
+        let decoder = crate::Decoder::new(parse_lexicon_tsv(LEFT_CONTEXT_LEXICON).unwrap());
+        let pool = decoder
+            .decode_sentence("ba", PERSONAL_CACHE_POOL_DEPTH)
+            .unwrap();
+        assert_eq!(
+            pool.first().map(|candidate| candidate.text.as_str()),
+            Some("吧")
+        );
+
+        let mut once_state = PersonalCacheReplayState::new();
+        once_state.learn_code_text(0, 1, "ab".to_owned(), "八".to_owned());
+        let once_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            &once_state,
+            PersonalCacheKind::ExactCodeText,
+            "ab",
+        );
+        assert_eq!(
+            once_candidates
+                .first()
+                .map(|candidate| candidate.text.as_str()),
+            Some("八")
+        );
+
+        let mut gain = PersonalExactCodeEvidenceStats::default();
+        gain.observe(&pool, &once_candidates, &once_state, "ab", "八");
+        assert_eq!(gain.target_top_changes, 1);
+        assert_eq!(gain.target_top_changes_once, 1);
+        assert_eq!(gain.target_top_changes_repeated, 0);
+        assert_eq!(gain.lost_target_top_changes, 0);
+
+        let mut loss = PersonalExactCodeEvidenceStats::default();
+        loss.observe(&pool, &once_candidates, &once_state, "ab", "吧");
+        assert_eq!(loss.competing_top_changes, 1);
+        assert_eq!(loss.lost_target_top_changes, 1);
+        assert_eq!(loss.lost_target_top_changes_once, 1);
+        assert_eq!(loss.lost_target_top_changes_repeated, 0);
+
+        let mut repeated_state = PersonalCacheReplayState::new();
+        repeated_state.learn_code_text(0, 1, "ab".to_owned(), "八".to_owned());
+        repeated_state.learn_code_text(1, 2, "ab".to_owned(), "八".to_owned());
+        let repeated_candidates = personal_ranked_candidates_from_pool(
+            &pool,
+            &repeated_state,
+            PersonalCacheKind::ExactCodeText,
+            "ab",
+        );
+        let mut repeated_gain = PersonalExactCodeEvidenceStats::default();
+        repeated_gain.observe(&pool, &repeated_candidates, &repeated_state, "ab", "八");
+        assert_eq!(repeated_gain.target_top_changes_once, 0);
+        assert_eq!(repeated_gain.target_top_changes_repeated, 1);
     }
 
     #[test]
