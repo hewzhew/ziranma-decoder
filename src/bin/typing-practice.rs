@@ -41,9 +41,10 @@ mod windows_app {
         GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW,
         MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW, SW_SHOW,
         SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC,
-        WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-        WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+        WM_CTLCOLORSTATIC, WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD,
+        WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+        WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
 
@@ -155,9 +156,18 @@ mod windows_app {
     }
 
     #[derive(Debug)]
+    struct WindowDeactivation {
+        elapsed_ms: u64,
+        after_event: usize,
+        selection_start_utf16: u32,
+        selection_end_utf16: u32,
+    }
+
+    #[derive(Debug)]
     enum PracticeEvent {
         DocumentDelta(DocumentDelta),
         Marker(TimelineMarker),
+        WindowDeactivation(WindowDeactivation),
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,6 +253,7 @@ mod windows_app {
     enum ReviewGroup<'a> {
         Document(ReviewDocumentGroup),
         Marker(&'a TimelineMarker),
+        WindowDeactivation(&'a WindowDeactivation),
     }
 
     struct TailTrimObservation {
@@ -348,6 +359,24 @@ mod windows_app {
             RecordOutcome::Recorded
         }
 
+        fn record_window_deactivation(&mut self, selection: (u32, u32)) -> RecordOutcome {
+            if self.mode != SessionMode::Recording {
+                return RecordOutcome::Ignored;
+            }
+            if self.events.len() >= MAX_TIMELINE_EVENTS {
+                self.mode = SessionMode::Review;
+                return RecordOutcome::LimitReached;
+            }
+            self.events
+                .push(PracticeEvent::WindowDeactivation(WindowDeactivation {
+                    elapsed_ms: self.elapsed_ms(),
+                    after_event: self.events.len(),
+                    selection_start_utf16: selection.0,
+                    selection_end_utf16: selection.1,
+                }));
+            RecordOutcome::Recorded
+        }
+
         fn finish(&mut self) {
             if self.mode == SessionMode::Recording {
                 self.mode = SessionMode::Review;
@@ -439,6 +468,12 @@ mod windows_app {
                 }
             }
             WM_CTLCOLORSTATIC => unsafe { paint_static(wparam, lparam) },
+            WM_ACTIVATE => {
+                if (wparam.0 & 0xffff) == WA_INACTIVE as usize {
+                    record_window_deactivation(window);
+                }
+                unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            }
             WM_COMMAND => {
                 let id = (wparam.0 & 0xffff) as i32;
                 let notification = ((wparam.0 >> 16) & 0xffff) as u32;
@@ -835,6 +870,24 @@ mod windows_app {
         focus_editor(window);
     }
 
+    fn record_window_deactivation(window: HWND) {
+        let selection = read_editor_selection(window).unwrap_or((0, 0));
+        let outcome = APP_STATE.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .map(|state| state.record_window_deactivation(selection))
+                .unwrap_or(RecordOutcome::Ignored)
+        });
+        match outcome {
+            RecordOutcome::Recorded => update_session_controls(window, None),
+            RecordOutcome::LimitReached => finish_session(
+                window,
+                Some("本轮已达到有界记录上限，已自动停止并保留现有时间线。"),
+            ),
+            RecordOutcome::Ignored => {}
+        }
+    }
+
     fn finish_session(window: HWND, notice: Option<&str>) {
         APP_STATE.with(|slot| {
             if let Some(state) = slot.borrow_mut().as_mut() {
@@ -963,6 +1016,14 @@ mod windows_app {
                     marker.selection_start_utf16,
                     marker.selection_end_utf16,
                 )),
+                ReviewGroup::WindowDeactivation(boundary) => output.push_str(&format!(
+                    "{} · +{} ms · 练习窗口离开前台 · 位于第 {} 条事实后 · 范围 {}–{}",
+                    index + 1,
+                    boundary.elapsed_ms,
+                    boundary.after_event,
+                    boundary.selection_start_utf16,
+                    boundary.selection_end_utf16,
+                )),
             }
         }
         output
@@ -1036,6 +1097,9 @@ mod windows_app {
                     )));
                 }
                 PracticeEvent::Marker(marker) => groups.push(ReviewGroup::Marker(marker)),
+                PracticeEvent::WindowDeactivation(boundary) => {
+                    groups.push(ReviewGroup::WindowDeactivation(boundary));
+                }
             }
         }
         groups
@@ -1270,6 +1334,48 @@ mod windows_app {
             assert!(review.contains("★ 现场标记"));
             assert!(review.contains("插入“呀”"));
             assert!(review.contains("删除“呀”"));
+        }
+
+        #[test]
+        fn window_deactivation_is_a_text_free_structural_boundary() {
+            let mut state = AppState::default();
+            state.begin(Vec::new());
+            assert_eq!(
+                state.record_change(wide("你"), (1, 1)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(
+                state.record_window_deactivation((1, 1)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(
+                state.record_change(wide("你好"), (2, 2)),
+                RecordOutcome::Recorded
+            );
+
+            let groups = group_timeline(&state.events);
+            assert_eq!(groups.len(), 3, "focus changes must stop insert grouping");
+            let review = render_timeline(&state.events);
+            assert!(review.contains("插入“你”"));
+            assert!(review.contains("练习窗口离开前台"));
+            assert!(review.contains("插入“好”"));
+            assert!(!format!("{:?}", state.events[1]).contains("你"));
+
+            let mut trimmed = AppState::default();
+            trimmed.begin(Vec::new());
+            assert_eq!(
+                trimmed.record_change(wide("线束缚"), (3, 3)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(
+                trimmed.record_window_deactivation((3, 3)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(
+                trimmed.record_change(wide("线束"), (2, 2)),
+                RecordOutcome::Recorded
+            );
+            assert!(find_tail_trim_observations(&trimmed.events).is_empty());
         }
 
         #[test]
