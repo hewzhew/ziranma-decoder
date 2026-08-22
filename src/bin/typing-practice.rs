@@ -147,12 +147,26 @@ mod windows_app {
         }
     }
 
-    #[derive(Debug)]
     struct TimelineMarker {
         elapsed_ms: u64,
         after_event: usize,
         selection_start_utf16: u32,
         selection_end_utf16: u32,
+        selected_text: Vec<u16>,
+    }
+
+    impl fmt::Debug for TimelineMarker {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("TimelineMarker")
+                .field("elapsed_ms", &self.elapsed_ms)
+                .field("after_event", &self.after_event)
+                .field("selection_start_utf16", &self.selection_start_utf16)
+                .field("selection_end_utf16", &self.selection_end_utf16)
+                .field("selected_text_utf16", &self.selected_text.len())
+                .field("debug_contains_text", &false)
+                .finish()
+        }
     }
 
     #[derive(Debug)]
@@ -341,20 +355,25 @@ mod windows_app {
             RecordOutcome::Recorded
         }
 
-        fn mark(&mut self, selection: (u32, u32)) -> RecordOutcome {
+        fn mark(&mut self, selection: (u32, u32), selected_text: Vec<u16>) -> RecordOutcome {
             if self.mode != SessionMode::Recording {
                 return RecordOutcome::Ignored;
             }
-            if self.events.len() >= MAX_TIMELINE_EVENTS {
+            if self.events.len() >= MAX_TIMELINE_EVENTS
+                || self.captured_utf16.saturating_add(selected_text.len()) > MAX_CAPTURED_UTF16
+            {
                 self.mode = SessionMode::Review;
                 return RecordOutcome::LimitReached;
             }
+            let selected_utf16 = selected_text.len();
             self.events.push(PracticeEvent::Marker(TimelineMarker {
                 elapsed_ms: self.elapsed_ms(),
                 after_event: self.events.len(),
                 selection_start_utf16: selection.0,
                 selection_end_utf16: selection.1,
+                selected_text,
             }));
+            self.captured_utf16 = self.captured_utf16.saturating_add(selected_utf16);
             self.markers = self.markers.saturating_add(1);
             RecordOutcome::Recorded
         }
@@ -852,11 +871,19 @@ mod windows_app {
     }
 
     fn mark_session(window: HWND) {
-        let selection = read_editor_selection(window).unwrap_or((0, 0));
+        let Ok(selection) = read_editor_selection(window) else {
+            return notify_error(window, "无法读取练习区选中范围");
+        };
+        let Ok(document) = read_control_utf16(window, EDITOR_ID) else {
+            return notify_error(window, "无法读取练习区文字");
+        };
+        let Some(selected_text) = selected_utf16(&document, selection) else {
+            return notify_error(window, "练习区选中范围无效");
+        };
         let outcome = APP_STATE.with(|slot| {
             slot.borrow_mut()
                 .as_mut()
-                .map(|state| state.mark(selection))
+                .map(|state| state.mark(selection, selected_text))
                 .unwrap_or(RecordOutcome::Ignored)
         });
         match outcome {
@@ -1008,14 +1035,21 @@ mod windows_app {
                         document.selection_end_utf16,
                     ));
                 }
-                ReviewGroup::Marker(marker) => output.push_str(&format!(
-                    "{} · +{} ms · ★ 现场标记 · 位于第 {} 条事实后 · 范围 {}–{}",
-                    index + 1,
-                    marker.elapsed_ms,
-                    marker.after_event,
-                    marker.selection_start_utf16,
-                    marker.selection_end_utf16,
-                )),
+                ReviewGroup::Marker(marker) => {
+                    let selection = if marker.selected_text.is_empty() {
+                        "光标位置".to_owned()
+                    } else {
+                        format!("选中“{}”", String::from_utf16_lossy(&marker.selected_text))
+                    };
+                    output.push_str(&format!(
+                        "{} · +{} ms · ★ 现场标记 · 位于第 {} 条事实后 · {selection} · 范围 {}–{}",
+                        index + 1,
+                        marker.elapsed_ms,
+                        marker.after_event,
+                        marker.selection_start_utf16,
+                        marker.selection_end_utf16,
+                    ));
+                }
                 ReviewGroup::WindowDeactivation(boundary) => output.push_str(&format!(
                     "{} · +{} ms · 练习窗口离开前台 · 位于第 {} 条事实后 · 范围 {}–{}",
                     index + 1,
@@ -1146,6 +1180,12 @@ mod windows_app {
         Ok((start, end))
     }
 
+    fn selected_utf16(document: &[u16], selection: (u32, u32)) -> Option<Vec<u16>> {
+        let start = usize::try_from(selection.0).ok()?;
+        let end = usize::try_from(selection.1).ok()?;
+        document.get(start..end).map(<[u16]>::to_vec)
+    }
+
     fn is_editor_f2(window: HWND, message: &MSG) -> bool {
         message.message == WM_KEYDOWN
             && message.wParam == WPARAM(VK_F2.0 as usize)
@@ -1213,7 +1253,7 @@ mod windows_app {
     mod tests {
         use super::{
             AppState, DocumentDelta, PracticeEvent, RecordOutcome, SessionMode,
-            find_tail_trim_observations, group_timeline, render_timeline,
+            find_tail_trim_observations, group_timeline, render_timeline, selected_utf16,
         };
 
         #[test]
@@ -1247,7 +1287,7 @@ mod windows_app {
                 state.record_change(wide("开始前甲"), (4, 4)),
                 RecordOutcome::Recorded
             );
-            assert_eq!(state.mark((4, 4)), RecordOutcome::Recorded);
+            assert_eq!(state.mark((4, 4), Vec::new()), RecordOutcome::Recorded);
             assert_eq!(
                 state.record_change(wide("开始前"), (3, 3)),
                 RecordOutcome::Recorded
@@ -1281,9 +1321,15 @@ mod windows_app {
             let mut event_bound = AppState::default();
             event_bound.begin(Vec::new());
             for _ in 0..super::MAX_TIMELINE_EVENTS {
-                assert_eq!(event_bound.mark((0, 0)), RecordOutcome::Recorded);
+                assert_eq!(
+                    event_bound.mark((0, 0), Vec::new()),
+                    RecordOutcome::Recorded
+                );
             }
-            assert_eq!(event_bound.mark((0, 0)), RecordOutcome::LimitReached);
+            assert_eq!(
+                event_bound.mark((0, 0), Vec::new()),
+                RecordOutcome::LimitReached
+            );
             assert_eq!(event_bound.mode, SessionMode::Review);
             assert_eq!(event_bound.events.len(), super::MAX_TIMELINE_EVENTS);
 
@@ -1299,6 +1345,15 @@ mod windows_app {
             );
             assert_eq!(text_bound.mode, SessionMode::Review);
             assert_eq!(text_bound.events.len(), 1);
+
+            let mut marker_bound = AppState::default();
+            marker_bound.begin(Vec::new());
+            assert_eq!(
+                marker_bound.mark((0, 0), vec![b'a' as u16; super::MAX_CAPTURED_UTF16 + 1]),
+                RecordOutcome::LimitReached
+            );
+            assert!(marker_bound.events.is_empty());
+            assert_eq!(marker_bound.mode, SessionMode::Review);
         }
 
         #[test]
@@ -1313,7 +1368,7 @@ mod windows_app {
                 state.record_change(wide("你好"), (2, 2)),
                 RecordOutcome::Recorded
             );
-            assert_eq!(state.mark((2, 2)), RecordOutcome::Recorded);
+            assert_eq!(state.mark((2, 2), Vec::new()), RecordOutcome::Recorded);
             assert_eq!(
                 state.record_change(wide("你好呀"), (3, 3)),
                 RecordOutcome::Recorded
@@ -1376,6 +1431,26 @@ mod windows_app {
                 RecordOutcome::Recorded
             );
             assert!(find_tail_trim_observations(&trimmed.events).is_empty());
+        }
+
+        #[test]
+        fn marker_snapshots_only_explicit_selection_and_redacts_debug() {
+            let document = wide("前文心意后文");
+            let selection = (2, 4);
+            let selected = selected_utf16(&document, selection).unwrap();
+            assert_eq!(String::from_utf16(&selected).unwrap(), "心意");
+            assert!(selected_utf16(&document, (3, 2)).is_none());
+            assert_eq!(selected_utf16(&document, (4, 4)), Some(Vec::new()));
+
+            let mut state = AppState::default();
+            state.begin(document);
+            assert_eq!(state.mark(selection, selected), RecordOutcome::Recorded);
+            let review = render_timeline(&state.events);
+            assert!(review.contains("选中“心意”"));
+            let debug = format!("{:?}", state.events[0]);
+            assert!(!debug.contains("心意"));
+            assert!(debug.contains("selected_text_utf16: 2"));
+            assert!(debug.contains("debug_contains_text: false"));
         }
 
         #[test]
@@ -1448,7 +1523,7 @@ mod windows_app {
                 state.record_change(wide("甲乙丙"), (3, 3)),
                 RecordOutcome::Recorded
             );
-            assert_eq!(state.mark((3, 3)), RecordOutcome::Recorded);
+            assert_eq!(state.mark((3, 3), Vec::new()), RecordOutcome::Recorded);
             assert_eq!(
                 state.record_change(wide("甲乙"), (2, 2)),
                 RecordOutcome::Recorded
