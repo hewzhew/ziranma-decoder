@@ -4964,6 +4964,7 @@ impl ExactShortTargetDepthAudit {
 enum ExactShortInsertionPlacement {
     #[default]
     TopOne,
+    ExactLane,
     FirstPage,
     GuardedFirstPage,
 }
@@ -4972,6 +4973,7 @@ impl ExactShortInsertionPlacement {
     fn label(self) -> &'static str {
         match self {
             Self::TopOne => "首选后立即插入",
+            Self::ExactLane => "现有完整词通道后插入",
             Self::FirstPage => "固定第一页、第二页开头插入",
             Self::GuardedFirstPage => "分页保护、第二页开头插入",
         }
@@ -5026,6 +5028,7 @@ impl ExactShortPagingAudit {
             placement,
             stable_prefix: match placement {
                 ExactShortInsertionPlacement::TopOne => 1,
+                ExactShortInsertionPlacement::ExactLane => 0,
                 ExactShortInsertionPlacement::FirstPage
                 | ExactShortInsertionPlacement::GuardedFirstPage => first_page_size,
             },
@@ -5115,7 +5118,7 @@ impl ExactShortPagingAudit {
 
     fn safety_gate_passed(self) -> bool {
         match self.placement {
-            ExactShortInsertionPlacement::TopOne => {
+            ExactShortInsertionPlacement::TopOne | ExactShortInsertionPlacement::ExactLane => {
                 self.useful_changes != 0
                     && self.top_changes == 0
                     && self.harmful_changes == 0
@@ -5198,6 +5201,16 @@ fn audit_exact_short_layer(
             request.frontier_limit,
         ),
         ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::ExactLane,
+            1,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
+            ExactShortInsertionPlacement::ExactLane,
+            2,
+            request.frontier_limit,
+        ),
+        ExactShortPagingAudit::with_profile(
             ExactShortInsertionPlacement::FirstPage,
             1,
             request.frontier_limit,
@@ -5234,6 +5247,19 @@ fn audit_exact_short_layer(
             MAX_CANDIDATE_SNAPSHOT_RANK,
             supplemental_config,
         )?;
+        let core_exact = core.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+        let supplemental_exact =
+            supplemental.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+        let existing_exact = core_exact
+            .iter()
+            .chain(&supplemental_exact)
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let exact_lane_prefix = baseline
+            .iter()
+            .take_while(|candidate| existing_exact.contains(candidate.as_str()))
+            .count()
+            .max(1);
         for profile in &mut profiles {
             let preview = match profile.placement {
                 ExactShortInsertionPlacement::GuardedFirstPage => {
@@ -5243,6 +5269,15 @@ fn audit_exact_short_layer(
                         MAX_CANDIDATE_SNAPSHOT_RANK,
                         profile.promotions,
                         request.frontier_limit,
+                    )?
+                }
+                ExactShortInsertionPlacement::ExactLane => {
+                    exact.catalog.preview_candidate_texts_after_prefix(
+                        &baseline,
+                        code,
+                        MAX_CANDIDATE_SNAPSHOT_RANK,
+                        profile.promotions,
+                        exact_lane_prefix,
                     )?
                 }
                 ExactShortInsertionPlacement::TopOne | ExactShortInsertionPlacement::FirstPage => {
@@ -5365,7 +5400,7 @@ fn audit_exact_short_layer(
     }
     writeln!(
         output,
-        "安全门口径：立即插入仍要求至少一个目标受益、首选零变化、公开目标零名次后移且零掉出；普通与受保护的第二页通道均要求至少一个目标受益、第一页逐项零变化、目标零跨页退化且零掉出总范围。总范围尾部位移单独报告，不被伪装成正确性结论。"
+        "安全门口径：首选后或现有完整词通道后插入均要求至少一个目标受益、首选零变化、公开目标零名次后移且零掉出；普通与受保护的第二页通道均要求至少一个目标受益、第一页逐项零变化、目标零跨页退化且零掉出总范围。总范围尾部位移单独报告，不被伪装成正确性结论。"
     )?;
     writeln!(
         output,
@@ -14246,8 +14281,14 @@ mod tests {
             .lines()
             .find(|line| line.contains("分页保护、第二页开头插入 · 精确补 2"))
             .unwrap();
+        let exact_lane = report
+            .lines()
+            .find(|line| line.contains("现有完整词通道后插入 · 精确补 2"))
+            .unwrap();
         assert!(report.contains("首选后立即插入 · 精确补 1"));
         assert!(report.contains("固定第一页、第二页开头插入 · 精确补 2"));
+        assert!(exact_lane.contains("第一页变化 0（实例 0）"));
+        assert!(exact_lane.contains("安全门 通过"));
         assert!(guarded.contains("第一页变化 0（实例 0）"));
         assert!(guarded.contains("安全门 通过"));
         assert!(report.contains("本次操作：只读预览"));
