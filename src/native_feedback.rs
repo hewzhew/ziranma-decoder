@@ -132,6 +132,24 @@ pub enum NativeCandidateSource {
     Shape,
 }
 
+/// Where a candidate sat before an effective personal ranking change.
+///
+/// The explicit legacy state prevents old snapshots from being mistaken for
+/// evidence that no movement occurred. Ranks are one-based absolute ranks in
+/// the loaded ordinary candidate pool, not positions within the visible page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeCandidateRankingMovement {
+    /// The source snapshot predates precise movement recording.
+    #[default]
+    Unrecorded,
+    /// No personal ranking operation changed this candidate's position.
+    Unchanged,
+    /// The candidate already existed at this absolute rank before promotion.
+    MovedFrom { absolute_rank: usize },
+    /// The candidate was recalled from outside the loaded ordinary pool.
+    RecalledFromOutsideLoadedPool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeCandidatePersonalization(u8);
 
@@ -177,11 +195,23 @@ impl NativeCandidatePersonalization {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeCandidateProvenance {
     source: NativeCandidateSource,
     personalization: NativeCandidatePersonalization,
     ranking_personalization: NativeCandidatePersonalization,
+    ranking_movement: NativeCandidateRankingMovement,
+}
+
+impl Default for NativeCandidateProvenance {
+    fn default() -> Self {
+        Self {
+            source: NativeCandidateSource::Unknown,
+            personalization: NativeCandidatePersonalization::NONE,
+            ranking_personalization: NativeCandidatePersonalization::NONE,
+            ranking_movement: NativeCandidateRankingMovement::Unchanged,
+        }
+    }
 }
 
 impl NativeCandidateProvenance {
@@ -194,6 +224,7 @@ impl NativeCandidateProvenance {
                 NativeCandidatePersonalization::NONE
             },
             ranking_personalization: NativeCandidatePersonalization::NONE,
+            ranking_movement: NativeCandidateRankingMovement::Unchanged,
         }
     }
 
@@ -205,9 +236,12 @@ impl NativeCandidateProvenance {
             source,
             personalization,
             ranking_personalization: NativeCandidatePersonalization::NONE,
+            ranking_movement: NativeCandidateRankingMovement::Unchanged,
         }
     }
 
+    /// Constructs provenance decoded from V14–V17, whose ranking movement
+    /// was not recorded and must remain explicitly unknown.
     pub fn with_personalization_and_ranking(
         source: NativeCandidateSource,
         personalization: NativeCandidatePersonalization,
@@ -217,6 +251,32 @@ impl NativeCandidateProvenance {
             source,
             personalization,
             ranking_personalization,
+            ranking_movement: NativeCandidateRankingMovement::Unrecorded,
+        })
+    }
+
+    pub fn with_personalization_ranking_and_movement(
+        source: NativeCandidateSource,
+        personalization: NativeCandidatePersonalization,
+        ranking_personalization: NativeCandidatePersonalization,
+        ranking_movement: NativeCandidateRankingMovement,
+    ) -> Option<Self> {
+        let ranking_is_valid = ranking_personalization.bits() & !personalization.bits() == 0;
+        let movement_is_valid = match ranking_movement {
+            NativeCandidateRankingMovement::Unrecorded => false,
+            NativeCandidateRankingMovement::Unchanged => ranking_personalization.is_empty(),
+            NativeCandidateRankingMovement::MovedFrom { absolute_rank } => {
+                !ranking_personalization.is_empty() && absolute_rank > 0
+            }
+            NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool => {
+                !ranking_personalization.is_empty()
+            }
+        };
+        (ranking_is_valid && movement_is_valid).then_some(Self {
+            source,
+            personalization,
+            ranking_personalization,
+            ranking_movement,
         })
     }
 
@@ -236,13 +296,37 @@ impl NativeCandidateProvenance {
         self.ranking_personalization
     }
 
-    pub fn add_personalization(&mut self, reason: NativeCandidatePersonalization) {
+    pub fn ranking_movement(self) -> NativeCandidateRankingMovement {
+        self.ranking_movement
+    }
+
+    pub(crate) fn add_personalization(&mut self, reason: NativeCandidatePersonalization) {
         self.personalization = self.personalization.with(reason);
     }
 
-    pub fn add_ranking_personalization(&mut self, reason: NativeCandidatePersonalization) {
+    pub(crate) fn add_ranking_personalization(
+        &mut self,
+        reason: NativeCandidatePersonalization,
+        movement: NativeCandidateRankingMovement,
+    ) {
+        let valid = !reason.is_empty()
+            && matches!(
+                movement,
+                NativeCandidateRankingMovement::MovedFrom { absolute_rank: 1.. }
+                    | NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool
+            );
+        debug_assert!(valid);
+        if !valid {
+            return;
+        }
         self.personalization = self.personalization.with(reason);
         self.ranking_personalization = self.ranking_personalization.with(reason);
+        if matches!(
+            self.ranking_movement,
+            NativeCandidateRankingMovement::Unchanged | NativeCandidateRankingMovement::Unrecorded
+        ) {
+            self.ranking_movement = movement;
+        }
     }
 }
 

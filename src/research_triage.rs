@@ -8,14 +8,15 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    NativeCandidateProvenance, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, NativePersonalPhraseAdjacency, WishCaptureScope, WishRuntimeIdentity,
-    WishSnapshot, native_slow_key_remainder_ms,
+    NativeCandidateProvenance, NativeCandidateRankingMovement, NativeCandidateSuppressionAction,
+    NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, WishCaptureScope,
+    WishRuntimeIdentity, WishSnapshot, native_slow_key_remainder_ms,
 };
 
 /// One 60 Hz frame, used as the fixed threshold for visible latency signals.
 pub const RESEARCH_TRIAGE_VISIBLE_LATENCY_MS: u32 = 16;
 pub const RESEARCH_CANDIDATE_LENGTH_BUCKET_COUNT: usize = 5;
+pub const RESEARCH_RANKING_MOVEMENT_BUCKET_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResearchTriageCoverage {
@@ -35,6 +36,7 @@ pub struct ResearchTriageCapabilityCoverage {
     pub post_commit_backspace_batches: usize,
     pub candidate_suppression_action_batches: usize,
     pub personal_phrase_adjacency_batches: usize,
+    pub candidate_ranking_movement_batches: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -78,6 +80,11 @@ pub struct ResearchRankingSignals {
     pub reranked_top_bypassed_commits: usize,
     pub nonreranked_top_bypassed_commits: usize,
     pub top_provenance_missing: usize,
+    pub reranked_top_moved_from_existing: usize,
+    pub reranked_top_recalled: usize,
+    pub reranked_top_movement_unavailable: usize,
+    /// One-based source ranks bucketed as 2, 3–4, 5–7, and 8+.
+    pub reranked_top_source_rank_buckets: [usize; RESEARCH_RANKING_MOVEMENT_BUCKET_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -340,6 +347,8 @@ fn analyze_research_issue_signals_from<'a>(
             usize::from(snapshot.supports_candidate_suppression_actions());
         report.capabilities.personal_phrase_adjacency_batches +=
             usize::from(snapshot.supports_personal_phrase_adjacency());
+        report.capabilities.candidate_ranking_movement_batches +=
+            usize::from(snapshot.supports_candidate_ranking_movement());
         report.coverage.events += snapshot.events().len();
         report.coverage.omitted_events += snapshot
             .omitted_before_window()
@@ -438,6 +447,7 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                                 report,
                                 precise_personalization,
                                 precise_ranking,
+                                snapshot.supports_candidate_ranking_movement(),
                                 matching,
                                 *absolute_rank,
                             );
@@ -558,6 +568,7 @@ fn observe_non_top_ranking(
     report: &mut ResearchIssueTriage,
     precise_personalization: bool,
     precise_ranking: bool,
+    precise_ranking_movement: bool,
     frame: &PresentedFrame,
     absolute_rank: usize,
 ) {
@@ -580,9 +591,39 @@ fn observe_non_top_ranking(
             Some(top) if top.ranking_personalization().is_empty() => {
                 report.ranking.nonreranked_top_bypassed_commits += 1;
             }
-            Some(_) => report.ranking.reranked_top_bypassed_commits += 1,
+            Some(top) => {
+                report.ranking.reranked_top_bypassed_commits += 1;
+                if precise_ranking_movement {
+                    match top.ranking_movement() {
+                        NativeCandidateRankingMovement::MovedFrom { absolute_rank } => {
+                            report.ranking.reranked_top_moved_from_existing += 1;
+                            report.ranking.reranked_top_source_rank_buckets
+                                [research_ranking_movement_bucket_index(absolute_rank)] += 1;
+                        }
+                        NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool => {
+                            report.ranking.reranked_top_recalled += 1;
+                        }
+                        NativeCandidateRankingMovement::Unrecorded
+                        | NativeCandidateRankingMovement::Unchanged => {
+                            report.ranking.reranked_top_movement_unavailable += 1;
+                        }
+                    }
+                } else {
+                    report.ranking.reranked_top_movement_unavailable += 1;
+                }
+            }
             None => report.ranking.top_provenance_missing += 1,
         }
+    }
+}
+
+/// Maps a one-based source rank into the shared 2, 3–4, 5–7, or 8+ report bucket.
+pub fn research_ranking_movement_bucket_index(absolute_rank: usize) -> usize {
+    match absolute_rank {
+        0..=2 => 0,
+        3..=4 => 1,
+        5..=7 => 2,
+        _ => 3,
     }
 }
 
@@ -688,6 +729,7 @@ mod tests {
         assert_eq!(report.capabilities.post_commit_backspace_batches, 1);
         assert_eq!(report.capabilities.candidate_suppression_action_batches, 1);
         assert_eq!(report.capabilities.personal_phrase_adjacency_batches, 1);
+        assert_eq!(report.capabilities.candidate_ranking_movement_batches, 1);
         assert_eq!(report.reachability.non_top_commits, 1);
         assert_eq!(report.ranking.precise_personalization_non_top_commits, 1);
         assert_eq!(report.ranking.personalized_target_non_top_commits, 1);
@@ -696,6 +738,72 @@ mod tests {
         assert_eq!(report.ranking.precise_ranking_non_top_commits, 1);
         assert_eq!(report.ranking.reranked_top_bypassed_commits, 1);
         assert_eq!(report.ranking.nonreranked_top_bypassed_commits, 0);
+        assert_eq!(report.ranking.reranked_top_movement_unavailable, 1);
+    }
+
+    #[test]
+    fn ranking_signals_bucket_existing_and_recalled_reranked_blockers() {
+        let ranked = |movement| {
+            NativeCandidateProvenance::with_personalization_ranking_and_movement(
+                NativeCandidateSource::CoreExact,
+                NativeCandidatePersonalization::PERSISTENT_EXACT,
+                NativeCandidatePersonalization::PERSISTENT_EXACT,
+                movement,
+            )
+            .unwrap()
+        };
+        let report = analyze_research_issue_signals(&[
+            snapshot(vec![
+                (
+                    10,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "abcd".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: 0,
+                        candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                        provenance: vec![
+                            ranked(NativeCandidateRankingMovement::MovedFrom { absolute_rank: 6 }),
+                            NativeCandidateProvenance::default(),
+                        ],
+                        automatic_transposition: None,
+                        loaded_candidates: 7,
+                        tab_assembly: None,
+                        may_have_more: false,
+                    },
+                ),
+                (20, commit("abcd", "乙", NativeCandidateView::Ordinary, 2)),
+            ]),
+            snapshot(vec![
+                (
+                    30,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "efgh".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: 0,
+                        candidates: vec!["丙".to_owned(), "丁".to_owned()],
+                        provenance: vec![
+                            ranked(NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool),
+                            NativeCandidateProvenance::default(),
+                        ],
+                        automatic_transposition: None,
+                        loaded_candidates: 2,
+                        tab_assembly: None,
+                        may_have_more: false,
+                    },
+                ),
+                (40, commit("efgh", "丁", NativeCandidateView::Ordinary, 2)),
+            ]),
+        ])
+        .unwrap();
+
+        assert_eq!(report.ranking.reranked_top_bypassed_commits, 2);
+        assert_eq!(report.ranking.reranked_top_moved_from_existing, 1);
+        assert_eq!(report.ranking.reranked_top_recalled, 1);
+        assert_eq!(report.ranking.reranked_top_movement_unavailable, 0);
+        assert_eq!(
+            report.ranking.reranked_top_source_rank_buckets,
+            [0, 0, 1, 0]
+        );
     }
 
     #[test]

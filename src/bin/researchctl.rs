@@ -7,8 +7,8 @@ use std::thread;
 
 use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
-    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
+    NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
+    NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
     ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage, ResearchSceneAnalysis,
     ResearchWishEpisodeKind, ResearchWishEvidenceKind, TranspositionCalibrationLabel,
@@ -16,7 +16,8 @@ use ziranma_core::{
     WishSnapshot, analyze_linked_research, analyze_research_issue_signals,
     analyze_research_issue_signals_for_runtime, analyze_runtime_half_pairs, list_wish_packages,
     native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-    research_feedback_enabled, set_research_feedback_enabled,
+    research_feedback_enabled, research_ranking_movement_bucket_index,
+    set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -33,6 +34,7 @@ const PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT: usize = 3;
 const PERSONAL_PHRASE_ADJACENCY_KIND_COUNT: usize = 7;
 const INITIAL_NON_TOP_RANK_BUCKET_COUNT: usize = 3;
 const NON_TOP_KEY_LENGTH_BUCKET_COUNT: usize = 5;
+const RANKING_MOVEMENT_BUCKET_COUNT: usize = 4;
 const CANDIDATE_PERSONALIZATION_KINDS: [(NativeCandidatePersonalization, &str); 6] = [
     (NativeCandidatePersonalization::PERSISTENT_EXACT, "持久精确"),
     (
@@ -395,6 +397,16 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
         "可核对的非首选提交",
         triage.ranking.precise_ranking_non_top_commits,
     );
+    let movement_coverage = render_triage_capability(
+        "V18 个人重排原始位次字段",
+        triage.capabilities.candidate_ranking_movement_batches,
+        triage.coverage.batches,
+        "可核对的被绕过重排首选",
+        triage
+            .ranking
+            .reranked_top_bypassed_commits
+            .saturating_sub(triage.ranking.reranked_top_movement_unavailable),
+    );
     let target_partition = triage.ranking.personalized_target_non_top_commits
         + triage.ranking.unpersonalized_target_non_top_commits
         + triage.ranking.target_provenance_missing;
@@ -427,6 +439,18 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
     writeln!(
         output,
         "排序与记忆：{personalization_coverage}；{target_partition_summary}。{ranking_coverage}；{ranking_partition_summary}。",
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "个人重排深度：{movement_coverage}；已有候选 {}（原第 2 位 {}、第 3–4 位 {}、第 5–7 位 {}、第 8 位及以后 {}），候选池外召回 {}，旧格式或证据不一致 {}。",
+        triage.ranking.reranked_top_moved_from_existing,
+        triage.ranking.reranked_top_source_rank_buckets[0],
+        triage.ranking.reranked_top_source_rank_buckets[1],
+        triage.ranking.reranked_top_source_rank_buckets[2],
+        triage.ranking.reranked_top_source_rank_buckets[3],
+        triage.ranking.reranked_top_recalled,
+        triage.ranking.reranked_top_movement_unavailable,
     )
     .unwrap();
     let shape_lookup_summary = if triage.recovery.shape_lookup_commits == 0 {
@@ -1048,6 +1072,10 @@ struct PersonalizedTopBypassAudit {
     replacement_provenance_observations: usize,
     reranked_replacements: usize,
     nonreranked_replacements: usize,
+    moved_from_existing: usize,
+    recalled_from_outside_pool: usize,
+    movement_unavailable: usize,
+    source_rank_buckets: [usize; RANKING_MOVEMENT_BUCKET_COUNT],
 }
 
 impl PersonalizedTopBypassAudit {
@@ -1055,6 +1083,7 @@ impl PersonalizedTopBypassAudit {
         &mut self,
         rank: usize,
         precise_ranking_personalization: bool,
+        precise_ranking_movement: bool,
         replacement: Option<NativeCandidateProvenance>,
         global_top: Option<NativeCandidateProvenance>,
     ) {
@@ -1073,6 +1102,24 @@ impl PersonalizedTopBypassAudit {
         }
 
         self.reranked_top_commits += 1;
+        if precise_ranking_movement {
+            match global_top.ranking_movement() {
+                NativeCandidateRankingMovement::MovedFrom { absolute_rank } => {
+                    self.moved_from_existing += 1;
+                    self.source_rank_buckets
+                        [research_ranking_movement_bucket_index(absolute_rank)] += 1;
+                }
+                NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool => {
+                    self.recalled_from_outside_pool += 1;
+                }
+                NativeCandidateRankingMovement::Unrecorded
+                | NativeCandidateRankingMovement::Unchanged => {
+                    self.movement_unavailable += 1;
+                }
+            }
+        } else {
+            self.movement_unavailable += 1;
+        }
         let mut reason_count = 0;
         for (index, (reason, _)) in CANDIDATE_PERSONALIZATION_KINDS.iter().enumerate() {
             if ranking.contains(*reason) {
@@ -1190,6 +1237,7 @@ struct ResearchReview {
     post_commit_backspace_capable_batches: usize,
     precise_personalization_capable_batches: usize,
     precise_ranking_personalization_capable_batches: usize,
+    candidate_ranking_movement_capable_batches: usize,
     candidate_suppression_action_capable_batches: usize,
     personal_phrase_adjacency_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
@@ -1224,6 +1272,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_precise_candidate_personalization());
         self.precise_ranking_personalization_capable_batches +=
             usize::from(snapshot.supports_precise_candidate_ranking_personalization());
+        self.candidate_ranking_movement_capable_batches +=
+            usize::from(snapshot.supports_candidate_ranking_movement());
         self.candidate_suppression_action_capable_batches +=
             usize::from(snapshot.supports_candidate_suppression_actions());
         self.personal_phrase_adjacency_capable_batches +=
@@ -1349,6 +1399,7 @@ impl ResearchReview {
                     self.personalized_top_bypass.observe(
                         *absolute_rank,
                         snapshot.supports_precise_candidate_ranking_personalization(),
+                        snapshot.supports_candidate_ranking_movement(),
                         provenance,
                         global_top_provenance,
                     );
@@ -1499,7 +1550,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -1507,6 +1558,8 @@ impl ResearchReview {
             self.precise_personalization_capable_batches,
             self.batches,
             self.precise_ranking_personalization_capable_batches,
+            self.batches,
+            self.candidate_ranking_movement_capable_batches,
             self.batches,
             self.candidate_suppression_action_capable_batches,
             self.batches,
@@ -1879,6 +1932,18 @@ impl ResearchReview {
             audit
                 .reranked_top_commits
                 .saturating_sub(audit.replacement_provenance_observations),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "被绕过重排首选的原始位次：已有候选 {}（原第 2 位 {}、第 3–4 位 {}、第 5–7 位 {}、第 8 位及以后 {}）；候选池外召回 {}；旧格式或证据不一致 {}。",
+            audit.moved_from_existing,
+            audit.source_rank_buckets[0],
+            audit.source_rank_buckets[1],
+            audit.source_rank_buckets[2],
+            audit.source_rank_buckets[3],
+            audit.recalled_from_outside_pool,
+            audit.movement_unavailable,
         )
         .unwrap();
     }
@@ -3364,13 +3429,19 @@ mod tests {
         let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
         let mut audit = PersonalizedTopBypassAudit::default();
 
-        audit.observe(2, true, Some(reranked_replacement), Some(stacked_top));
-        audit.observe(3, true, Some(plain), Some(stacked_top));
-        audit.observe(2, true, None, Some(session_top));
-        audit.observe(2, true, None, Some(plain));
-        audit.observe(7, true, None, None);
-        audit.observe(1, true, Some(plain), Some(stacked_top));
-        audit.observe(2, false, Some(plain), Some(stacked_top));
+        audit.observe(
+            2,
+            true,
+            false,
+            Some(reranked_replacement),
+            Some(stacked_top),
+        );
+        audit.observe(3, true, false, Some(plain), Some(stacked_top));
+        audit.observe(2, true, false, None, Some(session_top));
+        audit.observe(2, true, false, None, Some(plain));
+        audit.observe(7, true, false, None, None);
+        audit.observe(1, true, false, Some(plain), Some(stacked_top));
+        audit.observe(2, false, false, Some(plain), Some(stacked_top));
 
         let mut reasons = [0; CANDIDATE_PERSONALIZATION_KINDS.len()];
         reasons[0] = 2;
@@ -3388,6 +3459,10 @@ mod tests {
                 replacement_provenance_observations: 2,
                 reranked_replacements: 1,
                 nonreranked_replacements: 1,
+                moved_from_existing: 0,
+                recalled_from_outside_pool: 0,
+                movement_unavailable: 3,
+                source_rank_buckets: [0; RANKING_MOVEMENT_BUCKET_COUNT],
             }
         );
 
@@ -3405,6 +3480,43 @@ mod tests {
             aggregate
                 .contains("替代候选重排来源 2/3；其中也经个人重排 1、未经个人重排 1、来源缺失 1")
         );
+    }
+
+    #[test]
+    fn reranked_top_bypass_audit_keeps_v18_source_depth_separate_from_recall() {
+        let ranked = |movement| {
+            NativeCandidateProvenance::with_personalization_ranking_and_movement(
+                NativeCandidateSource::CoreExact,
+                NativeCandidatePersonalization::PERSISTENT_EXACT,
+                NativeCandidatePersonalization::PERSISTENT_EXACT,
+                movement,
+            )
+            .unwrap()
+        };
+        let mut audit = PersonalizedTopBypassAudit::default();
+        audit.observe(
+            2,
+            true,
+            true,
+            None,
+            Some(ranked(NativeCandidateRankingMovement::MovedFrom {
+                absolute_rank: 8,
+            })),
+        );
+        audit.observe(
+            2,
+            true,
+            true,
+            None,
+            Some(ranked(
+                NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool,
+            )),
+        );
+
+        assert_eq!(audit.moved_from_existing, 1);
+        assert_eq!(audit.recalled_from_outside_pool, 1);
+        assert_eq!(audit.movement_unavailable, 0);
+        assert_eq!(audit.source_rank_buckets, [0, 0, 0, 1]);
     }
 
     #[test]
@@ -4326,7 +4438,7 @@ mod tests {
         assert!(aggregate.contains("个人短语文档邻接 1/1 批"));
         assert!(aggregate.contains("个人短语文档邻接：首锚点 0；已验证相邻 1；明确断链 0"));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V17 1"));
+        assert!(aggregate.contains("反馈格式：V18 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"
@@ -4542,6 +4654,7 @@ mod tests {
                 post_commit_backspace_batches: 2,
                 candidate_suppression_action_batches: 2,
                 personal_phrase_adjacency_batches: 2,
+                candidate_ranking_movement_batches: 2,
             },
             reachability: ziranma_core::ResearchCandidateReachabilitySignals {
                 non_top_commits: 2,

@@ -40,15 +40,15 @@ use crate::{
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
     NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
     NativeCancellationSource, NativeCandidatePersonalization, NativeCandidateProvenance,
-    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackAuthorization, NativeFeedbackClearResult, NativeFeedbackContext,
-    NativeFeedbackEvent, NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError,
-    NativeFeedbackLifecycle, NativeFeedbackLimits, NativeFeedbackRecordResult,
-    NativeFeedbackSession, NativeFeedbackStartResult, NativeFeedbackStopResult,
-    NativeFeedbackSummary, NativePersonalPhraseAdjacency, NativeSelectionSource,
-    NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY,
-    PersonalContextRanking, PersonalRankingBatch, PersonalRankingSelection,
-    PersonalRankingSnapshot, PersonalRankingSuppressionAction,
+    NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
+    NativeCandidateView, NativeFeedbackAuthorization, NativeFeedbackClearResult,
+    NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackFreezeAuthorization,
+    NativeFeedbackFreezeError, NativeFeedbackLifecycle, NativeFeedbackLimits,
+    NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
+    NativeFeedbackStopResult, NativeFeedbackSummary, NativePersonalPhraseAdjacency,
+    NativeSelectionSource, NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH,
+    PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking, PersonalRankingBatch,
+    PersonalRankingSelection, PersonalRankingSnapshot, PersonalRankingSuppressionAction,
     PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
     RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, SupplementalCandidateLayerConfig,
     WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
@@ -479,10 +479,17 @@ struct CandidateBatch {
     resolved_shape_codes: Vec<Option<String>>,
     provenance: Vec<NativeCandidateProvenance>,
     personalized: Vec<bool>,
+    /// One-based positions in the unpersonalized loaded pool. Recalled
+    /// candidates use `None`; this parallel vector never leaves the process.
+    ranking_origins: Vec<Option<usize>>,
     protected_prefix_len: usize,
     automatic_transposition: Option<NativeAutomaticTranspositionDecision>,
     may_have_more: bool,
     view: InteractiveCandidateView,
+}
+
+fn initial_candidate_ranking_origins(length: usize) -> Vec<Option<usize>> {
+    (1..=length).map(Some).collect()
 }
 
 fn mirror_candidate_promotion(
@@ -491,6 +498,10 @@ fn mirror_candidate_promotion(
     personalization: NativeCandidatePersonalization,
 ) {
     let final_len = batch.candidates.len();
+    let ranking_origin_aligned = promotion.mirror_into(&mut batch.ranking_origins, None, final_len);
+    if !ranking_origin_aligned {
+        batch.ranking_origins = initial_candidate_ranking_origins(final_len);
+    }
     if !promotion.mirror_into(
         &mut batch.provenance,
         NativeCandidateProvenance::default(),
@@ -507,8 +518,17 @@ fn mirror_candidate_promotion(
     if !personalization.is_empty() {
         if let Some(provenance) = batch.provenance.get_mut(promotion.index) {
             provenance.add_personalization(personalization);
-            if promotion.changed {
-                provenance.add_ranking_personalization(personalization);
+            if promotion.changed && ranking_origin_aligned {
+                let movement = batch
+                    .ranking_origins
+                    .get(promotion.index)
+                    .copied()
+                    .flatten()
+                    .map_or(
+                        NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool,
+                        |absolute_rank| NativeCandidateRankingMovement::MovedFrom { absolute_rank },
+                    );
+                provenance.add_ranking_personalization(personalization, movement);
             }
         }
         if let Some(marker) = batch.personalized.get_mut(promotion.index) {
@@ -607,6 +627,7 @@ impl CandidateCache {
             resolved_shape_codes: vec![None; self.candidates.len()],
             provenance: self.provenance.clone(),
             personalized: vec![false; self.candidates.len()],
+            ranking_origins: initial_candidate_ranking_origins(self.candidates.len()),
             protected_prefix_len: self.protected_prefix_len,
             automatic_transposition: self.automatic_transposition_decision(),
             may_have_more: !self.exhausted && self.requested_limit < CANDIDATE_LIMIT,
@@ -2105,6 +2126,7 @@ impl CandidateDisplay {
                 provenance: vec![NativeCandidateProvenance::default(); candidates.len()],
                 personalized: vec![false; candidates.len()],
                 resolved_shape_codes: vec![None; candidates.len()],
+                ranking_origins: initial_candidate_ranking_origins(candidates.len()),
                 protected_prefix_len: 0,
                 candidates,
                 automatic_transposition: None,
@@ -2121,6 +2143,7 @@ impl CandidateDisplay {
             resolved_shape_codes: _,
             mut provenance,
             mut personalized,
+            ranking_origins: _,
             protected_prefix_len: _,
             automatic_transposition,
             may_have_more,
@@ -5179,6 +5202,7 @@ fn candidate_popup_render_preflight_display(variant: usize, page_start: usize) -
             resolved_shape_codes: vec![None; len],
             provenance: vec![NativeCandidateProvenance::default(); len],
             personalized: vec![false; len],
+            ranking_origins: initial_candidate_ranking_origins(len),
             protected_prefix_len: 0,
             automatic_transposition: None,
             may_have_more: false,
@@ -10032,6 +10056,7 @@ impl TsfTextService_Impl {
                 candidates.len()
             ],
             personalized: vec![false; candidates.len()],
+            ranking_origins: initial_candidate_ranking_origins(candidates.len()),
             resolved_shape_codes,
             protected_prefix_len: 0,
             automatic_transposition: None,
@@ -10241,6 +10266,7 @@ impl TsfTextService_Impl {
             batch.resolved_shape_codes.truncate(batch.candidates.len());
             batch.provenance.truncate(batch.candidates.len());
             batch.personalized.truncate(batch.candidates.len());
+            batch.ranking_origins.truncate(batch.candidates.len());
         }
         batch.protected_prefix_len = batch.protected_prefix_len.min(batch.candidates.len());
         Ok(batch)
@@ -12783,6 +12809,7 @@ mod tests {
                 NativeCandidateProvenance::default(),
             ],
             personalized: vec![false, true, false],
+            ranking_origins: initial_candidate_ranking_origins(3),
             protected_prefix_len: 0,
             automatic_transposition: None,
             may_have_more: false,
@@ -12810,6 +12837,42 @@ mod tests {
                 .ranking_personalization()
                 .contains(NativeCandidatePersonalization::SESSION_EXACT)
         );
+        assert_eq!(
+            batch.provenance[0].ranking_movement(),
+            NativeCandidateRankingMovement::MovedFrom { absolute_rank: 3 }
+        );
+        assert_eq!(batch.ranking_origins, [Some(3), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn recalled_candidate_records_that_it_was_outside_the_loaded_pool() {
+        let mut batch = CandidateBatch {
+            candidates: vec!["新".to_owned(), "甲".to_owned(), "乙".to_owned()],
+            resolved_shape_codes: vec![None; 3],
+            provenance: vec![NativeCandidateProvenance::default(); 2],
+            personalized: vec![false; 2],
+            ranking_origins: initial_candidate_ranking_origins(2),
+            protected_prefix_len: 0,
+            automatic_transposition: None,
+            may_have_more: false,
+            view: InteractiveCandidateView::Primary,
+        };
+
+        mirror_candidate_promotion(
+            &mut batch,
+            CandidateTextPromotion {
+                index: 0,
+                source_index: None,
+                changed: true,
+            },
+            NativeCandidatePersonalization::PERSISTENT_DISCOVERY,
+        );
+
+        assert_eq!(batch.ranking_origins, [None, Some(1), Some(2)]);
+        assert_eq!(
+            batch.provenance[0].ranking_movement(),
+            NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool
+        );
     }
 
     #[test]
@@ -12827,6 +12890,7 @@ mod tests {
                 NativeCandidateProvenance::new(NativeCandidateSource::Decoder, false),
             ],
             personalized: vec![true, false, false],
+            ranking_origins: initial_candidate_ranking_origins(3),
             protected_prefix_len: 0,
             automatic_transposition: Some(NativeAutomaticTranspositionDecision::new(
                 0,
@@ -12860,6 +12924,7 @@ mod tests {
             NativeCandidateSource::CoreExact
         );
         assert_eq!(batch.personalized, [false, true, false]);
+        assert_eq!(batch.ranking_origins, [Some(2), Some(1), Some(3)]);
         assert_eq!(
             batch
                 .automatic_transposition
@@ -12876,6 +12941,7 @@ mod tests {
             resolved_shape_codes: vec![None; 2],
             provenance: vec![NativeCandidateProvenance::default(); 2],
             personalized: vec![true, false],
+            ranking_origins: initial_candidate_ranking_origins(2),
             protected_prefix_len: 1,
             automatic_transposition: None,
             may_have_more: false,
@@ -12898,6 +12964,7 @@ mod tests {
                 NativeCandidateProvenance::default(),
             ],
             personalized: vec![false; 3],
+            ranking_origins: initial_candidate_ranking_origins(3),
             protected_prefix_len: 0,
             automatic_transposition: None,
             may_have_more: false,
@@ -12922,6 +12989,10 @@ mod tests {
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
         );
         assert!(batch.provenance[0].ranking_personalization().is_empty());
+        assert_eq!(
+            batch.provenance[0].ranking_movement(),
+            NativeCandidateRankingMovement::Unchanged
+        );
     }
 
     #[test]
@@ -24434,6 +24505,7 @@ mod tests {
                     ),
                 ],
                 personalized: vec![false, true],
+                ranking_origins: initial_candidate_ranking_origins(2),
                 protected_prefix_len: 0,
                 automatic_transposition: None,
                 may_have_more: false,
@@ -24482,6 +24554,7 @@ mod tests {
                 resolved_shape_codes: vec![None; ordinary.candidates.len()],
                 provenance: ordinary.provenance.clone(),
                 personalized: ordinary.personalized.clone(),
+                ranking_origins: initial_candidate_ranking_origins(ordinary.candidates.len()),
                 protected_prefix_len: 0,
                 automatic_transposition: None,
                 may_have_more: true,
@@ -24498,6 +24571,7 @@ mod tests {
                     false,
                 )],
                 personalized: vec![false],
+                ranking_origins: initial_candidate_ranking_origins(1),
                 protected_prefix_len: 0,
                 automatic_transposition: None,
                 may_have_more: false,
