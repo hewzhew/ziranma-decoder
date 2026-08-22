@@ -488,8 +488,9 @@ cargo run --release --bin candidatectl -- preflight `
 SHA-256 绑定来源侧车、清单、载荷、宿主和解码兼容标识。
 
 候选窗本身另有一条默认不运行的 Windows release 视觉预检。它只创建并销毁
-进程内 nonactivating 临时窗口，使用固定公开行覆盖首次出现、原位更新、第二页重绘
-及 96/120/144/192 DPI；不安装或激活输入法，也不读取候选槽、反馈记录或私人数据：
+进程内 nonactivating 临时窗口，使用固定公开行覆盖首次出现、原位更新、第二页重绘、
+长候选竖排扩宽及 96/120/144/192 DPI；不安装或激活输入法，也不读取候选槽、反馈记录
+或私人数据：
 
 ```powershell
 cargo run --release --bin candidatectl -- popup-render-preflight --repetitions 20

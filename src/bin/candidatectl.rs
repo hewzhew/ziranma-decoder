@@ -5944,7 +5944,7 @@ fn render_popup_render_preflight_report(
             .or_default()
             .push(sample);
     }
-    let expected_groups = 3_usize.saturating_mul(4);
+    let expected_groups = CandidatePopupRenderScenario::ALL.len().saturating_mul(4);
     let expected_samples = report.repetitions().saturating_mul(expected_groups);
     if grouped.len() != expected_groups
         || report.samples().len() != expected_samples
@@ -5961,7 +5961,7 @@ fn render_popup_render_preflight_report(
     writeln!(output, "候选窗生产 GDI release 预检")?;
     writeln!(
         output,
-        "工作负载：3 条固定视觉路径 × 4 档 DPI × 重复 {}；绘制样本 {}；候选正文不进入报告",
+        "工作负载：4 条固定视觉路径 × 4 档 DPI × 重复 {}；绘制样本 {}；候选正文不进入报告",
         report.repetitions(),
         report.samples().len(),
     )?;
@@ -6061,6 +6061,7 @@ fn popup_render_scenario_label(scenario: CandidatePopupRenderScenario) -> &'stat
         CandidatePopupRenderScenario::InitialShow => "首次创建",
         CandidatePopupRenderScenario::ContentUpdate => "原位更新",
         CandidatePopupRenderScenario::PageRedraw => "第二页重绘",
+        CandidatePopupRenderScenario::LongCandidateRedraw => "长候选竖排",
     }
 }
 

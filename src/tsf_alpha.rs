@@ -2714,6 +2714,18 @@ pub enum CandidatePopupRenderScenario {
     ContentUpdate,
     /// Repaints the second page, including its footer metadata.
     PageRedraw,
+    /// Resizes and repaints a long selected candidate in the wider vertical layout.
+    LongCandidateRedraw,
+}
+
+impl CandidatePopupRenderScenario {
+    /// Complete fixed scenario set used by the isolated rendering preflight.
+    pub const ALL: [Self; 4] = [
+        Self::InitialShow,
+        Self::ContentUpdate,
+        Self::PageRedraw,
+        Self::LongCandidateRedraw,
+    ];
 }
 
 /// Redacted timing evidence from one production candidate-popup paint.
@@ -5222,20 +5234,53 @@ impl Drop for CandidatePopup {
 const CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS: [u32; 4] = [96, 120, 144, 192];
 const MAX_CANDIDATE_POPUP_RENDER_PREFLIGHT_REPETITIONS: usize = 20;
 
-fn candidate_popup_render_preflight_display(variant: usize, page_start: usize) -> CandidateDisplay {
-    let candidates = match variant {
-        0 => [
-            "春风", "秋雨", "山川", "星河", "晨光", "晚霞", "清泉", "松林", "竹影", "云海", "微风",
-            "月色", "远山", "归舟",
-        ],
-        _ => [
-            "新芽", "流云", "青石", "白鹭", "疏影", "长风", "晴空", "灯火", "潮声", "飞鸟", "暖阳",
-            "清露", "花径", "溪桥",
-        ],
-    }
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
+fn candidate_popup_render_preflight_display(
+    scenario: CandidatePopupRenderScenario,
+) -> CandidateDisplay {
+    let (candidates, page_start) = match scenario {
+        CandidatePopupRenderScenario::InitialShow => (
+            [
+                "春风", "秋雨", "山川", "星河", "晨光", "晚霞", "清泉", "松林", "竹影", "云海",
+                "微风", "月色", "远山", "归舟",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+            0,
+        ),
+        CandidatePopupRenderScenario::ContentUpdate => (
+            [
+                "新芽", "流云", "青石", "白鹭", "疏影", "长风", "晴空", "灯火", "潮声", "飞鸟",
+                "暖阳", "清露", "花径", "溪桥",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+            0,
+        ),
+        CandidatePopupRenderScenario::PageRedraw => (
+            [
+                "新芽", "流云", "青石", "白鹭", "疏影", "长风", "晴空", "灯火", "潮声", "飞鸟",
+                "暖阳", "清露", "花径", "溪桥",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+            CANDIDATE_PAGE_SIZE,
+        ),
+        CandidatePopupRenderScenario::LongCandidateRedraw => {
+            let mut candidates = vec!["春夏秋冬".repeat(8)];
+            candidates.extend(
+                [
+                    "远山", "清泉", "松林", "竹影", "云海", "归舟", "晨光", "晚霞", "星河", "微风",
+                    "秋雨", "春风", "月色",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            (candidates, 0)
+        }
+    };
     let len = candidates.len();
     CandidateDisplay::from_batch(
         CandidateBatch {
@@ -5283,13 +5328,12 @@ pub fn preflight_candidate_popup_rendering(
         right: 120,
         bottom: 56,
     };
-    let first_page = candidate_popup_render_preflight_display(0, 0);
-    let updated_page = candidate_popup_render_preflight_display(1, 0);
-    let second_page = candidate_popup_render_preflight_display(1, CANDIDATE_PAGE_SIZE);
+    let displays = CandidatePopupRenderScenario::ALL
+        .map(|scenario| (scenario, candidate_popup_render_preflight_display(scenario)));
     let mut samples = Vec::with_capacity(
         repetitions
             .saturating_mul(CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS.len())
-            .saturating_mul(3),
+            .saturating_mul(CandidatePopupRenderScenario::ALL.len()),
     );
     let mut hide_durations =
         Vec::with_capacity(repetitions.saturating_mul(CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS.len()));
@@ -5298,16 +5342,12 @@ pub fn preflight_candidate_popup_rendering(
     for _ in 0..repetitions {
         for requested_dpi in CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS {
             let mut popup = CandidatePopup::default();
-            for (scenario, display) in [
-                (CandidatePopupRenderScenario::InitialShow, &first_page),
-                (CandidatePopupRenderScenario::ContentUpdate, &updated_page),
-                (CandidatePopupRenderScenario::PageRedraw, &second_page),
-            ] {
+            for (scenario, display) in &displays {
                 let mut completed = popup.render_preflight(
                     anchor,
                     display,
                     CandidatePopupRenderRequest {
-                        scenario,
+                        scenario: *scenario,
                         requested_dpi,
                     },
                 )?;
@@ -24200,19 +24240,34 @@ mod tests {
 
     #[test]
     fn popup_render_preflight_static_pages_cover_every_requested_dpi() {
-        let first = candidate_popup_render_preflight_display(0, 0);
-        let updated = candidate_popup_render_preflight_display(1, 0);
-        let second = candidate_popup_render_preflight_display(1, CANDIDATE_PAGE_SIZE);
+        let first =
+            candidate_popup_render_preflight_display(CandidatePopupRenderScenario::InitialShow);
+        let updated =
+            candidate_popup_render_preflight_display(CandidatePopupRenderScenario::ContentUpdate);
+        let second =
+            candidate_popup_render_preflight_display(CandidatePopupRenderScenario::PageRedraw);
+        let long = candidate_popup_render_preflight_display(
+            CandidatePopupRenderScenario::LongCandidateRedraw,
+        );
         assert_eq!(first.visible().len(), CANDIDATE_PAGE_SIZE);
         assert_eq!(updated.visible().len(), CANDIDATE_PAGE_SIZE);
         assert_eq!(second.visible().len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(long.visible().len(), CANDIDATE_PAGE_SIZE);
         assert_eq!(second.current_page(), 1);
+        assert_eq!(
+            long.visible()[0].chars().count(),
+            CANDIDATE_DISPLAY_MAX_CHARS
+        );
         for dpi in CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS {
             let first_metrics = candidate_popup_metrics(&first, dpi, popup_scale(dpi, 1_920));
             let updated_metrics = candidate_popup_metrics(&updated, dpi, popup_scale(dpi, 1_920));
             let second_metrics = candidate_popup_metrics(&second, dpi, popup_scale(dpi, 1_920));
+            let long_metrics = candidate_popup_metrics(&long, dpi, popup_scale(dpi, 1_920));
             assert!(first_metrics.width > 0 && first_metrics.height > 0);
             assert_eq!(updated_metrics, second_metrics);
+            assert_eq!(long_metrics.layout, CandidatePopupLayout::Vertical);
+            assert!(long_metrics.width > popup_scale(dpi, 360));
+            assert!(long_metrics.width <= popup_scale(dpi, POPUP_VERTICAL_MAX_WIDTH_LOGICAL));
         }
     }
 
