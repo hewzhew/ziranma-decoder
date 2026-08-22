@@ -4351,6 +4351,9 @@ const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 760;
 const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 70;
 const POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL: i32 = 144;
 const POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL: i32 = 288;
+const POPUP_VERTICAL_TEXT_MAX_WIDTH_LOGICAL: i32 = 594;
+const POPUP_VERTICAL_MAX_WIDTH_LOGICAL: i32 = 660;
+const POPUP_VERTICAL_ROUNDING_SLACK_LOGICAL: i32 = 2;
 const POPUP_ACTION_MIN_WIDTH_LOGICAL: i32 = 210;
 const POPUP_ACTION_DETAIL_GAP_LOGICAL: i32 = 12;
 const POPUP_NOTICE_ICON_SIZE_LOGICAL: i32 = 24;
@@ -4397,19 +4400,19 @@ fn candidate_popup_border_geometry(client: RECT, dpi: u32) -> Option<CandidatePo
     })
 }
 
-fn horizontal_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
-    let maximum_text_width = if selected {
-        POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL
-    } else {
-        POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL
-    };
-    let text_width = candidate
-        .chars()
+fn candidate_display_logical_text_width(candidate: &str) -> i32 {
+    let mut characters = candidate.chars();
+    let width = characters
+        .by_ref()
         .take(CANDIDATE_DISPLAY_MAX_CHARS)
         .fold(0_i32, |width, character| {
             width.saturating_add(if character.is_ascii() { 9 } else { 18 })
-        })
-        .clamp(18, maximum_text_width);
+        });
+    width.saturating_add(if characters.next().is_some() { 18 } else { 0 })
+}
+
+fn candidate_logical_width(candidate: &str, selected: bool, maximum_text_width: i32) -> i32 {
+    let text_width = candidate_display_logical_text_width(candidate).clamp(18, maximum_text_width);
     let leading_inset = if selected {
         POPUP_SELECTED_TEXT_INSET_LOGICAL
     } else {
@@ -4420,6 +4423,22 @@ fn horizontal_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
         .saturating_add(POPUP_RANK_GAP_LOGICAL)
         .saturating_add(text_width)
         .saturating_add(POPUP_TEXT_PADDING_LOGICAL)
+}
+
+fn horizontal_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
+    candidate_logical_width(
+        candidate,
+        selected,
+        if selected {
+            POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL
+        } else {
+            POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL
+        },
+    )
+}
+
+fn vertical_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
+    candidate_logical_width(candidate, selected, POPUP_VERTICAL_TEXT_MAX_WIDTH_LOGICAL)
 }
 
 fn estimated_popup_text_width(text: &str, ascii_width: i32, other_width: i32) -> i32 {
@@ -4586,7 +4605,11 @@ fn candidate_popup_metrics(
     let minimum_horizontal_width = outer_width
         .saturating_add(minimum_candidate_width)
         .saturating_add(footer_width);
-    if minimum_horizontal_width <= horizontal_limit {
+    let selected_requires_wide_vertical = display.visible().first().is_some_and(|candidate| {
+        candidate_display_logical_text_width(candidate)
+            > POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL
+    });
+    if !selected_requires_wide_vertical && minimum_horizontal_width <= horizontal_limit {
         return CandidatePopupMetrics {
             layout: CandidatePopupLayout::Horizontal,
             width: desired_horizontal_width.min(horizontal_limit),
@@ -4601,9 +4624,27 @@ fn candidate_popup_metrics(
 
     let rows = i32::try_from(display.visible().len()).unwrap_or(5);
     let footer_height = if footer_needed { 24 } else { 0 };
+    let vertical_candidate_width = display
+        .visible()
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            popup_scale(dpi, vertical_candidate_logical_width(candidate, index == 0))
+        })
+        .max()
+        .unwrap_or(0);
+    let desired_vertical_width = outer_width
+        .saturating_add(
+            vertical_candidate_width
+                .saturating_add(popup_scale(dpi, POPUP_VERTICAL_ROUNDING_SLACK_LOGICAL))
+                .max(footer_width),
+        )
+        .max(popup_scale(dpi, 360));
     CandidatePopupMetrics {
         layout: CandidatePopupLayout::Vertical,
-        width: popup_scale(dpi, 360).min(available_width.max(1)),
+        width: desired_vertical_width
+            .min(popup_scale(dpi, POPUP_VERTICAL_MAX_WIDTH_LOGICAL))
+            .min(available_width.max(1)),
         height: popup_scale(
             dpi,
             POPUP_OUTER_PADDING_LOGICAL
@@ -5670,11 +5711,16 @@ fn candidate_text_for_width(
     maximum_width: i32,
     mut measure: impl FnMut(&str) -> Option<i32>,
 ) -> String {
-    let characters = candidate
-        .chars()
+    let mut source = candidate.chars();
+    let characters = source
+        .by_ref()
         .take(CANDIDATE_DISPLAY_MAX_CHARS)
         .collect::<Vec<_>>();
-    let full = characters.iter().collect::<String>();
+    let source_truncated = source.next().is_some();
+    let mut full = characters.iter().collect::<String>();
+    if source_truncated {
+        full.push('…');
+    }
     let Some(full_width) = measure(&full) else {
         return full;
     };
@@ -24488,6 +24534,17 @@ mod tests {
         assert_eq!(candidate_text_for_width("省略号", 20, width), "省…");
         assert_eq!(candidate_text_for_width("省略号", 10, width), "…");
         assert_eq!(candidate_text_for_width("省略号", 20, |_| None), "省略号");
+
+        let over_limit = "甲".repeat(CANDIDATE_DISPLAY_MAX_CHARS + 1);
+        let complete_prefix = candidate_text_for_width(&over_limit, 330, width);
+        assert_eq!(
+            complete_prefix.chars().count(),
+            CANDIDATE_DISPLAY_MAX_CHARS + 1
+        );
+        assert!(complete_prefix.ends_with('…'));
+        let clipped_prefix = candidate_text_for_width(&over_limit, 320, width);
+        assert_eq!(clipped_prefix.chars().count(), CANDIDATE_DISPLAY_MAX_CHARS);
+        assert!(clipped_prefix.ends_with('…'));
     }
 
     #[test]
@@ -24614,25 +24671,24 @@ mod tests {
                 .collect(),
             0,
         );
-        let wide_screen = candidate_popup_metrics(&long, 96, 1920);
-        assert_eq!(wide_screen.layout, CandidatePopupLayout::Horizontal);
-        assert_eq!(wide_screen.width, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL);
-        let widths = horizontal_candidate_widths(&long, 96, wide_screen.width);
-        assert!(
-            widths.iter().copied().sum::<i32>()
-                <= wide_screen.width - POPUP_OUTER_PADDING_LOGICAL * 2
-        );
-        assert_eq!(
-            widths[0],
-            horizontal_candidate_logical_width(&long.visible()[0], true)
-        );
-        assert!(
-            widths[1..]
-                .iter()
-                .all(|width| *width >= POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL)
-        );
-        assert!(widths.iter().any(|width| {
-            *width < horizontal_candidate_logical_width(&long.visible()[0], false)
-        }));
+        for dpi in [96, 144, 192] {
+            let wide_screen = candidate_popup_metrics(&long, dpi, popup_scale(dpi, 1_920));
+            assert_eq!(wide_screen.layout, CandidatePopupLayout::Vertical);
+            assert!(wide_screen.width > popup_scale(dpi, 360));
+            assert!(wide_screen.width <= popup_scale(dpi, POPUP_VERTICAL_MAX_WIDTH_LOGICAL));
+            let selected_text_width = wide_screen.width
+                - popup_scale(dpi, POPUP_OUTER_PADDING_LOGICAL * 2)
+                - popup_scale(dpi, POPUP_SELECTED_TEXT_INSET_LOGICAL)
+                - popup_scale(dpi, POPUP_RANK_WIDTH_LOGICAL)
+                - popup_scale(dpi, POPUP_RANK_GAP_LOGICAL)
+                - popup_scale(dpi, POPUP_TEXT_PADDING_LOGICAL);
+            assert!(
+                selected_text_width
+                    >= popup_scale(
+                        dpi,
+                        i32::try_from(CANDIDATE_DISPLAY_MAX_CHARS).unwrap() * 18,
+                    )
+            );
+        }
     }
 }
