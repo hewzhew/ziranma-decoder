@@ -245,6 +245,36 @@ mod windows_app {
         Marker(&'a TimelineMarker),
     }
 
+    struct TailTrimObservation {
+        source_event_index: usize,
+        last_trim_event_index: usize,
+        first_elapsed_ms: u64,
+        last_elapsed_ms: u64,
+        start_utf16: usize,
+        original_inserted: Vec<u16>,
+        retained: Vec<u16>,
+        removed_suffix: Vec<u16>,
+        trim_steps: usize,
+    }
+
+    impl fmt::Debug for TailTrimObservation {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("TailTrimObservation")
+                .field("source_event_index", &self.source_event_index)
+                .field("last_trim_event_index", &self.last_trim_event_index)
+                .field("first_elapsed_ms", &self.first_elapsed_ms)
+                .field("last_elapsed_ms", &self.last_elapsed_ms)
+                .field("start_utf16", &self.start_utf16)
+                .field("original_inserted_utf16", &self.original_inserted.len())
+                .field("retained_utf16", &self.retained.len())
+                .field("removed_suffix_utf16", &self.removed_suffix.len())
+                .field("trim_steps", &self.trim_steps)
+                .field("debug_contains_text", &false)
+                .finish()
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecordOutcome {
         Ignored,
@@ -862,8 +892,31 @@ mod windows_app {
         if events.is_empty() {
             return "本轮没有观察到文本变化或现场标记。".to_owned();
         }
+        let observations = find_tail_trim_observations(events);
         let groups = group_timeline(events);
         let mut output = String::new();
+        if !observations.is_empty() {
+            output.push_str("结构观察（只描述连续编辑，待确认且不会自动学习）\r\n");
+            for observation in &observations {
+                let original = String::from_utf16_lossy(&observation.original_inserted);
+                let retained = String::from_utf16_lossy(&observation.retained);
+                let removed = String::from_utf16_lossy(&observation.removed_suffix);
+                let elapsed = if observation.first_elapsed_ms == observation.last_elapsed_ms {
+                    format!("+{} ms", observation.first_elapsed_ms)
+                } else {
+                    format!(
+                        "+{}–{} ms",
+                        observation.first_elapsed_ms, observation.last_elapsed_ms
+                    )
+                };
+                output.push_str(&format!(
+                    "○ {elapsed} · 插入“{original}”后连续裁去末尾“{removed}”，保留“{retained}” · 事实 {}–{}\r\n",
+                    observation.source_event_index + 1,
+                    observation.last_trim_event_index + 1,
+                ));
+            }
+            output.push_str("\r\n详细时间线\r\n");
+        }
         for (index, group) in groups.iter().enumerate() {
             if index > 0 {
                 output.push_str("\r\n");
@@ -913,6 +966,59 @@ mod windows_app {
             }
         }
         output
+    }
+
+    fn find_tail_trim_observations(events: &[PracticeEvent]) -> Vec<TailTrimObservation> {
+        let mut observations = Vec::new();
+        for (source_event_index, event) in events.iter().enumerate() {
+            let PracticeEvent::DocumentDelta(source) = event else {
+                continue;
+            };
+            if !source.removed.is_empty() || source.inserted.is_empty() {
+                continue;
+            }
+
+            let mut retained = source.inserted.clone();
+            let mut last_trim = None;
+            for (trim_event_index, next) in events.iter().enumerate().skip(source_event_index + 1) {
+                let PracticeEvent::DocumentDelta(trim) = next else {
+                    break;
+                };
+                if !trim.inserted.is_empty() || trim.removed.is_empty() {
+                    break;
+                }
+                let Some(relative_start) = trim.start_utf16.checked_sub(source.start_utf16) else {
+                    break;
+                };
+                if relative_start.saturating_add(trim.removed.len()) != retained.len()
+                    || retained.get(relative_start..) != Some(trim.removed.as_slice())
+                {
+                    break;
+                }
+                if relative_start == 0 {
+                    last_trim = None;
+                    break;
+                }
+                retained.truncate(relative_start);
+                last_trim = Some((trim_event_index, trim.elapsed_ms));
+            }
+
+            let Some((last_trim_event_index, last_elapsed_ms)) = last_trim else {
+                continue;
+            };
+            observations.push(TailTrimObservation {
+                source_event_index,
+                last_trim_event_index,
+                first_elapsed_ms: source.elapsed_ms,
+                last_elapsed_ms,
+                start_utf16: source.start_utf16,
+                removed_suffix: source.inserted[retained.len()..].to_vec(),
+                original_inserted: source.inserted.clone(),
+                retained,
+                trim_steps: last_trim_event_index.saturating_sub(source_event_index),
+            });
+        }
+        observations
     }
 
     fn group_timeline(events: &[PracticeEvent]) -> Vec<ReviewGroup<'_>> {
@@ -1042,8 +1148,8 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::{
-            AppState, DocumentDelta, PracticeEvent, RecordOutcome, SessionMode, group_timeline,
-            render_timeline,
+            AppState, DocumentDelta, PracticeEvent, RecordOutcome, SessionMode,
+            find_tail_trim_observations, group_timeline, render_timeline,
         };
 
         #[test]
@@ -1178,6 +1284,85 @@ mod windows_app {
             assert!(review.contains("2 次连续把“原”改为“最终”"));
             assert!(!review.contains("中间"));
             assert!(review.contains("+10–20 ms"));
+        }
+
+        #[test]
+        fn review_surfaces_only_structurally_adjacent_nonempty_tail_trims() {
+            let insert = DocumentDelta::between(&[], &wide("线束缚"), 10, (3, 3)).unwrap();
+            let first_trim =
+                DocumentDelta::between(&wide("线束缚"), &wide("线束"), 50_010, (2, 2)).unwrap();
+            let events = vec![
+                PracticeEvent::DocumentDelta(insert),
+                PracticeEvent::DocumentDelta(first_trim),
+            ];
+            let observations = find_tail_trim_observations(&events);
+            assert_eq!(observations.len(), 1, "elapsed time is descriptive only");
+            assert_eq!(
+                String::from_utf16(&observations[0].retained).unwrap(),
+                "线束"
+            );
+            assert_eq!(
+                String::from_utf16(&observations[0].removed_suffix).unwrap(),
+                "缚"
+            );
+            let review = render_timeline(&events);
+            assert!(review.contains("结构观察（只描述连续编辑，待确认且不会自动学习）"));
+            assert!(review.contains("插入“线束缚”后连续裁去末尾“缚”，保留“线束”"));
+            assert!(review.contains("详细时间线"));
+        }
+
+        #[test]
+        fn tail_trim_observation_rejects_middle_full_and_marked_edits() {
+            let insertion = || {
+                PracticeEvent::DocumentDelta(
+                    DocumentDelta::between(&[], &wide("甲乙丙"), 10, (3, 3)).unwrap(),
+                )
+            };
+            let middle = PracticeEvent::DocumentDelta(
+                DocumentDelta::between(&wide("甲乙丙"), &wide("甲丙"), 20, (1, 1)).unwrap(),
+            );
+            assert!(find_tail_trim_observations(&[insertion(), middle]).is_empty());
+
+            let full = PracticeEvent::DocumentDelta(
+                DocumentDelta::between(&wide("甲乙丙"), &[], 20, (0, 0)).unwrap(),
+            );
+            assert!(find_tail_trim_observations(&[insertion(), full]).is_empty());
+
+            let partial = PracticeEvent::DocumentDelta(
+                DocumentDelta::between(&wide("甲乙丙"), &wide("甲乙"), 20, (2, 2)).unwrap(),
+            );
+            let rest = PracticeEvent::DocumentDelta(
+                DocumentDelta::between(&wide("甲乙"), &[], 30, (0, 0)).unwrap(),
+            );
+            assert!(find_tail_trim_observations(&[insertion(), partial, rest]).is_empty());
+
+            let mut state = AppState::default();
+            state.begin(Vec::new());
+            assert_eq!(
+                state.record_change(wide("甲乙丙"), (3, 3)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(state.mark((3, 3)), RecordOutcome::Recorded);
+            assert_eq!(
+                state.record_change(wide("甲乙"), (2, 2)),
+                RecordOutcome::Recorded
+            );
+            assert!(find_tail_trim_observations(&state.events).is_empty());
+        }
+
+        #[test]
+        fn tail_trim_observation_debug_redacts_in_memory_text() {
+            let insert = DocumentDelta::between(&[], &wide("秘密心意"), 10, (4, 4)).unwrap();
+            let trim =
+                DocumentDelta::between(&wide("秘密心意"), &wide("秘密"), 20, (2, 2)).unwrap();
+            let events = vec![
+                PracticeEvent::DocumentDelta(insert),
+                PracticeEvent::DocumentDelta(trim),
+            ];
+            let debug = format!("{:?}", find_tail_trim_observations(&events));
+            assert!(!debug.contains("秘密"));
+            assert!(!debug.contains("心意"));
+            assert!(debug.contains("debug_contains_text: false"));
         }
 
         fn wide(text: &str) -> Vec<u16> {
