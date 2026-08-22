@@ -354,8 +354,10 @@ pub use public_lexicon_slice::{
 pub use research_analysis::{
     ResearchHabitClue, ResearchHabitKind, ResearchHalfPairAnalysis, ResearchInputEpisode,
     ResearchInputScene, ResearchRetypeClue, ResearchSceneAnalysis, ResearchSceneError,
-    ResearchWishContext, ResearchWishEpisode, ResearchWishEpisodeKind, ResearchWishEvidenceKind,
-    analyze_linked_research, analyze_runtime_half_pairs,
+    ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch,
+    ResearchSelectionConfirmationSequence, ResearchWishContext, ResearchWishEpisode,
+    ResearchWishEpisodeKind, ResearchWishEvidenceKind, analyze_linked_research,
+    analyze_runtime_half_pairs,
 };
 pub use research_feedback::{
     RESEARCH_FEEDBACK_CONSENT_FILE, RESEARCH_FEEDBACK_CONSENT_SCHEMA_V1,

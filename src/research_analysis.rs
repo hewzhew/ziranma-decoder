@@ -225,6 +225,7 @@ pub struct ResearchSceneAnalysis {
     wish_contexts: Vec<ResearchWishContext>,
     retype_clues: Vec<ResearchRetypeClue>,
     input_scenes: Vec<ResearchInputScene>,
+    selection_confirmation_sequences: Vec<ResearchSelectionConfirmationSequence>,
 }
 
 /// One completed input retained inside a reconstructed natural scene.
@@ -278,6 +279,67 @@ pub struct ResearchInputScene {
 impl ResearchInputScene {
     pub fn episodes(&self) -> &[ResearchInputEpisode] {
         &self.episodes
+    }
+}
+
+/// How much same-chain evidence can safely connect one V19 personal-selection
+/// confirmation to an earlier candidate commit.
+///
+/// A unique identity match is still an analysis-time correlation, not a
+/// durable selection identifier. Repeated equal commits deliberately remain
+/// ambiguous instead of being assigned by proximity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResearchSelectionConfirmationMatch {
+    UniquePriorCommit,
+    AmbiguousPriorCommits,
+    NoPriorCommit,
+}
+
+/// One V19 personal-selection confirmation retained in its continuous-chain
+/// order. This type intentionally omits `Debug` because it contains private
+/// input and committed text.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchSelectionConfirmation {
+    code: String,
+    text: String,
+    persistent_preferred: bool,
+    session_retained: bool,
+    matching: ResearchSelectionConfirmationMatch,
+}
+
+impl ResearchSelectionConfirmation {
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn persistent_preferred(&self) -> bool {
+        self.persistent_preferred
+    }
+
+    pub fn session_retained(&self) -> bool {
+        self.session_retained
+    }
+
+    pub fn matching(&self) -> ResearchSelectionConfirmationMatch {
+        self.matching
+    }
+}
+
+/// One uninterrupted process-local confirmation timeline. Separate streams
+/// and discontinuous journal chains are never merged or globally ordered.
+/// This type omits `Debug` because its confirmations contain private text.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchSelectionConfirmationSequence {
+    confirmations: Vec<ResearchSelectionConfirmation>,
+}
+
+impl ResearchSelectionConfirmationSequence {
+    pub fn confirmations(&self) -> &[ResearchSelectionConfirmation] {
+        &self.confirmations
     }
 }
 
@@ -418,6 +480,10 @@ impl ResearchSceneAnalysis {
     pub fn input_scenes(&self) -> &[ResearchInputScene] {
         &self.input_scenes
     }
+
+    pub fn selection_confirmation_sequences(&self) -> &[ResearchSelectionConfirmationSequence] {
+        &self.selection_confirmation_sequences
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -535,6 +601,7 @@ struct Episode {
     start_ms: u64,
     end_ms: u64,
     first_ordinal: u64,
+    completed_ordinal: u64,
     last_ordinal: u64,
     hard_boundary_after: bool,
     accepted_recovery: Option<RecoveryEvidence>,
@@ -542,6 +609,15 @@ struct Episode {
     outcome: EpisodeOutcome,
     post_commit_backspace_routed: bool,
     top_candidate: Option<String>,
+}
+
+struct SelectionConfirmation {
+    chain: usize,
+    ordinal: u64,
+    code: String,
+    text: String,
+    persistent_preferred: bool,
+    session_retained: bool,
 }
 
 enum EpisodeOutcome {
@@ -636,6 +712,7 @@ pub fn analyze_linked_research(
     let anchored_wishes = anchors.values().map(Vec::len).sum();
 
     let mut stream_episodes: HashMap<String, Vec<Episode>> = HashMap::new();
+    let mut stream_confirmations: HashMap<String, Vec<SelectionConfirmation>> = HashMap::new();
     let mut chain_breaks = 0;
     for (stream_id, batches) in &mut streams {
         batches.sort_by_key(|batch| batch.sequence);
@@ -645,9 +722,10 @@ pub fn analyze_linked_research(
         {
             return Err(ResearchSceneError::DuplicateBatchSequence);
         }
-        let (episodes, breaks) = reconstruct_stream(batches)?;
+        let (episodes, confirmations, breaks) = reconstruct_stream(batches)?;
         chain_breaks += breaks;
         stream_episodes.insert(stream_id.clone(), episodes);
+        stream_confirmations.insert(stream_id.clone(), confirmations);
     }
 
     let gaps = stream_episodes
@@ -689,6 +767,8 @@ pub fn analyze_linked_research(
     let wish_contexts = collect_wish_contexts(&stream_episodes, &scenes, &anchor_requests);
     let retype_clues = collect_retype_clues(stream_episodes.values());
     let input_scenes = collect_input_scenes(&stream_episodes, &scenes);
+    let selection_confirmation_sequences =
+        collect_selection_confirmation_sequences(&stream_episodes, &stream_confirmations);
     let mut episode_counts = scenes
         .iter()
         .map(|scene| scene.episodes)
@@ -716,6 +796,7 @@ pub fn analyze_linked_research(
         wish_contexts,
         retype_clues,
         input_scenes,
+        selection_confirmation_sequences,
     })
 }
 
@@ -967,8 +1048,9 @@ pub fn analyze_runtime_half_pairs(
 
 fn reconstruct_stream(
     batches: &[LinkedBatch<'_>],
-) -> Result<(Vec<Episode>, usize), ResearchSceneError> {
+) -> Result<(Vec<Episode>, Vec<SelectionConfirmation>, usize), ResearchSceneError> {
     let mut episodes = Vec::new();
+    let mut confirmations = Vec::new();
     let mut pending = None;
     let mut previous_sequence = None;
     let mut expected_ordinal = None;
@@ -1021,6 +1103,7 @@ fn reconstruct_stream(
             observe_event(
                 &mut pending,
                 &mut episodes,
+                &mut confirmations,
                 chain,
                 at_ms,
                 ordinal,
@@ -1039,12 +1122,13 @@ fn reconstruct_stream(
         );
         previous_end_ms = batch_end_ms;
     }
-    Ok((episodes, chain_breaks))
+    Ok((episodes, confirmations, chain_breaks))
 }
 
 fn observe_event(
     pending: &mut Option<PendingEpisode>,
     episodes: &mut Vec<Episode>,
+    confirmations: &mut Vec<SelectionConfirmation>,
     chain: usize,
     at_ms: u64,
     ordinal: u64,
@@ -1059,8 +1143,20 @@ fn observe_event(
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::CandidateSuppressionChanged { .. }
-        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
-        | NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
+        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
+        NativeFeedbackEvent::PersonalSelectionConfirmed {
+            code,
+            text,
+            persistent_preferred,
+            session_retained,
+        } => confirmations.push(SelectionConfirmation {
+            chain,
+            ordinal,
+            code: code.clone(),
+            text: text.clone(),
+            persistent_preferred: *persistent_preferred,
+            session_retained: *session_retained,
+        }),
         NativeFeedbackEvent::PostCommitBackspaceRouted => {
             if pending.is_none()
                 && let Some(previous) = episodes.last_mut()
@@ -1093,6 +1189,7 @@ fn observe_event(
                 start_ms: episode.start_ms,
                 end_ms: at_ms,
                 first_ordinal: episode.first_ordinal,
+                completed_ordinal: ordinal,
                 last_ordinal: ordinal,
                 hard_boundary_after: false,
                 accepted_recovery,
@@ -1118,6 +1215,7 @@ fn observe_event(
                 start_ms: episode.start_ms,
                 end_ms: at_ms,
                 first_ordinal: episode.first_ordinal,
+                completed_ordinal: ordinal,
                 last_ordinal: ordinal,
                 hard_boundary_after: false,
                 accepted_recovery: None,
@@ -1137,6 +1235,7 @@ fn observe_event(
                 start_ms: episode.start_ms,
                 end_ms: at_ms,
                 first_ordinal: episode.first_ordinal,
+                completed_ordinal: ordinal,
                 last_ordinal: ordinal,
                 hard_boundary_after: matches!(
                     source,
@@ -1356,6 +1455,92 @@ fn collect_input_scenes(
             (!episodes.is_empty()).then_some(ResearchInputScene { episodes })
         })
         .collect()
+}
+
+fn collect_selection_confirmation_sequences(
+    stream_episodes: &HashMap<String, Vec<Episode>>,
+    stream_confirmations: &HashMap<String, Vec<SelectionConfirmation>>,
+) -> Vec<ResearchSelectionConfirmationSequence> {
+    let mut stream_ids = stream_confirmations.keys().collect::<Vec<_>>();
+    stream_ids.sort_unstable();
+    let mut sequences = Vec::new();
+
+    for stream_id in stream_ids {
+        let episodes = stream_episodes
+            .get(stream_id)
+            .map_or(&[][..], Vec::as_slice);
+        let confirmations = &stream_confirmations[stream_id];
+        let mut chains = confirmations
+            .iter()
+            .map(|confirmation| confirmation.chain)
+            .collect::<Vec<_>>();
+        chains.sort_unstable();
+        chains.dedup();
+
+        for chain in chains {
+            let candidate_commits = episodes
+                .iter()
+                .filter(|episode| {
+                    episode.chain == chain
+                        && !episode.post_commit_backspace_routed
+                        && matches!(&episode.outcome, EpisodeOutcome::CandidateCommit { .. })
+                })
+                .collect::<Vec<_>>();
+            let mut chain_confirmations = confirmations
+                .iter()
+                .filter(|confirmation| confirmation.chain == chain)
+                .collect::<Vec<_>>();
+            chain_confirmations.sort_by_key(|confirmation| confirmation.ordinal);
+
+            let mut next_candidate = 0_usize;
+            let mut available = Vec::<usize>::new();
+            let mut rendered = Vec::with_capacity(chain_confirmations.len());
+            for confirmation in chain_confirmations {
+                while candidate_commits
+                    .get(next_candidate)
+                    .is_some_and(|episode| episode.completed_ordinal < confirmation.ordinal)
+                {
+                    available.push(next_candidate);
+                    next_candidate = next_candidate.saturating_add(1);
+                }
+
+                let matching_positions = available
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, candidate_index)| {
+                        let EpisodeOutcome::CandidateCommit { code, text, .. } =
+                            &candidate_commits[*candidate_index].outcome
+                        else {
+                            return None;
+                        };
+                        (code == &confirmation.code && text == &confirmation.text)
+                            .then_some(position)
+                    })
+                    .collect::<Vec<_>>();
+                let matching = match matching_positions.as_slice() {
+                    [position] => {
+                        available.remove(*position);
+                        ResearchSelectionConfirmationMatch::UniquePriorCommit
+                    }
+                    [] => ResearchSelectionConfirmationMatch::NoPriorCommit,
+                    _ => ResearchSelectionConfirmationMatch::AmbiguousPriorCommits,
+                };
+                rendered.push(ResearchSelectionConfirmation {
+                    code: confirmation.code.clone(),
+                    text: confirmation.text.clone(),
+                    persistent_preferred: confirmation.persistent_preferred,
+                    session_retained: confirmation.session_retained,
+                    matching,
+                });
+            }
+            if !rendered.is_empty() {
+                sequences.push(ResearchSelectionConfirmationSequence {
+                    confirmations: rendered,
+                });
+            }
+        }
+    }
+    sequences
 }
 
 fn is_bounded_retype_pair(previous: &Episode, next: &Episode) -> bool {
@@ -1583,6 +1768,20 @@ mod tests {
             },
             absolute_rank: rank,
             visible_rank: (rank.saturating_sub(1) % RECORDED_CANDIDATE_PAGE_SIZE) + 1,
+        }
+    }
+
+    fn confirmed(
+        code: &str,
+        text: &str,
+        persistent_preferred: bool,
+        session_retained: bool,
+    ) -> NativeFeedbackEvent {
+        NativeFeedbackEvent::PersonalSelectionConfirmed {
+            code: code.to_owned(),
+            text: text.to_owned(),
+            persistent_preferred,
+            session_retained,
         }
     }
 
@@ -1814,6 +2013,137 @@ mod tests {
         assert_eq!(episodes[1].kind(), ResearchWishEpisodeKind::RawCodeCommit);
         assert_eq!(episodes[1].top_candidate(), None);
         assert_eq!(episodes[2].kind(), ResearchWishEpisodeKind::Cancellation);
+    }
+
+    #[test]
+    fn personal_selection_confirmation_joins_a_contiguous_batch_boundary() {
+        let stream = "8a".repeat(32);
+        let first = snapshot(&stream, 0, 0, None, vec![(10, committed("aa", "甲"))]);
+        let second = snapshot(
+            &stream,
+            1,
+            1,
+            Some(12),
+            vec![(20, confirmed("aa", "甲", false, true))],
+        );
+
+        let report = analyze_linked_research(&[first, second], &[]).unwrap();
+        assert_eq!(report.chain_breaks(), 0);
+        assert_eq!(report.selection_confirmation_sequences().len(), 1);
+        let confirmation = &report.selection_confirmation_sequences()[0].confirmations()[0];
+        assert_eq!(confirmation.code(), "aa");
+        assert_eq!(confirmation.text(), "甲");
+        assert!(!confirmation.persistent_preferred());
+        assert!(confirmation.session_retained());
+        assert_eq!(
+            confirmation.matching(),
+            ResearchSelectionConfirmationMatch::UniquePriorCommit
+        );
+    }
+
+    #[test]
+    fn personal_selection_confirmation_uses_identity_not_event_proximity() {
+        let stream = "8b".repeat(32);
+        let report = analyze_linked_research(
+            &[snapshot(
+                &stream,
+                0,
+                0,
+                None,
+                vec![
+                    (10, committed("aa", "甲")),
+                    (11, confirmed("aa", "甲", true, false)),
+                    (20, committed("bb", "乙")),
+                    (30, committed("cc", "丙")),
+                    (31, confirmed("bb", "乙", false, true)),
+                ],
+            )],
+            &[],
+        )
+        .unwrap();
+
+        let confirmations = report.selection_confirmation_sequences()[0].confirmations();
+        assert_eq!(confirmations.len(), 2);
+        assert_eq!(confirmations[0].code(), "aa");
+        assert_eq!(confirmations[1].code(), "bb");
+        assert!(confirmations.iter().all(|confirmation| {
+            confirmation.matching() == ResearchSelectionConfirmationMatch::UniquePriorCommit
+        }));
+        assert!(confirmations[0].persistent_preferred());
+        assert!(!confirmations[0].session_retained());
+        assert!(!confirmations[1].persistent_preferred());
+        assert!(confirmations[1].session_retained());
+    }
+
+    #[test]
+    fn repeated_equal_commits_keep_personal_confirmation_ambiguous() {
+        let stream = "8c".repeat(32);
+        let report = analyze_linked_research(
+            &[snapshot(
+                &stream,
+                0,
+                0,
+                None,
+                vec![
+                    (10, committed("aa", "甲")),
+                    (20, committed("aa", "甲")),
+                    (21, confirmed("aa", "甲", true, true)),
+                ],
+            )],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.selection_confirmation_sequences()[0].confirmations()[0].matching(),
+            ResearchSelectionConfirmationMatch::AmbiguousPriorCommits
+        );
+    }
+
+    #[test]
+    fn retracted_commit_does_not_make_a_later_confirmation_ambiguous() {
+        let stream = "8e".repeat(32);
+        let report = analyze_linked_research(
+            &[snapshot(
+                &stream,
+                0,
+                0,
+                None,
+                vec![
+                    (10, committed("aa", "甲")),
+                    (11, NativeFeedbackEvent::PostCommitBackspaceRouted),
+                    (20, committed("aa", "甲")),
+                    (21, confirmed("aa", "甲", true, true)),
+                ],
+            )],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.selection_confirmation_sequences()[0].confirmations()[0].matching(),
+            ResearchSelectionConfirmationMatch::UniquePriorCommit
+        );
+    }
+
+    #[test]
+    fn personal_confirmation_never_pairs_across_a_chain_gap() {
+        let stream = "8d".repeat(32);
+        let first = snapshot(&stream, 0, 0, None, vec![(10, committed("aa", "甲"))]);
+        let after_gap = snapshot(
+            &stream,
+            2,
+            1,
+            Some(12),
+            vec![(20, confirmed("aa", "甲", true, true))],
+        );
+
+        let report = analyze_linked_research(&[first, after_gap], &[]).unwrap();
+        assert_eq!(report.chain_breaks(), 1);
+        assert_eq!(
+            report.selection_confirmation_sequences()[0].confirmations()[0].matching(),
+            ResearchSelectionConfirmationMatch::NoPriorCommit
+        );
     }
 
     #[test]

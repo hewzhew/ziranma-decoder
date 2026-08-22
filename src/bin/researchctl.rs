@@ -11,13 +11,13 @@ use ziranma_core::{
     NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
     ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage, ResearchSceneAnalysis,
-    ResearchWishEpisodeKind, ResearchWishEvidenceKind, TranspositionCalibrationLabel,
-    WishCaptureScope, WishJournalContext, WishPublicCandidateOrderPolicy, WishRuntimeIdentity,
-    WishSnapshot, analyze_linked_research, analyze_research_issue_signals,
-    analyze_research_issue_signals_for_runtime, analyze_runtime_half_pairs, list_wish_packages,
-    native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-    research_feedback_enabled, research_ranking_movement_bucket_index,
-    set_research_feedback_enabled,
+    ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch, ResearchWishEpisodeKind,
+    ResearchWishEvidenceKind, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
+    analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
+    analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
+    repository_root_for_user_tool_executable, research_feedback_enabled,
+    research_ranking_movement_bucket_index, set_research_feedback_enabled,
 };
 #[cfg(windows)]
 use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
@@ -25,6 +25,7 @@ use ziranma_core::{WindowsUserDataProtector, load_wish_snapshot};
 const MAX_REVIEW_BATCHES: usize = 4_096;
 const MAX_REVIEW_ITEMS: usize = 12;
 const MAX_RUNTIME_INPUT_SCENES: usize = 24;
+const MAX_RUNTIME_SELECTION_CONFIRMATIONS: usize = 48;
 const PARALLEL_LOAD_THRESHOLD: usize = 32;
 const MAX_PARALLEL_LOADERS: usize = 4;
 const WISH_SCHEMA_VERSION_COUNT: usize = CURRENT_WISH_SCHEMA_VERSION as usize;
@@ -237,32 +238,123 @@ fn render_runtime_input_scenes(analysis: &ResearchSceneAnalysis) -> String {
     .unwrap();
     let scenes = analysis.input_scenes();
     if scenes.is_empty() {
-        output.push_str("- 暂无可重建的连续片段。");
-        return output;
+        output.push_str("- 暂无可重建的连续片段。\n");
+    } else {
+        let omitted = scenes.len().saturating_sub(MAX_RUNTIME_INPUT_SCENES);
+        if omitted != 0 {
+            writeln!(
+                output,
+                "- 另有 {omitted} 个片段未展开；下面按稳定连续流顺序显示其余片段。"
+            )
+            .unwrap();
+        }
+        for (index, scene) in scenes.iter().skip(omitted).enumerate() {
+            write!(
+                output,
+                "- 片段 {}（{} 次完成输入）：",
+                omitted + index + 1,
+                scene.episodes().len()
+            )
+            .unwrap();
+            render_input_scene_episodes(&mut output, scene);
+            output.push('\n');
+        }
     }
-    let omitted = scenes.len().saturating_sub(MAX_RUNTIME_INPUT_SCENES);
-    if omitted != 0 {
-        writeln!(
-            output,
-            "- 另有 {omitted} 个片段未展开；下面按稳定连续流顺序显示其余片段。"
-        )
-        .unwrap();
-    }
-    for (index, scene) in scenes.iter().skip(omitted).enumerate() {
-        write!(
-            output,
-            "- 片段 {}（{} 次完成输入）：",
-            omitted + index + 1,
-            scene.episodes().len()
-        )
-        .unwrap();
-        render_input_scene_episodes(&mut output, scene);
-        output.push('\n');
-    }
+    render_selection_confirmations(&mut output, analysis);
     output.push_str(
-        "口径：显示当前运行身份的真实完成输入、实际名次和可核对首选；同一片段内部顺序可靠，不为不同宿主流伪造全局时间顺序；只在本机当前终端生成，不另行写盘。",
+        "口径：显示当前运行身份的真实完成输入、实际名次、可核对首选和独立确认时间线；同一片段或确认链内部顺序可靠，不为不同宿主流伪造全局时间顺序，也不把同码同字的多解确认强行归给某次提交；只在本机当前终端生成，不另行写盘。",
     );
     output
+}
+
+fn render_selection_confirmations(output: &mut String, analysis: &ResearchSceneAnalysis) {
+    let confirmations = analysis
+        .selection_confirmation_sequences()
+        .iter()
+        .enumerate()
+        .flat_map(|(sequence, items)| {
+            items
+                .confirmations()
+                .iter()
+                .map(move |confirmation| (sequence, confirmation))
+        })
+        .collect::<Vec<_>>();
+    output.push_str("个人选择确认（独立时间线，不冒充已精确关联）：");
+    if confirmations.is_empty() {
+        output.push_str("暂无 V19 确认事件。\n");
+        return;
+    }
+    output.push('\n');
+
+    let unique = confirmations
+        .iter()
+        .filter(|(_, confirmation)| {
+            confirmation.matching() == ResearchSelectionConfirmationMatch::UniquePriorCommit
+        })
+        .count();
+    let ambiguous = confirmations
+        .iter()
+        .filter(|(_, confirmation)| {
+            confirmation.matching() == ResearchSelectionConfirmationMatch::AmbiguousPriorCommits
+        })
+        .count();
+    let unmatched = confirmations.len().saturating_sub(unique + ambiguous);
+    writeln!(
+        output,
+        "- 配对审计：唯一 {unique}，多解 {ambiguous}，同链无前序证据 {unmatched}。"
+    )
+    .unwrap();
+
+    let omitted = confirmations
+        .len()
+        .saturating_sub(MAX_RUNTIME_SELECTION_CONFIRMATIONS);
+    if omitted != 0 {
+        writeln!(output, "- 另有 {omitted} 条较早确认未展开。").unwrap();
+    }
+    let mut previous_sequence = None;
+    for (sequence, confirmation) in confirmations.into_iter().skip(omitted) {
+        if previous_sequence == Some(sequence) {
+            output.push_str(" ｜ ");
+        } else {
+            if previous_sequence.is_some() {
+                output.push('\n');
+            }
+            write!(output, "- 确认链 {}：", sequence + 1).unwrap();
+            previous_sequence = Some(sequence);
+        }
+        render_selection_confirmation(output, confirmation);
+    }
+    output.push('\n');
+}
+
+fn render_selection_confirmation(
+    output: &mut String,
+    confirmation: &ResearchSelectionConfirmation,
+) {
+    write!(
+        output,
+        "{} → “{}”〔{}；{}；{}〕",
+        confirmation.code(),
+        confirmation.text(),
+        if confirmation.persistent_preferred() {
+            "已成为持久首选"
+        } else {
+            "持久证据已记录，尚未胜出"
+        },
+        if confirmation.session_retained() {
+            "会话选择保留"
+        } else {
+            "会话选择未保留"
+        },
+        match confirmation.matching() {
+            ResearchSelectionConfirmationMatch::UniquePriorCommit => "同链唯一前序提交可配对",
+            ResearchSelectionConfirmationMatch::AmbiguousPriorCommits => {
+                "同链存在多个同码同字前序提交，保持多解"
+            }
+            ResearchSelectionConfirmationMatch::NoPriorCommit => "同链无可核对前序提交",
+        }
+    )
+    .unwrap();
 }
 
 fn render_input_scene_episodes(output: &mut String, scene: &ResearchInputScene) {
