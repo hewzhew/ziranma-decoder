@@ -11,8 +11,9 @@ use ziranma_core::{
     NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
     RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
     ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage, ResearchSceneAnalysis,
-    ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch, ResearchWishEpisodeKind,
-    ResearchWishEvidenceKind, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch,
+    ResearchWishCandidateTextEvidence, ResearchWishEpisodeKind, ResearchWishEvidenceKind,
+    TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
     analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
     analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
@@ -3041,11 +3042,19 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
                     };
                     write!(
                         output,
-                        "{} → “{}”（第 {}；{}）{}",
+                        "{} → “{}”（第 {}；{}；{}；{}）{}",
                         episode.code(),
                         episode.text().unwrap_or(""),
                         episode.rank().unwrap_or(0),
                         evidence,
+                        episode
+                            .candidate_view()
+                            .map(candidate_view_label)
+                            .unwrap_or("候选视图未记录"),
+                        episode
+                            .selection_source()
+                            .map(selection_source_label)
+                            .unwrap_or("选择方式未记录"),
                         if episode.followed_by_retype() {
                             "〔随后 Backspace 后出现不同提交〕"
                         } else if episode.post_commit_backspace_routed() {
@@ -3055,6 +3064,7 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
                         }
                     )
                     .unwrap();
+                    render_wish_candidate_evidence(&mut output, episode);
                 }
                 ResearchWishEpisodeKind::RawCodeCommit => {
                     write!(output, "{}〔原码上屏〕", episode.code()).unwrap();
@@ -3119,6 +3129,126 @@ fn render_scene_analysis(analysis: &ResearchSceneAnalysis) -> String {
         "口径：失焦/宿主结束是硬边界；停顿是按本批证据自适应的软边界；单次改码不形成手癖结论。",
     );
     output
+}
+
+fn render_wish_candidate_evidence(
+    output: &mut String,
+    episode: &ziranma_core::ResearchWishEpisode,
+) {
+    let Some(evidence) = episode.candidate_evidence() else {
+        output.push_str("〔候选现场未配对：缺少同码同视图候选帧〕");
+        return;
+    };
+    let page = evidence.page_start() / 6 + 1;
+    let text_evidence = match evidence.text_evidence() {
+        ResearchWishCandidateTextEvidence::Verified => "候选文字已核对",
+        ResearchWishCandidateTextEvidence::Mismatched => "记录位置与提交文字不一致",
+        ResearchWishCandidateTextEvidence::Unavailable => "当前页缺少该名次文字",
+    };
+    write!(
+        output,
+        "〔现场：第 {page} 页，已加载 {}{}；{text_evidence}",
+        evidence.loaded_candidates(),
+        if evidence.may_have_more() {
+            "，后面仍可继续"
+        } else {
+            ""
+        }
+    )
+    .unwrap();
+    if let Some(tab) = evidence.tab_assembly() {
+        write!(
+            output,
+            "；Tab 第 {}/{} 字，形码 {}",
+            tab.position(),
+            tab.total_characters(),
+            if tab.shape_prefix().is_empty() {
+                "—"
+            } else {
+                tab.shape_prefix()
+            }
+        )
+        .unwrap();
+    }
+    match evidence.selected_provenance() {
+        Some(provenance) => {
+            write!(
+                output,
+                "；目标来源 {}",
+                candidate_source_label(provenance.source())
+            )
+            .unwrap();
+            if evidence.supports_precise_personalization() {
+                write!(
+                    output,
+                    "，个人标记 {}",
+                    render_candidate_personalization(provenance.personalization())
+                )
+                .unwrap();
+            } else {
+                output.push_str("，个人标记格式不足");
+            }
+            if evidence.supports_precise_ranking_personalization() {
+                write!(
+                    output,
+                    "，个人重排 {}",
+                    render_candidate_personalization(provenance.ranking_personalization())
+                )
+                .unwrap();
+                if evidence.supports_precise_ranking_movement() {
+                    write!(
+                        output,
+                        "（{}）",
+                        render_candidate_ranking_movement(provenance.ranking_movement())
+                    )
+                    .unwrap();
+                } else if !provenance.ranking_personalization().is_empty() {
+                    output.push_str("（原位次未记录）");
+                }
+            } else {
+                output.push_str("，个人重排格式不足");
+            }
+        }
+        None => output.push_str("；目标来源未记录"),
+    }
+    if episode.rank().is_some_and(|rank| rank > 1) {
+        match evidence.global_top_provenance() {
+            Some(provenance) => {
+                write!(
+                    output,
+                    "；当时首选来源 {}",
+                    candidate_source_label(provenance.source())
+                )
+                .unwrap();
+                if evidence.supports_precise_ranking_personalization() {
+                    write!(
+                        output,
+                        "，个人重排 {}",
+                        render_candidate_personalization(provenance.ranking_personalization())
+                    )
+                    .unwrap();
+                }
+            }
+            None => output.push_str("；当时首选来源未记录"),
+        }
+    }
+    output.push('〕');
+}
+
+fn candidate_view_label(view: NativeCandidateView) -> &'static str {
+    match view {
+        NativeCandidateView::Ordinary => "普通候选",
+        NativeCandidateView::TranspositionRecovery => "换序恢复",
+        NativeCandidateView::Shape => "Tab 找字",
+    }
+}
+
+fn selection_source_label(source: NativeSelectionSource) -> &'static str {
+    match source {
+        NativeSelectionSource::FirstCandidate => "空格首选",
+        NativeSelectionSource::Numeric => "数字选择",
+        NativeSelectionSource::Punctuation => "标点提交",
+    }
 }
 
 fn wish_category_label(category: ziranma_core::WishCategory) -> &'static str {
@@ -4869,6 +4999,140 @@ mod tests {
         ] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn scene_rendering_exposes_paired_tab_page_and_personal_evidence_without_guessing() {
+        use ziranma_core::{
+            NativeFeedbackAuthorization, NativeFeedbackContext, NativeFeedbackFreezeAuthorization,
+            NativeFeedbackLimits, NativeFeedbackSession, NativeTabAssemblyState, WishJournalAnchor,
+            WishJournalSpan,
+        };
+
+        let personal = NativeCandidateProvenance::with_personalization_ranking_and_movement(
+            NativeCandidateSource::Shape,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidateRankingMovement::MovedFrom { absolute_rank: 9 },
+        )
+        .unwrap();
+        let stream = "7c".repeat(32);
+        let mut feedback = NativeFeedbackSession::default();
+        feedback.start_memory(
+            NativeFeedbackAuthorization::explicit_memory_only(),
+            NativeFeedbackLimits::default(),
+        );
+        for (at_ms, event) in [
+            (
+                10,
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code: "qthplmj".to_owned(),
+                    view: NativeCandidateView::Shape,
+                    page_start: 0,
+                    candidates: ["一", "二", "三", "四", "五", "六"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    provenance: vec![
+                        NativeCandidateProvenance::new(
+                            NativeCandidateSource::Shape,
+                            false
+                        );
+                        6
+                    ],
+                    automatic_transposition: None,
+                    loaded_candidates: 7,
+                    tab_assembly: Some(NativeTabAssemblyState::new(4, 4, "")),
+                    may_have_more: true,
+                },
+            ),
+            (
+                20,
+                NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code: "qthplmj".to_owned(),
+                    view: NativeCandidateView::Shape,
+                    page_start: 6,
+                    candidates: vec!["件".to_owned()],
+                    provenance: vec![personal],
+                    automatic_transposition: None,
+                    loaded_candidates: 7,
+                    tab_assembly: Some(NativeTabAssemblyState::new(4, 4, "h")),
+                    may_have_more: false,
+                },
+            ),
+            (
+                21,
+                NativeFeedbackEvent::CandidateCommitted {
+                    code: "qthplmj".to_owned(),
+                    text: "件".to_owned(),
+                    view: NativeCandidateView::Shape,
+                    source: NativeSelectionSource::FirstCandidate,
+                    absolute_rank: 7,
+                    visible_rank: 1,
+                },
+            ),
+        ] {
+            feedback.record_at(NativeFeedbackContext::Eligible, event, at_ms);
+        }
+        let frozen = feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                22,
+                100,
+                16,
+            )
+            .unwrap();
+        let research = WishSnapshot::from_frozen_with_context(
+            &frozen,
+            WishCaptureScope::ContinuousJournal,
+            ziranma_core::WishCategory::Other,
+            None,
+            Some(WishJournalContext::ContinuousSpan(
+                WishJournalSpan::new(stream.clone(), 0, 0, None).unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let mut wish_feedback = NativeFeedbackSession::default();
+        wish_feedback.start_memory(
+            NativeFeedbackAuthorization::explicit_memory_only(),
+            NativeFeedbackLimits::default(),
+        );
+        wish_feedback.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "xuy".to_owned(),
+            },
+            1,
+        );
+        let wish_frozen = wish_feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                2,
+                10,
+                8,
+            )
+            .unwrap();
+        let wish = WishSnapshot::from_frozen_with_context(
+            &wish_frozen,
+            WishCaptureScope::RecentWindow,
+            ziranma_core::WishCategory::Ranking,
+            None,
+            Some(WishJournalContext::WishAnchor(
+                WishJournalAnchor::new(stream, 2).unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let analysis = analyze_linked_research(&[research], &[wish]).unwrap();
+        let rendered = render_scene_analysis(&analysis);
+        assert!(rendered.contains("第二页或更深；Tab 找字；空格首选"));
+        assert!(rendered.contains("第 2 页，已加载 7；候选文字已核对"));
+        assert!(rendered.contains("Tab 第 4/4 字，形码 h"));
+        assert!(rendered.contains("目标来源 Tab 找字，个人标记 持久精确"));
+        assert!(rendered.contains("个人重排 持久精确（原第 9 位）"));
+        assert!(rendered.contains("当时首选来源 Tab 找字，个人重排 无"));
+        assert!(!rendered.contains("候选现场未配对"));
     }
 
     #[test]

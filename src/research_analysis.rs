@@ -11,9 +11,9 @@ use std::fmt;
 
 use crate::{
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKETS,
-    NativeAutomaticTranspositionOutcome, NativeCancellationSource, NativeCandidateSource,
-    NativeCandidateView, NativeFeedbackEvent, WishJournalContext, WishRuntimeIdentity,
-    WishSnapshot,
+    NativeAutomaticTranspositionOutcome, NativeCancellationSource, NativeCandidateProvenance,
+    NativeCandidateSource, NativeCandidateView, NativeFeedbackEvent, NativeSelectionSource,
+    NativeTabAssemblyState, WishJournalContext, WishRuntimeIdentity, WishSnapshot,
 };
 
 const DEFAULT_SCENE_GAP_MS: u64 = 45_000;
@@ -51,6 +51,76 @@ pub enum ResearchWishEvidenceKind {
     Cancellation,
 }
 
+/// Whether the selected rank in a paired candidate frame names the committed
+/// text. The three states prevent a missing page from being reported as a
+/// mismatch and prevent a mismatch from being silently accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResearchWishCandidateTextEvidence {
+    Verified,
+    Mismatched,
+    Unavailable,
+}
+
+/// Exact candidate-frame evidence paired with one completed input near a wish.
+///
+/// This deliberately omits `Debug`: the Tab prefix is real private input even
+/// though candidate text itself is not duplicated into this structure.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResearchWishCandidateEvidence {
+    page_start: usize,
+    loaded_candidates: usize,
+    may_have_more: bool,
+    text_evidence: ResearchWishCandidateTextEvidence,
+    selected_provenance: Option<NativeCandidateProvenance>,
+    global_top_provenance: Option<NativeCandidateProvenance>,
+    tab_assembly: Option<NativeTabAssemblyState>,
+    precise_personalization: bool,
+    precise_ranking_personalization: bool,
+    precise_ranking_movement: bool,
+}
+
+impl ResearchWishCandidateEvidence {
+    pub fn page_start(&self) -> usize {
+        self.page_start
+    }
+
+    pub fn loaded_candidates(&self) -> usize {
+        self.loaded_candidates
+    }
+
+    pub fn may_have_more(&self) -> bool {
+        self.may_have_more
+    }
+
+    pub fn text_evidence(&self) -> ResearchWishCandidateTextEvidence {
+        self.text_evidence
+    }
+
+    pub fn selected_provenance(&self) -> Option<NativeCandidateProvenance> {
+        self.selected_provenance
+    }
+
+    pub fn global_top_provenance(&self) -> Option<NativeCandidateProvenance> {
+        self.global_top_provenance
+    }
+
+    pub fn tab_assembly(&self) -> Option<&NativeTabAssemblyState> {
+        self.tab_assembly.as_ref()
+    }
+
+    pub fn supports_precise_personalization(&self) -> bool {
+        self.precise_personalization
+    }
+
+    pub fn supports_precise_ranking_personalization(&self) -> bool {
+        self.precise_ranking_personalization
+    }
+
+    pub fn supports_precise_ranking_movement(&self) -> bool {
+        self.precise_ranking_movement
+    }
+}
+
 /// One completed input immediately preceding an explicitly anchored wish.
 ///
 /// This type intentionally omits `Debug` because it contains real input and
@@ -61,6 +131,9 @@ pub struct ResearchWishEpisode {
     code: String,
     text: Option<String>,
     rank: Option<usize>,
+    candidate_view: Option<NativeCandidateView>,
+    selection_source: Option<NativeSelectionSource>,
+    candidate_evidence: Option<ResearchWishCandidateEvidence>,
     post_commit_backspace_routed: bool,
     evidence_kind: ResearchWishEvidenceKind,
     followed_by_retype: bool,
@@ -81,6 +154,18 @@ impl ResearchWishEpisode {
 
     pub fn rank(&self) -> Option<usize> {
         self.rank
+    }
+
+    pub fn candidate_view(&self) -> Option<NativeCandidateView> {
+        self.candidate_view
+    }
+
+    pub fn selection_source(&self) -> Option<NativeSelectionSource> {
+        self.selection_source
+    }
+
+    pub fn candidate_evidence(&self) -> Option<&ResearchWishCandidateEvidence> {
+        self.candidate_evidence.as_ref()
     }
 
     pub fn post_commit_backspace_routed(&self) -> bool {
@@ -527,6 +612,7 @@ struct PendingEpisode {
     recovery: Option<RecoveryEvidence>,
     top_candidate_code: Option<String>,
     top_candidate: Option<String>,
+    candidate_frame: Option<EpisodeCandidateFrame>,
 }
 
 impl PendingEpisode {
@@ -539,39 +625,92 @@ impl PendingEpisode {
             recovery: None,
             top_candidate_code: None,
             top_candidate: None,
+            candidate_frame: None,
         }
     }
 
-    fn observe_candidates(&mut self, event: &NativeFeedbackEvent) {
-        let (code, page_start, candidates, automatic_transposition) = match event {
+    fn observe_candidates(
+        &mut self,
+        event: &NativeFeedbackEvent,
+        precise_personalization: bool,
+        precise_ranking_personalization: bool,
+        precise_ranking_movement: bool,
+    ) {
+        let (
+            code,
+            view,
+            page_start,
+            candidates,
+            provenance,
+            automatic_transposition,
+            loaded_candidates,
+            tab_assembly,
+            may_have_more,
+        ) = match event {
             NativeFeedbackEvent::CandidatesPresented {
                 code,
+                view,
                 page_start,
                 candidates,
-                ..
-            } => (code, page_start, candidates, None),
-            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
-                code,
-                page_start,
-                candidates,
-                automatic_transposition,
-                ..
+                may_have_more,
             } => (
                 code,
+                *view,
+                *page_start,
+                candidates,
+                Vec::new(),
+                None,
+                page_start.saturating_add(candidates.len()),
+                None,
+                *may_have_more,
+            ),
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code,
+                view,
                 page_start,
                 candidates,
+                provenance,
+                automatic_transposition,
+                loaded_candidates,
+                tab_assembly,
+                may_have_more,
+            } => (
+                code,
+                *view,
+                *page_start,
+                candidates,
+                provenance.clone(),
                 automatic_transposition.as_ref(),
+                *loaded_candidates,
+                tab_assembly.clone(),
+                *may_have_more,
             ),
             _ => return,
         };
         self.observe_code(code);
-        if *page_start == 0 {
+        if page_start == 0 {
             self.top_candidate_code = Some(code.clone());
             self.top_candidate = candidates.first().cloned();
         } else if self.top_candidate_code.as_deref() != Some(code) {
             self.top_candidate_code = None;
             self.top_candidate = None;
         }
+        self.candidate_frame = Some(EpisodeCandidateFrame::next(
+            EpisodeCandidateFrameUpdate {
+                code,
+                view,
+                page_start,
+                candidates: candidates.clone(),
+                provenance,
+                loaded_candidates,
+                tab_assembly,
+                may_have_more,
+                precise_personalization,
+                precise_ranking_personalization,
+                precise_ranking_movement,
+            },
+            self.candidate_frame.as_ref(),
+        ));
         if let Some(decision) = automatic_transposition
             && decision.outcome() == NativeAutomaticTranspositionOutcome::RecoveryAvailable
             && decision.visible_rank().is_some()
@@ -593,6 +732,101 @@ impl PendingEpisode {
             self.revision_from = Some(previous.to_owned());
         }
         self.previous_code = Some(code.to_owned());
+    }
+}
+
+#[derive(Clone)]
+struct EpisodeCandidateFrame {
+    code: String,
+    view: NativeCandidateView,
+    page_start: usize,
+    candidates: Vec<String>,
+    provenance: Vec<NativeCandidateProvenance>,
+    global_top_provenance: Option<NativeCandidateProvenance>,
+    loaded_candidates: usize,
+    tab_assembly: Option<NativeTabAssemblyState>,
+    may_have_more: bool,
+    precise_personalization: bool,
+    precise_ranking_personalization: bool,
+    precise_ranking_movement: bool,
+}
+
+struct EpisodeCandidateFrameUpdate<'a> {
+    code: &'a str,
+    view: NativeCandidateView,
+    page_start: usize,
+    candidates: Vec<String>,
+    provenance: Vec<NativeCandidateProvenance>,
+    loaded_candidates: usize,
+    tab_assembly: Option<NativeTabAssemblyState>,
+    may_have_more: bool,
+    precise_personalization: bool,
+    precise_ranking_personalization: bool,
+    precise_ranking_movement: bool,
+}
+
+impl EpisodeCandidateFrame {
+    fn next(update: EpisodeCandidateFrameUpdate<'_>, previous: Option<&Self>) -> Self {
+        let matching_previous =
+            previous.filter(|frame| frame.code == update.code && frame.view == update.view);
+        let global_top_provenance = if update.page_start == 0 {
+            update.provenance.first().copied()
+        } else {
+            matching_previous.and_then(|frame| frame.global_top_provenance)
+        };
+        Self {
+            code: update.code.to_owned(),
+            view: update.view,
+            page_start: update.page_start,
+            candidates: update.candidates,
+            provenance: update.provenance,
+            global_top_provenance,
+            loaded_candidates: update.loaded_candidates,
+            tab_assembly: update.tab_assembly,
+            may_have_more: update.may_have_more,
+            precise_personalization: update.precise_personalization,
+            precise_ranking_personalization: update.precise_ranking_personalization,
+            precise_ranking_movement: update.precise_ranking_movement,
+        }
+    }
+
+    fn selection_evidence(
+        &self,
+        code: &str,
+        view: NativeCandidateView,
+        absolute_rank: usize,
+        visible_rank: usize,
+        committed_text: &str,
+    ) -> Option<ResearchWishCandidateEvidence> {
+        if self.code != code || self.view != view {
+            return None;
+        }
+        let index = absolute_rank.checked_sub(self.page_start.saturating_add(1));
+        let position_matches = self.page_start.checked_add(visible_rank) == Some(absolute_rank);
+        let text_evidence = match (
+            position_matches,
+            index.and_then(|index| self.candidates.get(index)),
+        ) {
+            (true, Some(candidate)) if candidate == committed_text => {
+                ResearchWishCandidateTextEvidence::Verified
+            }
+            (false, _) | (true, Some(_)) => ResearchWishCandidateTextEvidence::Mismatched,
+            (true, None) => ResearchWishCandidateTextEvidence::Unavailable,
+        };
+        Some(ResearchWishCandidateEvidence {
+            page_start: self.page_start,
+            loaded_candidates: self.loaded_candidates,
+            may_have_more: self.may_have_more,
+            text_evidence,
+            selected_provenance: (text_evidence == ResearchWishCandidateTextEvidence::Verified)
+                .then(|| index.and_then(|index| self.provenance.get(index)).copied())
+                .flatten(),
+            global_top_provenance: self.global_top_provenance,
+            tab_assembly: self.tab_assembly.clone(),
+            precise_personalization: self.precise_personalization,
+            precise_ranking_personalization: self.precise_ranking_personalization,
+            precise_ranking_movement: self.precise_ranking_movement,
+        })
     }
 }
 
@@ -625,7 +859,10 @@ enum EpisodeOutcome {
     CandidateCommit {
         code: String,
         text: String,
+        view: NativeCandidateView,
+        source: NativeSelectionSource,
         rank: usize,
+        candidate_evidence: Option<ResearchWishCandidateEvidence>,
     },
     RawCodeCommit {
         code: String,
@@ -1105,10 +1342,19 @@ fn reconstruct_stream(
                 &mut pending,
                 &mut episodes,
                 &mut confirmations,
-                chain,
-                at_ms,
-                ordinal,
                 wish_event.event(),
+                EventObservationContext {
+                    chain,
+                    at_ms,
+                    ordinal,
+                    precise_personalization: batch
+                        .snapshot
+                        .supports_precise_candidate_personalization(),
+                    precise_ranking_personalization: batch
+                        .snapshot
+                        .supports_precise_candidate_ranking_personalization(),
+                    precise_ranking_movement: batch.snapshot.supports_candidate_ranking_movement(),
+                },
             );
         }
         previous_sequence = Some(batch.sequence);
@@ -1126,20 +1372,41 @@ fn reconstruct_stream(
     Ok((episodes, confirmations, chain_breaks))
 }
 
+#[derive(Clone, Copy)]
+struct EventObservationContext {
+    chain: usize,
+    at_ms: u64,
+    ordinal: u64,
+    precise_personalization: bool,
+    precise_ranking_personalization: bool,
+    precise_ranking_movement: bool,
+}
+
 fn observe_event(
     pending: &mut Option<PendingEpisode>,
     episodes: &mut Vec<Episode>,
     confirmations: &mut Vec<SelectionConfirmation>,
-    chain: usize,
-    at_ms: u64,
-    ordinal: u64,
     event: &NativeFeedbackEvent,
+    context: EventObservationContext,
 ) {
+    let EventObservationContext {
+        chain,
+        at_ms,
+        ordinal,
+        precise_personalization,
+        precise_ranking_personalization,
+        precise_ranking_movement,
+    } = context;
     match event {
         NativeFeedbackEvent::CandidatesPresented { .. }
         | NativeFeedbackEvent::CandidatesPresentedWithProvenance { .. } => {
             let episode = pending.get_or_insert_with(|| PendingEpisode::new(at_ms, ordinal));
-            episode.observe_candidates(event);
+            episode.observe_candidates(
+                event,
+                precise_personalization,
+                precise_ranking_personalization,
+                precise_ranking_movement,
+            );
         }
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
@@ -1172,8 +1439,10 @@ fn observe_event(
         NativeFeedbackEvent::CandidateCommitted {
             code,
             text,
+            view,
+            source,
             absolute_rank,
-            ..
+            visible_rank,
         } => {
             let mut episode = pending
                 .take()
@@ -1186,6 +1455,9 @@ fn observe_event(
                 .revision_from
                 .filter(|from| from != code)
                 .map(|from| (from, code.clone(), text.clone()));
+            let candidate_evidence = episode.candidate_frame.as_ref().and_then(|frame| {
+                frame.selection_evidence(code, *view, *absolute_rank, *visible_rank, text)
+            });
             episodes.push(Episode {
                 chain,
                 start_ms: episode.start_ms,
@@ -1199,7 +1471,10 @@ fn observe_event(
                 outcome: EpisodeOutcome::CandidateCommit {
                     code: code.clone(),
                     text: text.clone(),
+                    view: *view,
+                    source: *source,
                     rank: *absolute_rank,
+                    candidate_evidence,
                 },
                 post_commit_backspace_routed: false,
                 post_commit_backspace_ordinal: None,
@@ -1361,15 +1636,38 @@ fn collect_wish_contexts(
 
 impl Episode {
     fn as_wish_episode(&self, followed_by_retype: bool) -> ResearchWishEpisode {
-        let (kind, code, text, rank, evidence_kind) = match &self.outcome {
-            EpisodeOutcome::CandidateCommit { code, text, rank } => (
+        let (
+            kind,
+            code,
+            text,
+            rank,
+            candidate_view,
+            selection_source,
+            candidate_evidence,
+            evidence_kind,
+        ) = match &self.outcome {
+            EpisodeOutcome::CandidateCommit {
+                code,
+                text,
+                view,
+                source,
+                rank,
+                candidate_evidence,
+            } => (
                 ResearchWishEpisodeKind::CandidateCommit,
                 code.clone(),
                 Some(text.clone()),
                 Some(*rank),
-                match *rank {
-                    1 => ResearchWishEvidenceKind::TopCandidate,
-                    2..=RECORDED_CANDIDATE_PAGE_SIZE => {
+                Some(*view),
+                Some(*source),
+                candidate_evidence.clone(),
+                match (*rank, candidate_evidence.as_ref()) {
+                    (1, _) => ResearchWishEvidenceKind::TopCandidate,
+                    (_, Some(evidence)) if evidence.page_start() == 0 => {
+                        ResearchWishEvidenceKind::VisibleNonTopCandidate
+                    }
+                    (_, Some(_)) => ResearchWishEvidenceKind::DeepCandidate,
+                    (2..=RECORDED_CANDIDATE_PAGE_SIZE, None) => {
                         ResearchWishEvidenceKind::VisibleNonTopCandidate
                     }
                     _ => ResearchWishEvidenceKind::DeepCandidate,
@@ -1380,11 +1678,17 @@ impl Episode {
                 code.clone(),
                 None,
                 None,
+                None,
+                None,
+                None,
                 ResearchWishEvidenceKind::RawCodeCommit,
             ),
             EpisodeOutcome::Cancellation { code } => (
                 ResearchWishEpisodeKind::Cancellation,
                 code.clone(),
+                None,
+                None,
+                None,
                 None,
                 None,
                 ResearchWishEvidenceKind::Cancellation,
@@ -1395,6 +1699,9 @@ impl Episode {
             code,
             text,
             rank,
+            candidate_view,
+            selection_source,
+            candidate_evidence,
             post_commit_backspace_routed: self.post_commit_backspace_routed,
             evidence_kind,
             followed_by_retype,
@@ -1403,7 +1710,9 @@ impl Episode {
 
     fn as_input_episode(&self) -> ResearchInputEpisode {
         let (kind, code, text, rank) = match &self.outcome {
-            EpisodeOutcome::CandidateCommit { code, text, rank } => (
+            EpisodeOutcome::CandidateCommit {
+                code, text, rank, ..
+            } => (
                 ResearchWishEpisodeKind::CandidateCommit,
                 code.clone(),
                 Some(text.clone()),
@@ -1716,10 +2025,11 @@ mod tests {
     use super::*;
     use crate::{
         FrozenNativeFeedbackSnapshot, NativeAutomaticTranspositionDecision,
-        NativeAutomaticTranspositionTier, NativeCandidateProvenance, NativeCandidateSource,
+        NativeAutomaticTranspositionTier, NativeCandidatePersonalization,
+        NativeCandidateProvenance, NativeCandidateRankingMovement, NativeCandidateSource,
         NativeCandidateView, NativeFeedbackFreezeAuthorization, NativeFeedbackSession,
-        NativePersonalPhraseAdjacency, NativeSelectionSource, WishCaptureScope, WishCategory,
-        WishJournalAnchor, WishJournalSpan,
+        NativePersonalPhraseAdjacency, NativeSelectionSource, NativeTabAssemblyState,
+        WishCaptureScope, WishCategory, WishJournalAnchor, WishJournalSpan,
     };
 
     fn snapshot(
@@ -2518,5 +2828,248 @@ mod tests {
                 .iter()
                 .all(|episode| !episode.followed_by_retype())
         );
+    }
+
+    #[test]
+    fn wish_evidence_cards_retain_paging_tab_and_personalization_provenance() {
+        let stream = "6b".repeat(32);
+        let personal = NativeCandidateProvenance::with_personalization_ranking_and_movement(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+            NativeCandidateRankingMovement::MovedFrom { absolute_rank: 7 },
+        )
+        .unwrap();
+        let shape_provenance =
+            || NativeCandidateProvenance::new(NativeCandidateSource::Shape, false);
+        let research = snapshot(
+            &stream,
+            0,
+            0,
+            None,
+            vec![
+                (
+                    10,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "ab".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: 0,
+                        candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                        provenance: vec![
+                            NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
+                            personal,
+                        ],
+                        automatic_transposition: None,
+                        loaded_candidates: 2,
+                        tab_assembly: None,
+                        may_have_more: false,
+                    },
+                ),
+                (11, committed_at_rank("ab", "乙", 2)),
+                (
+                    20,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "qthplmj".to_owned(),
+                        view: NativeCandidateView::Shape,
+                        page_start: 0,
+                        candidates: ["一", "二", "三", "四", "五", "六"]
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        provenance: vec![shape_provenance(); RECORDED_CANDIDATE_PAGE_SIZE],
+                        automatic_transposition: None,
+                        loaded_candidates: 7,
+                        tab_assembly: Some(NativeTabAssemblyState::new(4, 4, "")),
+                        may_have_more: true,
+                    },
+                ),
+                (
+                    21,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "qthplmj".to_owned(),
+                        view: NativeCandidateView::Shape,
+                        page_start: RECORDED_CANDIDATE_PAGE_SIZE,
+                        candidates: vec!["件".to_owned()],
+                        provenance: vec![shape_provenance()],
+                        automatic_transposition: None,
+                        loaded_candidates: 7,
+                        tab_assembly: Some(NativeTabAssemblyState::new(4, 4, "h")),
+                        may_have_more: false,
+                    },
+                ),
+                (
+                    22,
+                    NativeFeedbackEvent::CandidateCommitted {
+                        code: "qthplmj".to_owned(),
+                        text: "件".to_owned(),
+                        view: NativeCandidateView::Shape,
+                        source: NativeSelectionSource::FirstCandidate,
+                        absolute_rank: 7,
+                        visible_rank: 1,
+                    },
+                ),
+                (
+                    30,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "cd".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: RECORDED_CANDIDATE_PAGE_SIZE,
+                        candidates: vec!["错位".to_owned()],
+                        provenance: vec![NativeCandidateProvenance::new(
+                            NativeCandidateSource::Decoder,
+                            false,
+                        )],
+                        automatic_transposition: None,
+                        loaded_candidates: 7,
+                        tab_assembly: None,
+                        may_have_more: false,
+                    },
+                ),
+                (
+                    31,
+                    NativeFeedbackEvent::CandidateCommitted {
+                        code: "cd".to_owned(),
+                        text: "目标".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        source: NativeSelectionSource::Numeric,
+                        absolute_rank: 7,
+                        visible_rank: 1,
+                    },
+                ),
+                (
+                    40,
+                    NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                        code: "ef".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        page_start: RECORDED_CANDIDATE_PAGE_SIZE,
+                        candidates: vec!["仅第七名".to_owned()],
+                        provenance: vec![NativeCandidateProvenance::new(
+                            NativeCandidateSource::Decoder,
+                            false,
+                        )],
+                        automatic_transposition: None,
+                        loaded_candidates: 7,
+                        tab_assembly: None,
+                        may_have_more: false,
+                    },
+                ),
+                (
+                    41,
+                    NativeFeedbackEvent::CandidateCommitted {
+                        code: "ef".to_owned(),
+                        text: "缺页目标".to_owned(),
+                        view: NativeCandidateView::Ordinary,
+                        source: NativeSelectionSource::Numeric,
+                        absolute_rank: 8,
+                        visible_rank: 2,
+                    },
+                ),
+            ],
+        );
+        let mut feedback = NativeFeedbackSession::default();
+        feedback.start_memory(
+            crate::NativeFeedbackAuthorization::explicit_memory_only(),
+            crate::NativeFeedbackLimits::default(),
+        );
+        feedback.record_at(
+            crate::NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "xuy".to_owned(),
+            },
+            1,
+        );
+        let frozen = feedback
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                2,
+                10,
+                8,
+            )
+            .unwrap();
+        let wish = WishSnapshot::from_frozen_with_context(
+            &frozen,
+            WishCaptureScope::RecentWindow,
+            WishCategory::Ranking,
+            None,
+            Some(WishJournalContext::WishAnchor(
+                WishJournalAnchor::new(stream, 8).unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let report = analyze_linked_research(&[research], &[wish]).unwrap();
+        let episodes = report.wish_contexts()[0].episodes();
+        assert_eq!(episodes.len(), 4);
+
+        let ordinary = &episodes[0];
+        assert_eq!(
+            ordinary.candidate_view(),
+            Some(NativeCandidateView::Ordinary)
+        );
+        assert_eq!(
+            ordinary.selection_source(),
+            Some(NativeSelectionSource::Numeric)
+        );
+        assert_eq!(
+            ordinary.evidence_kind(),
+            ResearchWishEvidenceKind::VisibleNonTopCandidate
+        );
+        let ordinary_evidence = ordinary.candidate_evidence().unwrap();
+        assert_eq!(ordinary_evidence.page_start(), 0);
+        assert_eq!(ordinary_evidence.loaded_candidates(), 2);
+        assert_eq!(
+            ordinary_evidence.text_evidence(),
+            ResearchWishCandidateTextEvidence::Verified
+        );
+        assert_eq!(ordinary_evidence.selected_provenance(), Some(personal));
+        assert!(ordinary_evidence.supports_precise_personalization());
+        assert!(ordinary_evidence.supports_precise_ranking_personalization());
+        assert!(ordinary_evidence.supports_precise_ranking_movement());
+
+        let tab = &episodes[1];
+        assert_eq!(tab.candidate_view(), Some(NativeCandidateView::Shape));
+        assert_eq!(
+            tab.selection_source(),
+            Some(NativeSelectionSource::FirstCandidate)
+        );
+        assert_eq!(tab.evidence_kind(), ResearchWishEvidenceKind::DeepCandidate);
+        let tab_evidence = tab.candidate_evidence().unwrap();
+        assert_eq!(tab_evidence.page_start(), RECORDED_CANDIDATE_PAGE_SIZE);
+        assert_eq!(tab_evidence.loaded_candidates(), 7);
+        assert!(!tab_evidence.may_have_more());
+        assert_eq!(
+            tab_evidence.text_evidence(),
+            ResearchWishCandidateTextEvidence::Verified
+        );
+        assert_eq!(
+            tab_evidence.selected_provenance().map(|item| item.source()),
+            Some(NativeCandidateSource::Shape)
+        );
+        assert_eq!(
+            tab_evidence
+                .global_top_provenance()
+                .map(|item| item.source()),
+            Some(NativeCandidateSource::Shape)
+        );
+        let tab_state = tab_evidence.tab_assembly().unwrap();
+        assert_eq!(tab_state.position(), 4);
+        assert_eq!(tab_state.total_characters(), 4);
+        assert_eq!(tab_state.shape_prefix(), "h");
+
+        let mismatched = episodes[2].candidate_evidence().unwrap();
+        assert_eq!(
+            mismatched.text_evidence(),
+            ResearchWishCandidateTextEvidence::Mismatched
+        );
+        assert_eq!(mismatched.selected_provenance(), None);
+        assert_eq!(mismatched.global_top_provenance(), None);
+
+        let unavailable = episodes[3].candidate_evidence().unwrap();
+        assert_eq!(
+            unavailable.text_evidence(),
+            ResearchWishCandidateTextEvidence::Unavailable
+        );
+        assert_eq!(unavailable.selected_provenance(), None);
+        assert_eq!(unavailable.global_top_provenance(), None);
     }
 }

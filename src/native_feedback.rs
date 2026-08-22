@@ -344,7 +344,7 @@ pub struct NativeTabAssemblyState {
 }
 
 impl NativeTabAssemblyState {
-    pub(crate) fn new(position: usize, total_characters: usize, stroke_prefix: &str) -> Self {
+    pub fn new(position: usize, total_characters: usize, stroke_prefix: &str) -> Self {
         Self {
             position,
             total_characters,

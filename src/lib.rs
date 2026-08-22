@@ -355,7 +355,8 @@ pub use research_analysis::{
     ResearchHabitClue, ResearchHabitKind, ResearchHalfPairAnalysis, ResearchInputEpisode,
     ResearchInputScene, ResearchRetypeClue, ResearchSceneAnalysis, ResearchSceneError,
     ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch,
-    ResearchSelectionConfirmationSequence, ResearchWishContext, ResearchWishEpisode,
+    ResearchSelectionConfirmationSequence, ResearchWishCandidateEvidence,
+    ResearchWishCandidateTextEvidence, ResearchWishContext, ResearchWishEpisode,
     ResearchWishEpisodeKind, ResearchWishEvidenceKind, analyze_linked_research,
     analyze_runtime_half_pairs,
 };
