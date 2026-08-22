@@ -9348,6 +9348,12 @@ impl PersonalRankingRuntime {
         self.snapshot.has_evidence(code, text)
     }
 
+    fn has_preferred_text(&self, code: &str) -> bool {
+        self.snapshot
+            .preferred_text_with_suppressions(code, &self.suppressions)
+            .is_some()
+    }
+
     fn has_anchored_suffix_evidence(
         &self,
         provider: &dyn CandidateProvider,
@@ -10182,7 +10188,20 @@ impl TsfTextService_Impl {
                     })
                     .unwrap_or(false)
             });
-        let load_limit = if contextual_search {
+        let exact_personal_search = view == InteractiveCandidateView::Primary
+            && automatic_transposition_request.is_none()
+            && self
+                .personal_ranking
+                .try_borrow()
+                .ok()
+                .zip(self.selection_memory.try_borrow().ok())
+                .is_some_and(|(ranking, memory)| {
+                    ranking.has_preferred_text(code)
+                        || memory
+                            .remembered_text(code)
+                            .is_some_and(|text| !ranking.is_suppressed(code, text))
+                });
+        let load_limit = if contextual_search || exact_personal_search {
             limit.max(PERSONAL_CONTEXT_SEARCH_DEPTH)
         } else {
             limit
@@ -24194,6 +24213,138 @@ mod tests {
             &third.personalized[..second.personalized.len()],
             second.personalized.as_slice()
         );
+    }
+
+    #[test]
+    fn remembered_second_page_exact_short_candidate_is_ready_on_the_first_page() {
+        let _guard = test_lock();
+        let provider = Arc::new(ExactShortPagingCandidateProvider::new());
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            provider.clone(),
+        )));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ubuu", "收束");
+
+        let first = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(first.candidates.len(), CANDIDATE_PAGE_SIZE);
+        assert_eq!(first.candidates[0], "收束");
+        assert_eq!(
+            first.provenance[0].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        assert!(
+            first.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::SESSION_EXACT)
+        );
+        assert!(first.personalized[0]);
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 1);
+
+        let second = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE * 2,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            &second.candidates[..first.candidates.len()],
+            first.candidates.as_slice()
+        );
+        assert_eq!(
+            &second.provenance[..first.provenance.len()],
+            first.provenance.as_slice()
+        );
+        assert_eq!(
+            &second.personalized[..first.personalized.len()],
+            first.personalized.as_slice()
+        );
+        assert_eq!(
+            second.candidates.iter().collect::<HashSet<_>>().len(),
+            second.candidates.len(),
+            "bounded personal prefetch must not duplicate page identities"
+        );
+    }
+
+    #[test]
+    fn confirmed_second_page_exact_short_candidate_uses_the_same_bounded_prefetch() {
+        let _guard = test_lock();
+        let provider = Arc::new(ExactShortPagingCandidateProvider::new());
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            provider.clone(),
+        )));
+        assert!(service.personal_ranking.borrow_mut().record("ubuu", "收束"));
+
+        let first = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(first.candidates[0], "收束");
+        assert_eq!(
+            first.provenance[0].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        assert!(
+            first.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn suppressed_exact_preference_does_not_trigger_personal_prefetch() {
+        let _guard = test_lock();
+        let provider = Arc::new(ExactShortPagingCandidateProvider::new());
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            provider.clone(),
+        )));
+        assert!(service.personal_ranking.borrow_mut().record("ubuu", "收束"));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ubuu", "收束");
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .append_suppression_action(
+                    PersonalRankingSuppressionActionKind::Suppress,
+                    "ubuu",
+                    "收束",
+                )
+        );
+
+        let first = service
+            .load_candidate_batch(
+                provider.as_ref(),
+                "ubuu",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(
+            first.candidates,
+            ExactShortPagingCandidateProvider::primary_candidates(CANDIDATE_PAGE_SIZE)
+        );
+        assert!(!first.candidates.iter().any(|candidate| candidate == "收束"));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.layer_requests.load(Ordering::Relaxed), 0);
     }
 
     #[test]
