@@ -20578,6 +20578,106 @@ mod tests {
     }
 
     #[test]
+    fn seven_key_tab_path_resolves_three_complete_slots_and_one_trailing_initial() {
+        let _guard = test_lock();
+        assert_eq!(
+            tab_phonetic_segments("qthplmj"),
+            Some(vec!["qt", "hp", "lm", "j"])
+        );
+
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ShapeCandidateProvider,
+        ))));
+        service
+            .composition
+            .borrow_mut()
+            .apply(CompositionInput::Letters("qthplmj".to_owned()));
+
+        let enter = service
+            .plan_key(WPARAM(usize::from(VK_TAB.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the longest odd Tab path should enter staged lookup");
+        assert!(enter.after.tab_assembly_has_trailing_initial());
+        assert_eq!(
+            candidate_popup_mode_label(enter.candidate_display.as_ref().unwrap()),
+            Some("找第 1 字 · qt · 形码 —")
+        );
+        *service.composition.borrow_mut() = enter.after;
+
+        for (expected_stage, expected_label) in [
+            (TabAssemblyStage::Second, "雀 → 第 2 字 · hp · 形码 —"),
+            (TabAssemblyStage::Later(3), "雀魂 → 第 3 字 · lm · 形码 —"),
+            (
+                TabAssemblyStage::Later(4),
+                "雀魂练 → 第 4 字 · j·声母 · 形码 —",
+            ),
+        ] {
+            let advance = service
+                .plan_key(WPARAM(usize::from(VK_1.0 + 2)), KeyModifiers::default())
+                .unwrap()
+                .expect("each complete slot should advance exactly one stage");
+            assert!(advance.edit.is_none());
+            assert!(advance.selection_to_remember.is_none());
+            assert_eq!(advance.after.tab_assembly_stage(), Some(expected_stage));
+            assert_eq!(
+                candidate_popup_mode_label(advance.candidate_display.as_ref().unwrap()),
+                Some(expected_label)
+            );
+            *service.composition.borrow_mut() = advance.after;
+        }
+
+        let refine = service
+            .plan_key(
+                WPARAM(usize::from(VK_A.0 + u16::from(b'h' - b'a'))),
+                KeyModifiers::default(),
+            )
+            .unwrap()
+            .expect("the trailing initial should retain ordinary shape refinement");
+        assert_eq!(refine.candidate_display.as_ref().unwrap().visible(), ["件"]);
+        assert_eq!(
+            candidate_popup_mode_label(refine.candidate_display.as_ref().unwrap()),
+            Some("雀魂练 → 第 4 字 · j·声母 · 笔画 横")
+        );
+        *service.composition.borrow_mut() = refine.after;
+
+        let complete = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("the verified trailing-initial choice should complete the word");
+        assert!(matches!(
+            complete.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "雀魂练件"
+        ));
+        let learned = complete
+            .selection_to_remember
+            .expect("the complete odd path should remain eligible for exact-code recall");
+        assert_eq!(learned.code, "qthplmj");
+        assert_eq!(learned.text, "雀魂练件");
+        assert!(learned.retractable_by_immediate_backspace);
+        assert!(matches!(
+            complete.feedback_after_success,
+            Some(NativeFeedbackEvent::CandidateCommitted {
+                code,
+                text,
+                view: NativeCandidateView::Shape,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 1,
+                visible_rank: 1,
+            }) if code == "qthplmj" && text == "雀魂练件"
+        ));
+        assert!(complete.after.phonetic().is_empty());
+        assert!(!complete.after.tab_mode());
+
+        service
+            .remember_selection_after_success_in_context(learned, NativeFeedbackContext::Eligible);
+        assert_eq!(
+            service.selection_memory.borrow().remembered_text("qthplmj"),
+            Some("雀魂练件"),
+            "the original seven-key input must remain the immediate recall key"
+        );
+    }
+
+    #[test]
     fn immediate_backspace_retracts_an_unconfirmed_tab_assembled_word() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
@@ -23965,6 +24065,69 @@ mod tests {
             InteractiveCandidateView::TranspositionRecovery
         );
         assert_eq!(provider.calls.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn maximum_length_composition_decodes_once_per_distinct_frontier_and_reuses_commit() {
+        let _guard = test_lock();
+        let provider = Arc::new(CountingCandidateProvider {
+            calls: AtomicUsize::new(0),
+            total: CANDIDATE_PAGE_SIZE,
+        });
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            provider.clone(),
+        )));
+        let mut previous_candidates = None;
+
+        for length in 1..=64 {
+            let plan = service
+                .plan_key(WPARAM(usize::from(VK_A.0)), KeyModifiers::default())
+                .unwrap()
+                .expect("each in-range letter should extend the active composition");
+            assert_eq!(plan.after.phonetic().len(), length);
+            let candidates = plan
+                .candidate_display
+                .as_ref()
+                .expect("each distinct prefix should expose its candidate frontier")
+                .candidates
+                .clone();
+            if let Some(previous) = previous_candidates.as_ref() {
+                assert_eq!(
+                    &candidates, previous,
+                    "a provider-stable frontier must not be reordered as the code grows"
+                );
+            }
+            previous_candidates = Some(candidates);
+            *service.composition.borrow_mut() = plan.after;
+        }
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 64);
+
+        let capped = service
+            .plan_key(WPARAM(usize::from(VK_A.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("an over-limit letter should remain consumed by the active composition");
+        assert_eq!(capped.after.phonetic().len(), 64);
+        assert_eq!(capped.after.notice(), Some("本轮最多输入 64 个字母"));
+        assert_eq!(
+            provider.calls.load(Ordering::Relaxed),
+            64,
+            "the unchanged capped query should reuse the deepest cached frontier"
+        );
+        *service.composition.borrow_mut() = capped.after;
+
+        let commit = service
+            .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+            .unwrap()
+            .expect("Space should commit the cached first candidate");
+        assert!(matches!(
+            commit.edit,
+            Some(PendingDocumentEdit::Commit(ref text)) if text == "候选1"
+        ));
+        assert_eq!(
+            provider.calls.load(Ordering::Relaxed),
+            64,
+            "commit must consume the displayed frontier instead of decoding it again"
+        );
     }
 
     #[test]
