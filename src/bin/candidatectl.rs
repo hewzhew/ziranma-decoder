@@ -29,31 +29,32 @@ use ziranma_core::{
     CandidateExactShortState, CandidatePackageManifest, CandidatePackageProvenance,
     CandidateReleaseSignature, CandidateSlotState, CandidateSnapshot, CandidateSnapshotDescriptor,
     CandidateSourceMaterial, CandidateSupplementalState, CharacterBigramLanguageModel,
-    ContinuousCompositionProbe, Decoder, DecoderIndexStats, ExactShortWordCatalog,
-    FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason, LexiconEntry,
-    MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
-    MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES,
-    MAX_CANDIDATE_PROVENANCE_BYTES, MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES,
-    MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES,
-    MAX_CANDIDATE_SNAPSHOT_RANK, MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES,
-    MAX_EXACT_SHORT_WORDS_PER_CODE, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES,
-    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES, MAX_PUBLIC_RIME_SLICE_ENTRIES,
-    MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES, MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS,
-    MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH, MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES,
-    MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES, PublicLexiconRankProbe,
-    PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig, PublicRimeSliceImportStats,
-    PublicSupplementalCompositionProbe, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
-    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SentenceCandidate, SupplementalCandidateLayerConfig,
-    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
-    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_rime_target,
-    audit_public_supplemental_layer, candidate_package_authentication_sha256,
-    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
-    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    ContinuousCompositionProbe, Decoder, DecoderIndexStats, ExactShortPageSession,
+    ExactShortWordCatalog, FourCharacterCorrectionDecision, FourCharacterCorrectionKeepReason,
+    LexiconEntry, MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES,
+    MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES, MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES,
+    MAX_CANDIDATE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
+    MAX_CANDIDATE_RELEASE_SIGNATURE_BYTES, MAX_CANDIDATE_SLOT_STATE_BYTES,
+    MAX_CANDIDATE_SNAPSHOT_BYTES, MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
+    MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, MAX_EXACT_SHORT_WORDS_PER_CODE,
+    MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_BYTES, MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES,
+    MAX_PUBLIC_RIME_SLICE_ENTRIES, MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    MAX_PUBLIC_RIME_SLICE_TEXT_CHARACTERS, MAX_PUBLIC_RIME_TWO_CHARACTER_COVERAGE_DEPTH,
+    MAX_PUBLIC_SHORT_WORD_CONFIRMATION_BYTES, MAX_PUBLIC_SHORT_WORD_CONSENSUS_ENTRIES,
+    PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
+    PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
+    SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
+    SentenceCandidate, SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
+    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
+    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
+    candidate_package_authentication_sha256, candidate_package_storage_id,
+    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
+    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
-    load_candidate_runtime_snapshots, load_candidate_runtime_snapshots_with_layers,
-    load_current_candidate_snapshot, parse_lexicon_tsv, parse_public_rime_phrase_allowlist,
-    parse_public_rime_slice, parse_public_short_word_consensus, parse_rime_lexicon,
-    parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
+    load_candidate_runtime_snapshots_with_layers, load_current_candidate_snapshot,
+    parse_lexicon_tsv, parse_public_rime_phrase_allowlist, parse_public_rime_slice,
+    parse_public_short_word_consensus, parse_rime_lexicon, parse_simplified_rime_lexicon,
+    parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_character_training_texts, select_public_continuous_composition_cases,
     select_public_lexicon_rank_probes, select_public_single_character_context_cases,
     select_public_static_context_cases, select_public_supplemental_composition_cases,
@@ -72,6 +73,10 @@ const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
 const MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STATIC_CONTEXT_ARPA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_STATIC_CONTEXT_ARPA_LINE_BYTES: usize = 1024 * 1024;
+// Keep the portable diagnostic aligned with the Windows host's fixed page
+// width. The CLI is also built on non-Windows CI, where the TSF constant is
+// intentionally unavailable.
+const RUNTIME_QUERY_PAGE_SIZE: usize = 6;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Options {
@@ -324,6 +329,7 @@ enum Options {
     RuntimeQuery {
         root: PathBuf,
         supplemental_root: Option<PathBuf>,
+        exact_short_root: Option<PathBuf>,
         code: String,
         limit: usize,
     },
@@ -808,9 +814,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Options::RuntimeQuery {
             root,
             supplemental_root,
+            exact_short_root,
             code,
             limit,
-        } => runtime_query(&root, supplemental_root.as_deref(), &code, limit)?,
+        } => runtime_query(
+            &root,
+            supplemental_root.as_deref(),
+            exact_short_root.as_deref(),
+            &code,
+            limit,
+        )?,
         Options::Adopt {
             root,
             package,
@@ -2035,6 +2048,7 @@ fn parse_runtime_query(
 ) -> Result<Options, Box<dyn std::error::Error>> {
     let mut root = None;
     let mut supplemental_root = None;
+    let mut exact_short_root = None;
     let mut code = None;
     let mut limit = None;
     while let Some(argument) = arguments.next() {
@@ -2045,6 +2059,9 @@ fn parse_runtime_query(
                 &mut arguments,
                 "--supplemental-root",
             )?,
+            "--exact-short-root" => {
+                set_path(&mut exact_short_root, &mut arguments, "--exact-short-root")?
+            }
             "--code" => set_value(&mut code, &mut arguments, "--code")?,
             "--limit" => set_usize(&mut limit, &mut arguments, "--limit")?,
             _ => return Err("unknown runtime-query argument; value was suppressed".into()),
@@ -2061,6 +2078,7 @@ fn parse_runtime_query(
     Ok(Options::RuntimeQuery {
         root: root.ok_or("runtime-query requires --root")?,
         supplemental_root,
+        exact_short_root,
         code,
         limit,
     })
@@ -3021,7 +3039,7 @@ fn print_usage() {
     eprintln!("  status --root <SLOT_DIR>");
     eprintln!("  runtime-check --root <SLOT_DIR>");
     eprintln!(
-        "  runtime-query --root <SLOT_DIR> [--supplemental-root <SUPPLEMENTAL_SLOT_DIR>] --code <LOWERCASE_KEYS> --limit <1..50>"
+        "  runtime-query --root <SLOT_DIR> [--supplemental-root <SUPPLEMENTAL_SLOT_DIR>] [--exact-short-root <EXACT_SHORT_SLOT_DIR>] --code <LOWERCASE_KEYS> --limit <1..50>"
     );
     eprintln!("  adopt|stage --root <SLOT_DIR> --package <PACKAGE_DIR> --expected-sha256 <SHA256>");
     eprintln!(
@@ -10341,49 +10359,107 @@ fn runtime_check(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
 fn runtime_query(
     root: &Path,
     supplemental_root: Option<&Path>,
+    exact_short_root: Option<&Path>,
     code: &str,
     limit: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let runtime = load_candidate_runtime_snapshots(root, supplemental_root)?
-        .ok_or("candidate runtime root is not configured")?;
-    let (mut candidates, supplemental_revision) = match runtime.supplemental() {
-        Some(supplemental) => (
-            // Keep this diagnostic aligned with TSF's gated runtime path.
-            layered_candidate_texts(
-                runtime.core(),
-                supplemental.snapshot(),
+    let runtime =
+        load_candidate_runtime_snapshots_with_layers(root, supplemental_root, exact_short_root)?
+            .ok_or("candidate runtime root is not configured")?;
+    let primary_candidates = |query_limit| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut candidates = match runtime.supplemental() {
+            Some(supplemental) => {
+                // Keep this diagnostic aligned with TSF's gated runtime path.
+                layered_candidate_texts(
+                    runtime.core(),
+                    supplemental.snapshot(),
+                    code,
+                    query_limit,
+                    supplemental.config(),
+                )?
+            }
+            None => runtime.core().candidate_texts(code, query_limit)?,
+        };
+        if query_limit >= 2
+            && !candidates.is_empty()
+            && let FourCharacterCorrectionDecision::Offer(offer) =
+                layered_four_character_correction_decision(
+                    runtime.core(),
+                    runtime
+                        .supplemental()
+                        .map(|supplemental| supplemental.snapshot().as_ref()),
+                    code,
+                    1,
+                )?
+            && let Some(recovered) = offer.candidates.into_iter().next()
+        {
+            let existing_index = candidates
+                .iter()
+                .position(|candidate| candidate == &recovered.text);
+            if existing_index != Some(0) {
+                if let Some(existing_index) = existing_index {
+                    candidates.remove(existing_index);
+                }
+                candidates.insert(1.min(candidates.len()), recovered.text);
+                candidates.truncate(query_limit);
+            }
+        }
+        Ok(candidates)
+    };
+
+    let mut exact_inserted = Vec::new();
+    let candidates = if let Some(exact_short) = runtime.exact_short()
+        && code.len() == 4
+        && limit > RUNTIME_QUERY_PAGE_SIZE
+    {
+        // Replay the same 6 -> 12 -> 18 ... lazy-depth sequence used by the
+        // host. Computing only the final depth can choose a different guarded
+        // insertion after an already presented second page has been frozen.
+        let mut session = ExactShortPageSession::default();
+        let mut requested_limit = RUNTIME_QUERY_PAGE_SIZE;
+        loop {
+            let primary = primary_candidates(requested_limit)?;
+            session.extend(
+                exact_short.catalog(),
+                &primary,
+                code,
+                requested_limit,
+                exact_short.exact_promotions(),
+                RUNTIME_QUERY_PAGE_SIZE,
+            )?;
+            if requested_limit == limit {
+                break;
+            }
+            requested_limit = requested_limit
+                .saturating_add(RUNTIME_QUERY_PAGE_SIZE)
+                .min(limit);
+        }
+        exact_inserted = session
+            .primary_indices()
+            .iter()
+            .map(Option::is_none)
+            .collect();
+        session
+            .extend(
+                exact_short.catalog(),
+                &primary_candidates(limit)?,
                 code,
                 limit,
-                supplemental.config(),
-            )?,
-            Some(supplemental.snapshot().revision()),
-        ),
-        None => (runtime.core().candidate_texts(code, limit)?, None),
-    };
-    if limit >= 2
-        && !candidates.is_empty()
-        && let FourCharacterCorrectionDecision::Offer(offer) =
-            layered_four_character_correction_decision(
-                runtime.core(),
-                runtime
-                    .supplemental()
-                    .map(|supplemental| supplemental.snapshot().as_ref()),
-                code,
-                1,
+                exact_short.exact_promotions(),
+                RUNTIME_QUERY_PAGE_SIZE,
             )?
-        && let Some(recovered) = offer.candidates.into_iter().next()
-    {
-        let existing_index = candidates
-            .iter()
-            .position(|candidate| candidate == &recovered.text);
-        if existing_index != Some(0) {
-            if let Some(existing_index) = existing_index {
-                candidates.remove(existing_index);
-            }
-            candidates.insert(1.min(candidates.len()), recovered.text);
-            candidates.truncate(limit);
-        }
-    }
+            .to_vec()
+    } else {
+        primary_candidates(limit)?
+    };
+    exact_inserted.resize(candidates.len(), false);
+
+    let supplemental_revision = runtime
+        .supplemental()
+        .map(|supplemental| supplemental.snapshot().revision());
+    let exact_short_revision = runtime
+        .exact_short()
+        .map(|exact_short| exact_short.catalog().revision());
     let mut output = String::new();
     writeln!(output, "TSF 公共候选管线审计").unwrap();
     writeln!(output, "核心版本：{}", runtime.core().revision()).unwrap();
@@ -10397,16 +10473,31 @@ fn runtime_query(
         })
     )
     .unwrap();
+    writeln!(
+        output,
+        "精确短词版本：{}",
+        exact_short_revision.unwrap_or(if runtime.exact_short_fell_back() {
+            "加载失败，已回退"
+        } else {
+            "未启用"
+        })
+    )
+    .unwrap();
     writeln!(output, "输入：{code}").unwrap();
     for (index, candidate) in candidates.iter().enumerate() {
-        writeln!(output, "{}. {}", index + 1, candidate).unwrap();
+        let source = if exact_inserted[index] {
+            " 〔公开精确短词〕"
+        } else {
+            ""
+        };
+        writeln!(output, "{}. {}{source}", index + 1, candidate).unwrap();
     }
     if candidates.is_empty() {
         writeln!(output, "（没有候选）").unwrap();
     }
     writeln!(
         output,
-        "口径：与 TSF 相同的公开包分层；不含显式别名、项目覆盖、会话记忆、个人学习或上下文重排。"
+        "口径：按 TSF 的 6 项分页顺序重放公开核心、补充与精确短词层；不含显式别名、项目覆盖、会话记忆、个人学习或上下文重排。"
     )
     .unwrap();
     writeln!(output, "本次操作：只读").unwrap();
@@ -13639,6 +13730,8 @@ mod tests {
                 "slots".to_owned(),
                 "--supplemental-root".to_owned(),
                 "supplement".to_owned(),
+                "--exact-short-root".to_owned(),
+                "exact-short".to_owned(),
                 "--code".to_owned(),
                 "daigle".to_owned(),
                 "--limit".to_owned(),
@@ -13648,6 +13741,7 @@ mod tests {
             Options::RuntimeQuery {
                 root: PathBuf::from("slots"),
                 supplemental_root: Some(PathBuf::from("supplement")),
+                exact_short_root: Some(PathBuf::from("exact-short")),
                 code: "daigle".to_owned(),
                 limit: 6,
             }
@@ -15769,9 +15863,97 @@ ngram 1=3\n\n\
         .unwrap();
         supplement_enable(&supplemental_slots, 1).unwrap();
 
-        let report = runtime_query(&core_slots, Some(&supplemental_slots), "dago", 2).unwrap();
+        let report =
+            runtime_query(&core_slots, Some(&supplemental_slots), None, "dago", 2).unwrap();
         assert!(report.contains("1. 大国\n2. 打过\n"));
         assert!(!report.contains("1. 打过\n"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_query_replays_enabled_exact_short_pages_and_marks_insertions() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+手术\tshou shu\t1200\n\
+手书\tshou shu\t1100\n\
+收书\tshou shu\t1000\n\
+受书\tshou shu\t900\n\
+收数\tshou shu\t800\n\
+手数\tshou shu\t700\n\
+受数\tshou shu\t600\n\
+收树\tshou shu\t500\n\
+手树\tshou shu\t400\n\
+受树\tshou shu\t300\n\
+收输\tshou shu\t200\n\
+手输\tshou shu\t100\n";
+        const EXACT: &str = "text\tpinyin\tfrequency\n\
+收束\tshou shu\t90\n\
+首数\tshou shu\t80\n";
+
+        let root = temporary_test_root();
+        let core_source = root.join("core.tsv");
+        let exact_source = root.join("exact.tsv");
+        let core_package = root.join("core-package");
+        let exact_package = root.join("exact-package");
+        let core_slots = root.join("core-slots");
+        let exact_slots = root.join("exact-slots");
+        fs::create_dir(&root).unwrap();
+        fs::write(&core_source, CORE).unwrap();
+        fs::write(&exact_source, EXACT).unwrap();
+        build_public_package(
+            &core_source,
+            &core_package,
+            "runtime-exact-core-v1",
+            &test_declaration(CORE),
+        )
+        .unwrap();
+        build_public_package(
+            &exact_source,
+            &exact_package,
+            "runtime-exact-layer-v1",
+            &test_declaration(EXACT),
+        )
+        .unwrap();
+        adopt(&core_slots, &core_package, &package_sha256(&core_package)).unwrap();
+        adopt(
+            &exact_slots,
+            &exact_package,
+            &package_sha256(&exact_package),
+        )
+        .unwrap();
+
+        let core_state = read_slot_state(&core_slots).unwrap();
+        let core = load_installed_package(&core_slots, core_state.current().unwrap()).unwrap();
+        let exact_state = read_slot_state(&exact_slots).unwrap();
+        let exact_package_id = exact_state.current().unwrap();
+        let exact = load_installed_exact_short_package(&exact_slots, exact_package_id).unwrap();
+        write_exact_short_combined_preflight(
+            &exact_slots,
+            &CandidateExactShortPreflightReceipt::new(
+                exact_package_id,
+                &exact.authentication_sha256,
+                2,
+                &core.authentication_sha256,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        write_exact_short_state(
+            &exact_slots,
+            &CandidateExactShortState::enabled(exact_package_id, 2).unwrap(),
+        )
+        .unwrap();
+
+        let first_page = runtime_query(&core_slots, None, Some(&exact_slots), "ubuu", 6).unwrap();
+        assert!(first_page.contains("精确短词版本：runtime-exact-layer-v1"));
+        assert!(first_page.contains("6. 手数\n"));
+        assert!(!first_page.contains("收束"));
+
+        let second_page = runtime_query(&core_slots, None, Some(&exact_slots), "ubuu", 12).unwrap();
+        assert!(second_page.contains("6. 手数\n7. 收束 〔公开精确短词〕\n"));
+        assert!(second_page.contains("8. 首数 〔公开精确短词〕\n"));
+        assert!(second_page.contains("9. 受数\n"));
 
         fs::remove_dir_all(root).unwrap();
     }

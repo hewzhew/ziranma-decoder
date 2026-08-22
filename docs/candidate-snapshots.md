@@ -875,12 +875,16 @@ cargo run --release --bin candidatectl -- adopt `
 candidatectl runtime-query `
   --root .\target\release\candidate-data `
   --supplemental-root .\.local\tsf-alpha\user-data\public-supplement `
+  --exact-short-root .\.local\tsf-alpha\user-data\public-exact-short `
   --code dago `
   --limit 10
 ```
 
-它包含公开核心/补充分层和 TSF 冷启动共有词校准，但不伪装成完整实机现场：
-显式别名、项目覆盖、会话记忆、个人学习和左侧上下文均明确排除。
+它包含公开核心/补充分层、四字纠错和显式提供的精确短词层。精确短词会按
+TSF 固定六项页宽重放 `6 → 12 → 18 …` 的惰性扩页，新增身份带
+`〔公开精确短词〕` 标记；因此不会再把“主层第 12 名”误报成启用精确层后的真实
+展示位次。它仍不伪装成完整实机现场：显式别名、项目覆盖、会话记忆、个人学习
+和左侧上下文均明确排除。
 
 运行时只打开以下确定路径：`slots.zcs`、`packages/<current>/manifest.zcm`、
 `packages/<current>/provenance.zcp`、`packages/<current>/lexicon.tsv` 与
