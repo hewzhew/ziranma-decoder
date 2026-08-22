@@ -27,6 +27,7 @@ cargo.exe build --release --locked --offline ^
     --bin aliaspad ^
     --bin personalctl ^
     --bin researchctl ^
+    --bin typing-practice ^
     --bin wishctl ^
     --bin wishpad ^
     --bin ziranma-launcher

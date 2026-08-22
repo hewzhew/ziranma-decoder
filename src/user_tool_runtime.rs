@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 const SLOT_SCHEMA: &str = "ziranma-user-tools-slots-v1";
 const LEGACY_BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v1";
-const BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v2";
+const PREVIOUS_BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v2";
+const BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v3";
 const MAX_SLOT_BYTES: u64 = 512;
 const MAX_MANIFEST_BYTES: u64 = 4_096;
 
@@ -28,8 +29,7 @@ const LEGACY_TOOL_NAMES: [&str; 7] = [
     "wishpad",
 ];
 
-/// Exact executable set stored in newly published user-tool bundles.
-pub const MANAGED_USER_TOOL_NAMES: [&str; 8] = [
+const PREVIOUS_TOOL_NAMES: [&str; 8] = [
     "aliasctl",
     "aliaspad",
     "candidatectl",
@@ -40,10 +40,24 @@ pub const MANAGED_USER_TOOL_NAMES: [&str; 8] = [
     "ziranma-launcher",
 ];
 
+/// Exact executable set stored in newly published user-tool bundles.
+pub const MANAGED_USER_TOOL_NAMES: [&str; 9] = [
+    "aliasctl",
+    "aliaspad",
+    "candidatectl",
+    "personalctl",
+    "researchctl",
+    "typing-practice",
+    "wishctl",
+    "wishpad",
+    "ziranma-launcher",
+];
+
 /// GUI tools that the native desktop launcher is allowed to start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchableUserTool {
     AliasPad,
+    TypingPractice,
     WishPad,
 }
 
@@ -51,6 +65,7 @@ impl LaunchableUserTool {
     fn executable_name(self) -> &'static str {
         match self {
             Self::AliasPad => "aliaspad.exe",
+            Self::TypingPractice => "typing-practice.exe",
             Self::WishPad => "wishpad.exe",
         }
     }
@@ -166,6 +181,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<(String, String)>, UserToolRuntime
         .collect::<Vec<_>>();
     let names: &[&str] = match lines.first().copied() {
         Some(line) if line == format!("schema={BUNDLE_SCHEMA}") => &MANAGED_USER_TOOL_NAMES,
+        Some(line) if line == format!("schema={PREVIOUS_BUNDLE_SCHEMA}") => &PREVIOUS_TOOL_NAMES,
         Some(line) if line == format!("schema={LEGACY_BUNDLE_SCHEMA}") => &LEGACY_TOOL_NAMES,
         _ => return Err(UserToolRuntimeError::InvalidManifest),
     };
@@ -322,25 +338,38 @@ mod tests {
         }
     }
 
-    fn write_bundle(repository: &Path, legacy: bool) -> (String, PathBuf) {
+    #[derive(Clone, Copy)]
+    enum TestBundleVersion {
+        Legacy,
+        Previous,
+        Current,
+    }
+
+    impl TestBundleVersion {
+        fn schema(self) -> &'static str {
+            match self {
+                Self::Legacy => LEGACY_BUNDLE_SCHEMA,
+                Self::Previous => PREVIOUS_BUNDLE_SCHEMA,
+                Self::Current => BUNDLE_SCHEMA,
+            }
+        }
+
+        fn names(self) -> &'static [&'static str] {
+            match self {
+                Self::Legacy => &LEGACY_TOOL_NAMES,
+                Self::Previous => &PREVIOUS_TOOL_NAMES,
+                Self::Current => &MANAGED_USER_TOOL_NAMES,
+            }
+        }
+    }
+
+    fn write_bundle(repository: &Path, version: TestBundleVersion) -> (String, PathBuf) {
         let user_tools = repository.join(".local/tsf-alpha/user-tools");
         let builds = user_tools.join("builds");
         fs::create_dir_all(&builds).unwrap();
-        let names: &[&str] = if legacy {
-            &LEGACY_TOOL_NAMES
-        } else {
-            &MANAGED_USER_TOOL_NAMES
-        };
         let mut payloads = Vec::new();
-        let mut manifest = format!(
-            "schema={}\n",
-            if legacy {
-                LEGACY_BUNDLE_SCHEMA
-            } else {
-                BUNDLE_SCHEMA
-            }
-        );
-        for name in names {
+        let mut manifest = format!("schema={}\n", version.schema());
+        for name in version.names() {
             let payload = format!("synthetic {name}").into_bytes();
             manifest.push_str(&format!("tool.{name}.exe={}\n", sha256_hex(&payload)));
             payloads.push((*name, payload));
@@ -361,10 +390,14 @@ mod tests {
     }
 
     #[test]
-    fn resolves_launchable_tools_from_current_and_legacy_bundles() {
-        for legacy in [false, true] {
+    fn resolves_launchable_tools_from_current_and_older_bundles() {
+        for version in [
+            TestBundleVersion::Legacy,
+            TestBundleVersion::Previous,
+            TestBundleVersion::Current,
+        ] {
             let root = TestDirectory::new();
-            let (_, bundle) = write_bundle(&root.0, legacy);
+            let (_, bundle) = write_bundle(&root.0, version);
             assert_eq!(
                 resolve_current_user_tool(&root.0, LaunchableUserTool::WishPad).unwrap(),
                 bundle.join("wishpad.exe")
@@ -373,13 +406,19 @@ mod tests {
                 resolve_current_user_tool(&root.0, LaunchableUserTool::AliasPad).unwrap(),
                 bundle.join("aliaspad.exe")
             );
+            let practice = resolve_current_user_tool(&root.0, LaunchableUserTool::TypingPractice);
+            if matches!(version, TestBundleVersion::Current) {
+                assert_eq!(practice.unwrap(), bundle.join("typing-practice.exe"));
+            } else {
+                assert_eq!(practice, Err(UserToolRuntimeError::ToolUnavailable));
+            }
         }
     }
 
     #[test]
     fn rejects_noncanonical_slots_modified_tools_and_extra_entries() {
         let root = TestDirectory::new();
-        let (_, bundle) = write_bundle(&root.0, false);
+        let (_, bundle) = write_bundle(&root.0, TestBundleVersion::Current);
         fs::write(bundle.join("wishpad.exe"), b"modified").unwrap();
         assert_eq!(
             resolve_current_user_tool(&root.0, LaunchableUserTool::WishPad),
@@ -387,7 +426,7 @@ mod tests {
         );
 
         let root = TestDirectory::new();
-        let (_, bundle) = write_bundle(&root.0, false);
+        let (_, bundle) = write_bundle(&root.0, TestBundleVersion::Current);
         fs::write(bundle.join("extra.exe"), b"unexpected").unwrap();
         assert_eq!(
             resolve_current_user_tool(&root.0, LaunchableUserTool::WishPad),
@@ -395,7 +434,7 @@ mod tests {
         );
 
         let root = TestDirectory::new();
-        let (bundle_id, _) = write_bundle(&root.0, false);
+        let (bundle_id, _) = write_bundle(&root.0, TestBundleVersion::Current);
         fs::write(
             root.0.join(".local/tsf-alpha/user-tools/slots.zut"),
             format!("schema={SLOT_SCHEMA}\ncurrent={bundle_id}\nprevious=-\n"),

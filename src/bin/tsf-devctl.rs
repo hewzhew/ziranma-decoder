@@ -3143,6 +3143,7 @@ mod tests {
             "--bin aliaspad",
             "--bin personalctl",
             "--bin researchctl",
+            "--bin typing-practice",
             "--bin wishctl",
             "--bin wishpad",
             "--bin ziranma-launcher",
@@ -3241,6 +3242,7 @@ mod tests {
             "candidatectl",
             "personalctl",
             "researchctl",
+            "typing-practice",
             "wishctl",
             "wishpad",
             "ziranma-launcher",
@@ -3255,6 +3257,7 @@ mod tests {
         assert!(script.contains("'--target-dir', $cargoTarget"));
         assert!(script.contains("ziranma-user-tools-slots-v1"));
         assert!(script.contains("ziranma-user-tools-bundle-v2"));
+        assert!(script.contains("ziranma-user-tools-bundle-v3"));
         assert!(script.contains("Publish-DesktopLauncher -BundleId $bundleId"));
         assert!(script.contains("Potential reclaim:"));
         assert!(script.contains("No files were deleted"));
@@ -3279,6 +3282,7 @@ mod tests {
             "candidatectl",
             "personalctl",
             "researchctl",
+            "typing-practice",
             "wishctl",
             "wishpad",
         ] {
@@ -3297,6 +3301,7 @@ mod tests {
             "personal-ime.cmd",
             "prepare-exact-short.cmd",
             "research-ime.cmd",
+            "typing-practice.cmd",
             "wish-ime.cmd",
         ] {
             let contents = fs::read_to_string(repository.join(wrapper)).unwrap();
@@ -3315,6 +3320,11 @@ mod tests {
                 "for /f \"usebackq delims=\" %%P in (`call \"%resolver%\" {tool}`) do set \"{tool}=%%P\""
             )));
         }
+
+        let practice = fs::read_to_string(repository.join("typing-practice.cmd")).unwrap();
+        assert!(practice.contains("call \"%resolver%\" typing-practice"));
+        assert!(practice.contains("start \"\" \"%typing_practice%\""));
+        assert!(practice.contains("if not \"%~1\"==\"\" goto usage"));
     }
 
     #[test]

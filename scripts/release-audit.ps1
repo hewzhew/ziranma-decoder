@@ -356,6 +356,7 @@ $requiredFiles = @(
     'scripts/resolve-user-tool.cmd',
     'src/bin/aliasctl.rs',
     'src/bin/aliaspad.rs',
+    'src/bin/typing-practice.rs',
     'src/bin/ziranma-launcher.rs',
     'src/bin/tsf-devctl.rs',
     'src/bin/wishctl.rs',
@@ -365,7 +366,8 @@ $requiredFiles = @(
     'src/user_tool_runtime.rs',
     'src/wish_command.rs',
     'src/wish_feedback.rs',
-    'wish-ime.cmd'
+    'wish-ime.cmd',
+    'typing-practice.cmd'
 )
 foreach ($requiredFile in $requiredFiles) {
     Assert-RequiredFile -RelativePath $requiredFile -CandidateSet $candidateSet

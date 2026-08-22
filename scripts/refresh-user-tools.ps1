@@ -37,7 +37,8 @@ $desktopLauncherRoot = Join-Path $repositoryRoot '.local\tsf-alpha\desktop-launc
 $desktopLauncherPath = Join-Path $desktopLauncherRoot 'ziranma-launcher.exe'
 $schema = 'ziranma-user-tools-slots-v1'
 $legacyBundleSchema = 'ziranma-user-tools-bundle-v1'
-$bundleSchema = 'ziranma-user-tools-bundle-v2'
+$previousBundleSchema = 'ziranma-user-tools-bundle-v2'
+$bundleSchema = 'ziranma-user-tools-bundle-v3'
 $legacyToolNames = @(
     'aliasctl',
     'aliaspad',
@@ -47,12 +48,23 @@ $legacyToolNames = @(
     'wishctl',
     'wishpad'
 )
+$previousToolNames = @(
+    'aliasctl',
+    'aliaspad',
+    'candidatectl',
+    'personalctl',
+    'researchctl',
+    'wishctl',
+    'wishpad',
+    'ziranma-launcher'
+)
 $toolNames = @(
     'aliasctl',
     'aliaspad',
     'candidatectl',
     'personalctl',
     'researchctl',
+    'typing-practice',
     'wishctl',
     'wishpad',
     'ziranma-launcher'
@@ -175,6 +187,8 @@ function Assert-Bundle {
     $manifestSchema = $lines[0].TrimEnd("`r")
     if ($manifestSchema -eq "schema=$bundleSchema") {
         $manifestToolNames = @($toolNames)
+    } elseif ($manifestSchema -eq "schema=$previousBundleSchema") {
+        $manifestToolNames = @($previousToolNames)
     } elseif ($manifestSchema -eq "schema=$legacyBundleSchema") {
         $manifestToolNames = @($legacyToolNames)
     } else {
@@ -659,7 +673,7 @@ function Show-Status {
     if ($null -eq $state) {
         Write-Host 'Current: not published; launchers use target/release'
         Write-Host 'Previous: none'
-        Write-Host 'Tools: 8 managed tools'
+        Write-Host 'Tools: 9 managed tools'
     } else {
         Assert-Bundle -BundleId $state.Current
         if ($null -ne $state.Previous) {
@@ -806,7 +820,7 @@ try {
     Write-Host 'IME user tool refresh completed'
     Write-Host "Current: $(Short-Id -Value $bundleId) ($result)"
     Write-Host "Previous: $(Short-Id -Value $previous)"
-    Write-Host 'Tools: alias, candidate, personal, research, wish, and desktop launch management'
+    Write-Host 'Tools: alias, candidate, personal, research, typing practice, wish, and desktop launch management'
     Write-Host 'TSF DLL: unchanged'
     Write-Host 'Administrator: not required'
     Write-Host 'Existing tool processes: unchanged; reopen them when convenient'

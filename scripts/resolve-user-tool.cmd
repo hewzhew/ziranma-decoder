@@ -10,6 +10,7 @@ if /i "%tool%"=="aliaspad" goto tool_ok
 if /i "%tool%"=="candidatectl" goto tool_ok
 if /i "%tool%"=="personalctl" goto tool_ok
 if /i "%tool%"=="researchctl" goto tool_ok
+if /i "%tool%"=="typing-practice" goto tool_ok
 if /i "%tool%"=="wishctl" goto tool_ok
 if /i "%tool%"=="wishpad" goto tool_ok
 goto usage
