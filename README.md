@@ -113,6 +113,9 @@ cargo run --release -- candidate-lab mafmkm 3 --json
 # 端到端逐键实验：连续双拼、候选选择、退格与 Tab 单字辅助
 cargo run --release -- typing-lab
 
+# 原生练习区：只观察自己的文本框，结束后查看仅内存时间线
+cargo run --release --bin typing-practice
+
 # 固定公开 2～6 字双词短语的连续输入评测
 cargo run --release -- public-compose-evaluate
 
@@ -166,6 +169,13 @@ CLI 程序自身只读取编译进程序的公开演示数据或固定公开快�
 不写文件，也没有持久个人排序、光标移动、标点或系统输入框上屏。完整按键、
 重定向回退与停止边界见[端到端连续输入实验台](docs/typing-lab.md)。真实 TSF
 练习区、结构化标记和加密轨迹的分阶段方案见[打字练习实验室](docs/typing-practice-lab.md)。
+
+`typing-practice` 是下一层的原生 Windows 练习区。只有按下“开始本轮”后，
+它才记录自己文本框内的插入、删除、替换、UTF-16 光标范围和显式现场标记；
+练习区内可用 F2 原地标记，鼠标按钮则会把焦点送回练习区。
+结束后在同一窗口显示有界时间线。当前版本不监听其他窗口、不写文件、不联网，
+退出即清空，也不会把任何观察自动当成词典或个人学习证据。它先用于验证真实
+TSF 组合与普通文档编辑能否处在同一可定位事件流里。
 
 终端宿主已把当前组合状态抽成可复用的 `CompositionSession`；已提交文字仍由
 宿主自己拥有。这是[自有 Windows TSF Alpha](docs/tsf-alpha.md)的地基，
