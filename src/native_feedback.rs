@@ -641,6 +641,20 @@ pub enum NativeFeedbackEvent {
         previous_components: usize,
         resulting_components: usize,
     },
+    /// One exact selection crossed its immediate-Backspace boundary and was
+    /// recorded by the persistent ranking runtime.
+    ///
+    /// The two booleans deliberately separate stored evidence from the
+    /// preference that actually wins after bounded support comparison. The
+    /// code and text remain private like `CandidateCommitted` and are needed
+    /// to correlate confirmations that unusual hosts deliver at a later
+    /// selection boundary.
+    PersonalSelectionConfirmed {
+        code: String,
+        text: String,
+        persistent_preferred: bool,
+        session_retained: bool,
+    },
 }
 
 impl NativeFeedbackEvent {
@@ -748,6 +762,12 @@ impl NativeFeedbackEvent {
                 resulting_components,
                 ..
             } => (*previous_components <= 4 && (1..=4).contains(resulting_components)).then_some(0),
+            Self::PersonalSelectionConfirmed { code, text, .. } => {
+                if !valid_code(code) || !valid_text(text) {
+                    return None;
+                }
+                measure_private_strings([code.as_str(), text.as_str()].into_iter())
+            }
         }
     }
 
@@ -761,7 +781,10 @@ impl NativeFeedbackEvent {
     }
 
     pub(crate) fn follows_completed_input_episode(&self) -> bool {
-        matches!(self, Self::PersonalPhraseAdjacencyObserved { .. })
+        matches!(
+            self,
+            Self::PersonalPhraseAdjacencyObserved { .. } | Self::PersonalSelectionConfirmed { .. }
+        )
     }
 }
 
@@ -1398,6 +1421,7 @@ impl NativeFeedbackSession {
                 NativeFeedbackEvent::PostCommitBackspaceRouted => {}
                 NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {}
                 NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
+                NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
             }
         }
         summary
@@ -1454,6 +1478,7 @@ impl NativeFeedbackSession {
                 | NativeFeedbackEvent::SlowKeyPathTiming { .. }
                 | NativeFeedbackEvent::PostCommitBackspaceRouted
                 | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
+                | NativeFeedbackEvent::PersonalSelectionConfirmed { .. }
         ) {
             return;
         }
@@ -1594,7 +1619,8 @@ impl NativeFeedbackSession {
             NativeFeedbackEvent::CandidatePopupTiming { .. }
             | NativeFeedbackEvent::SlowKeyPathTiming { .. }
             | NativeFeedbackEvent::PostCommitBackspaceRouted
-            | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
+            | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
+            | NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
         }
     }
 }
@@ -1808,6 +1834,43 @@ mod tests {
                 adjacency: NativePersonalPhraseAdjacency::VerifiedAdjacent,
                 previous_components: 4,
                 resulting_components: 5,
+            },
+        ] {
+            assert_eq!(invalid.validate_and_measure(), None);
+        }
+    }
+
+    #[test]
+    fn personal_selection_confirmation_is_private_and_identity_bounded() {
+        let event = NativeFeedbackEvent::PersonalSelectionConfirmed {
+            code: "ab".to_owned(),
+            text: "乙".to_owned(),
+            persistent_preferred: false,
+            session_retained: false,
+        };
+        assert_eq!(event.validate_and_measure(), Some("ab".len() + "乙".len()));
+        assert!(event.follows_completed_input_episode());
+
+        let mut session = NativeFeedbackSession::default();
+        start(&mut session, NativeFeedbackLimits::default());
+        assert_eq!(
+            record(&mut session, event),
+            NativeFeedbackRecordResult::Recorded
+        );
+        assert_eq!(session.summary().private_bytes, "ab".len() + "乙".len());
+
+        for invalid in [
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: String::new(),
+                text: "乙".to_owned(),
+                persistent_preferred: false,
+                session_retained: false,
+            },
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "ab".to_owned(),
+                text: String::new(),
+                persistent_preferred: true,
+                session_retained: true,
             },
         ] {
             assert_eq!(invalid.validate_and_measure(), None);

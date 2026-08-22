@@ -453,6 +453,22 @@ fn render_issue_triage(scope: &str, triage: &ResearchIssueTriage) -> String {
         triage.ranking.reranked_top_movement_unavailable,
     )
     .unwrap();
+    let confirmation_coverage = render_triage_capability(
+        "V19 个人选择确认字段",
+        triage.capabilities.personal_selection_confirmation_batches,
+        triage.coverage.batches,
+        "确认事件",
+        triage.personal_selection.confirmations,
+    );
+    writeln!(
+        output,
+        "个人选择确认：{confirmation_coverage}；成为持久首选 {}、已记录但尚未胜出 {}；会话选择保留 {}、未保留 {}。",
+        triage.personal_selection.persistent_preferred,
+        triage.personal_selection.persistent_not_preferred(),
+        triage.personal_selection.session_retained,
+        triage.personal_selection.session_not_retained(),
+    )
+    .unwrap();
     let shape_lookup_summary = if triage.recovery.shape_lookup_commits == 0 {
         "未观察到形码提交，逐字 Tab 辅助暂无分母".to_owned()
     } else {
@@ -1245,6 +1261,7 @@ struct ResearchReview {
     candidate_ranking_movement_capable_batches: usize,
     candidate_suppression_action_capable_batches: usize,
     personal_phrase_adjacency_capable_batches: usize,
+    personal_selection_confirmation_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
     public_candidate_order_policy_capable_batches: usize,
     public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
@@ -1255,6 +1272,9 @@ struct ResearchReview {
     candidate_suppression_actions: usize,
     candidate_restore_actions: usize,
     personal_phrase_adjacencies: [usize; PERSONAL_PHRASE_ADJACENCY_KIND_COUNT],
+    personal_selection_confirmations: usize,
+    personal_selection_persistent_preferred: usize,
+    personal_selection_session_retained: usize,
     runtime_batches: HashMap<WishRuntimeIdentity, usize>,
     unidentified_runtime_batches: usize,
     personalized_top_bypass: PersonalizedTopBypassAudit,
@@ -1283,6 +1303,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_candidate_suppression_actions());
         self.personal_phrase_adjacency_capable_batches +=
             usize::from(snapshot.supports_personal_phrase_adjacency());
+        self.personal_selection_confirmation_capable_batches +=
+            usize::from(snapshot.supports_personal_selection_confirmation());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
         self.public_candidate_order_policy_capable_batches +=
@@ -1496,6 +1518,16 @@ impl ResearchReview {
                     self.personal_phrase_adjacencies
                         [personal_phrase_adjacency_index(*adjacency)] += 1;
                 }
+                NativeFeedbackEvent::PersonalSelectionConfirmed {
+                    persistent_preferred,
+                    session_retained,
+                    ..
+                } => {
+                    self.personal_selection_confirmations += 1;
+                    self.personal_selection_persistent_preferred +=
+                        usize::from(*persistent_preferred);
+                    self.personal_selection_session_retained += usize::from(*session_retained);
+                }
             }
         }
         for observation in snapshot.automatic_transposition_observations()? {
@@ -1556,7 +1588,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；个人选择确认结果 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -1571,8 +1603,22 @@ impl ResearchReview {
             self.batches,
             self.personal_phrase_adjacency_capable_batches,
             self.batches,
+            self.personal_selection_confirmation_capable_batches,
+            self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "个人选择确认：已观察 {}；成为持久首选 {}，已记录但尚未胜出 {}；会话选择保留 {}，未保留 {}。V1–V18 不补猜。",
+            self.personal_selection_confirmations,
+            self.personal_selection_persistent_preferred,
+            self.personal_selection_confirmations
+                .saturating_sub(self.personal_selection_persistent_preferred),
+            self.personal_selection_session_retained,
+            self.personal_selection_confirmations
+                .saturating_sub(self.personal_selection_session_retained),
         )
         .unwrap();
         writeln!(
@@ -4396,6 +4442,18 @@ mod tests {
                 previous_components: 1,
                 resulting_components: 2,
             },
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "dago".to_owned(),
+                text: "打过".to_owned(),
+                persistent_preferred: false,
+                session_retained: false,
+            },
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "dago".to_owned(),
+                text: "打过".to_owned(),
+                persistent_preferred: true,
+                session_retained: true,
+            },
             NativeFeedbackEvent::CandidateSuppressionChanged {
                 code: "dago".to_owned(),
                 text: "打过".to_owned(),
@@ -4423,6 +4481,7 @@ mod tests {
                 total_ms: 18,
             },
         ];
+        let marker_ms = u64::try_from(events.len()).unwrap();
         for (index, event) in events.into_iter().enumerate() {
             assert_eq!(
                 session.record_at(
@@ -4436,7 +4495,7 @@ mod tests {
         let frozen = session
             .freeze_recent(
                 NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
-                10,
+                marker_ms,
                 30_000,
                 16,
             )
@@ -4460,6 +4519,9 @@ mod tests {
         assert_eq!(review.non_top_commits, 1);
         assert_eq!(review.candidate_suppression_actions, 1);
         assert_eq!(review.candidate_restore_actions, 1);
+        assert_eq!(review.personal_selection_confirmations, 2);
+        assert_eq!(review.personal_selection_persistent_preferred, 1);
+        assert_eq!(review.personal_selection_session_retained, 1);
         assert_eq!(
             review.personal_phrase_adjacencies
                 [personal_phrase_adjacency_index(NativePersonalPhraseAdjacency::VerifiedAdjacent,)],
@@ -4513,9 +4575,13 @@ mod tests {
         assert!(aggregate.contains("实际个人重排原因 1/1 批"));
         assert!(aggregate.contains("显式遗忘/恢复动作 1/1 批"));
         assert!(aggregate.contains("个人短语文档邻接 1/1 批"));
+        assert!(aggregate.contains("个人选择确认结果 1/1 批"));
         assert!(aggregate.contains("个人短语文档邻接：首锚点 0；已验证相邻 1；明确断链 0"));
+        assert!(aggregate.contains(
+            "个人选择确认：已观察 2；成为持久首选 1，已记录但尚未胜出 1；会话选择保留 1，未保留 1。V1–V18 不补猜"
+        ));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V18 1"));
+        assert!(aggregate.contains("反馈格式：V19 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"
@@ -4732,6 +4798,7 @@ mod tests {
                 candidate_suppression_action_batches: 2,
                 personal_phrase_adjacency_batches: 2,
                 candidate_ranking_movement_batches: 2,
+                personal_selection_confirmation_batches: 2,
             },
             reachability: ziranma_core::ResearchCandidateReachabilitySignals {
                 non_top_commits: 2,
@@ -4768,6 +4835,11 @@ mod tests {
                 anchor_text_changes: 1,
                 context_changes: 1,
                 range_unavailable: 1,
+            },
+            personal_selection: ziranma_core::ResearchPersonalSelectionSignals {
+                confirmations: 2,
+                persistent_preferred: 1,
+                session_retained: 1,
             },
             latency: ziranma_core::ResearchLatencySignals {
                 initial_popup_timings: 2,
@@ -4811,6 +4883,8 @@ mod tests {
         assert!(rendered.contains("V16 个人短语邻接字段：字段支持（2/2 批）"));
         assert!(rendered.contains("首锚点 1、已验证相邻 1、明确断链 3"));
         assert!(rendered.contains("范围不可用 1、键盘连续回退 1（合计 7/7）"));
+        assert!(rendered.contains("V19 个人选择确认字段：字段支持（2/2 批）"));
+        assert!(rendered.contains("成为持久首选 1、已记录但尚未胜出 1；会话选择保留 1、未保留 1"));
         assert!(rendered.contains("首次出现首帧慢样本 1/2"));
         assert!(rendered.contains("慢按键分段字段：字段支持（2/2 批）"));
         assert!(rendered.contains("候选提交可配对 4/5"));

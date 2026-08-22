@@ -8596,7 +8596,8 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::CandidateCommitted { code, .. }
         | NativeFeedbackEvent::RawCodeCommitted { code }
         | NativeFeedbackEvent::CompositionCancelled { code, .. }
-        | NativeFeedbackEvent::CandidateSuppressionChanged { code, .. } => Some(code),
+        | NativeFeedbackEvent::CandidateSuppressionChanged { code, .. }
+        | NativeFeedbackEvent::PersonalSelectionConfirmed { code, .. } => Some(code),
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::PostCommitBackspaceRouted
@@ -10610,6 +10611,21 @@ impl TsfTextService_Impl {
                 phrase.previous_session_text.as_deref(),
             );
         }
+        let session_retained = self
+            .selection_memory
+            .try_borrow()
+            .ok()
+            .and_then(|memory| {
+                memory
+                    .remembered_text(&pending.selection.code)
+                    .map(|text| text == pending.selection.text)
+            })
+            .unwrap_or(false);
+        self.record_personal_selection_confirmed(
+            &pending.selection,
+            selection_is_preferred,
+            session_retained,
+        );
         true
     }
 
@@ -10724,6 +10740,34 @@ impl TsfTextService_Impl {
                 adjacency: observation.adjacency.feedback_value(),
                 previous_components: observation.previous_components,
                 resulting_components: observation.resulting_components,
+            },
+            native_feedback_monotonic_ms(),
+        );
+        drop(feedback);
+        if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
+            self.native_feedback_language_bar_state.notify();
+        }
+    }
+
+    fn record_personal_selection_confirmed(
+        &self,
+        selection: &PlannedSelection,
+        persistent_preferred: bool,
+        session_retained: bool,
+    ) {
+        let Ok(mut feedback) = self.native_feedback.lock() else {
+            return;
+        };
+        if !feedback.is_accepting() {
+            return;
+        }
+        let result = feedback.record_at(
+            NativeFeedbackContext::Eligible,
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: selection.code.clone(),
+                text: selection.text.clone(),
+                persistent_preferred,
+                session_retained,
             },
             native_feedback_monotonic_ms(),
         );
@@ -17483,7 +17527,7 @@ mod tests {
         {
             let feedback = service_object.native_feedback.lock().unwrap();
             let events = feedback.events();
-            assert_eq!(events.len(), 9);
+            assert_eq!(events.len(), 10);
             assert!(matches!(
                 &events[0],
                 NativeFeedbackEvent::CandidatesPresentedWithProvenance {
@@ -17506,7 +17550,16 @@ mod tests {
                 } if code == "ab" && text == "乙"
             ));
             assert!(matches!(
-                &events[3],
+                &events[2],
+                NativeFeedbackEvent::PersonalSelectionConfirmed {
+                    code,
+                    text,
+                    persistent_preferred: true,
+                    session_retained: true,
+                } if code == "ab" && text == "乙"
+            ));
+            assert!(matches!(
+                &events[4],
                 NativeFeedbackEvent::CandidateCommitted {
                     source: NativeSelectionSource::FirstCandidate,
                     absolute_rank: 1,
@@ -17515,14 +17568,14 @@ mod tests {
                 }
             ));
             assert!(matches!(
-                &events[5],
+                &events[6],
                 NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                     view: NativeCandidateView::TranspositionRecovery,
                     ..
                 }
             ));
             assert!(matches!(
-                &events[6],
+                &events[7],
                 NativeFeedbackEvent::CandidateCommitted {
                     view: NativeCandidateView::TranspositionRecovery,
                     source: NativeSelectionSource::Numeric,
@@ -17530,14 +17583,14 @@ mod tests {
                 }
             ));
             assert!(matches!(
-                &events[7],
+                &events[8],
                 NativeFeedbackEvent::CompositionCancelled {
                     code,
                     source: NativeCancellationSource::Backspace,
                 } if code == "a"
             ));
             assert!(matches!(
-                &events[8],
+                &events[9],
                 NativeFeedbackEvent::CompositionCancelled {
                     code,
                     source: NativeCancellationSource::Escape,
@@ -17557,7 +17610,7 @@ mod tests {
             let summary = feedback.summary();
             assert_eq!(summary.lifecycle, crate::NativeFeedbackLifecycle::Stopped);
             assert!(summary.complete);
-            assert_eq!(summary.events, 9);
+            assert_eq!(summary.events, 10);
         }
         unsafe { thread_manager.Deactivate() }.expect("thread manager deactivation");
         drop(context);
@@ -23269,9 +23322,10 @@ mod tests {
     #[test]
     fn immediate_backspace_retracts_pending_personal_evidence_and_session_override() {
         let _guard = test_lock();
-        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
-            SelectionCandidateProvider,
-        ))));
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(SelectionCandidateProvider)),
+            NativeFeedbackLimits::default(),
+        ));
         service
             .native_feedback_context
             .lock()
@@ -23310,6 +23364,19 @@ mod tests {
                 .snapshot
                 .preferred_text("ab"),
             None
+        );
+        assert!(
+            !service
+                .native_feedback
+                .lock()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    NativeFeedbackEvent::PersonalSelectionConfirmed { .. }
+                )),
+            "an immediately retracted selection must not be reported as confirmed"
         );
         assert!(
             service
@@ -23439,9 +23506,10 @@ mod tests {
     #[test]
     fn a_following_key_confirms_pending_personal_evidence() {
         let _guard = test_lock();
-        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
-            SelectionCandidateProvider,
-        ))));
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(SelectionCandidateProvider)),
+            NativeFeedbackLimits::default(),
+        ));
         service
             .native_feedback_context
             .lock()
@@ -23468,14 +23536,24 @@ mod tests {
                 .preferred_text("ab"),
             Some("乙")
         );
+        assert!(matches!(
+            service.native_feedback.lock().unwrap().events().last(),
+            Some(NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code,
+                text,
+                persistent_preferred: true,
+                session_retained: true,
+            }) if code == "ab" && text == "乙"
+        ));
     }
 
     #[test]
     fn one_bypass_records_evidence_even_when_old_support_restores_the_session_preference() {
         let _guard = test_lock();
-        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
-            SelectionCandidateProvider,
-        ))));
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(SelectionCandidateProvider)),
+            NativeFeedbackLimits::default(),
+        ));
         service
             .native_feedback_context
             .lock()
@@ -23538,6 +23616,15 @@ mod tests {
                 .is_empty(),
             "a frame records only the applied preference, not every stored vote"
         );
+        assert!(matches!(
+            service.native_feedback.lock().unwrap().events().last(),
+            Some(NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code,
+                text,
+                persistent_preferred: false,
+                session_retained: false,
+            }) if code == "ab" && text == "乙"
+        ));
 
         service.remember_selection_after_success(PlannedSelection {
             code: "ab".to_owned(),
@@ -23558,14 +23645,24 @@ mod tests {
             service.selection_memory.borrow().remembered_text("ab"),
             Some("乙")
         );
+        assert!(matches!(
+            service.native_feedback.lock().unwrap().events().last(),
+            Some(NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code,
+                text,
+                persistent_preferred: true,
+                session_retained: true,
+            }) if code == "ab" && text == "乙"
+        ));
     }
 
     #[test]
     fn focus_loss_confirms_pending_personal_evidence() {
         let _guard = test_lock();
-        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
-            SelectionCandidateProvider,
-        ))));
+        let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
+            Some(Arc::new(SelectionCandidateProvider)),
+            NativeFeedbackLimits::default(),
+        ));
         service
             .native_feedback_context
             .lock()
@@ -23604,6 +23701,15 @@ mod tests {
                 .borrow()
                 .has_evidence("前", "ab")
         );
+        assert!(matches!(
+            service.native_feedback.lock().unwrap().events().last(),
+            Some(NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code,
+                text,
+                persistent_preferred: true,
+                session_retained: true,
+            }) if code == "ab" && text == "乙"
+        ));
     }
 
     #[test]

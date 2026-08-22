@@ -2735,6 +2735,26 @@ mod windows_app {
                 previous_components,
                 resulting_components
             ),
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code,
+                text,
+                persistent_preferred,
+                session_retained,
+            } => format!(
+                "个人选择确认　{} → {}（{}，{}）",
+                compact_text(code, 28),
+                compact_text(text, 40),
+                if *persistent_preferred {
+                    "已成为持久首选"
+                } else {
+                    "已记录但尚未胜出"
+                },
+                if *session_retained {
+                    "会话保留"
+                } else {
+                    "会话未保留"
+                }
+            ),
         }
     }
 
@@ -3580,6 +3600,28 @@ mod windows_app {
             assert_eq!(wish_importance_at(1), Some(WishImportance::Important));
             assert_eq!(wish_importance_at(2), None);
             assert_eq!(wish_importance_index(WishImportance::Important), 1);
+        }
+
+        #[test]
+        fn personal_selection_confirmation_summary_keeps_both_outcomes_visible() {
+            let recorded = event_summary(&NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "ab".to_owned(),
+                text: "乙".to_owned(),
+                persistent_preferred: false,
+                session_retained: true,
+            });
+            assert!(recorded.contains("个人选择确认"));
+            assert!(recorded.contains("已记录但尚未胜出"));
+            assert!(recorded.contains("会话保留"));
+
+            let preferred = event_summary(&NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "ab".to_owned(),
+                text: "乙".to_owned(),
+                persistent_preferred: true,
+                session_retained: false,
+            });
+            assert!(preferred.contains("已成为持久首选"));
+            assert!(preferred.contains("会话未保留"));
         }
 
         #[test]

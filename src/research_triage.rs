@@ -37,6 +37,7 @@ pub struct ResearchTriageCapabilityCoverage {
     pub candidate_suppression_action_batches: usize,
     pub personal_phrase_adjacency_batches: usize,
     pub candidate_ranking_movement_batches: usize,
+    pub personal_selection_confirmation_batches: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -113,6 +114,23 @@ pub struct ResearchPersonalPhraseSignals {
     pub anchor_text_changes: usize,
     pub context_changes: usize,
     pub range_unavailable: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResearchPersonalSelectionSignals {
+    pub confirmations: usize,
+    pub persistent_preferred: usize,
+    pub session_retained: usize,
+}
+
+impl ResearchPersonalSelectionSignals {
+    pub fn persistent_not_preferred(self) -> usize {
+        self.confirmations.saturating_sub(self.persistent_preferred)
+    }
+
+    pub fn session_not_retained(self) -> usize {
+        self.confirmations.saturating_sub(self.session_retained)
+    }
 }
 
 impl ResearchPersonalPhraseSignals {
@@ -233,6 +251,7 @@ pub struct ResearchIssueTriage {
     pub ranking: ResearchRankingSignals,
     pub recovery: ResearchRecoverySignals,
     pub personal_phrase: ResearchPersonalPhraseSignals,
+    pub personal_selection: ResearchPersonalSelectionSignals,
     pub latency: ResearchLatencySignals,
     pub display: ResearchCandidateDisplaySignals,
 }
@@ -349,6 +368,8 @@ fn analyze_research_issue_signals_from<'a>(
             usize::from(snapshot.supports_personal_phrase_adjacency());
         report.capabilities.candidate_ranking_movement_batches +=
             usize::from(snapshot.supports_candidate_ranking_movement());
+        report.capabilities.personal_selection_confirmation_batches +=
+            usize::from(snapshot.supports_personal_selection_confirmation());
         report.coverage.events += snapshot.events().len();
         report.coverage.omitted_events += snapshot
             .omitted_before_window()
@@ -559,6 +580,16 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                         report.personal_phrase.range_unavailable += 1;
                     }
                 }
+            }
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                persistent_preferred,
+                session_retained,
+                ..
+            } => {
+                report.personal_selection.confirmations += 1;
+                report.personal_selection.persistent_preferred +=
+                    usize::from(*persistent_preferred);
+                report.personal_selection.session_retained += usize::from(*session_retained);
             }
         }
     }
@@ -1173,6 +1204,18 @@ mod tests {
                 previous_components: 1,
                 resulting_components: 1,
             },
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "aa".to_owned(),
+                text: "甲".to_owned(),
+                persistent_preferred: false,
+                session_retained: false,
+            },
+            NativeFeedbackEvent::PersonalSelectionConfirmed {
+                code: "aa".to_owned(),
+                text: "甲".to_owned(),
+                persistent_preferred: true,
+                session_retained: true,
+            },
         ];
         let timed = events
             .into_iter()
@@ -1184,6 +1227,10 @@ mod tests {
         assert_eq!(report.capabilities.post_commit_backspace_batches, 1);
         assert_eq!(report.capabilities.candidate_suppression_action_batches, 1);
         assert_eq!(report.capabilities.personal_phrase_adjacency_batches, 1);
+        assert_eq!(
+            report.capabilities.personal_selection_confirmation_batches,
+            1
+        );
         assert_eq!(report.recovery.post_commit_backspaces_routed, 1);
         assert_eq!(report.recovery.candidate_suppressions, 1);
         assert_eq!(report.recovery.candidate_restores, 1);
@@ -1196,6 +1243,11 @@ mod tests {
         assert_eq!(report.personal_phrase.range_unavailable, 1);
         assert_eq!(report.personal_phrase.explicit_breaks(), 3);
         assert_eq!(report.personal_phrase.observations(), 7);
+        assert_eq!(report.personal_selection.confirmations, 2);
+        assert_eq!(report.personal_selection.persistent_preferred, 1);
+        assert_eq!(report.personal_selection.persistent_not_preferred(), 1);
+        assert_eq!(report.personal_selection.session_retained, 1);
+        assert_eq!(report.personal_selection.session_not_retained(), 1);
     }
 
     #[test]
@@ -1292,6 +1344,10 @@ mod tests {
         assert_eq!(report.capabilities.post_commit_backspace_batches, 2);
         assert_eq!(report.capabilities.candidate_suppression_action_batches, 2);
         assert_eq!(report.capabilities.personal_phrase_adjacency_batches, 2);
+        assert_eq!(
+            report.capabilities.personal_selection_confirmation_batches,
+            2
+        );
         assert_eq!(report.ranking.precise_personalization_non_top_commits, 3);
         assert_eq!(report.ranking.personalized_target_non_top_commits, 1);
         assert_eq!(report.ranking.unpersonalized_target_non_top_commits, 1);

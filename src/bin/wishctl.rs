@@ -658,6 +658,24 @@ fn print_event(event: &NativeFeedbackEvent) {
             previous_components,
             resulting_components
         ),
+        NativeFeedbackEvent::PersonalSelectionConfirmed {
+            code,
+            text,
+            persistent_preferred,
+            session_retained,
+        } => println!(
+            "个人选择确认  {code} → “{text}” [{}；{}]",
+            if *persistent_preferred {
+                "已成为持久首选"
+            } else {
+                "已记录，尚未成为持久首选"
+            },
+            if *session_retained {
+                "会话选择保留"
+            } else {
+                "会话选择未保留"
+            }
+        ),
     }
 }
 
@@ -908,6 +926,8 @@ mod tests {
         assert_eq!(wish_schema_version_label(13), "V13");
         assert_eq!(wish_schema_version_label(14), "V14");
         assert_eq!(wish_schema_version_label(15), "V15");
+        assert_eq!(wish_schema_version_label(18), "V18");
+        assert_eq!(wish_schema_version_label(19), "V19");
     }
 
     #[test]

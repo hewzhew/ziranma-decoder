@@ -1059,7 +1059,8 @@ fn observe_event(
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::CandidateSuppressionChanged { .. }
-        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
+        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
+        | NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
         NativeFeedbackEvent::PostCommitBackspaceRouted => {
             if pending.is_none()
                 && let Some(previous) = episodes.last_mut()
