@@ -1952,6 +1952,13 @@ impl ResearchReview {
             audit.movement_unavailable,
         )
         .unwrap();
+        if audit.reranked_top_commits != 0 {
+            writeln!(
+                output,
+                "确认边界说明：绕过一个已有重复支持的个人首选时，新选择仍会记入一次持久证据；若一票尚未成为持久首选，当前策略会在确认后撤回临时会话覆盖。因此后续帧中目标没有个性化标记，不能单独证明选择事件丢失。"
+            )
+            .unwrap();
+        }
     }
 
     fn initial_non_top_evidence(&self) -> InitialNonTopEvidence {
@@ -3505,6 +3512,7 @@ mod tests {
             aggregate
                 .contains("替代候选重排来源 2/3；其中也经个人重排 1、未经个人重排 1、来源缺失 1")
         );
+        assert!(aggregate.contains("新选择仍会记入一次持久证据；若一票尚未成为持久首选"));
     }
 
     #[test]

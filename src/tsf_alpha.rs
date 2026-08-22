@@ -10592,6 +10592,13 @@ impl TsfTextService_Impl {
                 );
             }
         }
+        // The confirmed choice has already contributed one persistent vote,
+        // but a previously repeated preference may still win the bounded
+        // support comparison. In that case restore the session lane as well:
+        // otherwise the transient last choice would look preferred even though
+        // the durable ranking deliberately still resolves to the older text.
+        // Analysis must therefore distinguish "evidence was recorded" from
+        // "the selected text became preferred" at this confirmation boundary.
         if !selection_is_preferred {
             self.restore_session_selection_after_pending(&pending);
         }
@@ -23464,7 +23471,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_support_drops_one_incidental_session_override_but_allows_repetition() {
+    fn one_bypass_records_evidence_even_when_old_support_restores_the_session_preference() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             SelectionCandidateProvider,
@@ -23499,9 +23506,37 @@ mod tests {
                 .preferred_text("ab"),
             Some("甲")
         );
+        assert!(
+            service
+                .personal_ranking
+                .borrow()
+                .snapshot
+                .has_evidence("ab", "乙"),
+            "the non-preferred replacement must still contribute persistent evidence"
+        );
         assert_eq!(
             service.selection_memory.borrow().remembered_text("ab"),
             None
+        );
+        let after_first_confirmation = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(after_first_confirmation.candidates, ["甲", "乙", "丙"]);
+        assert!(
+            after_first_confirmation.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        assert!(
+            after_first_confirmation.provenance[1]
+                .personalization()
+                .is_empty(),
+            "a frame records only the applied preference, not every stored vote"
         );
 
         service.remember_selection_after_success(PlannedSelection {
