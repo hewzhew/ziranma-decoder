@@ -161,6 +161,91 @@ mod windows_app {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReviewDocumentKind {
+        Insert,
+        Delete,
+        Replace,
+    }
+
+    struct ReviewDocumentGroup {
+        kind: ReviewDocumentKind,
+        first_elapsed_ms: u64,
+        last_elapsed_ms: u64,
+        start_utf16: usize,
+        removed: Vec<u16>,
+        inserted: Vec<u16>,
+        selection_start_utf16: u32,
+        selection_end_utf16: u32,
+        steps: usize,
+    }
+
+    impl ReviewDocumentGroup {
+        fn from_delta(delta: &DocumentDelta) -> Self {
+            Self {
+                kind: delta_kind(delta),
+                first_elapsed_ms: delta.elapsed_ms,
+                last_elapsed_ms: delta.elapsed_ms,
+                start_utf16: delta.start_utf16,
+                removed: delta.removed.clone(),
+                inserted: delta.inserted.clone(),
+                selection_start_utf16: delta.selection_start_utf16,
+                selection_end_utf16: delta.selection_end_utf16,
+                steps: 1,
+            }
+        }
+
+        fn try_extend(&mut self, delta: &DocumentDelta) -> bool {
+            if self.kind != delta_kind(delta) {
+                return false;
+            }
+            let merged = match self.kind {
+                ReviewDocumentKind::Insert => {
+                    if delta.start_utf16 == self.start_utf16.saturating_add(self.inserted.len()) {
+                        self.inserted.extend_from_slice(&delta.inserted);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ReviewDocumentKind::Delete => {
+                    if delta.start_utf16.saturating_add(delta.removed.len()) == self.start_utf16 {
+                        let mut removed = delta.removed.clone();
+                        removed.extend_from_slice(&self.removed);
+                        self.removed = removed;
+                        self.start_utf16 = delta.start_utf16;
+                        true
+                    } else if delta.start_utf16 == self.start_utf16 {
+                        self.removed.extend_from_slice(&delta.removed);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ReviewDocumentKind::Replace => {
+                    if delta.start_utf16 == self.start_utf16 && delta.removed == self.inserted {
+                        self.inserted.clone_from(&delta.inserted);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if merged {
+                self.last_elapsed_ms = delta.elapsed_ms;
+                self.selection_start_utf16 = delta.selection_start_utf16;
+                self.selection_end_utf16 = delta.selection_end_utf16;
+                self.steps = self.steps.saturating_add(1);
+            }
+            merged
+        }
+    }
+
+    enum ReviewGroup<'a> {
+        Document(ReviewDocumentGroup),
+        Marker(&'a TimelineMarker),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecordOutcome {
         Ignored,
         Recorded,
@@ -777,32 +862,47 @@ mod windows_app {
         if events.is_empty() {
             return "本轮没有观察到文本变化或现场标记。".to_owned();
         }
+        let groups = group_timeline(events);
         let mut output = String::new();
-        for (index, event) in events.iter().enumerate() {
+        for (index, group) in groups.iter().enumerate() {
             if index > 0 {
                 output.push_str("\r\n");
             }
-            match event {
-                PracticeEvent::DocumentDelta(delta) => {
-                    let removed = String::from_utf16_lossy(&delta.removed);
-                    let inserted = String::from_utf16_lossy(&delta.inserted);
-                    let action = match (delta.removed.is_empty(), delta.inserted.is_empty()) {
-                        (true, false) => format!("插入“{inserted}”"),
-                        (false, true) => format!("删除“{removed}”"),
-                        (false, false) => format!("“{removed}”改为“{inserted}”"),
-                        (true, true) => "文字未变化".to_owned(),
+            match group {
+                ReviewGroup::Document(document) => {
+                    let removed = String::from_utf16_lossy(&document.removed);
+                    let inserted = String::from_utf16_lossy(&document.inserted);
+                    let step_label = if document.steps > 1 {
+                        format!("{} 次连续", document.steps)
+                    } else {
+                        String::new()
+                    };
+                    let action = match document.kind {
+                        ReviewDocumentKind::Insert => format!("{step_label}插入“{inserted}”"),
+                        ReviewDocumentKind::Delete => format!("{step_label}删除“{removed}”"),
+                        ReviewDocumentKind::Replace => {
+                            format!("{step_label}把“{removed}”改为“{inserted}”")
+                        }
+                    };
+                    let elapsed = if document.first_elapsed_ms == document.last_elapsed_ms {
+                        format!("+{} ms", document.first_elapsed_ms)
+                    } else {
+                        format!(
+                            "+{}–{} ms",
+                            document.first_elapsed_ms, document.last_elapsed_ms
+                        )
                     };
                     output.push_str(&format!(
-                        "{} · +{} ms · {} · 起点 {} · 光标 {}–{}",
+                        "{} · {} · {} · 起点 {} · 光标 {}–{}",
                         index + 1,
-                        delta.elapsed_ms,
+                        elapsed,
                         action,
-                        delta.start_utf16,
-                        delta.selection_start_utf16,
-                        delta.selection_end_utf16,
+                        document.start_utf16,
+                        document.selection_start_utf16,
+                        document.selection_end_utf16,
                     ));
                 }
-                PracticeEvent::Marker(marker) => output.push_str(&format!(
+                ReviewGroup::Marker(marker) => output.push_str(&format!(
                     "{} · +{} ms · ★ 现场标记 · 位于第 {} 条事实后 · 范围 {}–{}",
                     index + 1,
                     marker.elapsed_ms,
@@ -813,6 +913,35 @@ mod windows_app {
             }
         }
         output
+    }
+
+    fn group_timeline(events: &[PracticeEvent]) -> Vec<ReviewGroup<'_>> {
+        let mut groups = Vec::<ReviewGroup<'_>>::new();
+        for event in events {
+            match event {
+                PracticeEvent::DocumentDelta(delta) => {
+                    if let Some(ReviewGroup::Document(group)) = groups.last_mut()
+                        && group.try_extend(delta)
+                    {
+                        continue;
+                    }
+                    groups.push(ReviewGroup::Document(ReviewDocumentGroup::from_delta(
+                        delta,
+                    )));
+                }
+                PracticeEvent::Marker(marker) => groups.push(ReviewGroup::Marker(marker)),
+            }
+        }
+        groups
+    }
+
+    fn delta_kind(delta: &DocumentDelta) -> ReviewDocumentKind {
+        match (delta.removed.is_empty(), delta.inserted.is_empty()) {
+            (true, false) => ReviewDocumentKind::Insert,
+            (false, true) => ReviewDocumentKind::Delete,
+            (false, false) => ReviewDocumentKind::Replace,
+            (true, true) => unreachable!("document delta always changes text"),
+        }
     }
 
     fn read_control_utf16(window: HWND, id: i32) -> Result<Vec<u16>, ()> {
@@ -913,7 +1042,8 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::{
-            AppState, DocumentDelta, PracticeEvent, RecordOutcome, SessionMode, render_timeline,
+            AppState, DocumentDelta, PracticeEvent, RecordOutcome, SessionMode, group_timeline,
+            render_timeline,
         };
 
         #[test]
@@ -999,6 +1129,55 @@ mod windows_app {
             );
             assert_eq!(text_bound.mode, SessionMode::Review);
             assert_eq!(text_bound.events.len(), 1);
+        }
+
+        #[test]
+        fn review_groups_only_structurally_continuous_same_kind_edits() {
+            let mut state = AppState::default();
+            state.begin(Vec::new());
+            assert_eq!(
+                state.record_change(wide("你"), (1, 1)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(
+                state.record_change(wide("你好"), (2, 2)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(state.mark((2, 2)), RecordOutcome::Recorded);
+            assert_eq!(
+                state.record_change(wide("你好呀"), (3, 3)),
+                RecordOutcome::Recorded
+            );
+            assert_eq!(
+                state.record_change(wide("你好"), (2, 2)),
+                RecordOutcome::Recorded
+            );
+
+            let groups = group_timeline(&state.events);
+            assert_eq!(
+                groups.len(),
+                4,
+                "marker and insert-then-delete are boundaries"
+            );
+            let review = render_timeline(&state.events);
+            assert!(review.contains("2 次连续插入“你好”"));
+            assert!(review.contains("★ 现场标记"));
+            assert!(review.contains("插入“呀”"));
+            assert!(review.contains("删除“呀”"));
+        }
+
+        #[test]
+        fn review_collapses_same_span_replacement_evolution_to_the_final_text() {
+            let first = DocumentDelta::between(&wide("原"), &wide("中间"), 10, (2, 2)).unwrap();
+            let second = DocumentDelta::between(&wide("中间"), &wide("最终"), 20, (2, 2)).unwrap();
+            let events = vec![
+                PracticeEvent::DocumentDelta(first),
+                PracticeEvent::DocumentDelta(second),
+            ];
+            let review = render_timeline(&events);
+            assert!(review.contains("2 次连续把“原”改为“最终”"));
+            assert!(!review.contains("中间"));
+            assert!(review.contains("+10–20 ms"));
         }
 
         fn wide(text: &str) -> Vec<u16> {
