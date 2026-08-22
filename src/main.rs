@@ -65,8 +65,9 @@ use shape_lab_cli::{
 };
 use typing_lab_cli::{
     TYPING_LAB_CANDIDATE_POOL_DEPTH, TYPING_LAB_USAGE, TypingLabEffect, TypingLabInput,
-    TypingLabSelectionMemory, TypingLabSession, find_single_character_pinyin,
-    parse_typing_lab_arguments, parse_typing_lab_input, render_typing_lab_screen,
+    TypingLabSelectionMemory, TypingLabSession, TypingLabTimeline, TypingLabTimelineSource,
+    find_single_character_pinyin, parse_typing_lab_arguments, parse_typing_lab_input,
+    render_typing_lab_screen, render_typing_lab_timeline,
 };
 #[cfg(windows)]
 use windows_shape_keys::WindowsShapeKeyReader;
@@ -1067,6 +1068,7 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let shape_lab = ShapeLab::new(&imported.entries, &shapes);
     let mut input_source = TypingLabInputSource::open();
     let mut session = TypingLabSession::default();
+    let mut timeline = TypingLabTimeline::default();
     let mut selection_memory = TypingLabSelectionMemory::default();
     let mut phonetic_cache = TypingLabPhoneticCache::default();
     let mut deep_decode = None::<TypingLabDeepDecode>;
@@ -1114,6 +1116,15 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let visible_range =
             session.visible_candidate_range(candidates.len(), options.visible_limit);
         let visible_candidates = &candidates[visible_range];
+        let timeline_source = if session.tab_mode() {
+            TypingLabTimelineSource::Shape
+        } else {
+            match candidate_kind {
+                TypingLabCandidateKind::Ordinary => TypingLabTimelineSource::Ordinary,
+                TypingLabCandidateKind::Recovery => TypingLabTimelineSource::Recovery,
+                TypingLabCandidateKind::Other => TypingLabTimelineSource::Idle,
+            }
+        };
 
         screen.clear();
         print!(
@@ -1123,6 +1134,7 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 visible_candidates,
                 candidates.len(),
                 input_source.direct_keys(),
+                timeline.summary(),
             )
         );
         if !input_source.direct_keys() {
@@ -1138,10 +1150,12 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             .then_some(phonetic_cache.candidates.as_slice());
         match session.apply(input) {
             TypingLabEffect::Continue => {}
-            TypingLabEffect::CommittedBackspace => {}
+            TypingLabEffect::CommittedBackspace(removed) => timeline.record_trim(removed),
             TypingLabEffect::Confirm => select_typing_candidate(
                 &mut session,
                 &mut selection_memory,
+                &mut timeline,
+                timeline_source,
                 &candidates,
                 candidate_details,
                 1,
@@ -1149,6 +1163,8 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             TypingLabEffect::Select(rank) => select_typing_candidate(
                 &mut session,
                 &mut selection_memory,
+                &mut timeline,
+                timeline_source,
                 &candidates,
                 candidate_details,
                 rank,
@@ -1188,13 +1204,26 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     session.set_notice("Tab 只用于完整单字码");
                 }
             }
+            TypingLabEffect::Mark => {
+                timeline.record_marker(
+                    timeline_source,
+                    session.phonetic(),
+                    session.candidate_page_start(),
+                    visible_candidates.len(),
+                    candidates.len(),
+                );
+                session.set_notice("已标一下当前现场；退出时统一查看");
+            }
             TypingLabEffect::Quit => break,
         }
     }
 
     screen.leave()?;
+    if !timeline.is_empty() {
+        println!("{}", render_typing_lab_timeline(&timeline));
+    }
     if !session.committed().is_empty() {
-        println!("{}", session.committed());
+        println!("本轮最终保留：{}", session.committed());
     }
     Ok(())
 }
@@ -1202,6 +1231,8 @@ fn run_typing_lab(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn select_typing_candidate(
     session: &mut TypingLabSession,
     selection_memory: &mut TypingLabSelectionMemory,
+    timeline: &mut TypingLabTimeline,
+    timeline_source: TypingLabTimelineSource,
     candidates: &[String],
     candidate_details: Option<&[SentenceCandidate]>,
     rank: usize,
@@ -1209,11 +1240,22 @@ fn select_typing_candidate(
     let candidate_index = rank
         .checked_sub(1)
         .and_then(|index| session.candidate_page_start().checked_add(index));
-    if let Some(candidate) = candidate_index.and_then(|index| candidates.get(index)) {
-        if let Some(detail) = candidate_index.and_then(|index| candidate_details?.get(index)) {
+    if let Some((candidate_index, candidate)) =
+        candidate_index.and_then(|index| candidates.get(index).map(|candidate| (index, candidate)))
+    {
+        let code = session.phonetic().to_owned();
+        if let Some(detail) = candidate_details.and_then(|details| details.get(candidate_index)) {
             selection_memory.remember(session.phonetic(), detail);
         }
-        session.commit(candidate);
+        if session.commit(candidate) {
+            timeline.record_commit(
+                timeline_source,
+                code,
+                candidate,
+                candidate_index.saturating_add(1),
+                candidates.len(),
+            );
+        }
     } else {
         session.set_notice("这个位置没有候选");
     }
@@ -3079,6 +3121,30 @@ mod typing_lab_runtime_tests {
         assert!(TypingLabCandidateKind::Ordinary.remembers_selection());
         assert!(!TypingLabCandidateKind::Recovery.remembers_selection());
         assert!(!TypingLabCandidateKind::Other.remembers_selection());
+    }
+
+    #[test]
+    fn successful_typing_selection_enters_the_in_memory_timeline() {
+        let mut session = TypingLabSession::default();
+        session.apply(TypingLabInput::Letters("da".to_owned()));
+        let mut memory = TypingLabSelectionMemory::default();
+        let mut timeline = TypingLabTimeline::default();
+
+        select_typing_candidate(
+            &mut session,
+            &mut memory,
+            &mut timeline,
+            TypingLabTimelineSource::Ordinary,
+            &["大".to_owned(), "答".to_owned()],
+            None,
+            2,
+        );
+
+        assert_eq!(session.committed(), "答");
+        assert_eq!(timeline.summary().commits, 1);
+        let rendered = render_typing_lab_timeline(&timeline);
+        assert!(rendered.contains("da → “答”"));
+        assert!(rendered.contains("第 2 项"));
     }
 
     #[test]

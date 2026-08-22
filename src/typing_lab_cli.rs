@@ -19,14 +19,16 @@ Shift+Tab 打开独立的换序候选，用于查看相邻两键颠倒的结果�
 完整单字码可以按 Tab 进入音形辅助；h/u/p/n/v 是横竖撇捺折，其他小写字母保留为部件前缀。
 Esc 返回或清空；输入为空时再按 Esc 退出。q 始终是普通双拼字母。
 重定向输入时也可使用 -、+、= 或 :prev、:next 等行命令。
+F2（重定向输入时为 :mark）会在仅内存时间线中标一下当前现场；退出时统一查看。
 
 实验台使用固定公开词典与笔画快照，不读取私人记录、不写文件。
-它只在内存中记住本轮显式选择；输入和候选仍可能进入终端捕获或录屏。";
+它只在内存中记住本轮显式选择与时间线；输入和候选仍可能进入终端捕获或录屏。";
 
 pub const DEFAULT_TYPING_LAB_LIMIT: usize = 5;
 pub const MAX_TYPING_LAB_LIMIT: usize = 10;
 pub const TYPING_LAB_CANDIDATE_POOL_DEPTH: usize = 200;
 const MAX_COMMITTED_CHARACTERS: usize = 4096;
+const MAX_TIMELINE_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TypingLabOptions {
@@ -45,6 +47,7 @@ pub enum TypingLabInput {
     NextPage,
     EnterTab,
     EnterRecovery,
+    Mark,
     Escape,
     Quit,
     Invalid,
@@ -61,6 +64,7 @@ impl TypingLabInput {
             Self::NextPage => CompositionInput::NextPage,
             Self::EnterTab => CompositionInput::EnterTab,
             Self::EnterRecovery => CompositionInput::EnterRecovery,
+            Self::Mark => return None,
             Self::Escape => CompositionInput::Escape,
             Self::Invalid => CompositionInput::Invalid,
             Self::Quit => return None,
@@ -71,13 +75,152 @@ impl TypingLabInput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypingLabEffect {
     Continue,
-    CommittedBackspace,
+    CommittedBackspace(char),
     Confirm,
     Select(usize),
     PreviousPage,
     NextPage,
     RequestTab,
+    Mark,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypingLabTimelineSource {
+    Ordinary,
+    Recovery,
+    Shape,
+    Idle,
+}
+
+impl TypingLabTimelineSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ordinary => "普通候选",
+            Self::Recovery => "换序候选",
+            Self::Shape => "Tab 找字",
+            Self::Idle => "空闲现场",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypingLabTimelineSummary {
+    pub commits: usize,
+    pub trims: usize,
+    pub markers: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TypingLabTimelineEntry {
+    Commit {
+        source: TypingLabTimelineSource,
+        code: String,
+        text: String,
+        rank: usize,
+        loaded_candidates: usize,
+        retained_characters: usize,
+        trims: usize,
+    },
+    Marker {
+        source: TypingLabTimelineSource,
+        code: String,
+        page_start: usize,
+        visible_candidates: usize,
+        loaded_candidates: usize,
+    },
+    UnlinkedTrim,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TypingLabTimeline {
+    entries: Vec<TypingLabTimelineEntry>,
+    summary: TypingLabTimelineSummary,
+    omitted_entries: usize,
+}
+
+impl TypingLabTimeline {
+    pub fn summary(&self) -> TypingLabTimelineSummary {
+        self.summary
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.omitted_entries == 0
+    }
+
+    pub fn record_commit(
+        &mut self,
+        source: TypingLabTimelineSource,
+        code: impl Into<String>,
+        text: impl Into<String>,
+        rank: usize,
+        loaded_candidates: usize,
+    ) {
+        let text = text.into();
+        let retained_characters = text.chars().count();
+        self.push(TypingLabTimelineEntry::Commit {
+            source,
+            code: code.into(),
+            text,
+            rank: rank.max(1),
+            loaded_candidates: loaded_candidates.max(rank),
+            retained_characters,
+            trims: 0,
+        });
+        self.summary.commits = self.summary.commits.saturating_add(1);
+    }
+
+    pub fn record_trim(&mut self, removed: char) {
+        self.summary.trims = self.summary.trims.saturating_add(1);
+        for entry in self.entries.iter_mut().rev() {
+            let TypingLabTimelineEntry::Commit {
+                text,
+                retained_characters,
+                trims,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if *retained_characters == 0 {
+                continue;
+            }
+            let expected = text.chars().nth(retained_characters.saturating_sub(1));
+            if expected == Some(removed) {
+                *retained_characters = retained_characters.saturating_sub(1);
+                *trims = trims.saturating_add(1);
+                return;
+            }
+            break;
+        }
+        self.push(TypingLabTimelineEntry::UnlinkedTrim);
+    }
+
+    pub fn record_marker(
+        &mut self,
+        source: TypingLabTimelineSource,
+        code: impl Into<String>,
+        page_start: usize,
+        visible_candidates: usize,
+        loaded_candidates: usize,
+    ) {
+        self.push(TypingLabTimelineEntry::Marker {
+            source,
+            code: code.into(),
+            page_start,
+            visible_candidates,
+            loaded_candidates,
+        });
+        self.summary.markers = self.summary.markers.saturating_add(1);
+    }
+
+    fn push(&mut self, entry: TypingLabTimelineEntry) {
+        if self.entries.len() == MAX_TIMELINE_ENTRIES {
+            self.entries.remove(0);
+            self.omitted_entries = self.omitted_entries.saturating_add(1);
+        }
+        self.entries.push(entry);
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -171,19 +314,24 @@ impl TypingLabSession {
         true
     }
 
-    pub fn backspace_committed(&mut self) -> bool {
+    pub fn backspace_committed(&mut self) -> Option<char> {
         if !self.composition.phonetic().is_empty()
             || self.composition.tab_mode()
             || self.composition.recovery_mode()
         {
-            return false;
+            return None;
         }
-        self.committed.pop().is_some()
+        self.committed.pop()
     }
 
     pub fn apply(&mut self, input: TypingLabInput) -> TypingLabEffect {
-        if matches!(input, TypingLabInput::Backspace) && self.backspace_committed() {
-            return TypingLabEffect::CommittedBackspace;
+        if matches!(input, TypingLabInput::Backspace)
+            && let Some(removed) = self.backspace_committed()
+        {
+            return TypingLabEffect::CommittedBackspace(removed);
+        }
+        if matches!(input, TypingLabInput::Mark) {
+            return TypingLabEffect::Mark;
         }
         let exit_on_pass_through = matches!(input, TypingLabInput::Escape);
         let Some(input) = input.into_composition() else {
@@ -242,6 +390,7 @@ pub fn parse_typing_lab_input(raw: &str) -> TypingLabInput {
         "" | ":space" | ":enter" => TypingLabInput::Confirm,
         ":tab" => TypingLabInput::EnterTab,
         ":recover" | ":recovery" => TypingLabInput::EnterRecovery,
+        ":mark" => TypingLabInput::Mark,
         "-" | ":prev" | ":pageup" => TypingLabInput::PreviousPage,
         "+" | "=" | ":next" | ":pagedown" => TypingLabInput::NextPage,
         ":back" | ":backspace" => TypingLabInput::Backspace,
@@ -278,8 +427,17 @@ pub fn render_typing_lab_screen(
     candidates: &[String],
     candidate_count: usize,
     direct_keys: bool,
+    timeline: TypingLabTimelineSummary,
 ) -> String {
     let mut output = String::new();
+    if timeline != TypingLabTimelineSummary::default() {
+        writeln!(
+            output,
+            "本轮：提交 {}　裁剪 {}　标记 {}",
+            timeline.commits, timeline.trims, timeline.markers
+        )
+        .expect("writing to String cannot fail");
+    }
     if !session.committed().is_empty() {
         writeln!(output, "已选：{}", session.committed()).expect("writing to String cannot fail");
     }
@@ -328,21 +486,22 @@ pub fn render_typing_lab_screen(
         if direct_keys {
             writeln!(
                 output,
-                "h横　s竖　p撇　n捺　z折　数字选择　-前页　+后页　退格撤回　Esc返回"
+                "h横　s竖　p撇　n捺　z折　数字选择　-前页　+后页　F2标一下　退格撤回　Esc返回"
             )
             .expect("writing to String cannot fail");
         } else {
             writeln!(
                 output,
-                "h横　s竖　p撇　n捺　z折　数字选择　-前页　+后页　:back撤回　:esc返回"
+                "h横　s竖　p撇　n捺　z折　数字选择　-前页　+后页　:mark标一下　:back撤回　:esc返回"
             )
             .expect("writing to String cannot fail");
         }
     } else if session.recovery_mode() {
         if direct_keys {
-            writeln!(output, "空格首选　数字选择　Esc返回").expect("writing to String cannot fail");
+            writeln!(output, "空格首选　数字选择　F2标一下　Esc返回")
+                .expect("writing to String cannot fail");
         } else {
-            writeln!(output, "空行首选　数字选择　:esc返回")
+            writeln!(output, "空行首选　数字选择　:mark标一下　:esc返回")
                 .expect("writing to String cannot fail");
         }
     } else if direct_keys {
@@ -353,7 +512,7 @@ pub fn render_typing_lab_screen(
         };
         writeln!(
             output,
-            "空格首选　数字选择　-前页　+后页　Shift+Tab换序　Tab找字　{backspace}　Esc清空/退出"
+            "空格首选　数字选择　-前页　+后页　Shift+Tab换序　Tab找字　F2标一下　{backspace}　Esc清空/退出"
         )
         .expect("writing to String cannot fail");
     } else {
@@ -364,12 +523,114 @@ pub fn render_typing_lab_screen(
         };
         writeln!(
             output,
-            "空行首选　数字选择　-前页　+后页　:recover换序　:tab找字　{backspace}　:esc清空　:quit退出"
+            "空行首选　数字选择　-前页　+后页　:recover换序　:tab找字　:mark标一下　{backspace}　:esc清空　:quit退出"
         )
         .expect("writing to String cannot fail");
     }
     if let Some(notice) = session.notice() {
         writeln!(output, "{notice}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+pub fn render_typing_lab_timeline(timeline: &TypingLabTimeline) -> String {
+    let mut output = String::new();
+    writeln!(output, "本轮时间线（仅在内存中，程序退出后消失）")
+        .expect("writing to String cannot fail");
+    if timeline.omitted_entries > 0 {
+        writeln!(
+            output,
+            "较早的 {} 条明细已从有界时间线中移除。",
+            timeline.omitted_entries
+        )
+        .expect("writing to String cannot fail");
+    }
+    if timeline.entries.is_empty() {
+        writeln!(output, "本轮没有提交、裁剪或标记。").expect("writing to String cannot fail");
+        return output;
+    }
+
+    for (index, entry) in timeline.entries.iter().enumerate() {
+        match entry {
+            TypingLabTimelineEntry::Commit {
+                source,
+                code,
+                text,
+                rank,
+                loaded_candidates,
+                retained_characters,
+                trims,
+            } => {
+                writeln!(
+                    output,
+                    "{}. {}：{} → “{}”（第 {} 项；当时已加载 {} 项）",
+                    index + 1,
+                    source.label(),
+                    code,
+                    text,
+                    rank,
+                    loaded_candidates
+                )
+                .expect("writing to String cannot fail");
+                if *trims > 0 {
+                    if *retained_characters == 0 {
+                        writeln!(output, "   末尾裁剪 {} 字；这一项已删空。", trims)
+                            .expect("writing to String cannot fail");
+                    } else {
+                        let retained = text.chars().take(*retained_characters).collect::<String>();
+                        writeln!(
+                            output,
+                            "   末尾裁剪 {} 字；这一项当前保留“{}”。",
+                            trims, retained
+                        )
+                        .expect("writing to String cannot fail");
+                    }
+                }
+            }
+            TypingLabTimelineEntry::Marker {
+                source,
+                code,
+                page_start,
+                visible_candidates,
+                loaded_candidates,
+            } => {
+                let context = if code.is_empty() {
+                    source.label().to_owned()
+                } else {
+                    format!("{}，输入 {}", source.label(), code)
+                };
+                if *visible_candidates == 0 {
+                    writeln!(
+                        output,
+                        "{}. ★ 标记：{}；当时没有可见候选。",
+                        index + 1,
+                        context
+                    )
+                    .expect("writing to String cannot fail");
+                } else {
+                    let first = page_start.saturating_add(1);
+                    let last = page_start.saturating_add(*visible_candidates);
+                    writeln!(
+                        output,
+                        "{}. ★ 标记：{}；当时查看第 {}–{} 项，已加载 {} 项。",
+                        index + 1,
+                        context,
+                        first,
+                        last,
+                        loaded_candidates
+                    )
+                    .expect("writing to String cannot fail");
+                }
+            }
+            TypingLabTimelineEntry::UnlinkedTrim => {
+                writeln!(
+                    output,
+                    "{}. 删除 1 字；来源提交已超出当前有界明细。",
+                    index + 1
+                )
+                .expect("writing to String cannot fail");
+            }
+        }
     }
     output
 }
@@ -419,6 +680,7 @@ mod tests {
         assert_eq!(parse_typing_lab_input("-"), TypingLabInput::PreviousPage);
         assert_eq!(parse_typing_lab_input("+"), TypingLabInput::NextPage);
         assert_eq!(parse_typing_lab_input("="), TypingLabInput::NextPage);
+        assert_eq!(parse_typing_lab_input(":mark"), TypingLabInput::Mark);
         assert_eq!(parse_typing_lab_input(":back"), TypingLabInput::Backspace);
         assert_eq!(parse_typing_lab_input(""), TypingLabInput::Confirm);
     }
@@ -472,10 +734,11 @@ mod tests {
         assert!(session.commit("线束缚"));
         assert_eq!(
             session.apply(TypingLabInput::Backspace),
-            TypingLabEffect::CommittedBackspace
+            TypingLabEffect::CommittedBackspace('缚')
         );
         assert_eq!(session.committed(), "线束");
-        let screen = render_typing_lab_screen(&session, &[], 0, true);
+        let screen =
+            render_typing_lab_screen(&session, &[], 0, true, TypingLabTimelineSummary::default());
         assert!(screen.contains("退格删末字"));
 
         session.apply(TypingLabInput::Letters("xm".to_owned()));
@@ -600,6 +863,7 @@ mod tests {
             &["麻烦猫猫".to_owned(), "麻烦毛毛".to_owned()],
             12,
             true,
+            TypingLabTimelineSummary::default(),
         );
         assert!(rendered.contains("输入：mafmkm"));
         assert!(rendered.contains("1 麻烦猫猫"));
@@ -607,5 +871,40 @@ mod tests {
         assert!(rendered.contains("Tab找字"));
         assert!(!rendered.contains("评分"));
         assert!(!rendered.contains("实验排序"));
+    }
+
+    #[test]
+    fn in_memory_timeline_groups_commits_and_suffix_trims() {
+        let mut timeline = TypingLabTimeline::default();
+        timeline.record_commit(TypingLabTimelineSource::Ordinary, "xmuufu", "线束缚", 2, 17);
+        timeline.record_trim('缚');
+        timeline.record_marker(TypingLabTimelineSource::Idle, "", 0, 0, 0);
+
+        assert_eq!(
+            timeline.summary(),
+            TypingLabTimelineSummary {
+                commits: 1,
+                trims: 1,
+                markers: 1,
+            }
+        );
+        let rendered = render_typing_lab_timeline(&timeline);
+        assert!(rendered.contains("仅在内存中"));
+        assert!(rendered.contains("xmuufu → “线束缚”"));
+        assert!(rendered.contains("第 2 项"));
+        assert!(rendered.contains("末尾裁剪 1 字"));
+        assert!(rendered.contains("当前保留“线束”"));
+        assert!(rendered.contains("★ 标记：空闲现场"));
+    }
+
+    #[test]
+    fn timeline_marker_keeps_page_context_without_copying_candidates() {
+        let mut timeline = TypingLabTimeline::default();
+        timeline.record_marker(TypingLabTimelineSource::Recovery, "mafkmm", 5, 5, 20);
+
+        let rendered = render_typing_lab_timeline(&timeline);
+        assert!(rendered.contains("换序候选，输入 mafkmm"));
+        assert!(rendered.contains("第 6–10 项"));
+        assert!(rendered.contains("已加载 20 项"));
     }
 }

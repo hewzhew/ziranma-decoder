@@ -17,6 +17,7 @@ const VK_ESCAPE: u16 = 0x1b;
 const VK_SPACE: u16 = 0x20;
 const VK_PRIOR: u16 = 0x21;
 const VK_NEXT: u16 = 0x22;
+const VK_F2: u16 = 0x71;
 const VK_OEM_PLUS: u16 = 0xbb;
 const VK_OEM_MINUS: u16 = 0xbd;
 const VK_0: u16 = 0x30;
@@ -108,6 +109,7 @@ fn decode_key_event(event: &KEY_EVENT_RECORD) -> Option<TypingLabInput> {
         VK_ESCAPE => Some(TypingLabInput::Escape),
         VK_PRIOR => Some(TypingLabInput::PreviousPage),
         VK_NEXT => Some(TypingLabInput::NextPage),
+        VK_F2 => Some(TypingLabInput::Mark),
         VK_OEM_MINUS => Some(TypingLabInput::PreviousPage),
         VK_OEM_PLUS => Some(TypingLabInput::NextPage),
         VK_A..=VK_Z => Some(TypingLabInput::Letters(
@@ -133,7 +135,7 @@ mod tests {
     use windows_core::BOOL;
 
     use super::{
-        VK_A, VK_BACK, VK_ESCAPE, VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN,
+        VK_A, VK_BACK, VK_ESCAPE, VK_F2, VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN,
         VK_SPACE, VK_TAB, decode_key_event,
     };
     use crate::typing_lab_cli::TypingLabInput;
@@ -182,6 +184,10 @@ mod tests {
         assert_eq!(
             decode_key_event(&pressed(VK_NEXT)),
             Some(TypingLabInput::NextPage)
+        );
+        assert_eq!(
+            decode_key_event(&pressed(VK_F2)),
+            Some(TypingLabInput::Mark)
         );
         assert_eq!(
             decode_key_event(&pressed(VK_OEM_MINUS)),
