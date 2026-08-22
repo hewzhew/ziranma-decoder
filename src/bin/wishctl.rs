@@ -7,13 +7,13 @@ use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
-    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
-    NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource, WishCaptureScope,
-    WishCategory, WishCommand, WishCommandAckStatus, WishEventRole, WishFeedbackError,
-    WishImportance, WishJournalContext, WishNote, WishPublicCandidateOrderPolicy, WishReviewStatus,
-    dispatch_wish_command, list_trashed_wish_packages, list_wish_packages, load_wish_note,
-    load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash,
-    save_wish_note,
+    NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
+    NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
+    WishFeedbackError, WishImportance, WishJournalContext, WishNote,
+    WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
+    list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
+    move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash, save_wish_note,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -550,13 +550,16 @@ fn print_event(event: &NativeFeedbackEvent) {
                     let evidence = candidate_personalization_label(provenance.personalization());
                     let ranking =
                         candidate_personalization_label(provenance.ranking_personalization());
+                    let ranking_movement =
+                        candidate_ranking_movement_label(provenance.ranking_movement());
                     format!(
                         "{} {text}〔{}{}〕",
                         page_start + index + 1,
                         candidate_source_label(provenance.source()),
                         [
                             (!evidence.is_empty()).then(|| format!("个人证据 {evidence}")),
-                            (!ranking.is_empty()).then(|| format!("实际重排 {ranking}")),
+                            (!ranking.is_empty())
+                                .then(|| format!("实际重排 {ranking}，{ranking_movement}")),
                         ]
                         .into_iter()
                         .flatten()
@@ -732,6 +735,17 @@ fn candidate_personalization_label(personalization: NativeCandidatePersonalizati
     .filter_map(|(bit, label)| personalization.contains(bit).then_some(label))
     .collect::<Vec<_>>()
     .join("+")
+}
+
+fn candidate_ranking_movement_label(movement: NativeCandidateRankingMovement) -> String {
+    match movement {
+        NativeCandidateRankingMovement::Unrecorded => "原位次未记录".to_owned(),
+        NativeCandidateRankingMovement::Unchanged => "未发生位移".to_owned(),
+        NativeCandidateRankingMovement::MovedFrom { absolute_rank } => {
+            format!("原第 {absolute_rank} 位")
+        }
+        NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool => "候选池外召回".to_owned(),
+    }
 }
 
 fn automatic_transposition_label(decision: &NativeAutomaticTranspositionDecision) -> String {
@@ -1013,6 +1027,26 @@ mod tests {
             "持久精确+会话尾简+左侧上下文"
         );
         assert!(candidate_personalization_label(NativeCandidatePersonalization::NONE).is_empty());
+    }
+
+    #[test]
+    fn candidate_ranking_movement_labels_keep_legacy_depth_and_recall_distinct() {
+        assert_eq!(
+            candidate_ranking_movement_label(NativeCandidateRankingMovement::Unrecorded),
+            "原位次未记录"
+        );
+        assert_eq!(
+            candidate_ranking_movement_label(NativeCandidateRankingMovement::MovedFrom {
+                absolute_rank: 8,
+            }),
+            "原第 8 位"
+        );
+        assert_eq!(
+            candidate_ranking_movement_label(
+                NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool
+            ),
+            "候选池外召回"
+        );
     }
 
     #[test]
