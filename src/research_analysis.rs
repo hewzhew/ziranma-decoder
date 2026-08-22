@@ -608,6 +608,7 @@ struct Episode {
     revision: Option<(String, String, String)>,
     outcome: EpisodeOutcome,
     post_commit_backspace_routed: bool,
+    post_commit_backspace_ordinal: Option<u64>,
     top_candidate: Option<String>,
 }
 
@@ -1163,6 +1164,7 @@ fn observe_event(
                 && matches!(previous.outcome, EpisodeOutcome::CandidateCommit { .. })
             {
                 previous.post_commit_backspace_routed = true;
+                previous.post_commit_backspace_ordinal = Some(ordinal);
                 previous.last_ordinal = ordinal;
                 previous.end_ms = at_ms;
             }
@@ -1200,6 +1202,7 @@ fn observe_event(
                     rank: *absolute_rank,
                 },
                 post_commit_backspace_routed: false,
+                post_commit_backspace_ordinal: None,
                 top_candidate: (episode.top_candidate_code.as_deref() == Some(code.as_str()))
                     .then_some(episode.top_candidate)
                     .flatten(),
@@ -1222,6 +1225,7 @@ fn observe_event(
                 revision: None,
                 outcome: EpisodeOutcome::RawCodeCommit { code: code.clone() },
                 post_commit_backspace_routed: false,
+                post_commit_backspace_ordinal: None,
                 top_candidate: None,
             });
         }
@@ -1245,6 +1249,7 @@ fn observe_event(
                 revision: None,
                 outcome: EpisodeOutcome::Cancellation { code: code.clone() },
                 post_commit_backspace_routed: false,
+                post_commit_backspace_ordinal: None,
                 top_candidate: None,
             });
         }
@@ -1482,7 +1487,6 @@ fn collect_selection_confirmation_sequences(
                 .iter()
                 .filter(|episode| {
                     episode.chain == chain
-                        && !episode.post_commit_backspace_routed
                         && matches!(&episode.outcome, EpisodeOutcome::CandidateCommit { .. })
                 })
                 .collect::<Vec<_>>();
@@ -1508,8 +1512,14 @@ fn collect_selection_confirmation_sequences(
                     .iter()
                     .enumerate()
                     .filter_map(|(position, candidate_index)| {
-                        let EpisodeOutcome::CandidateCommit { code, text, .. } =
-                            &candidate_commits[*candidate_index].outcome
+                        let episode = candidate_commits[*candidate_index];
+                        if episode
+                            .post_commit_backspace_ordinal
+                            .is_some_and(|retracted| retracted < confirmation.ordinal)
+                        {
+                            return None;
+                        }
+                        let EpisodeOutcome::CandidateCommit { code, text, .. } = &episode.outcome
                         else {
                             return None;
                         };
@@ -2114,6 +2124,31 @@ mod tests {
                     (11, NativeFeedbackEvent::PostCommitBackspaceRouted),
                     (20, committed("aa", "甲")),
                     (21, confirmed("aa", "甲", true, true)),
+                ],
+            )],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.selection_confirmation_sequences()[0].confirmations()[0].matching(),
+            ResearchSelectionConfirmationMatch::UniquePriorCommit
+        );
+    }
+
+    #[test]
+    fn later_backspace_does_not_retroactively_unmatch_an_earlier_confirmation() {
+        let stream = "8f".repeat(32);
+        let report = analyze_linked_research(
+            &[snapshot(
+                &stream,
+                0,
+                0,
+                None,
+                vec![
+                    (10, committed("aa", "甲")),
+                    (11, confirmed("aa", "甲", true, true)),
+                    (12, NativeFeedbackEvent::PostCommitBackspaceRouted),
                 ],
             )],
             &[],
