@@ -138,6 +138,8 @@ DPI 取整的 `CandidateScene`。生产 Alpha 已经从该 scene 读取客户区
 GDI 仍负责测量真实字体，但测得的高度与基线会作为纯数值送进 scene，因此数字与
 正文的垂直对齐不再由 painter 重算。单项操作提示会先由 GDI 测出标签与说明宽度，
 再由 scene 决定是否分栏；页脚内部的模式与页码也由 scene 分出互不重叠的区域。
+候选文字的有界逻辑宽度估算、横/竖项目宽度和横排空间不足时的压缩策略也已移入
+同一无窗口模块，生产 TSF 与未来实验室不会分别维护两套宽度算法。
 `candidate.rank`、`candidate.text`、`candidate.action-detail`、
 `candidate.personal-mark`、`notice.icon`、`footer.mode` 和 `footer.page` 均已有稳定
 语义名。96/144 DPI 的精确矩形测试以及生产 96/120/144/192 DPI 布局联结测试固定了

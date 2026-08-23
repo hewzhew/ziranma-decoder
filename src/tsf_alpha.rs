@@ -29,7 +29,11 @@ use crate::candidate_snapshot::{
 use crate::candidate_ui::{
     CandidateRgb, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics,
     CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
-    build_candidate_scene, candidate_ui_scale,
+    allocate_horizontal_candidate_widths, build_candidate_scene,
+    candidate_horizontal_logical_width as shared_candidate_horizontal_logical_width,
+    candidate_ui_scale,
+    candidate_vertical_logical_width as shared_candidate_vertical_logical_width,
+    estimated_candidate_logical_text_width,
 };
 use crate::candidate_ui_gdi::{
     CandidateSceneFonts, CandidateScenePaintContent, paint_candidate_scene,
@@ -4822,13 +4826,12 @@ const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.ho
 const POPUP_HORIZONTAL_MIN_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_min_width;
 const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 =
     DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_min_item_width;
+#[cfg(test)]
 const POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL: i32 =
     DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_text_max_width;
 const POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL: i32 =
     DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_selected_text_max_width;
 const POPUP_VERTICAL_MIN_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_min_width;
-const POPUP_VERTICAL_TEXT_MAX_WIDTH_LOGICAL: i32 =
-    DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_text_max_width;
 const POPUP_VERTICAL_MAX_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_max_width;
 const POPUP_VERTICAL_ROUNDING_SLACK_LOGICAL: i32 =
     DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_rounding_slack;
@@ -4879,44 +4882,25 @@ fn candidate_popup_border_geometry(client: RECT, dpi: u32) -> Option<CandidatePo
 }
 
 fn candidate_display_logical_text_width(candidate: &str) -> i32 {
-    let mut characters = candidate.chars();
-    let width = characters
-        .by_ref()
-        .take(CANDIDATE_DISPLAY_MAX_CHARS)
-        .fold(0_i32, |width, character| {
-            width.saturating_add(if character.is_ascii() { 9 } else { 18 })
-        });
-    width.saturating_add(if characters.next().is_some() { 18 } else { 0 })
-}
-
-fn candidate_logical_width(candidate: &str, selected: bool, maximum_text_width: i32) -> i32 {
-    let text_width = candidate_display_logical_text_width(candidate).clamp(18, maximum_text_width);
-    let leading_inset = if selected {
-        POPUP_SELECTED_TEXT_INSET_LOGICAL
-    } else {
-        POPUP_TEXT_PADDING_LOGICAL
-    };
-    leading_inset
-        .saturating_add(POPUP_RANK_WIDTH_LOGICAL)
-        .saturating_add(POPUP_RANK_GAP_LOGICAL)
-        .saturating_add(text_width)
-        .saturating_add(POPUP_TEXT_PADDING_LOGICAL)
+    estimated_candidate_logical_text_width(candidate, CANDIDATE_DISPLAY_MAX_CHARS)
 }
 
 fn horizontal_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
-    candidate_logical_width(
+    shared_candidate_horizontal_logical_width(
+        DEFAULT_CANDIDATE_VISUAL_SPEC,
         candidate,
         selected,
-        if selected {
-            POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL
-        } else {
-            POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL
-        },
+        CANDIDATE_DISPLAY_MAX_CHARS,
     )
 }
 
 fn vertical_candidate_logical_width(candidate: &str, selected: bool) -> i32 {
-    candidate_logical_width(candidate, selected, POPUP_VERTICAL_TEXT_MAX_WIDTH_LOGICAL)
+    shared_candidate_vertical_logical_width(
+        DEFAULT_CANDIDATE_VISUAL_SPEC,
+        candidate,
+        selected,
+        CANDIDATE_DISPLAY_MAX_CHARS,
+    )
 }
 
 fn estimated_popup_text_width(text: &str, ascii_width: i32, other_width: i32) -> i32 {
@@ -4984,54 +4968,15 @@ fn candidate_popup_footer_logical_width(display: &CandidateDisplay) -> i32 {
 
 fn horizontal_candidate_widths(display: &CandidateDisplay, dpi: u32, popup_width: i32) -> Vec<i32> {
     let footer_width = popup_scale(dpi, candidate_popup_footer_logical_width(display));
-    let padding = popup_scale(dpi, POPUP_OUTER_PADDING_LOGICAL);
-    let budget = popup_width
-        .saturating_sub(padding.saturating_mul(2))
-        .saturating_sub(footer_width)
-        .max(0);
-    if display.action_detail().is_some() {
-        return vec![budget];
-    }
-    let mut widths = display
-        .visible()
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            popup_scale(
-                dpi,
-                horizontal_candidate_logical_width(candidate, index == 0),
-            )
-        })
-        .collect::<Vec<_>>();
-    let minimums = widths
-        .iter()
-        .enumerate()
-        .map(|(index, width)| {
-            if index == 0 {
-                *width
-            } else {
-                popup_scale(dpi, POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL)
-            }
-        })
-        .collect::<Vec<_>>();
-
-    while widths.iter().copied().sum::<i32>() > budget {
-        let flexible = widths
-            .iter()
-            .zip(&minimums)
-            .filter(|(width, minimum)| width > minimum)
-            .count();
-        if flexible == 0 {
-            break;
-        }
-        let excess = widths.iter().copied().sum::<i32>().saturating_sub(budget);
-        let share = excess.saturating_add(i32::try_from(flexible).unwrap_or(i32::MAX) - 1)
-            / i32::try_from(flexible).unwrap_or(1);
-        for (width, minimum) in widths.iter_mut().zip(&minimums) {
-            *width = (*width).saturating_sub(share).max(*minimum);
-        }
-    }
-    widths
+    allocate_horizontal_candidate_widths(
+        DEFAULT_CANDIDATE_VISUAL_SPEC,
+        dpi,
+        popup_width,
+        footer_width,
+        display.visible(),
+        display.action_detail().is_some(),
+        CANDIDATE_DISPLAY_MAX_CHARS,
+    )
 }
 
 fn candidate_popup_metrics(

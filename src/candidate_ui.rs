@@ -367,6 +367,137 @@ pub(crate) struct CandidateSceneRequest<'a> {
     pub(crate) action_detail_metrics: Option<CandidateSceneActionDetailMetrics>,
 }
 
+/// Estimates the production logical width of bounded candidate text without
+/// requiring a font or platform drawing context.
+pub(crate) fn estimated_candidate_logical_text_width(
+    candidate: &str,
+    max_characters: usize,
+) -> i32 {
+    let mut characters = candidate.chars();
+    let width = characters
+        .by_ref()
+        .take(max_characters)
+        .fold(0_i32, |width, character| {
+            width.saturating_add(if character.is_ascii() { 9 } else { 18 })
+        });
+    width.saturating_add(if characters.next().is_some() { 18 } else { 0 })
+}
+
+fn candidate_logical_width(
+    spec: CandidateVisualSpec,
+    candidate: &str,
+    selected: bool,
+    maximum_text_width: i32,
+    max_characters: usize,
+) -> i32 {
+    let text_width = estimated_candidate_logical_text_width(candidate, max_characters)
+        .clamp(18, maximum_text_width);
+    let leading_inset = if selected {
+        spec.selected_text_inset
+    } else {
+        spec.text_padding
+    };
+    leading_inset
+        .saturating_add(spec.rank_width)
+        .saturating_add(spec.rank_gap)
+        .saturating_add(text_width)
+        .saturating_add(spec.text_padding)
+}
+
+pub(crate) fn candidate_horizontal_logical_width(
+    spec: CandidateVisualSpec,
+    candidate: &str,
+    selected: bool,
+    max_characters: usize,
+) -> i32 {
+    candidate_logical_width(
+        spec,
+        candidate,
+        selected,
+        if selected {
+            spec.horizontal_selected_text_max_width
+        } else {
+            spec.horizontal_text_max_width
+        },
+        max_characters,
+    )
+}
+
+pub(crate) fn candidate_vertical_logical_width(
+    spec: CandidateVisualSpec,
+    candidate: &str,
+    selected: bool,
+    max_characters: usize,
+) -> i32 {
+    candidate_logical_width(
+        spec,
+        candidate,
+        selected,
+        spec.vertical_text_max_width,
+        max_characters,
+    )
+}
+
+/// Allocates exact physical widths for an already-sized horizontal popup.
+/// The footer width is physical pixels, matching `CandidateSceneRequest`.
+pub(crate) fn allocate_horizontal_candidate_widths(
+    spec: CandidateVisualSpec,
+    dpi: u32,
+    popup_width: i32,
+    footer_width: i32,
+    candidates: &[String],
+    action_detail: bool,
+    max_characters: usize,
+) -> Vec<i32> {
+    let padding = candidate_ui_scale(dpi, spec.outer_padding);
+    let budget = popup_width
+        .saturating_sub(padding.saturating_mul(2))
+        .saturating_sub(footer_width)
+        .max(0);
+    if action_detail {
+        return vec![budget];
+    }
+    let mut widths = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            candidate_ui_scale(
+                dpi,
+                candidate_horizontal_logical_width(spec, candidate, index == 0, max_characters),
+            )
+        })
+        .collect::<Vec<_>>();
+    let minimums = widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            if index == 0 {
+                *width
+            } else {
+                candidate_ui_scale(dpi, spec.horizontal_min_item_width)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    while widths.iter().copied().sum::<i32>() > budget {
+        let flexible = widths
+            .iter()
+            .zip(&minimums)
+            .filter(|(width, minimum)| width > minimum)
+            .count();
+        if flexible == 0 {
+            break;
+        }
+        let flexible = i32::try_from(flexible).unwrap_or(i32::MAX);
+        let excess = widths.iter().copied().sum::<i32>().saturating_sub(budget);
+        let share = excess.saturating_add(flexible.saturating_sub(1)) / flexible.max(1);
+        for (width, minimum) in widths.iter_mut().zip(&minimums) {
+            *width = (*width).saturating_sub(share).max(*minimum);
+        }
+    }
+    widths
+}
+
 /// Scales a reviewed 96-DPI token to physical pixels with deterministic
 /// nearest-integer rounding.
 pub(crate) fn candidate_ui_scale(dpi: u32, logical: i32) -> i32 {
@@ -794,6 +925,42 @@ pub(crate) fn build_candidate_scene(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_width_policy_preserves_bounded_text_and_horizontal_allocation() {
+        let spec = DEFAULT_CANDIDATE_VISUAL_SPEC;
+        assert_eq!(estimated_candidate_logical_text_width("abc中", 32), 45);
+        assert_eq!(
+            estimated_candidate_logical_text_width(&"甲".repeat(33), 32),
+            594
+        );
+        assert_eq!(
+            candidate_horizontal_logical_width(spec, "春夏秋冬", true, 32),
+            112
+        );
+        assert_eq!(
+            candidate_horizontal_logical_width(spec, "远山", false, 32),
+            70
+        );
+        assert_eq!(
+            candidate_vertical_logical_width(spec, &"甲".repeat(40), true, 32),
+            634
+        );
+
+        let candidates = ["春夏秋冬", "远山", "流云"].map(str::to_owned);
+        assert_eq!(
+            allocate_horizontal_candidate_widths(spec, 96, 280, 0, &candidates, false, 32),
+            [112, 70, 70]
+        );
+        assert_eq!(
+            allocate_horizontal_candidate_widths(spec, 144, 420, 0, &candidates, false, 32),
+            [168, 105, 105]
+        );
+        assert_eq!(
+            allocate_horizontal_candidate_widths(spec, 96, 210, 0, &candidates[..1], true, 32),
+            [200]
+        );
+    }
 
     #[test]
     fn default_scene_tokens_keep_stable_semantic_names() {
