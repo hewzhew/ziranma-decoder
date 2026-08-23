@@ -17,6 +17,9 @@ mod candidate_ui_gdi;
 #[cfg(windows)]
 #[path = "../candidate_ui_lab_annotation.rs"]
 mod candidate_ui_lab_annotation;
+#[cfg(windows)]
+#[path = "../candidate_ui_lab_visual.rs"]
+mod candidate_ui_lab_visual;
 
 #[cfg(windows)]
 fn main() {
@@ -33,7 +36,7 @@ mod windows_app {
 
     use crate::candidate_ui::{
         CandidateRgb, CandidateScene, CandidateSceneFontMetrics, CandidateSceneLayout,
-        CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
+        CandidateSceneRect, CandidateSceneRequest, CandidateVisualSpec,
         allocate_horizontal_candidate_widths, build_candidate_scene,
         candidate_horizontal_logical_width, candidate_ui_scale, candidate_vertical_logical_width,
     };
@@ -45,6 +48,7 @@ mod windows_app {
         MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS, capture_candidate_ui_lab_annotation_context,
         export_candidate_ui_lab_annotations,
     };
+    use crate::candidate_ui_lab_visual::CandidateUiLabVisualState;
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
@@ -168,6 +172,7 @@ mod windows_app {
         last_scene: Option<CandidateScene>,
         drag_anchor: Option<(i32, i32)>,
         selection: Option<CandidateSceneRect>,
+        visual: CandidateUiLabVisualState,
         annotations: CandidateUiLabAnnotationSession,
         pending_annotation: Option<CandidateUiLabAnnotationContext>,
         note_window: Option<HWND>,
@@ -184,6 +189,7 @@ mod windows_app {
                 last_scene: None,
                 drag_anchor: None,
                 selection: None,
+                visual: CandidateUiLabVisualState::default(),
                 annotations: CandidateUiLabAnnotationSession::default(),
                 pending_annotation: None,
                 note_window: None,
@@ -199,6 +205,10 @@ mod windows_app {
 
         fn scenario(&self) -> LabScenario {
             LabScenario::ALL[self.scenario_index]
+        }
+
+        fn active_spec(&self) -> CandidateVisualSpec {
+            self.visual.active_spec()
         }
 
         fn cycle_dpi(&mut self) {
@@ -217,6 +227,31 @@ mod windows_app {
                 CandidateSceneLayout::Vertical => CandidateSceneLayout::Horizontal,
             };
             self.reset_inspection();
+        }
+
+        fn toggle_visual_variant(&mut self) {
+            self.visual.toggle_variant();
+            self.reset_inspection();
+        }
+
+        fn cycle_visual_token(&mut self) {
+            self.visual.cycle_token();
+        }
+
+        fn adjust_visual_draft(&mut self, steps: i32) -> bool {
+            if !self.visual.adjust_draft(steps) {
+                return false;
+            }
+            self.reset_inspection();
+            true
+        }
+
+        fn reset_visual_draft(&mut self) -> bool {
+            if !self.visual.reset_draft() {
+                return false;
+            }
+            self.reset_inspection();
+            true
         }
 
         fn reset_inspection(&mut self) {
@@ -347,12 +382,31 @@ mod windows_app {
                         return false;
                     };
                     match u32::try_from(wparam.0).unwrap_or_default() {
-                        0x44 => state.cycle_dpi(),
-                        0x48 => state.toggle_layout(),
-                        0x53 => state.cycle_scenario(),
-                        _ => return false,
+                        0x41 => {
+                            state.toggle_visual_variant();
+                            true
+                        }
+                        0x44 => {
+                            state.cycle_dpi();
+                            true
+                        }
+                        0x48 => {
+                            state.toggle_layout();
+                            true
+                        }
+                        0x52 => state.reset_visual_draft(),
+                        0x53 => {
+                            state.cycle_scenario();
+                            true
+                        }
+                        0x54 => {
+                            state.cycle_visual_token();
+                            true
+                        }
+                        0xbb => state.adjust_visual_draft(1),
+                        0xbd => state.adjust_visual_draft(-1),
+                        _ => false,
                     }
-                    true
                 });
                 if changed {
                     refresh_window(window, true);
@@ -470,7 +524,7 @@ mod windows_app {
                 state.dpi(),
                 selection,
                 scene,
-                DEFAULT_CANDIDATE_VISUAL_SPEC,
+                state.active_spec(),
             )
             .map_err(|error| error.to_string())
         });
@@ -879,18 +933,22 @@ mod windows_app {
         } else {
             format!(" · 批注 {}（仅内存）", state.annotations.len())
         };
+        let token = state.visual.selected_token();
         format!(
-            "候选窗实验室 · {} · {} DPI · {}{}{}    H 布局 / D 缩放 / S 场景 / 拖拽圈选 / N 批注 / E 导出 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {} · {} · {} {}{}{}    A 对照 / T 参数 / - + 调整 / R 重置 / H D S 场景 / 圈选 N 批注 E 导出 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
+            state.visual.active_variant().label(),
+            token.label(),
+            state.visual.selected_value(),
             hit,
             annotations,
         )
     }
 
     fn frame_metrics(state: &LabState) -> LabFrameMetrics {
-        let spec = DEFAULT_CANDIDATE_VISUAL_SPEC;
+        let spec = state.active_spec();
         let dpi = state.dpi();
         let content = state.scenario().content();
         let scale = |logical| candidate_ui_scale(dpi, logical);
@@ -1046,8 +1104,9 @@ mod windows_app {
 
         let snapshot = APP_STATE.with(|slot| slot.borrow().as_ref().cloned().unwrap_or_default());
         let dpi = snapshot.dpi();
+        let spec = snapshot.active_spec();
         let content = snapshot.scenario().content();
-        let fonts = unsafe { create_fonts(dpi) };
+        let fonts = unsafe { create_fonts(dpi, spec) };
         let initial_font = [fonts.candidate, fonts.selected, fonts.metadata]
             .into_iter()
             .find(|font| !font.is_invalid())
@@ -1066,7 +1125,7 @@ mod windows_app {
         let metrics = frame_metrics(&snapshot);
         let horizontal_widths = if snapshot.layout == CandidateSceneLayout::Horizontal {
             allocate_horizontal_candidate_widths(
-                DEFAULT_CANDIDATE_VISUAL_SPEC,
+                spec,
                 dpi,
                 width,
                 metrics.footer_width,
@@ -1078,7 +1137,7 @@ mod windows_app {
             Vec::new()
         };
         let scene = build_candidate_scene(
-            DEFAULT_CANDIDATE_VISUAL_SPEC,
+            spec,
             CandidateSceneRequest {
                 layout: snapshot.layout,
                 dpi,
@@ -1104,7 +1163,7 @@ mod windows_app {
                 paint_candidate_scene(
                     hdc,
                     dpi,
-                    DEFAULT_CANDIDATE_VISUAL_SPEC,
+                    spec,
                     scene,
                     fonts,
                     CandidateScenePaintContent {
@@ -1119,16 +1178,12 @@ mod windows_app {
             }
         } else {
             unsafe {
-                fill_background(hdc, &client, DEFAULT_CANDIDATE_VISUAL_SPEC.background);
+                fill_background(hdc, &client, spec.background);
             }
         }
         if let Some(selection) = snapshot.selection {
             unsafe {
-                paint_selection_frame(
-                    hdc,
-                    selection,
-                    DEFAULT_CANDIDATE_VISUAL_SPEC.selection_accent,
-                );
+                paint_selection_frame(hdc, selection, spec.selection_accent);
             }
         }
         APP_STATE.with(|slot| {
@@ -1180,8 +1235,7 @@ mod windows_app {
         }
     }
 
-    unsafe fn create_fonts(dpi: u32) -> CandidateSceneFonts {
-        let spec = DEFAULT_CANDIDATE_VISUAL_SPEC;
+    unsafe fn create_fonts(dpi: u32, spec: CandidateVisualSpec) -> CandidateSceneFonts {
         CandidateSceneFonts {
             candidate: unsafe {
                 create_font(
@@ -1290,6 +1344,61 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::candidate_ui_lab_visual::CandidateUiLabToken;
+
+        fn assert_current_scene_builds(state: &LabState) {
+            let content = state.scenario().content();
+            let metrics = frame_metrics(state);
+            let widths = if state.layout == CandidateSceneLayout::Horizontal {
+                allocate_horizontal_candidate_widths(
+                    state.active_spec(),
+                    state.dpi(),
+                    metrics.width,
+                    metrics.footer_width,
+                    &content.candidates,
+                    false,
+                    MAX_CANDIDATE_CHARACTERS,
+                )
+            } else {
+                Vec::new()
+            };
+            let scene = build_candidate_scene(
+                state.active_spec(),
+                CandidateSceneRequest {
+                    layout: state.layout,
+                    dpi: state.dpi(),
+                    width: metrics.width,
+                    height: metrics.height,
+                    candidate_count: content.candidates.len(),
+                    horizontal_candidate_widths: &widths,
+                    footer_width: metrics.footer_width,
+                    footer_mode: content.mode_label.is_some(),
+                    footer_page: content.page_label.is_some(),
+                    selected_surface: true,
+                    show_rank: true,
+                    notice_icon: false,
+                    personalized: &content.personalized,
+                    rank_metrics: None,
+                    candidate_text_metrics: None,
+                    selected_text_metrics: None,
+                    action_detail_metrics: None,
+                },
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "scene failed: scenario={:?} dpi={} layout={:?} metrics={:?} widths={:?} spec={:?}",
+                    state.scenario(),
+                    state.dpi(),
+                    state.layout,
+                    metrics,
+                    widths,
+                    state.active_spec(),
+                )
+            });
+            assert_eq!(scene.items.len(), content.candidates.len());
+            assert_eq!(scene.client.right, metrics.width);
+            assert_eq!(scene.client.bottom, metrics.height);
+        }
 
         #[test]
         fn every_public_scenario_builds_at_every_reviewed_dpi_and_layout() {
@@ -1305,58 +1414,39 @@ mod windows_app {
                             scenario_index,
                             ..LabState::default()
                         };
-                        let content = state.scenario().content();
-                        let metrics = frame_metrics(&state);
-                        let widths = if layout == CandidateSceneLayout::Horizontal {
-                            allocate_horizontal_candidate_widths(
-                                DEFAULT_CANDIDATE_VISUAL_SPEC,
-                                state.dpi(),
-                                metrics.width,
-                                metrics.footer_width,
-                                &content.candidates,
-                                false,
-                                MAX_CANDIDATE_CHARACTERS,
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        let scene = build_candidate_scene(
-                            DEFAULT_CANDIDATE_VISUAL_SPEC,
-                            CandidateSceneRequest {
-                                layout,
-                                dpi: state.dpi(),
-                                width: metrics.width,
-                                height: metrics.height,
-                                candidate_count: content.candidates.len(),
-                                horizontal_candidate_widths: &widths,
-                                footer_width: metrics.footer_width,
-                                footer_mode: content.mode_label.is_some(),
-                                footer_page: content.page_label.is_some(),
-                                selected_surface: true,
-                                show_rank: true,
-                                notice_icon: false,
-                                personalized: &content.personalized,
-                                rank_metrics: None,
-                                candidate_text_metrics: None,
-                                selected_text_metrics: None,
-                                action_detail_metrics: None,
-                            },
-                        )
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "scene failed: scenario={:?} dpi={} layout={:?} metrics={:?} widths={:?}",
-                                state.scenario(),
-                                state.dpi(),
-                                layout,
-                                metrics,
-                                widths
-                            )
-                        });
-                        assert_eq!(scene.items.len(), content.candidates.len());
-                        assert_eq!(scene.client.right, metrics.width);
-                        assert_eq!(scene.client.bottom, metrics.height);
+                        assert_current_scene_builds(&state);
                     }
                 }
+            }
+        }
+
+        #[test]
+        fn every_adjustable_visual_extreme_builds_every_public_scene() {
+            let mut visual = CandidateUiLabVisualState::default();
+            for _ in CandidateUiLabToken::ALL {
+                for steps in [i32::MIN, i32::MAX] {
+                    visual.reset_draft();
+                    let _ = visual.adjust_draft(steps);
+                    for scenario_index in 0..LabScenario::ALL.len() {
+                        for dpi_index in 0..DPIS.len() {
+                            for layout in [
+                                CandidateSceneLayout::Horizontal,
+                                CandidateSceneLayout::Vertical,
+                            ] {
+                                let state = LabState {
+                                    layout,
+                                    dpi_index,
+                                    scenario_index,
+                                    visual,
+                                    ..LabState::default()
+                                };
+                                assert_current_scene_builds(&state);
+                            }
+                        }
+                    }
+                }
+                visual.reset_draft();
+                visual.cycle_token();
             }
         }
 
