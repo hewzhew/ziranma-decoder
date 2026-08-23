@@ -408,7 +408,7 @@ impl CandidateExactPhrasePreflightReceipt {
         {
             return Err(CandidateExactPhrasePreflightReceiptError::InvalidSha256);
         }
-        if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&supplemental_promotions) {
+        if supplemental_promotions != 1 {
             return Err(CandidateExactPhrasePreflightReceiptError::InvalidPromotionLimit);
         }
         Ok(Self {

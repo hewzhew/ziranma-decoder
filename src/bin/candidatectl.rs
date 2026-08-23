@@ -66,7 +66,8 @@ use ziranma_core::{
 use ziranma_core::{
     CandidatePopupRenderPreflightReport, CandidatePopupRenderScenario,
     TSF_ALPHA_CANDIDATE_PAGE_SIZE, TsfCandidatePreflightError, preflight_candidate_popup_rendering,
-    preflight_candidate_snapshot, preflight_exact_short_candidate_layers,
+    preflight_candidate_snapshot, preflight_exact_phrase_candidate_layers,
+    preflight_exact_short_candidate_layers,
 };
 
 const PINNED_RIME_PINYIN_SIMP_SHA256: &str =
@@ -216,6 +217,13 @@ enum Options {
         repetitions: usize,
     },
     ExactPhraseLayerPreflight {
+        core_package: PathBuf,
+        supplemental_package: PathBuf,
+        phrase_package: PathBuf,
+        sample_limit: usize,
+        repetitions: usize,
+    },
+    ExactPhraseTsfPreflight {
         core_package: PathBuf,
         supplemental_package: PathBuf,
         phrase_package: PathBuf,
@@ -705,6 +713,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_limit,
             repetitions,
         })?,
+        Options::ExactPhraseTsfPreflight {
+            core_package,
+            supplemental_package,
+            phrase_package,
+            sample_limit,
+            repetitions,
+        } => preflight_exact_phrase_tsf(ExactPhraseTsfPreflightRequest {
+            core_package: &core_package,
+            supplemental_package: &supplemental_package,
+            phrase_package: &phrase_package,
+            sample_limit,
+            repetitions,
+        })?,
         Options::LayerAudit {
             core_payload,
             supplemental_payload,
@@ -955,6 +976,7 @@ fn parse_options(
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "exact-phrase-layer-audit" => parse_exact_phrase_layer_audit(arguments),
         "exact-phrase-layer-preflight" => parse_exact_phrase_layer_preflight(arguments),
+        "exact-phrase-tsf-preflight" => parse_exact_phrase_tsf_preflight(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
@@ -2347,6 +2369,53 @@ fn parse_exact_phrase_layer_preflight(
     })
 }
 
+fn parse_exact_phrase_tsf_preflight(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_package = None;
+    let mut supplemental_package = None;
+    let mut phrase_package = None;
+    let mut sample_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-package" => set_path(&mut core_package, &mut arguments, "--core-package")?,
+            "--supplemental-package" => set_path(
+                &mut supplemental_package,
+                &mut arguments,
+                "--supplemental-package",
+            )?,
+            "--phrase-package" => {
+                set_path(&mut phrase_package, &mut arguments, "--phrase-package")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err(
+                    "unknown exact-phrase-tsf-preflight argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let sample_limit = sample_limit.ok_or("exact-phrase-tsf-preflight requires --sample-limit")?;
+    if !(1..=32).contains(&sample_limit) {
+        return Err("exact-phrase-tsf-preflight --sample-limit is outside the fixed bound".into());
+    }
+    let repetitions = repetitions.ok_or("exact-phrase-tsf-preflight requires --repetitions")?;
+    if !(1..=20).contains(&repetitions) || sample_limit.saturating_mul(repetitions) > 640 {
+        return Err("exact-phrase-tsf-preflight workload exceeds the fixed 640-probe bound".into());
+    }
+    Ok(Options::ExactPhraseTsfPreflight {
+        core_package: core_package.ok_or("exact-phrase-tsf-preflight requires --core-package")?,
+        supplemental_package: supplemental_package
+            .ok_or("exact-phrase-tsf-preflight requires --supplemental-package")?,
+        phrase_package: phrase_package
+            .ok_or("exact-phrase-tsf-preflight requires --phrase-package")?,
+        sample_limit,
+        repetitions,
+    })
+}
+
 fn parse_runtime_query(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -3302,6 +3371,9 @@ fn print_usage() {
     );
     eprintln!(
         "  exact-phrase-layer-preflight --core-package <PUBLIC_PACKAGE_DIR> --supplemental-package <PUBLIC_PACKAGE_DIR> --phrase-package <FOUR_SOURCE_PUBLIC_PACKAGE_DIR> --sample-limit <1..32> --repetitions <1..20>"
+    );
+    eprintln!(
+        "  exact-phrase-tsf-preflight --core-package <PUBLIC_PACKAGE_DIR> --supplemental-package <PUBLIC_PACKAGE_DIR> --phrase-package <FOUR_SOURCE_PUBLIC_PACKAGE_DIR> --sample-limit <1..32> --repetitions <1..20>"
     );
     eprintln!(
         "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
@@ -7573,6 +7645,35 @@ struct ExactPhraseLayerPreflightSummary {
     checksum: usize,
 }
 
+struct ExactPhraseTsfPreflightRequest<'a> {
+    core_package: &'a Path,
+    supplemental_package: &'a Path,
+    phrase_package: &'a Path,
+    sample_limit: usize,
+    repetitions: usize,
+}
+
+struct ExactPhraseTsfLayerIdentity {
+    revision: String,
+    authentication_sha256: String,
+    load_duration: Duration,
+}
+
+struct ExactPhraseTsfPreflightSummary {
+    core: ExactPhraseTsfLayerIdentity,
+    supplemental: ExactPhraseTsfLayerIdentity,
+    phrase: ExactPhraseTsfLayerIdentity,
+    phrase_entries: usize,
+    phrase_codes: usize,
+    requested_probes: usize,
+    inspected_codes: usize,
+    repetitions: usize,
+    target_rank_samples: [usize; EXACT_PHRASE_FIRST_PAGE],
+    first_page: DurationSummary,
+    commit: DurationSummary,
+    complete_path: DurationSummary,
+}
+
 fn preflight_exact_phrase_layer(
     request: ExactPhraseLayerPreflightRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -7884,6 +7985,254 @@ fn verify_exact_phrase_preview(
         return Err("exact phrase preview is unbounded or contains duplicates".into());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn preflight_exact_phrase_tsf(
+    request: ExactPhraseTsfPreflightRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    run_exact_phrase_tsf_preflight(request)
+        .map(|summary| render_exact_phrase_tsf_preflight_report(&summary))
+}
+
+#[cfg(windows)]
+fn run_exact_phrase_tsf_preflight(
+    request: ExactPhraseTsfPreflightRequest<'_>,
+) -> Result<ExactPhraseTsfPreflightSummary, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("exact-phrase-tsf-preflight must run from a release build".into());
+    }
+    if !(1..=32).contains(&request.sample_limit)
+        || !(1..=20).contains(&request.repetitions)
+        || request.sample_limit.saturating_mul(request.repetitions) > 640
+    {
+        return Err("exact phrase TSF preflight workload is outside the fixed bound".into());
+    }
+
+    let core_started = Instant::now();
+    let core = load_public_package_directory(request.core_package)?;
+    let core_load = core_started.elapsed();
+    let supplemental_started = Instant::now();
+    let supplemental = load_public_package_directory(request.supplemental_package)?;
+    let supplemental_load = supplemental_started.elapsed();
+    let phrase_started = Instant::now();
+    let phrase = load_public_package_directory(request.phrase_package)?;
+    let phrase_load = phrase_started.elapsed();
+
+    // Authenticate the complete four-source provenance, strict three-character
+    // shape, unique-code catalog, guarded first-page merge, deduplication, and
+    // negative-control fallback before opening any synthetic TSF Context.
+    let layer_summary = preflight_loaded_exact_phrase_layer(
+        &core,
+        &supplemental,
+        &phrase,
+        request.sample_limit,
+        1,
+        [core_load, supplemental_load, phrase_load],
+    )?;
+    let phrase_entries = parse_lexicon_tsv(&phrase.payload_text)?;
+    let all_codes = evenly_spaced_exact_short_codes(&phrase_entries, phrase_entries.len());
+    if request.sample_limit > all_codes.len() {
+        return Err("exact phrase TSF preflight package exposes too few distinct codes".into());
+    }
+
+    struct Probe {
+        code: String,
+        expected_text: String,
+        target_rank: usize,
+    }
+
+    let expected_core_revision = core.snapshot.revision();
+    let expected_supplemental_revision = supplemental.snapshot.revision();
+    let expected_phrase_revision = phrase.snapshot.revision();
+    let supplemental_config = SupplementalCandidateLayerConfig {
+        exact_promotions: 1,
+    };
+    let mut probes = Vec::<Probe>::with_capacity(request.sample_limit);
+    let mut inspected = BTreeSet::<usize>::new();
+    let per_anchor_scan = all_codes.len().min(64);
+    for sample_index in 0..request.sample_limit {
+        let anchor = sample_index * all_codes.len() / request.sample_limit;
+        let mut selected = None;
+        for offset in 0..per_anchor_scan {
+            let code_index = (anchor + offset) % all_codes.len();
+            if !inspected.insert(code_index) {
+                continue;
+            }
+            let code = &all_codes[code_index];
+            let expected_text = phrase
+                .snapshot
+                .exact_full_code_texts(code, 1)?
+                .into_iter()
+                .next()
+                .ok_or("exact phrase TSF sample is missing its authenticated identity")?;
+            match preflight_exact_phrase_candidate_layers(
+                Arc::clone(&core.snapshot),
+                Arc::clone(&supplemental.snapshot),
+                supplemental_config,
+                Arc::clone(&phrase.snapshot),
+                code,
+                &expected_text,
+            ) {
+                Ok(report) => {
+                    if report.core_revision() != expected_core_revision
+                        || report.supplemental_revision() != expected_supplemental_revision
+                        || report.phrase_revision() != expected_phrase_revision
+                        || report.input_keys() != EXACT_PHRASE_CHARACTERS * 2
+                        || report.committed_characters() != EXACT_PHRASE_CHARACTERS
+                        || !(1..=EXACT_PHRASE_FIRST_PAGE).contains(&report.target_rank())
+                    {
+                        return Err("exact phrase TSF preflight runtime identity changed".into());
+                    }
+                    selected = Some(Probe {
+                        code: code.clone(),
+                        expected_text,
+                        target_rank: report.target_rank(),
+                    });
+                }
+                Err(TsfCandidatePreflightError::ExactPhrasePageMismatch) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+        probes.push(selected.ok_or(
+            "exact phrase TSF preflight found too few page-stable probes within the bounded scan",
+        )?);
+    }
+
+    let sample_count = probes.len().saturating_mul(request.repetitions);
+    let mut first_page_samples = Vec::with_capacity(sample_count);
+    let mut commit_samples = Vec::with_capacity(sample_count);
+    let mut complete_path_samples = Vec::with_capacity(sample_count);
+    let mut target_rank_samples = [0_usize; EXACT_PHRASE_FIRST_PAGE];
+    for _ in 0..request.repetitions {
+        for probe in &probes {
+            let report = preflight_exact_phrase_candidate_layers(
+                Arc::clone(&core.snapshot),
+                Arc::clone(&supplemental.snapshot),
+                supplemental_config,
+                Arc::clone(&phrase.snapshot),
+                &probe.code,
+                &probe.expected_text,
+            )?;
+            if report.core_revision() != expected_core_revision
+                || report.supplemental_revision() != expected_supplemental_revision
+                || report.phrase_revision() != expected_phrase_revision
+                || report.target_rank() != probe.target_rank
+            {
+                return Err("exact phrase TSF preflight probe changed after discovery".into());
+            }
+            let target_index = report.target_rank() - 1;
+            target_rank_samples[target_index] += 1;
+            first_page_samples.push(report.first_page_duration());
+            commit_samples.push(report.commit_duration());
+            complete_path_samples.push(report.first_page_duration() + report.commit_duration());
+        }
+    }
+
+    Ok(ExactPhraseTsfPreflightSummary {
+        core: ExactPhraseTsfLayerIdentity {
+            revision: core.snapshot.revision().to_owned(),
+            authentication_sha256: core.authentication_sha256,
+            load_duration: core_load,
+        },
+        supplemental: ExactPhraseTsfLayerIdentity {
+            revision: supplemental.snapshot.revision().to_owned(),
+            authentication_sha256: supplemental.authentication_sha256,
+            load_duration: supplemental_load,
+        },
+        phrase: ExactPhraseTsfLayerIdentity {
+            revision: phrase.snapshot.revision().to_owned(),
+            authentication_sha256: phrase.authentication_sha256,
+            load_duration: phrase_load,
+        },
+        phrase_entries: layer_summary.phrase_entries,
+        phrase_codes: layer_summary.phrase_codes,
+        requested_probes: probes.len(),
+        inspected_codes: inspected.len(),
+        repetitions: request.repetitions,
+        target_rank_samples,
+        first_page: summarize_durations(&mut first_page_samples)
+            .ok_or("exact phrase TSF preflight produced no first-page samples")?,
+        commit: summarize_durations(&mut commit_samples)
+            .ok_or("exact phrase TSF preflight produced no commit samples")?,
+        complete_path: summarize_durations(&mut complete_path_samples)
+            .ok_or("exact phrase TSF preflight produced no complete-path samples")?,
+    })
+}
+
+#[cfg(not(windows))]
+fn preflight_exact_phrase_tsf(
+    _request: ExactPhraseTsfPreflightRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Err("exact phrase TSF preflight requires Windows".into())
+}
+
+fn render_exact_phrase_tsf_preflight_report(summary: &ExactPhraseTsfPreflightSummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "TSF 三字精确词第一页 release 预检").unwrap();
+    for (label, identity) in [
+        ("核心", &summary.core),
+        ("补充", &summary.supplemental),
+        ("三字层", &summary.phrase),
+    ] {
+        writeln!(
+            output,
+            "{label}：{} · 认证 SHA-256 {} · 载入 {:.3} ms",
+            identity.revision,
+            identity.authentication_sha256,
+            duration_ms(identity.load_duration),
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "形状门：{} 条、{} 个唯一六键码；四源 provenance、当前核心/补充载荷、既有整词前缀、第一页和负对照均先通过纯三包认证",
+        summary.phrase_entries, summary.phrase_codes,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "工作负载：等距锚点 {} 个；每锚点最多检查 64 个码；实际检查 {} 个码；每码发现预热 1 次；重复 {}；计时样本 {}；页宽 {}",
+        summary.requested_probes,
+        summary.inspected_codes,
+        summary.repetitions,
+        summary.first_page.samples,
+        EXACT_PHRASE_FIRST_PAGE,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "目标位次样本：第 1 项 {}；第 2 项 {}；第 3 项 {}；第 4 项 {}；第 5 项 {}；第 6 项 {}",
+        summary.target_rank_samples[0],
+        summary.target_rank_samples[1],
+        summary.target_rank_samples[2],
+        summary.target_rank_samples[3],
+        summary.target_rank_samples[4],
+        summary.target_rank_samples[5],
+    )
+    .unwrap();
+    write_tsf_preflight_duration(&mut output, "输入至第一页状态就绪", summary.first_page);
+    write_tsf_preflight_duration(&mut output, "空格或数字键提交目标", summary.commit);
+    write_tsf_preflight_duration(&mut output, "首键至提交完成", summary.complete_path);
+    writeln!(
+        output,
+        "功能门：全部计时样本均保持既有完整词前缀，在第一页以 PublicConsensusExact 来源命中目标，并由空格或普通数字键实际提交"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "性能口径：同机、release、每次新建真实系统 TSF 合成 Context；计时截止同步候选状态与提交，不包含候选窗绘制、桌面合成、屏幕首帧或实际宿主呈现。"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "隐私与启用边界：报告不含探针码、候选正文或个人数据；本次操作只读，不写槽位、状态或运行时凭据，不安装、不启用，预检通过也不构成换代许可。"
+    )
+    .unwrap();
+    output
 }
 
 fn existing_exact_texts(
@@ -14309,6 +14658,52 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_tsf_preflight_parser_binds_only_bounded_public_packages() {
+        assert_eq!(
+            parse_options([
+                "exact-phrase-tsf-preflight".to_owned(),
+                "--core-package".to_owned(),
+                "core".to_owned(),
+                "--supplemental-package".to_owned(),
+                "supplemental".to_owned(),
+                "--phrase-package".to_owned(),
+                "phrase".to_owned(),
+                "--sample-limit".to_owned(),
+                "32".to_owned(),
+                "--repetitions".to_owned(),
+                "20".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactPhraseTsfPreflight {
+                core_package: PathBuf::from("core"),
+                supplemental_package: PathBuf::from("supplemental"),
+                phrase_package: PathBuf::from("phrase"),
+                sample_limit: 32,
+                repetitions: 20,
+            }
+        );
+        for (sample_limit, repetitions) in [(0, 1), (33, 1), (1, 0), (1, 21)] {
+            assert!(
+                parse_options([
+                    "exact-phrase-tsf-preflight".to_owned(),
+                    "--sample-limit".to_owned(),
+                    sample_limit.to_string(),
+                    "--repetitions".to_owned(),
+                    repetitions.to_string(),
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            parse_options([
+                "exact-phrase-tsf-preflight".to_owned(),
+                "--unknown".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn phrase_layer_build_parser_requires_all_three_public_materials() {
         let arguments = vec![
             "build-phrase-layer",
@@ -14906,6 +15301,59 @@ mod tests {
         assert!(report.contains("本次操作只读"));
         assert!(!report.contains("ubuu"));
         assert!(!report.contains("收束"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_phrase_tsf_preflight_debug_guard_runs_before_opening_packages() {
+        let error = preflight_exact_phrase_tsf(ExactPhraseTsfPreflightRequest {
+            core_package: Path::new("must-not-be-opened-core"),
+            supplemental_package: Path::new("must-not-be-opened-supplemental"),
+            phrase_package: Path::new("must-not-be-opened-phrase"),
+            sample_limit: 1,
+            repetitions: 1,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "exact-phrase-tsf-preflight must run from a release build"
+        );
+    }
+
+    #[test]
+    fn exact_phrase_tsf_preflight_report_contains_only_aggregate_evidence() {
+        let duration = DurationSummary {
+            samples: 40,
+            median: Duration::from_micros(1_250),
+            p95: Duration::from_micros(2_500),
+            p99: Duration::from_micros(3_750),
+            maximum: Duration::from_micros(5_000),
+        };
+        let identity = |label: &str, digest: char| ExactPhraseTsfLayerIdentity {
+            revision: format!("public-{label}-v1"),
+            authentication_sha256: digest.to_string().repeat(64),
+            load_duration: Duration::from_millis(5),
+        };
+        let report = render_exact_phrase_tsf_preflight_report(&ExactPhraseTsfPreflightSummary {
+            core: identity("core", 'a'),
+            supplemental: identity("supplemental", 'b'),
+            phrase: identity("phrase", 'c'),
+            phrase_entries: 2_799,
+            phrase_codes: 2_799,
+            requested_probes: 8,
+            inspected_codes: 11,
+            repetitions: 5,
+            target_rank_samples: [20, 10, 5, 3, 1, 1],
+            first_page: duration,
+            commit: duration,
+            complete_path: duration,
+        });
+        assert!(report.contains("计时样本 40"));
+        assert!(report.contains("第 1 项 20"));
+        assert!(report.contains("median 1.250 ms"));
+        assert!(report.contains("不写槽位、状态或运行时凭据"));
+        assert!(!report.contains("zljnll"));
+        assert!(!report.contains("再进来"));
     }
 
     #[test]

@@ -74,8 +74,9 @@ pub use tsf_alpha::{
     CandidatePopupRenderPreflightError, CandidatePopupRenderPreflightReport,
     CandidatePopupRenderSample, CandidatePopupRenderScenario, TSF_ALPHA_CANDIDATE_PAGE_SIZE,
     TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID, TsfCandidatePreflightError,
-    TsfCandidatePreflightReport, TsfExactShortPreflightReport, preflight_candidate_popup_rendering,
-    preflight_candidate_snapshot, preflight_exact_short_candidate_layer,
+    TsfCandidatePreflightReport, TsfExactPhrasePreflightReport, TsfExactShortPreflightReport,
+    preflight_candidate_popup_rendering, preflight_candidate_snapshot,
+    preflight_exact_phrase_candidate_layers, preflight_exact_short_candidate_layer,
     preflight_exact_short_candidate_layers,
 };
 

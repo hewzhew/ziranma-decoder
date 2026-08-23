@@ -499,8 +499,31 @@ target\release\candidatectl.exe exact-phrase-layer-preflight `
 16 个负对照全部保持原样。两层查询 median 为 11.286/13.219 ms、p95 为
 13.209/15.249 ms，三包预览 median 为 10.755/13.061 ms、p95 为
 12.667/15.240 ms。这些差异只视作同机噪声，不声称新层更快。该门仍没有创建真实
-Context、候选窗或桌面帧，因此不能替代 TSF 三层宿主预检、首帧与分页验证，也不构成
-启用许可。
+Context、候选窗或桌面帧，因此它本身不能替代 TSF 三层宿主预检，也不构成启用许可。
+
+`exact-phrase-tsf-preflight` 随后把相同三包送入真实 Windows TSF 合成 Context。命令
+在创建 Context 前重新执行四源绑定、六键唯一形状、既有整词前缀、去重、第一页和
+负对照门；再从三字层全码序等距取锚点，每个锚点最多检查 64 个候选码，只保留能在
+第一页稳定提交的探针。首项用空格，后续项用普通数字键；正式计时总量固定不超过
+640 次。发现与报告均不输出探针码或候选正文：
+
+```powershell
+target\release\candidatectl.exe exact-phrase-tsf-preflight `
+  --core-package .local\candidate-rime-pinyin-simp-0c6861ef-v1 `
+  --supplemental-package .local\public-audit\wanxiang-fdda7afb\package-top100k-v1 `
+  --phrase-package .local\public-audit\wanxiang-fdda7afb\package-exact-phrase-train-span-v1 `
+  --sample-limit 16 --repetitions 5
+```
+
+两次固定 release 运行均重新认证上述三份 SHA-256，并各自完成 16 个发现预热与 80 个
+计时提交。第一次的第一页状态 median/p95 为 24.991/32.306 ms，提交为
+0.012/0.018 ms，首键至提交为 25.003/32.318 ms；第二次依次为
+25.278/33.595 ms、0.013/0.018 ms 和 25.290/33.609 ms。三字层加载分别为
+5.244 和 5.213 ms。当前公开包的 16 个等距稳定探针全部位于第 1 项，所以这组实包
+性能证据只覆盖空格提交；第 2 项数字键提交已由真实 Context 的聚焦合成回归验证，
+但不能冒充实包位次或性能分布。该计时截止同步候选状态与提交，不包含候选窗绘制、
+桌面合成、屏幕首帧或实际应用呈现。命令不写槽位、状态或
+`exact-phrase-preflight.zep`，通过仍不构成 prepare、enable、安装或换代许可。
 
 三包专项门之后新增了一个仍不可启用的运行时骨架。独立根内预留严格三行
 `exact-phrase.zcl`，并继续复用不可变 `slots.zcs`、`packages` 与普通包 `.zpf`；
@@ -509,7 +532,7 @@ Context、候选窗或桌面帧，因此不能替代 TSF 三层宿主预检、�
 六键且每码唯一，四源 provenance 还须包含当前核心与补充载荷摘要。
 
 即便上述检查全部通过，加载器仍要求独立 `exact-phrase-preflight.zep` 同时绑定三包
-认证摘要、补充层影响上限、页宽 6 和未来的真实
+认证摘要、经过公开审计的补充层影响上限 1、页宽 6 和未来的真实
 `tsf-exact-phrase-first-page-context-v1` 宿主。当前没有任何命令会生成该凭据，也没有
 prepare/enable、安装脚本或 TSF 类工厂根发现逻辑；已有日用加载入口仍不传入三字根。
 因此这一步只冻结了默认关闭、失败回退的状态与认证契约，为下一阶段真实 Context

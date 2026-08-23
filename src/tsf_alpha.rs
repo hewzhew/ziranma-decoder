@@ -981,6 +981,7 @@ struct SnapshotCandidateProvider {
     snapshot: Arc<CandidateSnapshot>,
     supplemental: PublicSupplementRuntime,
     exact_short: PublicExactShortRuntime,
+    exact_phrase: Option<Arc<CandidateSnapshot>>,
     aliases: Option<ExplicitAliasRuntime>,
     refresh_throttle: Mutex<RefreshThrottle>,
     shape_candidate_pools: Mutex<ShapeCandidatePoolCache>,
@@ -1001,6 +1002,7 @@ impl SnapshotCandidateProvider {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(supplemental),
             exact_short: PublicExactShortRuntime::managed(None, None, None, None),
+            exact_phrase: None,
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -1032,6 +1034,7 @@ impl SnapshotCandidateProvider {
                 core_authentication_sha256,
                 supplemental_identity,
             ),
+            exact_phrase: None,
             aliases: alias_root.map(ExplicitAliasRuntime::new),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -1204,6 +1207,20 @@ impl SnapshotCandidateProvider {
                         automatic_transposition_blocked = true;
                     }
                 }
+                if let (Some((supplemental, config)), Some(phrase)) =
+                    (supplemental.as_ref(), self.exact_phrase.as_ref())
+                    && config.exact_promotions == 1
+                    && apply_exact_phrase_candidate(
+                        &self.snapshot,
+                        supplemental,
+                        phrase,
+                        code,
+                        limit,
+                        &mut snapshot_query,
+                    )
+                {
+                    automatic_transposition_blocked = true;
+                }
                 automatic_transposition_blocked |= snapshot_query.automatic_transposition_blocked;
                 for candidate in snapshot_query.candidates {
                     if seen.insert(candidate.text.clone()) {
@@ -1250,6 +1267,65 @@ impl SnapshotCandidateProvider {
     }
 }
 
+fn apply_exact_phrase_candidate(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    phrase: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+    query: &mut InteractiveCandidateQuery,
+) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    let Some(candidate) = phrase
+        .exact_full_code_texts(code, 1)
+        .ok()
+        .and_then(|candidates| candidates.into_iter().next())
+    else {
+        return false;
+    };
+    let Some(existing_exact) = core
+        .exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)
+        .ok()
+        .zip(
+            supplemental
+                .exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)
+                .ok(),
+        )
+        .map(|(core, supplemental)| core.into_iter().chain(supplemental).collect::<HashSet<_>>())
+    else {
+        return false;
+    };
+    if existing_exact.contains(candidate.as_str()) {
+        return false;
+    }
+    let stable_prefix = query
+        .candidates
+        .iter()
+        .take_while(|item| existing_exact.contains(item.text.as_str()))
+        .count();
+    if stable_prefix >= limit {
+        return false;
+    }
+    if let Some(existing_index) = query
+        .candidates
+        .iter()
+        .position(|item| item.text == candidate)
+    {
+        query.candidates.remove(existing_index);
+    }
+    query.candidates.insert(
+        stable_prefix.min(query.candidates.len()),
+        crate::candidate_snapshot::InteractiveCandidateText {
+            text: candidate,
+            source: InteractiveCandidateSource::PublicConsensusExact,
+        },
+    );
+    query.candidates.truncate(limit);
+    true
+}
+
 fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidateSource {
     match source {
         InteractiveCandidateSource::CoreExact => NativeCandidateSource::CoreExact,
@@ -1277,6 +1353,7 @@ struct CandidateProviderBlueprint {
     exact_short: Option<CandidateRuntimeExactShort>,
     exact_short_root: Option<PathBuf>,
     static_exact_short: Option<ExactShortCandidateLayer>,
+    static_exact_phrase: Option<Arc<CandidateSnapshot>>,
     alias_root: Option<PathBuf>,
 }
 
@@ -1297,6 +1374,7 @@ impl CandidateProviderBlueprint {
         if let Some(layer) = self.static_exact_short.clone() {
             provider.exact_short = PublicExactShortRuntime::static_layer(Some(layer));
         }
+        provider.exact_phrase = self.static_exact_phrase.clone();
         Arc::new(provider)
     }
 }
@@ -1831,6 +1909,12 @@ impl CandidateProvider for SnapshotCandidateProvider {
             || supplemental.as_ref().is_some_and(|(snapshot, _)| {
                 snapshot
                     .exact_full_code_texts(code, CANDIDATE_LIMIT)
+                    .ok()
+                    .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
+            })
+            || self.exact_phrase.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .exact_full_code_texts(code, 1)
                     .ok()
                     .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == text))
             })
@@ -2425,6 +2509,7 @@ fn development_candidate_blueprint() -> CandidateProviderLoadResult {
                 exact_short: None,
                 exact_short_root: None,
                 static_exact_short: None,
+                static_exact_phrase: None,
                 alias_root: None,
             })
         })
@@ -2463,6 +2548,7 @@ fn candidate_provider_for_roots(
             exact_short: runtime.exact_short().cloned(),
             exact_short_root: exact_short_root.map(Path::to_path_buf),
             static_exact_short: None,
+            static_exact_phrase: None,
             alias_root,
         }),
         None => development_candidate_blueprint().map(|mut blueprint| {
@@ -2705,6 +2791,53 @@ impl TsfExactShortPreflightReport {
     }
 }
 
+/// Redacted evidence from a real TSF first-page exact-phrase preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TsfExactPhrasePreflightReport {
+    core_revision: String,
+    supplemental_revision: String,
+    phrase_revision: String,
+    input_keys: usize,
+    committed_characters: usize,
+    target_rank: usize,
+    first_page: Duration,
+    commit: Duration,
+}
+
+impl TsfExactPhrasePreflightReport {
+    pub fn core_revision(&self) -> &str {
+        &self.core_revision
+    }
+
+    pub fn supplemental_revision(&self) -> &str {
+        &self.supplemental_revision
+    }
+
+    pub fn phrase_revision(&self) -> &str {
+        &self.phrase_revision
+    }
+
+    pub fn input_keys(&self) -> usize {
+        self.input_keys
+    }
+
+    pub fn committed_characters(&self) -> usize {
+        self.committed_characters
+    }
+
+    pub fn target_rank(&self) -> usize {
+        self.target_rank
+    }
+
+    pub fn first_page_duration(&self) -> Duration {
+        self.first_page
+    }
+
+    pub fn commit_duration(&self) -> Duration {
+        self.commit
+    }
+}
+
 /// Fixed visual paths exercised by the isolated candidate-popup preflight.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CandidatePopupRenderScenario {
@@ -2861,6 +2994,8 @@ pub enum TsfCandidatePreflightError {
     CandidateMismatch,
     /// The expected exact word is not uniquely exposed as second-page first.
     ExactShortPageMismatch,
+    /// The exact phrase did not occupy its guarded first-page position.
+    ExactPhrasePageMismatch,
     /// Another synthetic-host operation is already using local COM state.
     HostBusy,
     /// The calling thread could not enter a compatible COM apartment.
@@ -2888,6 +3023,9 @@ impl fmt::Display for TsfCandidatePreflightError {
             Self::InvalidExpectedText => write!(formatter, "TSF 预检目标文字无效"),
             Self::CandidateMismatch => write!(formatter, "候选快照与 TSF 预检目标不符"),
             Self::ExactShortPageMismatch => write!(formatter, "精确短词未稳定出现在第二页首项"),
+            Self::ExactPhrasePageMismatch => {
+                write!(formatter, "三字精确词未稳定出现在第一页守护位置")
+            }
             Self::HostBusy => write!(formatter, "TSF 合成宿主当前不可用"),
             Self::ComInitialization => write!(formatter, "TSF 预检无法初始化 COM"),
             Self::ThreadManager => write!(formatter, "TSF 预检无法建立线程管理器"),
@@ -2939,6 +3077,7 @@ pub fn preflight_candidate_snapshot(
             exact_short: None,
             exact_short_root: None,
             static_exact_short: None,
+            static_exact_phrase: None,
             alias_root: None,
         },
         probe_code,
@@ -3016,6 +3155,7 @@ pub fn preflight_exact_short_candidate_layers(
             catalog: exact_short,
             exact_promotions,
         }),
+        static_exact_phrase: None,
         alias_root: None,
     };
 
@@ -3066,7 +3206,7 @@ pub fn preflight_exact_short_candidate_layers(
         blueprint,
         probe_code,
         expected_text,
-        PreflightSelection::SecondPageFirstCandidate,
+        PreflightSelection::SecondPageFirst,
     );
     if !can_unload_now() {
         return Err(TsfCandidatePreflightError::Cleanup);
@@ -3080,6 +3220,141 @@ pub fn preflight_exact_short_candidate_layers(
         committed_characters,
         first_page: timings.first_page,
         second_page: timings.second_page,
+        commit: timings.commit,
+    })
+}
+
+/// Routes a core, supplemental, and exact three-character phrase stack
+/// through the real system TSF Context path.
+///
+/// The phrase must occupy the position immediately after all existing exact
+/// words while remaining on the first six-item page. Rank one is committed by
+/// Space; later guarded ranks are committed by their ordinary number key.
+/// No runtime root, receipt, window, or current-user state is opened.
+pub fn preflight_exact_phrase_candidate_layers(
+    core: Arc<CandidateSnapshot>,
+    supplemental: Arc<CandidateSnapshot>,
+    supplemental_config: SupplementalCandidateLayerConfig,
+    phrase: Arc<CandidateSnapshot>,
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<TsfExactPhrasePreflightReport, TsfCandidatePreflightError> {
+    let committed_characters = validate_candidate_preflight_request(probe_code, expected_text)?;
+    if probe_code.len() != 6
+        || committed_characters != 3
+        || supplemental_config.exact_promotions != 1
+        || phrase
+            .exact_full_code_texts(probe_code, 1)
+            .map_err(|_| TsfCandidatePreflightError::ExactPhrasePageMismatch)?
+            .first()
+            .map(String::as_str)
+            != Some(expected_text)
+    {
+        return Err(TsfCandidatePreflightError::ExactPhrasePageMismatch);
+    }
+    let core_revision = core.revision().to_owned();
+    let supplemental_revision = supplemental.revision().to_owned();
+    let phrase_revision = phrase.revision().to_owned();
+    let base_blueprint = CandidateProviderBlueprint {
+        snapshot: Arc::clone(&core),
+        core_authentication_sha256: None,
+        supplemental: None,
+        supplemental_root: None,
+        static_supplemental: Some((Arc::clone(&supplemental), supplemental_config)),
+        exact_short: None,
+        exact_short_root: None,
+        static_exact_short: None,
+        static_exact_phrase: None,
+        alias_root: None,
+    };
+    let mut phrase_blueprint = base_blueprint.clone();
+    phrase_blueprint.static_exact_phrase = Some(phrase);
+
+    let baseline_provider = base_blueprint.build();
+    let phrase_provider = phrase_blueprint.build();
+    let mut baseline_cache = CandidateCache::default();
+    let mut phrase_cache = CandidateCache::default();
+    let baseline = baseline_cache.load_with_automatic_transposition(
+        baseline_provider.as_ref(),
+        probe_code,
+        CANDIDATE_PAGE_SIZE,
+        InteractiveCandidateView::Primary,
+        None,
+    );
+    let preview = phrase_cache.load_with_automatic_transposition(
+        phrase_provider.as_ref(),
+        probe_code,
+        CANDIDATE_PAGE_SIZE,
+        InteractiveCandidateView::Primary,
+        None,
+    );
+    let existing_exact = core
+        .exact_full_code_texts(probe_code, MAX_CANDIDATE_SNAPSHOT_RANK)
+        .map_err(|_| TsfCandidatePreflightError::ExactPhrasePageMismatch)?
+        .into_iter()
+        .chain(
+            supplemental
+                .exact_full_code_texts(probe_code, MAX_CANDIDATE_SNAPSHOT_RANK)
+                .map_err(|_| TsfCandidatePreflightError::ExactPhrasePageMismatch)?,
+        )
+        .collect::<HashSet<_>>();
+    if existing_exact.contains(expected_text) {
+        return Err(TsfCandidatePreflightError::ExactPhrasePageMismatch);
+    }
+    let target_index = baseline
+        .candidates
+        .iter()
+        .take_while(|candidate| existing_exact.contains(candidate.as_str()))
+        .count();
+    if target_index >= CANDIDATE_PAGE_SIZE
+        || preview.candidates.get(target_index).map(String::as_str) != Some(expected_text)
+        || preview
+            .provenance
+            .get(target_index)
+            .copied()
+            .map(NativeCandidateProvenance::source)
+            != Some(NativeCandidateSource::PublicConsensusExact)
+        || baseline
+            .candidates
+            .iter()
+            .take(target_index)
+            .ne(preview.candidates.iter().take(target_index))
+        || baseline
+            .provenance
+            .iter()
+            .take(target_index)
+            .ne(preview.provenance.iter().take(target_index))
+        || preview.candidates.iter().collect::<HashSet<_>>().len() != preview.candidates.len()
+    {
+        return Err(TsfCandidatePreflightError::ExactPhrasePageMismatch);
+    }
+    drop(baseline_provider);
+    drop(phrase_provider);
+
+    let _host_guard = SYNTHETIC_HOST_LOCK
+        .lock()
+        .map_err(|_| TsfCandidatePreflightError::HostBusy)?;
+    if !can_unload_now() {
+        return Err(TsfCandidatePreflightError::HostBusy);
+    }
+    let result = run_candidate_preflight_with_selection(
+        phrase_blueprint,
+        probe_code,
+        expected_text,
+        PreflightSelection::FirstPageAt(target_index),
+    );
+    if !can_unload_now() {
+        return Err(TsfCandidatePreflightError::Cleanup);
+    }
+    let timings = result?;
+    Ok(TsfExactPhrasePreflightReport {
+        core_revision,
+        supplemental_revision,
+        phrase_revision,
+        input_keys: probe_code.len(),
+        committed_characters,
+        target_rank: target_index + 1,
+        first_page: timings.first_page,
         commit: timings.commit,
     })
 }
@@ -3242,8 +3517,9 @@ fn read_preflight_context_text(context: &ITfContext, client_id: u32) -> Result<S
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreflightSelection {
-    FirstCandidate,
-    SecondPageFirstCandidate,
+    First,
+    FirstPageAt(usize),
+    SecondPageFirst,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3262,7 +3538,7 @@ fn run_candidate_preflight(
         blueprint,
         probe_code,
         expected_text,
-        PreflightSelection::FirstCandidate,
+        PreflightSelection::First,
     )
 }
 
@@ -3351,7 +3627,7 @@ fn run_candidate_preflight_with_selection(
     }
     let first_page = first_page_started_at.elapsed();
 
-    let second_page = if selection == PreflightSelection::SecondPageFirstCandidate {
+    let second_page = if selection == PreflightSelection::SecondPageFirst {
         let second_page_started_at = Instant::now();
         let next_page = WPARAM(usize::from(VK_NEXT.0));
         // SAFETY: routes one ordinary candidate-navigation key through the
@@ -3376,12 +3652,24 @@ fn run_candidate_preflight_with_selection(
     };
 
     let commit_started_at = Instant::now();
-    let space = WPARAM(usize::from(VK_SPACE.0));
+    let commit_key = match selection {
+        PreflightSelection::FirstPageAt(index) if index > 0 && index < CANDIDATE_PAGE_SIZE => {
+            WPARAM(usize::from(
+                VK_1.0 + u16::try_from(index).unwrap_or(u16::MAX),
+            ))
+        }
+        PreflightSelection::First
+        | PreflightSelection::FirstPageAt(0)
+        | PreflightSelection::SecondPageFirst => WPARAM(usize::from(VK_SPACE.0)),
+        PreflightSelection::FirstPageAt(_) => {
+            return Err(TsfCandidatePreflightError::ExactPhrasePageMismatch);
+        }
+    };
     // SAFETY: routes one ordinary confirmation key through the same context.
-    let tested = unsafe { key_sink.OnTestKeyDown(&context, space, lparam) }
+    let tested = unsafe { key_sink.OnTestKeyDown(&context, commit_key, lparam) }
         .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
     // SAFETY: commits the first candidate through the active service.
-    let handled = unsafe { key_sink.OnKeyDown(&context, space, lparam) }
+    let handled = unsafe { key_sink.OnKeyDown(&context, commit_key, lparam) }
         .map_err(|_| TsfCandidatePreflightError::KeyRouting)?;
     if !tested.as_bool() || !handled.as_bool() {
         return Err(TsfCandidatePreflightError::KeyRouting);
@@ -13795,6 +14083,7 @@ mod tests {
             snapshot,
             supplemental: PublicSupplementRuntime::static_layer(None),
             exact_short: PublicExactShortRuntime::managed(None, None, None, None),
+            exact_phrase: None,
             aliases: Some(runtime),
             refresh_throttle: Mutex::new(RefreshThrottle::default()),
             shape_candidate_pools: Mutex::new(ShapeCandidatePoolCache::default()),
@@ -16441,6 +16730,99 @@ mod tests {
         assert_eq!(
             preflight_exact_short_candidate_layer(core, exact, 1, "ubuu", "收束").unwrap_err(),
             TsfCandidatePreflightError::ExactShortPageMismatch
+        );
+    }
+
+    #[test]
+    fn exact_phrase_preflight_commits_first_page_target_through_real_tsf_context() {
+        let _guard = test_state_lock();
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+再\tzai\t200\n\
+进来\tjin lai\t190\n\
+在\tzai\t180\n\
+金\tjin\t170\n\
+来\tlai\t160\n";
+        const SUPPLEMENTAL: &str =
+            "text\tpinyin\tfrequency\n其他词\tqi ta ci\t100\n属于\tshu yu\t90\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t80\n";
+        let core_manifest =
+            CandidatePackageManifest::from_payload("tsf-exact-phrase-core-v1", false, CORE)
+                .unwrap();
+        let supplemental_manifest = CandidatePackageManifest::from_payload(
+            "tsf-exact-phrase-supplemental-v1",
+            false,
+            SUPPLEMENTAL,
+        )
+        .unwrap();
+        let phrase_manifest =
+            CandidatePackageManifest::from_payload("tsf-exact-phrase-layer-v1", false, PHRASE)
+                .unwrap();
+        let report = preflight_exact_phrase_candidate_layers(
+            Arc::new(core_manifest.load_snapshot(CORE).unwrap()),
+            Arc::new(supplemental_manifest.load_snapshot(SUPPLEMENTAL).unwrap()),
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+            Arc::new(phrase_manifest.load_snapshot(PHRASE).unwrap()),
+            "zljnll",
+            "再进来",
+        )
+        .unwrap();
+        assert_eq!(report.core_revision(), "tsf-exact-phrase-core-v1");
+        assert_eq!(
+            report.supplemental_revision(),
+            "tsf-exact-phrase-supplemental-v1"
+        );
+        assert_eq!(report.phrase_revision(), "tsf-exact-phrase-layer-v1");
+        assert_eq!(report.input_keys(), 6);
+        assert_eq!(report.committed_characters(), 3);
+        assert_eq!(report.target_rank(), 1);
+        assert!(!format!("{report:?}").contains("再进来"));
+    }
+
+    #[test]
+    fn exact_phrase_preflight_preserves_existing_exact_prefix_and_commits_later_rank() {
+        let _guard = test_state_lock();
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+载进来\tzai jin lai\t300\n\
+再\tzai\t200\n\
+进来\tjin lai\t190\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n其他词\tqi ta ci\t100\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t80\n";
+        let snapshot = |revision: &str, payload: &str| {
+            Arc::new(
+                CandidatePackageManifest::from_payload(revision, false, payload)
+                    .unwrap()
+                    .load_snapshot(payload)
+                    .unwrap(),
+            )
+        };
+        let report = preflight_exact_phrase_candidate_layers(
+            snapshot("tsf-phrase-prefix-core-v1", CORE),
+            snapshot("tsf-phrase-prefix-supplemental-v1", SUPPLEMENTAL),
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+            snapshot("tsf-phrase-prefix-layer-v1", PHRASE),
+            "zljnll",
+            "再进来",
+        )
+        .unwrap();
+        assert_eq!(report.target_rank(), 2);
+
+        assert_eq!(
+            preflight_exact_phrase_candidate_layers(
+                snapshot("tsf-phrase-invalid-core-v1", CORE),
+                snapshot("tsf-phrase-invalid-supplemental-v1", SUPPLEMENTAL),
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 2,
+                },
+                snapshot("tsf-phrase-invalid-layer-v1", PHRASE),
+                "zljnll",
+                "再进来",
+            )
+            .unwrap_err(),
+            TsfCandidatePreflightError::ExactPhrasePageMismatch
         );
     }
 
