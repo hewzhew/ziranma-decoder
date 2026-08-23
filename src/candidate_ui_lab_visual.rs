@@ -44,13 +44,19 @@ pub(crate) enum CandidateUiLabToken {
     VerticalMinWidth,
     CornerDiameter,
     SelectedSurfaceHeight,
+    SelectedSurfaceLeftInset,
+    SelectedSurfaceRightInset,
+    SelectedSurfaceCornerDiameter,
     SelectionAccentWidth,
+    SelectionAccentLeftInset,
+    SelectionAccentCornerDiameter,
+    PersonalMarkSize,
     CandidateFontHeight,
     MetadataFontHeight,
 }
 
 impl CandidateUiLabToken {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::OuterPadding,
         Self::RowHeight,
         Self::TextPadding,
@@ -62,7 +68,13 @@ impl CandidateUiLabToken {
         Self::VerticalMinWidth,
         Self::CornerDiameter,
         Self::SelectedSurfaceHeight,
+        Self::SelectedSurfaceLeftInset,
+        Self::SelectedSurfaceRightInset,
+        Self::SelectedSurfaceCornerDiameter,
         Self::SelectionAccentWidth,
+        Self::SelectionAccentLeftInset,
+        Self::SelectionAccentCornerDiameter,
+        Self::PersonalMarkSize,
         Self::CandidateFontHeight,
         Self::MetadataFontHeight,
     ];
@@ -80,7 +92,13 @@ impl CandidateUiLabToken {
             Self::VerticalMinWidth => "竖排最小宽度",
             Self::CornerDiameter => "外框圆角直径",
             Self::SelectedSurfaceHeight => "首选底色高度",
+            Self::SelectedSurfaceLeftInset => "首选底色左留白",
+            Self::SelectedSurfaceRightInset => "首选底色右留白",
+            Self::SelectedSurfaceCornerDiameter => "首选底色圆角直径",
             Self::SelectionAccentWidth => "首选蓝条宽度",
+            Self::SelectionAccentLeftInset => "首选蓝条左位置",
+            Self::SelectionAccentCornerDiameter => "首选蓝条圆角直径",
+            Self::PersonalMarkSize => "个人标记大小",
             Self::CandidateFontHeight => "候选字号高度",
             Self::MetadataFontHeight => "序号字号高度",
         }
@@ -99,7 +117,13 @@ impl CandidateUiLabToken {
             Self::VerticalMinWidth => CandidateUiLabTokenBounds::new(280, 620, 10),
             Self::CornerDiameter => CandidateUiLabTokenBounds::new(0, 24, 1),
             Self::SelectedSurfaceHeight => CandidateUiLabTokenBounds::new(20, 48, 1),
+            Self::SelectedSurfaceLeftInset => CandidateUiLabTokenBounds::new(0, 12, 1),
+            Self::SelectedSurfaceRightInset => CandidateUiLabTokenBounds::new(0, 16, 1),
+            Self::SelectedSurfaceCornerDiameter => CandidateUiLabTokenBounds::new(0, 20, 1),
             Self::SelectionAccentWidth => CandidateUiLabTokenBounds::new(1, 8, 1),
+            Self::SelectionAccentLeftInset => CandidateUiLabTokenBounds::new(0, 16, 1),
+            Self::SelectionAccentCornerDiameter => CandidateUiLabTokenBounds::new(0, 12, 1),
+            Self::PersonalMarkSize => CandidateUiLabTokenBounds::new(2, 8, 1),
             Self::CandidateFontHeight => CandidateUiLabTokenBounds::new(13, 24, 1),
             Self::MetadataFontHeight => CandidateUiLabTokenBounds::new(10, 20, 1),
         }
@@ -118,7 +142,13 @@ impl CandidateUiLabToken {
             Self::VerticalMinWidth => spec.vertical_min_width,
             Self::CornerDiameter => spec.corner_diameter,
             Self::SelectedSurfaceHeight => spec.selected_surface_height,
+            Self::SelectedSurfaceLeftInset => spec.selected_surface_left_inset,
+            Self::SelectedSurfaceRightInset => spec.selected_surface_right_inset,
+            Self::SelectedSurfaceCornerDiameter => spec.selected_surface_corner_diameter,
             Self::SelectionAccentWidth => spec.selection_accent_width,
+            Self::SelectionAccentLeftInset => spec.selection_accent_left_inset,
+            Self::SelectionAccentCornerDiameter => spec.selection_accent_corner_diameter,
+            Self::PersonalMarkSize => spec.personal_mark_size,
             Self::CandidateFontHeight => spec.candidate_font_height,
             Self::MetadataFontHeight => spec.metadata_font_height,
         }
@@ -137,7 +167,13 @@ impl CandidateUiLabToken {
             Self::VerticalMinWidth => spec.vertical_min_width = value,
             Self::CornerDiameter => spec.corner_diameter = value,
             Self::SelectedSurfaceHeight => spec.selected_surface_height = value,
+            Self::SelectedSurfaceLeftInset => spec.selected_surface_left_inset = value,
+            Self::SelectedSurfaceRightInset => spec.selected_surface_right_inset = value,
+            Self::SelectedSurfaceCornerDiameter => spec.selected_surface_corner_diameter = value,
             Self::SelectionAccentWidth => spec.selection_accent_width = value,
+            Self::SelectionAccentLeftInset => spec.selection_accent_left_inset = value,
+            Self::SelectionAccentCornerDiameter => spec.selection_accent_corner_diameter = value,
+            Self::PersonalMarkSize => spec.personal_mark_size = value,
             Self::CandidateFontHeight => spec.candidate_font_height = value,
             Self::MetadataFontHeight => spec.metadata_font_height = value,
         }
@@ -407,6 +443,13 @@ impl CandidateUiLabVisualState {
 }
 
 fn valid_draft(spec: CandidateVisualSpec) -> bool {
+    let selected_right = spec
+        .horizontal_min_item_width
+        .saturating_sub(spec.selected_surface_right_inset);
+    let accent_right = spec
+        .selected_surface_left_inset
+        .saturating_add(spec.selection_accent_left_inset)
+        .saturating_add(spec.selection_accent_width);
     spec.outer_padding >= 0
         && spec.row_height > 0
         && spec.text_padding >= 0
@@ -416,7 +459,22 @@ fn valid_draft(spec: CandidateVisualSpec) -> bool {
         && spec.vertical_min_width <= spec.vertical_max_width
         && spec.selected_surface_height > 0
         && spec.selected_surface_height <= spec.row_height
+        && spec.selected_surface_left_inset >= 0
+        && spec.selected_surface_right_inset >= 0
+        && spec
+            .selected_surface_left_inset
+            .saturating_add(spec.selected_surface_right_inset)
+            < spec.horizontal_min_item_width
+        && spec.selected_surface_corner_diameter >= 0
+        && spec.selected_surface_corner_diameter <= spec.selected_surface_height
         && spec.selection_accent_width > 0
+        && spec.selection_accent_left_inset >= 0
+        && accent_right <= selected_right
+        && spec.selection_accent_corner_diameter >= 0
+        && spec.selection_accent_corner_diameter <= spec.candidate_font_height
+        && spec.personal_mark_size > 0
+        && spec.personal_mark_size <= spec.rank_width
+        && spec.personal_mark_size <= spec.metadata_font_height
         && spec.candidate_font_height > 0
         && spec.candidate_font_height <= spec.row_height
         && spec.metadata_font_height > 0
@@ -543,5 +601,39 @@ mod tests {
             .unwrap();
         assert!(!state.adjust_draft(-1));
         assert_eq!(state.active_spec().row_height, 36);
+    }
+
+    #[test]
+    fn selection_geometry_stays_inside_the_smallest_candidate_surface() {
+        let token_index = |target| {
+            CandidateUiLabToken::ALL
+                .iter()
+                .position(|token| *token == target)
+                .unwrap()
+        };
+        let mut state = CandidateUiLabVisualState::default();
+
+        assert!(state.select_token(token_index(CandidateUiLabToken::SelectedSurfaceLeftInset)));
+        assert!(state.adjust_draft(i32::MAX));
+        assert!(state.select_token(token_index(CandidateUiLabToken::SelectedSurfaceRightInset)));
+        assert!(state.adjust_draft(i32::MAX));
+        assert!(state.select_token(token_index(CandidateUiLabToken::SelectionAccentLeftInset)));
+        assert!(state.adjust_draft(i32::MAX));
+        assert!(state.select_token(token_index(CandidateUiLabToken::HorizontalMinItemWidth)));
+        assert!(state.adjust_draft(i32::MIN));
+        assert!(state.select_token(token_index(CandidateUiLabToken::SelectionAccentWidth)));
+        assert!(state.adjust_draft(1));
+        assert_eq!(state.active_spec().selection_accent_width, 4);
+        assert!(!state.adjust_draft(1));
+
+        let spec = state.active_spec();
+        assert_eq!(spec.horizontal_min_item_width, 48);
+        assert_eq!(
+            spec.selected_surface_left_inset
+                + spec.selection_accent_left_inset
+                + spec.selection_accent_width,
+            spec.horizontal_min_item_width - spec.selected_surface_right_inset
+        );
+        assert!(valid_draft(spec));
     }
 }

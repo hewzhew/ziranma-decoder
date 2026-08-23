@@ -2495,6 +2495,66 @@ mod windows_app {
         }
 
         #[test]
+        fn selection_accent_height_always_tracks_the_measured_selected_text() {
+            let mut visual = CandidateUiLabVisualState::default();
+            for _ in CandidateUiLabToken::ALL {
+                for steps in [i32::MIN, i32::MAX] {
+                    visual.reset_draft();
+                    let _ = visual.adjust_draft(steps);
+                    let spec = visual.active_spec();
+                    for dpi in DPIS {
+                        let padding = candidate_ui_scale(dpi, spec.outer_padding);
+                        let row_height = candidate_ui_scale(dpi, spec.row_height);
+                        let item_width =
+                            candidate_ui_scale(dpi, spec.horizontal_min_item_width.max(200));
+                        let selected_height = candidate_ui_scale(dpi, spec.candidate_font_height);
+                        let rank_height = candidate_ui_scale(dpi, spec.metadata_font_height);
+                        let scene = build_candidate_scene(
+                            spec,
+                            CandidateSceneRequest {
+                                layout: CandidateSceneLayout::Horizontal,
+                                dpi,
+                                width: padding.saturating_mul(2).saturating_add(item_width),
+                                height: padding.saturating_mul(2).saturating_add(row_height),
+                                candidate_count: 1,
+                                horizontal_candidate_widths: &[item_width],
+                                footer_width: 0,
+                                footer_mode: false,
+                                footer_page: false,
+                                selected_surface: true,
+                                show_rank: true,
+                                notice_icon: false,
+                                personalized: &[false],
+                                rank_metrics: Some(CandidateSceneFontMetrics {
+                                    height: rank_height,
+                                    ascent: rank_height.saturating_sub(3),
+                                }),
+                                candidate_text_metrics: Some(CandidateSceneFontMetrics {
+                                    height: selected_height,
+                                    ascent: selected_height.saturating_sub(3),
+                                }),
+                                selected_text_metrics: Some(CandidateSceneFontMetrics {
+                                    height: selected_height,
+                                    ascent: selected_height.saturating_sub(3),
+                                }),
+                                action_detail_metrics: None,
+                            },
+                        )
+                        .unwrap();
+                        let item = scene.items[0];
+                        let accent = item.selection_accent.unwrap();
+                        assert_eq!(
+                            (accent.top, accent.bottom),
+                            (item.text.top, item.text.bottom)
+                        );
+                    }
+                }
+                visual.reset_draft();
+                visual.cycle_token();
+            }
+        }
+
+        #[test]
         fn controls_cycle_only_fixed_public_states() {
             let mut state = LabState::default();
             for expected in [120, 144, 192, 96] {
