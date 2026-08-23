@@ -13097,6 +13097,14 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             *state = CandidateForgetState::Inactive;
         }
         let _ = self.confirm_pending_personal_selection();
+        // A deactivated TSF service may remain cached by its host for a long
+        // time, so `Drop` is not a timely durability boundary. Publish the
+        // small tail of confirmed choices here as well; foreground services
+        // only enqueue the bounded background write, while synthetic tests
+        // use the same synchronous fallback as the existing drop path.
+        if let Ok(mut ranking) = self.personal_ranking.try_borrow_mut() {
+            let _ = ranking.flush();
+        }
         self.clear_immediate_retype_correction();
         self.clear_personal_phrase_composer();
         self.clear_personal_left_context();
@@ -24655,6 +24663,50 @@ mod tests {
                 session_retained: true,
             }) if code == "ab" && text == "乙"
         ));
+    }
+
+    #[test]
+    fn deactivation_publishes_confirmed_personal_tail_before_service_drop() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let parent = std::env::temp_dir().join(format!(
+            "ziranma-tsf-deactivation-ranking-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("ranking");
+        let service_object = ComObject::new(TsfTextService::counted_for_process_test(Some(
+            Arc::new(SelectionCandidateProvider),
+        )));
+        service_object
+            .personal_ranking
+            .replace(PersonalRankingRuntime::new(Some(root.clone())));
+        service_object.remember_selection_after_success_in_context(
+            PlannedSelection {
+                code: "ab".to_owned(),
+                text: "乙".to_owned(),
+                retractable_by_immediate_backspace: true,
+            },
+            NativeFeedbackContext::Eligible,
+        );
+        let service: ITfTextInputProcessorEx = service_object.to_interface();
+
+        // SAFETY: this local process-test service has no active TSF advice;
+        // deactivation is explicitly idempotent for that cleanup boundary.
+        unsafe { service.Deactivate() }.expect("process-test deactivation");
+        assert!(service_object.pending_personal_selection.borrow().is_none());
+        let reloaded = PersonalRankingRuntime::new(Some(root));
+        assert_eq!(
+            reloaded.snapshot.preferred_text("ab"),
+            Some("乙"),
+            "another host must observe the confirmed tail before the first service is dropped"
+        );
+
+        drop(service);
+        drop(service_object);
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
