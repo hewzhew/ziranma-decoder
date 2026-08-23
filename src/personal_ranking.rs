@@ -626,6 +626,36 @@ impl PersonalRankingSnapshot {
         self.preferred_text_where(code, |text| !suppressions.is_suppressed(code, text))
     }
 
+    /// Returns whether at least two unsuppressed personal texts compete under
+    /// the same exact code. Callers can use this to abstain from a context-free
+    /// promotion without discarding either piece of confirmed evidence.
+    pub fn has_competing_texts_with_suppressions(
+        &self,
+        code: &str,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+    ) -> bool {
+        self.entries_for_code(code)
+            .filter(|((_, text), _)| !suppressions.is_suppressed(code, text))
+            .take(2)
+            .count()
+            >= 2
+    }
+
+    /// Returns whether an unsuppressed persistent identity differs from a
+    /// caller-owned text under the same exact code. The TSF session layer uses
+    /// this to recognize a newly selected alternative before that choice has
+    /// crossed its delayed persistence boundary.
+    pub fn has_other_text_with_suppressions(
+        &self,
+        code: &str,
+        text: &str,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+    ) -> bool {
+        self.entries_for_code(code).any(|((_, entry_text), _)| {
+            entry_text != text && !suppressions.is_suppressed(code, entry_text)
+        })
+    }
+
     fn preferred_text_where(
         &self,
         code: &str,
@@ -2987,9 +3017,16 @@ mod tests {
         ranking.record("cd", "甲").unwrap();
         let mut suppressions = PersonalRankingSuppressionSnapshot::default();
 
+        assert!(ranking.has_competing_texts_with_suppressions("ab", &suppressions));
+        assert!(!ranking.has_competing_texts_with_suppressions("cd", &suppressions));
+        assert!(ranking.has_other_text_with_suppressions("ab", "甲", &suppressions));
+        assert!(!ranking.has_other_text_with_suppressions("cd", "甲", &suppressions));
+
         assert!(suppressions.suppress("ab", "甲").unwrap());
         assert!(!suppressions.suppress("ab", "甲").unwrap());
         assert_eq!(suppressions.entry_count(), 1);
+        assert!(!ranking.has_competing_texts_with_suppressions("ab", &suppressions));
+        assert!(!ranking.has_other_text_with_suppressions("ab", "乙", &suppressions));
         assert_eq!(
             ranking.preferred_text_with_suppressions("ab", &suppressions),
             Some("乙")
@@ -3010,6 +3047,7 @@ mod tests {
         assert!(suppressions.restore("ab", "甲").unwrap());
         assert!(!suppressions.restore("ab", "甲").unwrap());
         assert_eq!(suppressions.entry_count(), 0);
+        assert!(ranking.has_competing_texts_with_suppressions("ab", &suppressions));
         assert_eq!(
             ranking.preferred_text_with_suppressions("ab", &suppressions),
             Some("甲")

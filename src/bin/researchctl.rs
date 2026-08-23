@@ -935,6 +935,7 @@ impl TopRegressionBoundary {
 struct SelectionPattern {
     selections: usize,
     non_top_selections: usize,
+    reranked_top_bypass_selections: usize,
     first_rank: Option<usize>,
     first_provenance: Option<NativeCandidateProvenance>,
     first_global_top_provenance: Option<NativeCandidateProvenance>,
@@ -1201,6 +1202,15 @@ struct PersonalizedTopBypassAudit {
     recalled_from_outside_pool: usize,
     movement_unavailable: usize,
     source_rank_buckets: [usize; RANKING_MOVEMENT_BUCKET_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PersonalizedTopAmbiguityAudit {
+    classified_bypass_commits: usize,
+    multi_output_code_bypass_commits: usize,
+    single_output_code_bypass_commits: usize,
+    multi_output_codes: usize,
+    single_output_codes: usize,
 }
 
 impl PersonalizedTopBypassAudit {
@@ -1623,6 +1633,12 @@ impl ResearchReview {
                         .selections
                         .entry((code.clone(), text.clone()))
                         .or_default();
+                    pattern.reranked_top_bypass_selections += usize::from(
+                        *absolute_rank > 1
+                            && snapshot.supports_precise_candidate_ranking_personalization()
+                            && global_top_provenance
+                                .is_some_and(|top| !top.ranking_personalization().is_empty()),
+                    );
                     pattern.observe(
                         *absolute_rank,
                         *source,
@@ -2238,6 +2254,7 @@ impl ResearchReview {
 
     fn render_personalized_top_bypass(&self, output: &mut String) {
         let audit = self.personalized_top_bypass;
+        let ambiguity = self.personalized_top_ambiguity_audit();
         writeln!(
             output,
             "实际个人重排首选绕过审计：V14+ 非首选提交 {}；首选原因可比较 {}/{}（实际重排首选 {}、未发生个人重排 {}、来源缺失 {}）。",
@@ -2249,6 +2266,17 @@ impl ResearchReview {
             audit
                 .ranking_capable_non_top_commits
                 .saturating_sub(audit.top_provenance_observations),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "个人重排与同码多义交叉：可按提交文字分类 {}/{} 次；其中同码已观察到多种提交文字 {} 次（{} 个码），只观察到一种提交文字 {} 次（{} 个码）。多种文字不自动等于多义正确，也不自动等于个人重排错误。",
+            ambiguity.classified_bypass_commits,
+            audit.reranked_top_commits,
+            ambiguity.multi_output_code_bypass_commits,
+            ambiguity.multi_output_codes,
+            ambiguity.single_output_code_bypass_commits,
+            ambiguity.single_output_codes,
         )
         .unwrap();
         writeln!(
@@ -2284,6 +2312,30 @@ impl ResearchReview {
             )
             .unwrap();
         }
+    }
+
+    fn personalized_top_ambiguity_audit(&self) -> PersonalizedTopAmbiguityAudit {
+        let mut by_code: HashMap<&str, (usize, usize)> = HashMap::new();
+        for ((code, _), pattern) in &self.selections {
+            let entry = by_code.entry(code).or_default();
+            entry.0 += 1;
+            entry.1 += pattern.reranked_top_bypass_selections;
+        }
+        let mut audit = PersonalizedTopAmbiguityAudit::default();
+        for (output_count, bypass_commits) in by_code.into_values() {
+            if bypass_commits == 0 {
+                continue;
+            }
+            audit.classified_bypass_commits += bypass_commits;
+            if output_count >= 2 {
+                audit.multi_output_code_bypass_commits += bypass_commits;
+                audit.multi_output_codes += 1;
+            } else {
+                audit.single_output_code_bypass_commits += bypass_commits;
+                audit.single_output_codes += 1;
+            }
+        }
+        audit
     }
 
     fn initial_non_top_evidence(&self) -> InitialNonTopEvidence {
@@ -4075,6 +4127,21 @@ mod tests {
                 );
             }
         }
+        review
+            .selections
+            .get_mut(&("same".to_owned(), "alpha".to_owned()))
+            .unwrap()
+            .reranked_top_bypass_selections = 2;
+        review
+            .selections
+            .get_mut(&("same".to_owned(), "beta".to_owned()))
+            .unwrap()
+            .reranked_top_bypass_selections = 1;
+        review
+            .selections
+            .get_mut(&("cold".to_owned(), "gamma".to_owned()))
+            .unwrap()
+            .reranked_top_bypass_selections = 2;
 
         let pressure = review.selection_pressure();
         assert_eq!(
@@ -4102,6 +4169,16 @@ mod tests {
             pressure.first_non_top_later_top_identities
                 + pressure.followup_first_non_top_never_top_identities
         );
+        assert_eq!(
+            review.personalized_top_ambiguity_audit(),
+            PersonalizedTopAmbiguityAudit {
+                classified_bypass_commits: 5,
+                multi_output_code_bypass_commits: 3,
+                single_output_code_bypass_commits: 2,
+                multi_output_codes: 1,
+                single_output_codes: 1,
+            }
+        );
         let mut rendered = String::new();
         review.render_selection_pressure(&mut rendered);
         assert!(rendered.contains("至少两种文字都曾从非首选提交 1"));
@@ -4112,6 +4189,16 @@ mod tests {
         assert!(rendered.contains("到达后又出现非首选 1"));
         for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
             assert!(!rendered.contains(private_value));
+        }
+
+        review.personalized_top_bypass.reranked_top_commits = 5;
+        let mut ambiguity_rendered = String::new();
+        review.render_personalized_top_bypass(&mut ambiguity_rendered);
+        assert!(ambiguity_rendered.contains(
+            "可按提交文字分类 5/5 次；其中同码已观察到多种提交文字 3 次（1 个码），只观察到一种提交文字 2 次（1 个码）"
+        ));
+        for private_value in ["same", "alpha", "beta", "cold", "gamma"] {
+            assert!(!ambiguity_rendered.contains(private_value));
         }
     }
 

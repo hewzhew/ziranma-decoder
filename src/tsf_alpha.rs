@@ -10038,6 +10038,19 @@ impl PersonalRankingRuntime {
             .is_some()
     }
 
+    fn has_competing_exact_texts(&self, code: &str, session_text: Option<&str>) -> bool {
+        self.snapshot
+            .has_competing_texts_with_suppressions(code, &self.suppressions)
+            || session_text.is_some_and(|text| {
+                !self.suppressions.is_suppressed(code, text)
+                    && self.snapshot.has_other_text_with_suppressions(
+                        code,
+                        text,
+                        &self.suppressions,
+                    )
+            })
+    }
+
     fn has_anchored_suffix_evidence(
         &self,
         provider: &dyn CandidateProvider,
@@ -10918,6 +10931,19 @@ impl TsfTextService_Impl {
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .clone();
+        let context_free_short_exact_blocked = if code.len() == 2 {
+            let personal_ranking = self
+                .personal_ranking
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            let selection_memory = self
+                .selection_memory
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
+            personal_ranking.has_competing_exact_texts(code, selection_memory.remembered_text(code))
+        } else {
+            false
+        };
         let contextual_search = view == InteractiveCandidateView::Primary
             && automatic_transposition_request.is_none()
             && left_context.as_deref().is_some_and(|previous| {
@@ -10936,6 +10962,7 @@ impl TsfTextService_Impl {
             });
         let exact_personal_search = view == InteractiveCandidateView::Primary
             && automatic_transposition_request.is_none()
+            && !context_free_short_exact_blocked
             && self
                 .personal_ranking
                 .try_borrow()
@@ -10973,14 +11000,18 @@ impl TsfTextService_Impl {
                 .selection_memory
                 .try_borrow()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
-            let session_exact_text = selection_memory
-                .remembered_text(code)
-                .filter(|text| !personal_ranking.is_suppressed(code, text));
-            let persistent_exact_promotion = personal_ranking.promote_texts_after_decision(
-                code,
-                &mut batch.candidates,
-                protected_prefix,
-            );
+            let session_exact_text = selection_memory.remembered_text(code).filter(|text| {
+                !context_free_short_exact_blocked && !personal_ranking.is_suppressed(code, text)
+            });
+            let persistent_exact_promotion = (!context_free_short_exact_blocked)
+                .then(|| {
+                    personal_ranking.promote_texts_after_decision(
+                        code,
+                        &mut batch.candidates,
+                        protected_prefix,
+                    )
+                })
+                .flatten();
             if let Some(promotion) = persistent_exact_promotion {
                 mirror_candidate_promotion(
                     &mut batch,
@@ -14289,8 +14320,12 @@ mod tests {
             !stale_writer.is_suppressed("ab", "丙词"),
             "a runtime that has not refreshed must remain a faithful stale-host simulation"
         );
+        assert!(stale_writer.has_competing_exact_texts("ab", None));
         assert!(stale_writer.record("ab", "丙词"));
         assert!(stale_writer.flush());
+        assert!(stale_writer.refresh());
+        assert!(stale_writer.is_suppressed("ab", "丙词"));
+        assert!(!stale_writer.has_competing_exact_texts("ab", None));
 
         let mut restarted = PersonalRankingRuntime::new_with_roots(
             Some(ranking_root.clone()),
@@ -14299,6 +14334,7 @@ mod tests {
         assert!(restarted.has_evidence("ab", "丙词"));
         assert!(restarted.is_suppressed("ab", "丙词"));
         assert!(!restarted.is_suppressed("cd", "丙词"));
+        assert!(!restarted.has_competing_exact_texts("ab", None));
 
         let mut same_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
         assert!(restarted.promote_texts_after("ab", &mut same_code, 0));
@@ -14317,6 +14353,7 @@ mod tests {
 
         let restored =
             PersonalRankingRuntime::new_with_roots(Some(ranking_root), Some(suppression_root));
+        assert!(restored.has_competing_exact_texts("ab", None));
         let mut same_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
         assert!(restored.promote_texts_after("ab", &mut same_code, 0));
         assert_eq!(same_code, ["丙词", "甲词", "乙词"]);
@@ -23992,7 +24029,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_left_context_overrides_global_recency_only_for_the_matching_context() {
+    fn confirmed_left_context_resolves_competing_short_exact_evidence_without_global_oscillation() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             PersonalContextCandidateProvider,
@@ -24054,9 +24091,10 @@ mod tests {
                 .contains(NativeCandidatePersonalization::LEFT_CONTEXT)
         );
         assert!(
-            matching.provenance[1]
+            !matching.provenance[1]
                 .personalization()
-                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT),
+            "competing two-key evidence must not globally promote either text"
         );
         assert!(
             matching.provenance[1].ranking_personalization().is_empty(),
@@ -24090,6 +24128,192 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated.candidates[0], "吧");
+        assert!(unrelated.provenance[0].ranking_personalization().is_empty());
+    }
+
+    #[test]
+    fn context_free_short_exact_abstains_only_after_competition_and_long_codes_still_learn() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        assert!(service.personal_ranking.borrow_mut().record("ui", "试"));
+        let one_short_preference = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ui",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(one_short_preference.candidates[..2], ["试", "是"]);
+        assert!(
+            one_short_preference.provenance[0]
+                .ranking_personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+
+        assert!(service.personal_ranking.borrow_mut().record("ui", "是"));
+        let competing_short = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ui",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(competing_short.candidates[..2], ["是", "试"]);
+        assert!(
+            competing_short
+                .provenance
+                .iter()
+                .all(|candidate| candidate.ranking_personalization().is_empty())
+        );
+
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .suppressions
+                .suppress("ui", "是")
+                .unwrap()
+        );
+        let after_forget = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ui",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(after_forget.candidates[..2], ["试", "是"]);
+        assert!(
+            after_forget.provenance[0]
+                .ranking_personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+
+        assert!(service.personal_ranking.borrow_mut().record("uiub", "失手"));
+        assert!(service.personal_ranking.borrow_mut().record("uiub", "是手"));
+        let long_exact = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "uiub",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(long_exact.candidates[0], "是手");
+        assert!(
+            long_exact.provenance[0]
+                .ranking_personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT),
+            "longer exact codes keep the existing deliberate preference-change behavior"
+        );
+    }
+
+    #[test]
+    fn context_free_short_exact_counts_a_distinct_unsuppressed_session_choice() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+
+        assert!(service.personal_ranking.borrow_mut().record("ui", "是"));
+        service
+            .selection_memory
+            .borrow_mut()
+            .remember_text("ui", "试");
+        let competing_session = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ui",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(competing_session.candidates[..2], ["是", "试"]);
+        assert!(
+            competing_session
+                .provenance
+                .iter()
+                .all(|candidate| candidate.personalization().is_empty()),
+            "a distinct pending session choice must not temporarily replace the stable public order"
+        );
+
+        assert!(
+            service
+                .personal_ranking
+                .borrow_mut()
+                .suppressions
+                .suppress("ui", "试")
+                .unwrap()
+        );
+        let suppressed_session = service
+            .load_candidate_batch(
+                service.candidate_provider.as_ref().unwrap().as_ref(),
+                "ui",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(suppressed_session.candidates[..2], ["是", "试"]);
+        assert!(
+            suppressed_session.provenance[0]
+                .personalization()
+                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT),
+            "suppressing the competing session identity must restore the remaining exact evidence"
+        );
+    }
+
+    #[test]
+    fn short_exact_abstention_keeps_absent_evidence_and_protected_prefixes_out_of_ranking() {
+        let _guard = test_lock();
+        let absent = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            PersonalPhraseCandidateProvider,
+        ))));
+        assert!(absent.personal_ranking.borrow_mut().record("ui", "试"));
+        assert!(absent.personal_ranking.borrow_mut().record("ui", "另"));
+
+        let absent_competitor = absent
+            .load_candidate_batch(
+                absent.candidate_provider.as_ref().unwrap().as_ref(),
+                "ui",
+                CANDIDATE_PAGE_SIZE,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(absent_competitor.candidates[..2], ["是", "试"]);
+        assert!(!absent_competitor.candidates.iter().any(|text| text == "另"));
+        assert!(
+            absent_competitor
+                .provenance
+                .iter()
+                .all(|candidate| candidate.personalization().is_empty())
+        );
+
+        let protected = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            ProtectedSelectionCandidateProvider,
+        ))));
+        assert!(protected.personal_ranking.borrow_mut().record("ab", "乙"));
+        assert!(protected.personal_ranking.borrow_mut().record("ab", "丙"));
+        let protected_batch = protected
+            .load_candidate_batch(
+                protected.candidate_provider.as_ref().unwrap().as_ref(),
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(protected_batch.candidates, ["甲", "乙", "丙"]);
+        assert_eq!(protected_batch.protected_prefix_len, 1);
+        assert!(
+            protected_batch
+                .provenance
+                .iter()
+                .all(|candidate| candidate.personalization().is_empty())
+        );
     }
 
     #[test]
@@ -24812,7 +25036,7 @@ mod tests {
     }
 
     #[test]
-    fn one_bypass_records_evidence_even_when_old_support_restores_the_session_preference() {
+    fn one_bypass_records_evidence_while_short_code_competition_abstains_from_ranking() {
         let _guard = test_lock();
         let service = ComObject::new(TsfTextService::counted_for_process_test_with_feedback(
             Some(Arc::new(SelectionCandidateProvider)),
@@ -24870,15 +25094,11 @@ mod tests {
             .unwrap();
         assert_eq!(after_first_confirmation.candidates, ["甲", "乙", "丙"]);
         assert!(
-            after_first_confirmation.provenance[0]
-                .personalization()
-                .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
-        );
-        assert!(
-            after_first_confirmation.provenance[1]
-                .personalization()
-                .is_empty(),
-            "a frame records only the applied preference, not every stored vote"
+            after_first_confirmation
+                .provenance
+                .iter()
+                .all(|candidate| candidate.personalization().is_empty()),
+            "two confirmed short-code texts keep their evidence without applying either as a context-free top"
         );
         assert!(matches!(
             service.native_feedback.lock().unwrap().events().last(),
@@ -24908,6 +25128,22 @@ mod tests {
         assert_eq!(
             service.selection_memory.borrow().remembered_text("ab"),
             Some("乙")
+        );
+        let after_preference_change = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(after_preference_change.candidates, ["甲", "乙", "丙"]);
+        assert!(
+            after_preference_change
+                .provenance
+                .iter()
+                .all(|candidate| candidate.personalization().is_empty()),
+            "changing the stored winner must not re-enable a context-free global top for an ambiguous short code"
         );
         assert!(matches!(
             service.native_feedback.lock().unwrap().events().last(),
