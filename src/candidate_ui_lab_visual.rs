@@ -1,6 +1,6 @@
 //! Bounded A/B visual-token editing for the public candidate UI lab.
 
-use crate::candidate_ui::{CandidateVisualSpec, DEFAULT_CANDIDATE_VISUAL_SPEC};
+use crate::candidate_ui::{CandidateRgb, CandidateVisualSpec, DEFAULT_CANDIDATE_VISUAL_SPEC};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CandidateUiLabVariant {
@@ -145,6 +145,85 @@ impl CandidateUiLabToken {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateUiLabColorRole {
+    Background,
+    SelectedBackground,
+    SelectedText,
+    CandidateText,
+    SelectedRank,
+    Rank,
+    Page,
+    SelectionAccent,
+    ModeAccent,
+    Border,
+    FooterDivider,
+}
+
+impl CandidateUiLabColorRole {
+    pub(crate) const ALL: [Self; 11] = [
+        Self::Background,
+        Self::SelectedBackground,
+        Self::SelectedText,
+        Self::CandidateText,
+        Self::SelectedRank,
+        Self::Rank,
+        Self::Page,
+        Self::SelectionAccent,
+        Self::ModeAccent,
+        Self::Border,
+        Self::FooterDivider,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Background => "主背景",
+            Self::SelectedBackground => "首选底色",
+            Self::SelectedText => "首选正文",
+            Self::CandidateText => "候选正文",
+            Self::SelectedRank => "首选序号",
+            Self::Rank => "普通序号",
+            Self::Page => "页码",
+            Self::SelectionAccent => "首选标记",
+            Self::ModeAccent => "模式标记",
+            Self::Border => "外边框",
+            Self::FooterDivider => "页脚分隔线",
+        }
+    }
+
+    pub(crate) const fn value(self, spec: CandidateVisualSpec) -> CandidateRgb {
+        match self {
+            Self::Background => spec.background,
+            Self::SelectedBackground => spec.selected_background,
+            Self::SelectedText => spec.selected_text,
+            Self::CandidateText => spec.candidate_text,
+            Self::SelectedRank => spec.selected_rank,
+            Self::Rank => spec.rank,
+            Self::Page => spec.page,
+            Self::SelectionAccent => spec.selection_accent,
+            Self::ModeAccent => spec.mode_accent,
+            Self::Border => spec.border,
+            Self::FooterDivider => spec.footer_divider,
+        }
+    }
+
+    fn set(self, spec: &mut CandidateVisualSpec, value: CandidateRgb) {
+        match self {
+            Self::Background => spec.background = value,
+            Self::SelectedBackground => spec.selected_background = value,
+            Self::SelectedText => spec.selected_text = value,
+            Self::CandidateText => spec.candidate_text = value,
+            Self::SelectedRank => spec.selected_rank = value,
+            Self::Rank => spec.rank = value,
+            Self::Page => spec.page = value,
+            Self::SelectionAccent => spec.selection_accent = value,
+            Self::ModeAccent => spec.mode_accent = value,
+            Self::Border => spec.border = value,
+            Self::FooterDivider => spec.footer_divider = value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CandidateUiLabTokenBounds {
     minimum: i32,
     maximum: i32,
@@ -185,6 +264,7 @@ pub(crate) struct CandidateUiLabVisualState {
     draft: CandidateVisualSpec,
     active: CandidateUiLabVariant,
     token_index: usize,
+    color_role_index: usize,
 }
 
 impl Default for CandidateUiLabVisualState {
@@ -194,6 +274,7 @@ impl Default for CandidateUiLabVisualState {
             draft: DEFAULT_CANDIDATE_VISUAL_SPEC,
             active: CandidateUiLabVariant::Draft,
             token_index: 0,
+            color_role_index: 0,
         }
     }
 }
@@ -230,6 +311,26 @@ impl CandidateUiLabVisualState {
         self.token_index
     }
 
+    pub(crate) fn selected_color_role(self) -> CandidateUiLabColorRole {
+        CandidateUiLabColorRole::ALL[self.color_role_index]
+    }
+
+    pub(crate) const fn selected_color_role_index(self) -> usize {
+        self.color_role_index
+    }
+
+    pub(crate) fn selected_color(self) -> CandidateRgb {
+        self.selected_color_role().value(self.active_spec())
+    }
+
+    pub(crate) fn selected_baseline_color(self) -> CandidateRgb {
+        self.selected_color_role().value(self.baseline)
+    }
+
+    pub(crate) fn selected_draft_color(self) -> CandidateRgb {
+        self.selected_color_role().value(self.draft)
+    }
+
     pub(crate) fn selected_value(self) -> i32 {
         self.selected_token().value(self.active_spec())
     }
@@ -247,6 +348,14 @@ impl CandidateUiLabVisualState {
             return false;
         }
         self.token_index = index;
+        true
+    }
+
+    pub(crate) fn select_color_role(&mut self, index: usize) -> bool {
+        if index >= CandidateUiLabColorRole::ALL.len() || index == self.color_role_index {
+            return false;
+        }
+        self.color_role_index = index;
         true
     }
 
@@ -275,6 +384,16 @@ impl CandidateUiLabVisualState {
             return false;
         }
         self.draft = draft;
+        self.active = CandidateUiLabVariant::Draft;
+        true
+    }
+
+    pub(crate) fn set_draft_color(&mut self, color: CandidateRgb) -> bool {
+        let role = self.selected_color_role();
+        if role.value(self.draft) == color {
+            return false;
+        }
+        role.set(&mut self.draft, color);
         self.active = CandidateUiLabVariant::Draft;
         true
     }
@@ -365,6 +484,43 @@ mod tests {
             CandidateUiLabToken::ALL[CandidateUiLabToken::ALL.len() - 1]
         );
         assert!(!state.select_token(CandidateUiLabToken::ALL.len() - 1));
+    }
+
+    #[test]
+    fn every_semantic_color_edits_only_the_selected_draft_role() {
+        let mut state = CandidateUiLabVisualState::default();
+        for (index, expected) in CandidateUiLabColorRole::ALL.into_iter().enumerate() {
+            assert_eq!(state.selected_color_role(), expected);
+            assert_eq!(state.selected_color_role_index(), index);
+            let baseline = state.selected_baseline_color();
+            assert_eq!(state.selected_color(), baseline);
+            assert_eq!(state.selected_draft_color(), baseline);
+            assert!(!state.set_draft_color(baseline));
+
+            let replacement = CandidateRgb {
+                red: baseline.red.wrapping_add(1),
+                green: baseline.green,
+                blue: baseline.blue,
+            };
+            assert!(state.set_draft_color(replacement));
+            assert_eq!(state.active_variant(), CandidateUiLabVariant::Draft);
+            assert_eq!(state.selected_color(), replacement);
+            assert_eq!(state.selected_draft_color(), replacement);
+            assert_eq!(state.selected_baseline_color(), baseline);
+            assert_eq!(expected.value(state.comparison_spec()), baseline);
+            assert!(state.reset_draft());
+            assert_eq!(state.selected_draft_color(), baseline);
+
+            if index + 1 < CandidateUiLabColorRole::ALL.len() {
+                assert!(state.select_color_role(index + 1));
+            }
+        }
+        assert!(!state.select_color_role(CandidateUiLabColorRole::ALL.len()));
+        assert_eq!(
+            state.selected_color_role(),
+            CandidateUiLabColorRole::ALL[CandidateUiLabColorRole::ALL.len() - 1]
+        );
+        assert!(!state.select_color_role(CandidateUiLabColorRole::ALL.len() - 1));
     }
 
     #[test]

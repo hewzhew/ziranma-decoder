@@ -48,7 +48,9 @@ mod windows_app {
         MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS, capture_candidate_ui_lab_annotation_context,
         export_candidate_ui_lab_annotations,
     };
-    use crate::candidate_ui_lab_visual::{CandidateUiLabToken, CandidateUiLabVisualState};
+    use crate::candidate_ui_lab_visual::{
+        CandidateUiLabColorRole, CandidateUiLabToken, CandidateUiLabVisualState,
+    };
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
@@ -59,6 +61,9 @@ mod windows_app {
         SelectObject, SetBkMode, TEXTMETRICW, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Controls::Dialogs::{
+        CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW, CommDlgExtendedError,
+    };
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
@@ -93,6 +98,9 @@ mod windows_app {
     const PANEL_INCREASE_ID: i32 = 305;
     const PANEL_RESET_ID: i32 = 306;
     const PANEL_COMPARE_ID: i32 = 307;
+    const PANEL_COLOR_ID: i32 = 308;
+    const PANEL_COLOR_DETAILS_ID: i32 = 309;
+    const PANEL_COLOR_PICK_ID: i32 = 310;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
 
     thread_local! {
@@ -267,6 +275,14 @@ mod windows_app {
             true
         }
 
+        fn set_visual_draft_color(&mut self, color: CandidateRgb) -> bool {
+            if !self.visual.set_draft_color(color) {
+                return false;
+            }
+            self.reset_inspection();
+            true
+        }
+
         fn reset_visual_draft(&mut self) -> bool {
             if !self.visual.reset_draft() {
                 return false;
@@ -289,7 +305,9 @@ mod windows_app {
         ToggleVariant,
         CycleToken,
         SelectToken(usize),
+        SelectColorRole(usize),
         AdjustDraft(i32),
+        SetDraftColor(CandidateRgb),
         ResetDraft,
     }
 
@@ -323,8 +341,22 @@ mod windows_app {
                     LabVisualChange::None
                 }
             }
+            LabVisualCommand::SelectColorRole(index) => {
+                if state.visual.select_color_role(index) {
+                    LabVisualChange::Metadata
+                } else {
+                    LabVisualChange::None
+                }
+            }
             LabVisualCommand::AdjustDraft(steps) => {
                 if state.adjust_visual_draft(steps) {
+                    LabVisualChange::Scene
+                } else {
+                    LabVisualChange::None
+                }
+            }
+            LabVisualCommand::SetDraftColor(color) => {
+                if state.set_visual_draft_color(color) {
                     LabVisualChange::Scene
                 } else {
                     LabVisualChange::None
@@ -788,7 +820,7 @@ mod windows_app {
                 x,
                 y,
                 500,
-                270,
+                390,
                 Some(owner),
                 None,
                 Some(HINSTANCE(module.0)),
@@ -967,9 +999,57 @@ mod windows_app {
                 create_control(
                     window,
                     w!("STATIC"),
-                    w!("候选预览仍使用独立窗口和共享 GDI painter；关闭面板后按 P 可重新打开。"),
+                    w!("语义颜色（只修改 B 草案）"),
                     20,
                     184,
+                    445,
+                    24,
+                    0,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("COMBOBOX"),
+                    PCWSTR::null(),
+                    20,
+                    210,
+                    290,
+                    240,
+                    PANEL_COLOR_ID,
+                    CBS_DROPDOWNLIST | WS_TABSTOP.0 as i32 | WS_VSCROLL.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("选择 B 颜色…"),
+                    326,
+                    209,
+                    138,
+                    32,
+                    PANEL_COLOR_PICK_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    20,
+                    252,
+                    445,
+                    44,
+                    PANEL_COLOR_DETAILS_ID,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    w!("候选预览仍使用独立窗口和共享 GDI painter；关闭面板后按 P 可重新打开。"),
+                    20,
+                    304,
                     445,
                     42,
                     0,
@@ -994,6 +1074,28 @@ mod windows_app {
             let result = unsafe {
                 SendMessageW(
                     combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(label.as_ptr() as isize)),
+                )
+            };
+            if result.0 < 0 {
+                return false;
+            }
+        }
+        let color_combo = match unsafe { GetDlgItem(Some(window), PANEL_COLOR_ID) } {
+            Ok(combo) => combo,
+            Err(_) => return false,
+        };
+        for role in CandidateUiLabColorRole::ALL {
+            let label = role
+                .label()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let result = unsafe {
+                SendMessageW(
+                    color_combo,
                     CB_ADDSTRING,
                     None,
                     Some(LPARAM(label.as_ptr() as isize)),
@@ -1035,6 +1137,34 @@ mod windows_app {
             }
             return;
         }
+        if id == PANEL_COLOR_ID && notification == CBN_SELCHANGE {
+            let combo = match unsafe { GetDlgItem(Some(window), PANEL_COLOR_ID) } {
+                Ok(combo) => combo,
+                Err(_) => return,
+            };
+            let selected = unsafe { SendMessageW(combo, CB_GETCURSEL, None, None) }.0;
+            let Ok(selected) = usize::try_from(selected) else {
+                return;
+            };
+            let result = APP_STATE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let state = slot.as_mut()?;
+                (state.panel_window == Some(window)).then_some(())?;
+                let owner = state.panel_owner?;
+                Some((
+                    owner,
+                    apply_visual_command(state, LabVisualCommand::SelectColorRole(selected)),
+                ))
+            });
+            if let Some((owner, change)) = result {
+                match change {
+                    LabVisualChange::None => sync_visual_panel(window),
+                    LabVisualChange::Metadata => refresh_visual_views(owner, false),
+                    LabVisualChange::Scene => refresh_visual_views(owner, true),
+                }
+            }
+            return;
+        }
         if notification != BN_CLICKED {
             return;
         }
@@ -1055,6 +1185,38 @@ mod windows_app {
                 } else {
                     open_comparison_window(owner);
                 }
+            }
+            return;
+        }
+        if id == PANEL_COLOR_PICK_ID {
+            let target = APP_STATE.with(|slot| {
+                let slot = slot.borrow();
+                let state = slot.as_ref()?;
+                (state.panel_window == Some(window)).then_some(())?;
+                Some((state.panel_owner?, state.visual.selected_draft_color()))
+            });
+            let Some((owner, initial)) = target else {
+                return;
+            };
+            let color = match choose_candidate_color(window, initial) {
+                Ok(Some(color)) => color,
+                Ok(None) => return,
+                Err(error) => return notify_error(owner, &error),
+            };
+            let change = APP_STATE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let Some(state) = slot.as_mut() else {
+                    return LabVisualChange::None;
+                };
+                if state.panel_window != Some(window) {
+                    return LabVisualChange::None;
+                }
+                apply_visual_command(state, LabVisualCommand::SetDraftColor(color))
+            });
+            match change {
+                LabVisualChange::None => sync_visual_panel(window),
+                LabVisualChange::Metadata => refresh_visual_views(owner, false),
+                LabVisualChange::Scene => refresh_visual_views(owner, true),
             }
             return;
         }
@@ -1079,6 +1241,45 @@ mod windows_app {
                 LabVisualChange::Scene => refresh_visual_views(owner, true),
             }
         }
+    }
+
+    fn choose_candidate_color(
+        owner: HWND,
+        initial: CandidateRgb,
+    ) -> Result<Option<CandidateRgb>, String> {
+        let mut custom_colors = [COLORREF(0); 16];
+        let mut request = CHOOSECOLORW {
+            lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+            hwndOwner: owner,
+            rgbResult: candidate_colorref(initial),
+            lpCustColors: custom_colors.as_mut_ptr(),
+            Flags: CC_FULLOPEN | CC_RGBINIT,
+            ..Default::default()
+        };
+        if unsafe { ChooseColorW(&mut request) }.as_bool() {
+            return Ok(Some(candidate_rgb(request.rgbResult)));
+        }
+        if unsafe { CommDlgExtendedError() }.0 == 0 {
+            Ok(None)
+        } else {
+            Err("Windows 选色器没有成功打开".to_owned())
+        }
+    }
+
+    const fn candidate_colorref(color: CandidateRgb) -> COLORREF {
+        COLORREF(color.red as u32 | ((color.green as u32) << 8) | ((color.blue as u32) << 16))
+    }
+
+    const fn candidate_rgb(color: COLORREF) -> CandidateRgb {
+        CandidateRgb {
+            red: (color.0 & 0xff) as u8,
+            green: ((color.0 >> 8) & 0xff) as u8,
+            blue: ((color.0 >> 16) & 0xff) as u8,
+        }
+    }
+
+    fn format_candidate_color(color: CandidateRgb) -> String {
+        format!("#{:02X}{:02X}{:02X}", color.red, color.green, color.blue)
     }
 
     fn sync_visual_panel(window: HWND) {
@@ -1109,6 +1310,15 @@ mod windows_app {
             bounds.step(),
         );
         set_control_text(window, PANEL_DETAILS_ID, &details);
+        let color_role = visual.selected_color_role();
+        let color_details = format!(
+            "{}：当前 {}  ·  A {}  ·  B {}",
+            color_role.label(),
+            format_candidate_color(visual.selected_color()),
+            format_candidate_color(visual.selected_baseline_color()),
+            format_candidate_color(visual.selected_draft_color()),
+        );
+        set_control_text(window, PANEL_COLOR_DETAILS_ID, &color_details);
         let comparison_open = comparison
             .filter(|comparison| unsafe { IsWindow(Some(*comparison)) }.as_bool())
             .is_some();
@@ -1127,6 +1337,16 @@ mod windows_app {
                     combo,
                     CB_SETCURSEL,
                     Some(WPARAM(visual.selected_token_index())),
+                    None,
+                )
+            };
+        }
+        if let Ok(combo) = unsafe { GetDlgItem(Some(window), PANEL_COLOR_ID) } {
+            let _ = unsafe {
+                SendMessageW(
+                    combo,
+                    CB_SETCURSEL,
+                    Some(WPARAM(visual.selected_color_role_index())),
                     None,
                 )
             };
@@ -2344,6 +2564,88 @@ mod windows_app {
             assert_eq!(
                 apply_visual_command(&mut state, LabVisualCommand::ResetDraft),
                 LabVisualChange::None
+            );
+        }
+
+        #[test]
+        fn semantic_color_commands_preserve_the_baseline_and_reset_inspection() {
+            let selection = CandidateSceneRect {
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+            };
+            let mut state = LabState {
+                selection: Some(selection),
+                last_hit: Some("candidate.text".to_owned()),
+                ..LabState::default()
+            };
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::SelectColorRole(1)),
+                LabVisualChange::Metadata
+            );
+            assert_eq!(state.selection, Some(selection));
+            assert_eq!(
+                apply_visual_command(
+                    &mut state,
+                    LabVisualCommand::SelectColorRole(CandidateUiLabColorRole::ALL.len())
+                ),
+                LabVisualChange::None
+            );
+
+            let baseline = state.active_spec();
+            let replacement = CandidateRgb {
+                red: 12,
+                green: 34,
+                blue: 56,
+            };
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::SetDraftColor(replacement)),
+                LabVisualChange::Scene
+            );
+            assert_eq!(state.active_spec().selected_background, replacement);
+            assert_eq!(state.comparison_spec(), baseline);
+            assert!(state.selection.is_none());
+            assert!(state.last_hit.is_none());
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::SetDraftColor(replacement)),
+                LabVisualChange::None
+            );
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::ResetDraft),
+                LabVisualChange::Scene
+            );
+            assert_eq!(state.active_spec(), baseline);
+        }
+
+        #[test]
+        fn native_color_conversion_is_exact_and_hex_is_canonical() {
+            for color in [
+                CandidateRgb {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                },
+                CandidateRgb {
+                    red: 12,
+                    green: 34,
+                    blue: 56,
+                },
+                CandidateRgb {
+                    red: 255,
+                    green: 254,
+                    blue: 253,
+                },
+            ] {
+                assert_eq!(candidate_rgb(candidate_colorref(color)), color);
+            }
+            assert_eq!(
+                format_candidate_color(CandidateRgb {
+                    red: 12,
+                    green: 34,
+                    blue: 56,
+                }),
+                "#0C2238"
             );
         }
 
