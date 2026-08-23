@@ -4485,9 +4485,18 @@ fn action_popup_logical_width(display: &CandidateDisplay, label: &str, detail: &
 }
 
 fn candidate_popup_mode_label(display: &CandidateDisplay) -> Option<&str> {
-    display.mode_label().or_else(|| {
-        (display.view() == InteractiveCandidateView::TranspositionRecovery).then_some("换序")
-    })
+    display
+        .mode_label()
+        .or_else(|| {
+            (display.view() == InteractiveCandidateView::TranspositionRecovery).then_some("换序")
+        })
+        .or_else(|| {
+            (display.mode == CandidateDisplayMode::Normal
+                && display.view() == InteractiveCandidateView::Primary
+                && !display.is_notice()
+                && display.visible_personalized().iter().any(|value| *value))
+            .then_some("个人 · Ctrl+Del")
+        })
 }
 
 fn candidate_popup_mode_logical_width(display: &CandidateDisplay) -> i32 {
@@ -25160,6 +25169,74 @@ mod tests {
             Some("忘记 · 数字选择")
         );
         assert!(candidate_popup_footer_logical_width(&forget_one_page) > 60);
+    }
+
+    #[test]
+    fn personal_memory_hint_is_visible_only_on_relevant_ordinary_pages() {
+        let personal = NativeCandidateProvenance::with_personalization(
+            NativeCandidateSource::CoreExact,
+            NativeCandidatePersonalization::PERSISTENT_EXACT,
+        );
+        let plain = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let personal_page = CandidateDisplay::from_batch(
+            CandidateBatch {
+                candidates: vec!["人物".to_owned(), "任务".to_owned()],
+                resolved_shape_codes: vec![None; 2],
+                provenance: vec![personal, plain],
+                personalized: vec![true, false],
+                ranking_origins: initial_candidate_ranking_origins(2),
+                protected_prefix_len: 0,
+                automatic_transposition: None,
+                may_have_more: false,
+                view: InteractiveCandidateView::Primary,
+            },
+            0,
+        );
+        assert_eq!(
+            candidate_popup_mode_label(&personal_page),
+            Some("个人 · Ctrl+Del")
+        );
+        assert!(candidate_popup_footer_logical_width(&personal_page) > 0);
+        let metrics = candidate_popup_metrics(&personal_page, 96, 1_920);
+        assert_eq!(metrics.layout, CandidatePopupLayout::Horizontal);
+        assert_eq!(
+            horizontal_candidate_widths(&personal_page, 96, metrics.width),
+            personal_page
+                .visible()
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    horizontal_candidate_logical_width(candidate, index == 0)
+                })
+                .collect::<Vec<_>>(),
+            "an unconstrained short popup should grow for the hint instead of squeezing candidates"
+        );
+
+        let mut off_page_candidates = (0..7)
+            .map(|index| format!("候选{index}"))
+            .collect::<Vec<_>>();
+        off_page_candidates[0] = "个人候选".to_owned();
+        let off_page = CandidateDisplay::from_batch(
+            CandidateBatch {
+                resolved_shape_codes: vec![None; off_page_candidates.len()],
+                provenance: [vec![personal], vec![plain; 6]].concat(),
+                personalized: [vec![true], vec![false; 6]].concat(),
+                ranking_origins: initial_candidate_ranking_origins(off_page_candidates.len()),
+                candidates: off_page_candidates,
+                protected_prefix_len: 0,
+                automatic_transposition: None,
+                may_have_more: false,
+                view: InteractiveCandidateView::Primary,
+            },
+            6,
+        );
+        assert_eq!(candidate_popup_mode_label(&off_page), None);
+
+        let mut recovery = personal_page.clone();
+        recovery.view = InteractiveCandidateView::TranspositionRecovery;
+        assert_eq!(candidate_popup_mode_label(&recovery), Some("换序"));
+        let forget = personal_page.with_mode(CandidateDisplayMode::ForgetSelecting);
+        assert_eq!(candidate_popup_mode_label(&forget), Some("忘记 · 数字选择"));
     }
 
     #[test]
