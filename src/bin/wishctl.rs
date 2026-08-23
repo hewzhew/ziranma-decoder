@@ -676,6 +676,17 @@ fn print_event(event: &NativeFeedbackEvent) {
                 "会话选择未保留"
             }
         ),
+        NativeFeedbackEvent::ShortWordExtraKeyTiming {
+            observed_code,
+            intended_code,
+            extra_index,
+            inter_key_gaps_ms,
+            visible_rank,
+        } => println!(
+            "短词多按时序  {observed_code} → {intended_code}；删除第 {} 键；相邻间隔 {:?} ms；候选第 {visible_rank} 项",
+            extra_index.saturating_add(1),
+            inter_key_gaps_ms,
+        ),
     }
 }
 
@@ -928,6 +939,7 @@ mod tests {
         assert_eq!(wish_schema_version_label(15), "V15");
         assert_eq!(wish_schema_version_label(18), "V18");
         assert_eq!(wish_schema_version_label(19), "V19");
+        assert_eq!(wish_schema_version_label(20), "V20");
     }
 
     #[test]

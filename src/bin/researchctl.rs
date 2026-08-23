@@ -1321,6 +1321,47 @@ struct FollowupNonTopPressure {
     dominant_top_sources: [usize; CANDIDATE_SOURCE_KIND_COUNT],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastestGapRelation {
+    Unique,
+    Tied,
+    NotFastest,
+}
+
+fn short_word_extra_key_local_gap(
+    inter_key_gaps_ms: &[u32],
+    extra_index: usize,
+) -> Option<(u32, FastestGapRelation)> {
+    if inter_key_gaps_ms.is_empty() || extra_index > inter_key_gaps_ms.len() {
+        return None;
+    }
+    let mut adjacent = Vec::with_capacity(2);
+    if let Some(left) = extra_index
+        .checked_sub(1)
+        .and_then(|index| inter_key_gaps_ms.get(index))
+    {
+        adjacent.push(*left);
+    }
+    if let Some(right) = inter_key_gaps_ms.get(extra_index) {
+        adjacent.push(*right);
+    }
+    let local_gap = adjacent.into_iter().min()?;
+    let global_gap = inter_key_gaps_ms.iter().copied().min()?;
+    let relation = if local_gap != global_gap {
+        FastestGapRelation::NotFastest
+    } else if inter_key_gaps_ms
+        .iter()
+        .filter(|&&gap| gap == global_gap)
+        .count()
+        == 1
+    {
+        FastestGapRelation::Unique
+    } else {
+        FastestGapRelation::Tied
+    };
+    Some((local_gap, relation))
+}
+
 #[derive(Default)]
 struct ResearchReview {
     available_batches: usize,
@@ -1366,6 +1407,7 @@ struct ResearchReview {
     candidate_suppression_action_capable_batches: usize,
     personal_phrase_adjacency_capable_batches: usize,
     personal_selection_confirmation_capable_batches: usize,
+    short_word_extra_key_timing_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
     public_candidate_order_policy_capable_batches: usize,
     public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
@@ -1379,6 +1421,21 @@ struct ResearchReview {
     personal_selection_confirmations: usize,
     personal_selection_persistent_preferred: usize,
     personal_selection_session_retained: usize,
+    short_word_extra_key_timing_events: usize,
+    short_word_extra_key_two_syllable_events: usize,
+    short_word_extra_key_three_syllable_events: usize,
+    short_word_extra_key_rank_one: usize,
+    short_word_extra_key_rank_two: usize,
+    short_word_extra_key_other_rank: usize,
+    short_word_extra_key_local_gap_ms: Vec<u32>,
+    short_word_extra_key_unique_fastest: usize,
+    short_word_extra_key_tied_fastest: usize,
+    short_word_extra_key_not_fastest: usize,
+    short_word_extra_key_selected_same_batch: usize,
+    short_word_extra_key_other_candidate_same_batch: usize,
+    short_word_extra_key_continued_same_batch: usize,
+    short_word_extra_key_raw_or_cancelled_same_batch: usize,
+    short_word_extra_key_unresolved_at_batch_end: usize,
     runtime_batches: HashMap<WishRuntimeIdentity, usize>,
     unidentified_runtime_batches: usize,
     personalized_top_bypass: PersonalizedTopBypassAudit,
@@ -1409,6 +1466,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_personal_phrase_adjacency());
         self.personal_selection_confirmation_capable_batches +=
             usize::from(snapshot.supports_personal_selection_confirmation());
+        self.short_word_extra_key_timing_capable_batches +=
+            usize::from(snapshot.supports_short_word_extra_key_timing());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
         self.public_candidate_order_policy_capable_batches +=
@@ -1433,6 +1492,7 @@ impl ResearchReview {
             .saturating_add(snapshot.omitted_untimed())
             .saturating_add(snapshot.omitted_by_event_limit());
         let mut frame: Option<PresentedFrame> = None;
+        let mut pending_short_word_extra_key: Option<(String, usize)> = None;
         let observation_location = SelectionObservationLocation::from_snapshot(snapshot);
         for wish_event in snapshot.events() {
             match wish_event.event() {
@@ -1443,6 +1503,13 @@ impl ResearchReview {
                     candidates,
                     may_have_more,
                 } => {
+                    if pending_short_word_extra_key
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending != code)
+                    {
+                        self.short_word_extra_key_continued_same_batch += 1;
+                        pending_short_word_extra_key = None;
+                    }
                     self.observe_frame(
                         *view,
                         page_start.saturating_add(candidates.len()),
@@ -1471,6 +1538,13 @@ impl ResearchReview {
                     may_have_more,
                     ..
                 } => {
+                    if pending_short_word_extra_key
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending != code)
+                    {
+                        self.short_word_extra_key_continued_same_batch += 1;
+                        pending_short_word_extra_key = None;
+                    }
                     self.observe_frame(
                         *view,
                         *loaded_candidates,
@@ -1496,6 +1570,15 @@ impl ResearchReview {
                     absolute_rank,
                     ..
                 } => {
+                    if let Some((pending_code, recovery_rank)) = pending_short_word_extra_key.take()
+                        && pending_code == *code
+                    {
+                        if recovery_rank == *absolute_rank {
+                            self.short_word_extra_key_selected_same_batch += 1;
+                        } else {
+                            self.short_word_extra_key_other_candidate_same_batch += 1;
+                        }
+                    }
                     self.candidate_commits += 1;
                     self.top_one_commits += usize::from(*absolute_rank == 1);
                     self.non_top_commits += usize::from(*absolute_rank > 1);
@@ -1558,11 +1641,23 @@ impl ResearchReview {
                     frame = None;
                 }
                 NativeFeedbackEvent::RawCodeCommitted { code } => {
+                    if pending_short_word_extra_key
+                        .take()
+                        .is_some_and(|(pending, _)| pending == *code)
+                    {
+                        self.short_word_extra_key_raw_or_cancelled_same_batch += 1;
+                    }
                     self.raw_commits += 1;
                     *self.raw_codes.entry(code.clone()).or_insert(0) += 1;
                     frame = None;
                 }
                 NativeFeedbackEvent::CompositionCancelled { code, .. } => {
+                    if pending_short_word_extra_key
+                        .take()
+                        .is_some_and(|(pending, _)| pending == *code)
+                    {
+                        self.short_word_extra_key_raw_or_cancelled_same_batch += 1;
+                    }
                     self.cancellations += 1;
                     *self.cancelled_codes.entry(code.clone()).or_insert(0) += 1;
                     frame = None;
@@ -1634,8 +1729,50 @@ impl ResearchReview {
                         usize::from(*persistent_preferred);
                     self.personal_selection_session_retained += usize::from(*session_retained);
                 }
+                NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                    observed_code,
+                    extra_index,
+                    inter_key_gaps_ms,
+                    visible_rank,
+                    ..
+                } => {
+                    self.short_word_extra_key_timing_events += 1;
+                    self.short_word_extra_key_two_syllable_events +=
+                        usize::from(observed_code.len() == 5);
+                    self.short_word_extra_key_three_syllable_events +=
+                        usize::from(observed_code.len() == 7);
+                    match visible_rank {
+                        1 => self.short_word_extra_key_rank_one += 1,
+                        2 => self.short_word_extra_key_rank_two += 1,
+                        _ => self.short_word_extra_key_other_rank += 1,
+                    }
+                    if let Some((local_gap, relation)) =
+                        short_word_extra_key_local_gap(inter_key_gaps_ms, *extra_index)
+                    {
+                        self.short_word_extra_key_local_gap_ms.push(local_gap);
+                        match relation {
+                            FastestGapRelation::Unique => {
+                                self.short_word_extra_key_unique_fastest += 1;
+                            }
+                            FastestGapRelation::Tied => {
+                                self.short_word_extra_key_tied_fastest += 1;
+                            }
+                            FastestGapRelation::NotFastest => {
+                                self.short_word_extra_key_not_fastest += 1;
+                            }
+                        }
+                    }
+                    if pending_short_word_extra_key
+                        .replace((observed_code.clone(), *visible_rank))
+                        .is_some()
+                    {
+                        self.short_word_extra_key_unresolved_at_batch_end += 1;
+                    }
+                }
             }
         }
+        self.short_word_extra_key_unresolved_at_batch_end +=
+            usize::from(pending_short_word_extra_key.is_some());
         for observation in snapshot.automatic_transposition_observations()? {
             match observation.label() {
                 TranspositionCalibrationLabel::Accepted => self.transposition_accepted += 1,
@@ -1694,7 +1831,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；个人选择确认结果 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；个人选择确认结果 {}/{} 批；短词多按完整时序 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -1711,10 +1848,13 @@ impl ResearchReview {
             self.batches,
             self.personal_selection_confirmation_capable_batches,
             self.batches,
+            self.short_word_extra_key_timing_capable_batches,
+            self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
         )
         .unwrap();
+        self.render_short_word_extra_key_timing(output);
         writeln!(
             output,
             "个人选择确认：已观察 {}；成为持久首选 {}，已记录但尚未胜出 {}；会话选择保留 {}，未保留 {}。V1–V18 不补猜。",
@@ -1753,6 +1893,39 @@ impl ResearchReview {
             output,
             "{}",
             render_current_schema_readiness(&self.source_schema_versions, self.batches)
+        )
+        .unwrap();
+    }
+
+    fn render_short_word_extra_key_timing(&self, output: &mut String) {
+        if self.short_word_extra_key_timing_capable_batches == 0 {
+            output.push_str("短词多按完整时序：尚无 V20 批次；旧批次不补猜被判作多按键的位置。\n");
+            return;
+        }
+        writeln!(
+            output,
+            "短词多按完整时序：事件 {}（两音节 {}、三音节 {}）；实际可见名次第 1 项 {}、第 2 项 {}、其他 {}；多按键相邻边为全段唯一最快 {}、并列最快 {}、并非最快 {}；局部间隔 P50 {} ms、P95 {} ms。",
+            self.short_word_extra_key_timing_events,
+            self.short_word_extra_key_two_syllable_events,
+            self.short_word_extra_key_three_syllable_events,
+            self.short_word_extra_key_rank_one,
+            self.short_word_extra_key_rank_two,
+            self.short_word_extra_key_other_rank,
+            self.short_word_extra_key_unique_fastest,
+            self.short_word_extra_key_tied_fastest,
+            self.short_word_extra_key_not_fastest,
+            percentile(&self.short_word_extra_key_local_gap_ms, 50).unwrap_or(0),
+            percentile(&self.short_word_extra_key_local_gap_ms, 95).unwrap_or(0),
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "短词多按同批终局：选择恢复 {}、选择其他候选 {}、继续输入 {}、原码或取消 {}、批末未决 {}。相邻边最快只描述相关性；两种删除若共享同一按键边，时序仍不能证明哪一键多按。",
+            self.short_word_extra_key_selected_same_batch,
+            self.short_word_extra_key_other_candidate_same_batch,
+            self.short_word_extra_key_continued_same_batch,
+            self.short_word_extra_key_raw_or_cancelled_same_batch,
+            self.short_word_extra_key_unresolved_at_batch_end,
         )
         .unwrap();
     }
@@ -3736,6 +3909,150 @@ mod tests {
     }
 
     #[test]
+    fn short_word_extra_key_local_gap_handles_edge_and_internal_keys() {
+        assert_eq!(
+            short_word_extra_key_local_gap(&[3, 11, 19], 0),
+            Some((3, FastestGapRelation::Unique))
+        );
+        assert_eq!(
+            short_word_extra_key_local_gap(&[19, 11, 3], 3),
+            Some((3, FastestGapRelation::Unique))
+        );
+        assert_eq!(
+            short_word_extra_key_local_gap(&[17, 8, 3, 14], 2),
+            Some((3, FastestGapRelation::Unique))
+        );
+    }
+
+    #[test]
+    fn short_word_extra_key_local_gap_distinguishes_ties_and_slower_edges() {
+        assert_eq!(
+            short_word_extra_key_local_gap(&[4, 12, 4], 0),
+            Some((4, FastestGapRelation::Tied))
+        );
+        assert_eq!(
+            short_word_extra_key_local_gap(&[3, 10, 12], 2),
+            Some((10, FastestGapRelation::NotFastest))
+        );
+    }
+
+    #[test]
+    fn short_word_extra_key_local_gap_rejects_missing_or_out_of_range_timing() {
+        assert_eq!(short_word_extra_key_local_gap(&[], 0), None);
+        assert_eq!(short_word_extra_key_local_gap(&[3, 5], 3), None);
+    }
+
+    #[test]
+    fn review_tracks_short_word_extra_key_timing_and_same_batch_outcomes() {
+        use ziranma_core::{
+            NativeFeedbackAuthorization, NativeFeedbackContext, NativeFeedbackFreezeAuthorization,
+            NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
+        };
+
+        let timing = || NativeFeedbackEvent::ShortWordExtraKeyTiming {
+            observed_code: "kehyi".to_owned(),
+            intended_code: "keyi".to_owned(),
+            extra_index: 2,
+            inter_key_gaps_ms: vec![61, 14, 57, 73],
+            visible_rank: 2,
+        };
+        let events = vec![
+            timing(),
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "kehyi".to_owned(),
+                text: "可以".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::Numeric,
+                absolute_rank: 2,
+                visible_rank: 2,
+            },
+            timing(),
+            NativeFeedbackEvent::CandidateCommitted {
+                code: "kehyi".to_owned(),
+                text: "可坏一".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                source: NativeSelectionSource::FirstCandidate,
+                absolute_rank: 1,
+                visible_rank: 1,
+            },
+            timing(),
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code: "keyi".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                page_start: 0,
+                candidates: vec!["可以".to_owned()],
+                provenance: vec![NativeCandidateProvenance::new(
+                    NativeCandidateSource::CoreExact,
+                    false,
+                )],
+                automatic_transposition: None,
+                loaded_candidates: 1,
+                tab_assembly: None,
+                may_have_more: false,
+            },
+            timing(),
+            NativeFeedbackEvent::RawCodeCommitted {
+                code: "kehyi".to_owned(),
+            },
+            timing(),
+        ];
+        let mut session = NativeFeedbackSession::default();
+        session.start_memory(
+            NativeFeedbackAuthorization::explicit_memory_only(),
+            NativeFeedbackLimits::default(),
+        );
+        for (index, event) in events.iter().cloned().enumerate() {
+            assert_eq!(
+                session.record_at(
+                    NativeFeedbackContext::Eligible,
+                    event,
+                    u64::try_from(index + 1).unwrap(),
+                ),
+                NativeFeedbackRecordResult::Recorded
+            );
+        }
+        let frozen = session
+            .freeze_recent(
+                NativeFeedbackFreezeAuthorization::explicit_private_snapshot(),
+                u64::try_from(events.len()).unwrap(),
+                30_000,
+                events.len(),
+            )
+            .unwrap();
+        let snapshot = WishSnapshot::from_frozen_with_context(
+            &frozen,
+            WishCaptureScope::ContinuousJournal,
+            ziranma_core::WishCategory::Other,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut review = ResearchReview::default();
+        review.observe(&snapshot).unwrap();
+
+        assert_eq!(review.short_word_extra_key_timing_capable_batches, 1);
+        assert_eq!(review.short_word_extra_key_timing_events, 5);
+        assert_eq!(review.short_word_extra_key_two_syllable_events, 5);
+        assert_eq!(review.short_word_extra_key_three_syllable_events, 0);
+        assert_eq!(review.short_word_extra_key_rank_two, 5);
+        assert_eq!(review.short_word_extra_key_unique_fastest, 5);
+        assert_eq!(review.short_word_extra_key_selected_same_batch, 1);
+        assert_eq!(review.short_word_extra_key_other_candidate_same_batch, 1);
+        assert_eq!(review.short_word_extra_key_continued_same_batch, 1);
+        assert_eq!(review.short_word_extra_key_raw_or_cancelled_same_batch, 1);
+        assert_eq!(review.short_word_extra_key_unresolved_at_batch_end, 1);
+        let mut rendered = String::new();
+        review.render_short_word_extra_key_timing(&mut rendered);
+        assert!(rendered.contains("短词多按完整时序：事件 5（两音节 5、三音节 0）"));
+        assert!(
+            rendered.contains("选择恢复 1、选择其他候选 1、继续输入 1、原码或取消 1、批末未决 1")
+        );
+        for private_value in ["kehyi", "keyi", "可以", "可坏一"] {
+            assert!(!rendered.contains(private_value));
+        }
+    }
+
+    #[test]
     fn aggregate_selection_pressure_distinguishes_competing_and_cold_identities() {
         let mut review = ResearchReview::default();
         for (code, text, ranks) in [
@@ -4930,7 +5247,7 @@ mod tests {
             "个人选择确认：已观察 2；成为持久首选 1，已记录但尚未胜出 1；会话选择保留 1，未保留 1。V1–V18 不补猜"
         ));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V19 1"));
+        assert!(aggregate.contains("反馈格式：V20 1"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"

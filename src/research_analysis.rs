@@ -1417,7 +1417,8 @@ fn observe_event(
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::CandidateSuppressionChanged { .. }
-        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
+        | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
+        | NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
         NativeFeedbackEvent::PersonalSelectionConfirmed {
             code,
             text,

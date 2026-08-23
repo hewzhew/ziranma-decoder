@@ -2755,6 +2755,20 @@ mod windows_app {
                     "会话未保留"
                 }
             ),
+            NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                observed_code,
+                intended_code,
+                extra_index,
+                inter_key_gaps_ms,
+                visible_rank,
+            } => format!(
+                "短词多按时序　{} → {}（删除第 {} 键，候选第 {} 项；间隔 {:?} ms）",
+                compact_text(observed_code, 28),
+                compact_text(intended_code, 28),
+                extra_index.saturating_add(1),
+                visible_rank,
+                inter_key_gaps_ms,
+            ),
         }
     }
 

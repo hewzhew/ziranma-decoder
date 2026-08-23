@@ -591,6 +591,7 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                     usize::from(*persistent_preferred);
                 report.personal_selection.session_retained += usize::from(*session_retained);
             }
+            NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
         }
     }
 }

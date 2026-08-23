@@ -684,6 +684,20 @@ pub enum NativeFeedbackEvent {
         persistent_preferred: bool,
         session_retained: bool,
     },
+    /// One public short-word extra-key recovery that was actually visible in
+    /// the ordinary candidate frame, together with the complete delivered-key
+    /// timing trace for that composition.
+    ///
+    /// This event is diagnostic only: it records the rank produced by the
+    /// conservative public-consensus lane and never changes candidate order.
+    /// Both codes remain private like `CandidateCommitted`.
+    ShortWordExtraKeyTiming {
+        observed_code: String,
+        intended_code: String,
+        extra_index: usize,
+        inter_key_gaps_ms: Vec<u32>,
+        visible_rank: usize,
+    },
 }
 
 impl NativeFeedbackEvent {
@@ -796,6 +810,41 @@ impl NativeFeedbackEvent {
                     return None;
                 }
                 measure_private_strings([code.as_str(), text.as_str()].into_iter())
+            }
+            Self::ShortWordExtraKeyTiming {
+                observed_code,
+                intended_code,
+                extra_index,
+                inter_key_gaps_ms,
+                visible_rank,
+            } => {
+                if !matches!(observed_code.len(), 5 | 7)
+                    || !valid_code(observed_code)
+                    || !valid_code(intended_code)
+                    || intended_code.len().saturating_add(1) != observed_code.len()
+                    || *extra_index >= observed_code.len()
+                    || inter_key_gaps_ms.len().saturating_add(1) != observed_code.len()
+                    || !(1..=MAX_FEEDBACK_CANDIDATES_PER_PAGE).contains(visible_rank)
+                {
+                    return None;
+                }
+                let observed = observed_code.as_bytes();
+                let actual = observed[*extra_index];
+                let adjacent = extra_index
+                    .checked_sub(1)
+                    .and_then(|index| observed.get(index))
+                    .is_some_and(|&neighbor| crate::are_qwerty_neighbors(actual, neighbor))
+                    || observed
+                        .get(extra_index.saturating_add(1))
+                        .is_some_and(|&neighbor| crate::are_qwerty_neighbors(actual, neighbor));
+                let mut restored = observed.to_vec();
+                restored.remove(*extra_index);
+                if !adjacent || restored != intended_code.as_bytes() {
+                    return None;
+                }
+                measure_private_strings(
+                    [observed_code.as_str(), intended_code.as_str()].into_iter(),
+                )
             }
         }
     }
@@ -1451,6 +1500,7 @@ impl NativeFeedbackSession {
                 NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {}
                 NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
                 NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
+                NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
             }
         }
         summary
@@ -1508,6 +1558,7 @@ impl NativeFeedbackSession {
                 | NativeFeedbackEvent::PostCommitBackspaceRouted
                 | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
                 | NativeFeedbackEvent::PersonalSelectionConfirmed { .. }
+                | NativeFeedbackEvent::ShortWordExtraKeyTiming { .. }
         ) {
             return;
         }
@@ -1649,7 +1700,8 @@ impl NativeFeedbackSession {
             | NativeFeedbackEvent::SlowKeyPathTiming { .. }
             | NativeFeedbackEvent::PostCommitBackspaceRouted
             | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
-            | NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
+            | NativeFeedbackEvent::PersonalSelectionConfirmed { .. }
+            | NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
         }
     }
 }
@@ -2950,5 +3002,47 @@ mod tests {
             session.freeze_recent(authorization, 20, 30_000, 10),
             Err(NativeFeedbackFreezeError::NotAccepting)
         ));
+    }
+
+    #[test]
+    fn short_word_extra_key_timing_requires_one_neighbor_deletion_and_complete_gaps() {
+        let event = NativeFeedbackEvent::ShortWordExtraKeyTiming {
+            observed_code: "kehyi".to_owned(),
+            intended_code: "keyi".to_owned(),
+            extra_index: 2,
+            inter_key_gaps_ms: vec![61, 14, 57, 73],
+            visible_rank: 2,
+        };
+        assert_eq!(event.validate_and_measure(), Some(9));
+
+        let invalid = |extra_index, gaps: Vec<u32>, intended: &str| {
+            NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                observed_code: "kehyi".to_owned(),
+                intended_code: intended.to_owned(),
+                extra_index,
+                inter_key_gaps_ms: gaps,
+                visible_rank: 2,
+            }
+        };
+        assert!(
+            invalid(2, vec![14], "keyi")
+                .validate_and_measure()
+                .is_none()
+        );
+        assert!(
+            invalid(5, vec![61, 14, 57, 73], "keyi")
+                .validate_and_measure()
+                .is_none()
+        );
+        assert!(
+            invalid(2, vec![61, 14, 57, 73], "kehi")
+                .validate_and_measure()
+                .is_none()
+        );
+        assert!(
+            invalid(4, vec![61, 14, 57, 73], "kehy")
+                .validate_and_measure()
+                .is_none()
+        );
     }
 }

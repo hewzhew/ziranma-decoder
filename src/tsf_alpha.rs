@@ -33,7 +33,7 @@ use crate::{
     CandidateRuntimeError, CandidateRuntimeExactShort, CandidateRuntimeExactShortSelection,
     CandidateRuntimeSupplemental, CandidateRuntimeSupplementalSelection, CandidateSnapshot,
     CharacterShapeIndex, CompositionEffect, CompositionInput, CompositionPunctuation,
-    CompositionSession, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
+    CompositionSession, Correction, DEFAULT_NATIVE_FEEDBACK_WISH_EPISODE_MAX_LOOKBACK_MS,
     DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES, DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
     DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder, ExactShortPageSession, ExactShortWordCatalog,
     ExactShortWordCatalogError, ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot,
@@ -250,6 +250,12 @@ struct AutomaticTranspositionTimingEvidence {
     previous_pair: Option<CompletedPairTiming>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShortWordExtraKeyRecovery {
+    intended_code: String,
+    extra_index: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum AutomaticTranspositionOutcome {
     #[default]
@@ -326,6 +332,13 @@ trait CandidateProvider: Send + Sync {
         _pattern: AutomaticTranspositionPattern,
         _limit: usize,
     ) -> Option<CandidateProviderOutput> {
+        None
+    }
+
+    /// Replays the narrow public short-word lane only to retain its structural
+    /// edit evidence beside an already displayed correction. Candidate order
+    /// remains owned by `candidates_with_provenance`.
+    fn short_word_extra_key_recovery(&self, _code: &str) -> Option<ShortWordExtraKeyRecovery> {
         None
     }
 
@@ -1891,6 +1904,28 @@ impl CandidateProvider for SnapshotCandidateProvider {
             provenance,
             protected_prefix_len: 0,
             automatic_transposition_blocked: true,
+        })
+    }
+
+    fn short_word_extra_key_recovery(&self, code: &str) -> Option<ShortWordExtraKeyRecovery> {
+        let supplemental = self.supplemental.current()?;
+        let decision = layered_short_word_extra_key_correction_decision(
+            &self.snapshot,
+            Some(&supplemental.0),
+            code,
+            1,
+        )
+        .ok()?;
+        let ShortWordExtraKeyCorrectionDecision::Offer(offer) = decision else {
+            return None;
+        };
+        let correction = &offer.candidates.first()?.correction;
+        let Correction::ExtraKey { index, .. } = correction else {
+            return None;
+        };
+        Some(ShortWordExtraKeyRecovery {
+            intended_code: offer.intended_code,
+            extra_index: *index,
         })
     }
 
@@ -9215,11 +9250,43 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::CompositionCancelled { code, .. }
         | NativeFeedbackEvent::CandidateSuppressionChanged { code, .. }
         | NativeFeedbackEvent::PersonalSelectionConfirmed { code, .. } => Some(code),
+        NativeFeedbackEvent::ShortWordExtraKeyTiming { observed_code, .. } => Some(observed_code),
         NativeFeedbackEvent::CandidatePopupTiming { .. }
         | NativeFeedbackEvent::SlowKeyPathTiming { .. }
         | NativeFeedbackEvent::PostCommitBackspaceRouted
         | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => None,
     }
+}
+
+fn short_word_extra_key_timing_event(
+    provider: &dyn CandidateProvider,
+    candidate_event: &NativeFeedbackEvent,
+    trace: &CompositionLetterTimingTrace,
+) -> Option<NativeFeedbackEvent> {
+    let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+        code,
+        view: NativeCandidateView::Ordinary,
+        page_start: 0,
+        provenance,
+        ..
+    } = candidate_event
+    else {
+        return None;
+    };
+    let visible_rank = provenance
+        .iter()
+        .position(|candidate| candidate.source() == NativeCandidateSource::FourCharacterCorrection)?
+        .saturating_add(1);
+    let recovery = provider.short_word_extra_key_recovery(code)?;
+    let gaps = trace.complete_gaps(code)?.to_vec();
+    let event = NativeFeedbackEvent::ShortWordExtraKeyTiming {
+        observed_code: code.clone(),
+        intended_code: recovery.intended_code,
+        extra_index: recovery.extra_index,
+        inter_key_gaps_ms: gaps,
+        visible_rank,
+    };
+    event.validate_and_measure().is_some().then_some(event)
 }
 
 fn elapsed_milliseconds(started_at: Instant) -> u32 {
@@ -10136,6 +10203,7 @@ struct TsfTextService {
     shift_chord_pending: Cell<bool>,
     last_delivered_letter: Cell<Option<DeliveredLetterAnchor>>,
     last_completed_pair_timing: Cell<Option<CompletedPairTiming>>,
+    composition_letter_timing: RefCell<CompositionLetterTimingTrace>,
     key_advice_mode: KeyAdviceMode,
     #[cfg(test)]
     synthetic_key_modifiers: Cell<KeyModifiers>,
@@ -10145,6 +10213,58 @@ struct TsfTextService {
 struct DeliveredLetterAnchor {
     at: Instant,
     code_len_after: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompositionLetterTimingTrace {
+    code: String,
+    inter_key_gaps_ms: Vec<u32>,
+}
+
+impl CompositionLetterTimingTrace {
+    fn after_key(
+        &self,
+        before_code: &str,
+        after_code: &str,
+        delivered_letter: bool,
+        consecutive_gap_ms: Option<u64>,
+    ) -> Self {
+        if !delivered_letter {
+            return if before_code == after_code {
+                self.clone()
+            } else {
+                Self::default()
+            };
+        }
+        let appended_one = after_code.len() == before_code.len().saturating_add(1)
+            && after_code.starts_with(before_code);
+        if !appended_one {
+            return Self::default();
+        }
+        if before_code.is_empty() {
+            return Self {
+                code: after_code.to_owned(),
+                inter_key_gaps_ms: Vec::new(),
+            };
+        }
+        if self.code != before_code
+            || self.inter_key_gaps_ms.len().saturating_add(1) != before_code.len()
+        {
+            return Self::default();
+        }
+        let Some(gap_ms) = consecutive_gap_ms.and_then(|gap| u32::try_from(gap).ok()) else {
+            return Self::default();
+        };
+        let mut next = self.clone();
+        next.code = after_code.to_owned();
+        next.inter_key_gaps_ms.push(gap_ms);
+        next
+    }
+
+    fn complete_gaps(&self, code: &str) -> Option<&[u32]> {
+        (self.code == code && self.inter_key_gaps_ms.len().saturating_add(1) == code.len())
+            .then_some(self.inter_key_gaps_ms.as_slice())
+    }
 }
 
 const RESEARCH_FEEDBACK_BATCH_EVENTS: usize = 256;
@@ -10638,6 +10758,7 @@ impl TsfTextService {
             shift_chord_pending: Cell::new(false),
             last_delivered_letter: Cell::new(None),
             last_completed_pair_timing: Cell::new(None),
+            composition_letter_timing: RefCell::new(CompositionLetterTimingTrace::default()),
             key_advice_mode,
             #[cfg(test)]
             synthetic_key_modifiers: Cell::new(KeyModifiers::default()),
@@ -10710,29 +10831,31 @@ impl TsfTextService_Impl {
         &self,
         wparam: WPARAM,
         modifiers: KeyModifiers,
-    ) -> (Option<u64>, Option<DeliveredLetterAnchor>) {
+    ) -> (Option<u64>, Option<u64>, Option<DeliveredLetterAnchor>) {
         let Some(CompositionInput::Letters(letters)) = u16::try_from(wparam.0)
             .ok()
             .and_then(|vkey| decode_virtual_key(vkey, modifiers, self.input_mode.get()))
         else {
-            return (None, None);
+            return (None, None, None);
         };
         if letters.len() != 1 {
-            return (None, None);
+            return (None, None, None);
         }
         let Ok(composition) = self.composition.try_borrow() else {
-            return (None, None);
+            return (None, None, None);
         };
         let code_len = composition.phonetic().len();
         let now = Instant::now();
-        let pair_gap_ms = self.last_delivered_letter.get().and_then(|anchor| {
-            (code_len % 2 == 1 && anchor.code_len_after == code_len).then(|| {
+        let consecutive_gap_ms = self.last_delivered_letter.get().and_then(|anchor| {
+            (anchor.code_len_after == code_len).then(|| {
                 u64::try_from(now.saturating_duration_since(anchor.at).as_millis())
                     .unwrap_or(u64::MAX)
             })
         });
+        let pair_gap_ms = (code_len % 2 == 1).then_some(consecutive_gap_ms).flatten();
         (
             pair_gap_ms,
+            consecutive_gap_ms,
             Some(DeliveredLetterAnchor {
                 at: now,
                 code_len_after: code_len.saturating_add(1),
@@ -11884,6 +12007,9 @@ impl TsfTextService_Impl {
         self.shift_chord_pending.set(false);
         self.last_delivered_letter.set(None);
         self.last_completed_pair_timing.set(None);
+        if let Ok(mut timing) = self.composition_letter_timing.try_borrow_mut() {
+            *timing = CompositionLetterTimingTrace::default();
+        }
         if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
             *state = CandidateForgetState::Inactive;
         }
@@ -12882,7 +13008,8 @@ impl TsfTextService_Impl {
             }
         }
         let refresh_ms = elapsed_milliseconds(refresh_started_at);
-        let (pair_gap_ms, next_letter_anchor) = self.delivered_letter_timing(wparam, modifiers);
+        let (pair_gap_ms, consecutive_gap_ms, next_letter_anchor) =
+            self.delivered_letter_timing(wparam, modifiers);
         let previous_pair_timing = self.last_completed_pair_timing.get();
         let planning_started_at = Instant::now();
         let Some(plan) = self.plan_key_with_transposition_timing(
@@ -12896,6 +13023,11 @@ impl TsfTextService_Impl {
         else {
             self.last_delivered_letter.set(None);
             self.last_completed_pair_timing.set(None);
+            *self
+                .composition_letter_timing
+                .try_borrow_mut()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))? =
+                CompositionLetterTimingTrace::default();
             if u16::try_from(wparam.0)
                 .ok()
                 .is_none_or(|vkey| !self.key_continues_personal_phrase(vkey, modifiers))
@@ -12940,6 +13072,21 @@ impl TsfTextService_Impl {
             action_after_success,
             candidate_forget_action_after_success,
         } = plan;
+        let next_letter_timing = self
+            .composition_letter_timing
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .after_key(
+                before.phonetic(),
+                after.phonetic(),
+                next_letter_anchor.is_some(),
+                consecutive_gap_ms,
+            );
+        let short_word_timing_event = feedback_after_success.as_ref().and_then(|event| {
+            self.candidate_provider.as_deref().and_then(|provider| {
+                short_word_extra_key_timing_event(provider, event, &next_letter_timing)
+            })
+        });
         let breaks_personal_phrase = selection_to_remember.is_none()
             && (edit
                 .as_ref()
@@ -13025,6 +13172,10 @@ impl TsfTextService_Impl {
         }
         *composition = after;
         drop(composition);
+        *self
+            .composition_letter_timing
+            .try_borrow_mut()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))? = next_letter_timing;
         if let Some(selection) = selection_to_remember {
             let document_adjacency = self.take_personal_phrase_document_adjacency();
             let observation = self
@@ -13078,14 +13229,25 @@ impl TsfTextService_Impl {
                 .map(|mut candidate_ui| candidate_ui.update_contents(display, feedback_context))
                 .unwrap_or(false);
             if presented
-                && let Some(event) = feedback_after_success
                 && let Ok(mut feedback) = self.native_feedback.lock()
                 && feedback.is_accepting()
             {
-                let record_result =
-                    feedback.record_at(feedback_context, event, native_feedback_monotonic_ms());
+                let recorded_at = native_feedback_monotonic_ms();
+                let mut stopped = false;
+                if let Some(event) = feedback_after_success {
+                    stopped |= matches!(
+                        feedback.record_at(feedback_context, event, recorded_at),
+                        NativeFeedbackRecordResult::Stopped(_)
+                    );
+                }
+                if let Some(event) = short_word_timing_event {
+                    stopped |= matches!(
+                        feedback.record_at(feedback_context, event, recorded_at),
+                        NativeFeedbackRecordResult::Stopped(_)
+                    );
+                }
                 drop(feedback);
-                if matches!(record_result, NativeFeedbackRecordResult::Stopped(_)) {
+                if stopped {
                     self.native_feedback_language_bar_state.notify();
                 }
             }
@@ -13116,6 +13278,9 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         self.shift_chord_pending.set(false);
         self.last_delivered_letter.set(None);
         self.last_completed_pair_timing.set(None);
+        if let Ok(mut timing) = self.composition_letter_timing.try_borrow_mut() {
+            *timing = CompositionLetterTimingTrace::default();
+        }
         if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
             *state = CandidateForgetState::Inactive;
         }
@@ -15598,7 +15763,6 @@ mod tests {
             NativeCandidateSource::FourCharacterCorrection
         );
         assert!(visible.automatic_transposition_blocked);
-
         let exact = provider.candidates_with_provenance(
             intended.as_str(),
             6,
@@ -15613,6 +15777,28 @@ mod tests {
                 .provenance
                 .iter()
                 .all(|item| item.source() != NativeCandidateSource::FourCharacterCorrection)
+        );
+    }
+
+    #[test]
+    fn composition_letter_timing_trace_requires_one_unbroken_append_chain() {
+        let first = CompositionLetterTimingTrace::default().after_key("", "k", true, None);
+        let second = first.after_key("k", "ke", true, Some(61));
+        let third = second.after_key("ke", "keh", true, Some(14));
+        let fourth = third.after_key("keh", "kehy", true, Some(57));
+        let complete = fourth.after_key("kehy", "kehyi", true, Some(73));
+        assert_eq!(
+            complete.complete_gaps("kehyi"),
+            Some([61, 14, 57, 73].as_slice())
+        );
+        assert_eq!(complete.after_key("kehyi", "kehyi", false, None), complete);
+        assert_eq!(
+            complete.after_key("kehyi", "kehy", false, None),
+            CompositionLetterTimingTrace::default()
+        );
+        assert_eq!(
+            CompositionLetterTimingTrace::default().after_key("ke", "keh", true, Some(14)),
+            CompositionLetterTimingTrace::default()
         );
     }
 
@@ -15667,6 +15853,41 @@ mod tests {
             NativeCandidateSource::FourCharacterCorrection
         );
         assert!(visible.automatic_transposition_blocked);
+        let frame = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "kehyi".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: visible.candidates.clone(),
+            provenance: visible.provenance.clone(),
+            automatic_transposition: None,
+            loaded_candidates: visible.candidates.len(),
+            tab_assembly: None,
+            may_have_more: false,
+        };
+        let trace = CompositionLetterTimingTrace {
+            code: "kehyi".to_owned(),
+            inter_key_gaps_ms: vec![61, 14, 57, 73],
+        };
+        assert!(matches!(
+            short_word_extra_key_timing_event(&provider, &frame, &trace),
+            Some(NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                observed_code,
+                intended_code,
+                extra_index: 2,
+                inter_key_gaps_ms,
+                visible_rank: 2,
+            }) if observed_code == "kehyi"
+                && intended_code == "keyi"
+                && inter_key_gaps_ms == [61, 14, 57, 73]
+        ));
+        assert!(
+            short_word_extra_key_timing_event(
+                &provider,
+                &frame,
+                &CompositionLetterTimingTrace::default(),
+            )
+            .is_none()
+        );
 
         let core_only = SnapshotCandidateProvider::new(core, None, None);
         let without_consensus =

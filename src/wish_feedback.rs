@@ -51,6 +51,7 @@ pub const WISH_SCHEMA_V16: &str = "ziranma-wish-v16";
 pub const WISH_SCHEMA_V17: &str = "ziranma-wish-v17";
 pub const WISH_SCHEMA_V18: &str = "ziranma-wish-v18";
 pub const WISH_SCHEMA_V19: &str = "ziranma-wish-v19";
+pub const WISH_SCHEMA_V20: &str = "ziranma-wish-v20";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -59,7 +60,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 19;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 20;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -79,6 +80,7 @@ const WISH_PLAINTEXT_MAGIC_V16: &[u8] = b"ziranma-wish-v16\0";
 const WISH_PLAINTEXT_MAGIC_V17: &[u8] = b"ziranma-wish-v17\0";
 const WISH_PLAINTEXT_MAGIC_V18: &[u8] = b"ziranma-wish-v18\0";
 const WISH_PLAINTEXT_MAGIC_V19: &[u8] = b"ziranma-wish-v19\0";
+const WISH_PLAINTEXT_MAGIC_V20: &[u8] = b"ziranma-wish-v20\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -555,6 +557,10 @@ impl WishSnapshot {
         self.source_schema_version >= 19
     }
 
+    pub fn supports_short_word_extra_key_timing(&self) -> bool {
+        self.source_schema_version >= 20
+    }
+
     pub fn category(&self) -> WishCategory {
         self.category
     }
@@ -739,7 +745,8 @@ impl WishSnapshot {
                 | NativeFeedbackEvent::SlowKeyPathTiming { .. }
                 | NativeFeedbackEvent::PostCommitBackspaceRouted
                 | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
-                | NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
+                | NativeFeedbackEvent::PersonalSelectionConfirmed { .. }
+                | NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
             }
         }
         if let Some(previous) = pending {
@@ -829,7 +836,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V19);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V20);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -899,7 +906,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V19) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V20) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V20)?;
+            20
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V19) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V19)?;
             19
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V18) {
@@ -2052,6 +2062,26 @@ fn render_event(
             output.push(u8::from(*persistent_preferred));
             output.push(u8::from(*session_retained));
         }
+        NativeFeedbackEvent::ShortWordExtraKeyTiming {
+            observed_code,
+            intended_code,
+            extra_index,
+            inter_key_gaps_ms,
+            visible_rank,
+        } => {
+            if version < 20 {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            output.push(16);
+            put_string(output, observed_code)?;
+            put_string(output, intended_code)?;
+            put_usize(output, *extra_index)?;
+            put_usize(output, inter_key_gaps_ms.len())?;
+            for gap_ms in inter_key_gaps_ms {
+                put_u32(output, *gap_ms);
+            }
+            put_usize(output, *visible_rank)?;
+        }
     }
     Ok(())
 }
@@ -2124,6 +2154,26 @@ fn parse_event(
             persistent_preferred: reader.boolean()?,
             session_retained: reader.boolean()?,
         },
+        16 if version >= 20 => {
+            let observed_code = reader.string()?;
+            let intended_code = reader.string()?;
+            let extra_index = reader.usize()?;
+            let gap_count = reader.usize()?;
+            if gap_count > 6 {
+                return Err(WishFeedbackError::InvalidSnapshot);
+            }
+            let mut inter_key_gaps_ms = Vec::with_capacity(gap_count);
+            for _ in 0..gap_count {
+                inter_key_gaps_ms.push(reader.u32()?);
+            }
+            NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                observed_code,
+                intended_code,
+                extra_index,
+                inter_key_gaps_ms,
+                visible_rank: reader.usize()?,
+            }
+        }
         tag if (tag == 6 && version >= 3)
             || (tag == 7 && version >= 4)
             || (tag == 8 && version >= 5)
@@ -2882,13 +2932,15 @@ mod tests {
             17
         } else if magic == WISH_PLAINTEXT_MAGIC_V18 {
             18
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V19 {
             19
+        } else {
+            20
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V19.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V20.len()..]);
         rendered
     }
 
@@ -2924,13 +2976,13 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V19));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 19);
+        assert_eq!(parsed.source_schema_version(), 20);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
@@ -2941,6 +2993,7 @@ mod tests {
         assert!(parsed.supports_personal_phrase_adjacency());
         assert!(parsed.supports_candidate_ranking_movement());
         assert!(parsed.supports_personal_selection_confirmation());
+        assert!(parsed.supports_short_word_extra_key_timing());
         assert_eq!(
             parsed.public_candidate_order_policy(),
             WishPublicCandidateOrderPolicy::Unrecorded
@@ -3093,7 +3146,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V19));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_candidate_suppression_actions());
         assert!(matches!(
@@ -3135,7 +3188,7 @@ mod tests {
             snapshot.source_events += 1;
 
             let rendered = snapshot.render().unwrap();
-            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V19));
+            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
             let parsed = WishSnapshot::parse(&rendered).unwrap();
             assert!(parsed.supports_personal_phrase_adjacency());
             assert!(matches!(
@@ -3164,7 +3217,7 @@ mod tests {
 
         let mut falsely_downgraded = Vec::with_capacity(rendered.len());
         falsely_downgraded.extend_from_slice(WISH_PLAINTEXT_MAGIC_V15);
-        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V19.len()..]);
+        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V20.len()..]);
         assert!(WishSnapshot::parse(&falsely_downgraded).is_err());
 
         let mut unknown_adjacency = rendered.clone();
@@ -3196,10 +3249,12 @@ mod tests {
         });
         snapshot.source_events += 1;
 
-        let rendered = snapshot.render().unwrap();
+        let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V19);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V19));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert_eq!(parsed.source_schema_version(), 19);
         assert!(parsed.supports_personal_selection_confirmation());
+        assert!(!parsed.supports_short_word_extra_key_timing());
         assert!(matches!(
             parsed.events().last().map(WishEvent::event),
             Some(NativeFeedbackEvent::PersonalSelectionConfirmed {
@@ -3214,6 +3269,45 @@ mod tests {
         let legacy = render_current_body_with_magic(&private_snapshot(), WISH_PLAINTEXT_MAGIC_V18);
         let parsed_legacy = WishSnapshot::parse(&legacy).unwrap();
         assert!(!parsed_legacy.supports_personal_selection_confirmation());
+    }
+
+    #[test]
+    fn v20_round_trips_short_word_extra_key_timing_and_v19_rejects_it() {
+        let mut snapshot = private_snapshot();
+        snapshot.events.push(WishEvent {
+            milliseconds_before_marker: 0,
+            event: NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                observed_code: "kehyi".to_owned(),
+                intended_code: "keyi".to_owned(),
+                extra_index: 2,
+                inter_key_gaps_ms: vec![61, 14, 57, 73],
+                visible_rank: 2,
+            },
+        });
+        snapshot.source_events += 1;
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert_eq!(parsed.source_schema_version(), 20);
+        assert!(parsed.supports_short_word_extra_key_timing());
+        assert!(matches!(
+            parsed.events().last().map(WishEvent::event),
+            Some(NativeFeedbackEvent::ShortWordExtraKeyTiming {
+                observed_code,
+                intended_code,
+                extra_index: 2,
+                inter_key_gaps_ms,
+                visible_rank: 2,
+            }) if observed_code == "kehyi"
+                && intended_code == "keyi"
+                && inter_key_gaps_ms == &[61, 14, 57, 73]
+        ));
+        assert!(snapshot.render_with_event_version(19).is_err());
+
+        let legacy = render_current_body_with_magic(&private_snapshot(), WISH_PLAINTEXT_MAGIC_V19);
+        let parsed_legacy = WishSnapshot::parse(&legacy).unwrap();
+        assert!(!parsed_legacy.supports_short_word_extra_key_timing());
     }
 
     #[test]
@@ -3380,7 +3474,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V19));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
@@ -3506,7 +3600,7 @@ mod tests {
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V19));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_candidate_ranking_movement());
         let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
