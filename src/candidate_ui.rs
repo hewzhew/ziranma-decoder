@@ -148,6 +148,13 @@ pub(crate) struct CandidateSceneFontMetrics {
     pub(crate) ascent: i32,
 }
 
+/// Physical widths measured for one selected action label and its detail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateSceneActionDetailMetrics {
+    pub(crate) label_width: i32,
+    pub(crate) detail_width: i32,
+}
+
 impl CandidateSceneRect {
     fn width(self) -> i32 {
         self.right.saturating_sub(self.left).max(0)
@@ -175,11 +182,14 @@ pub(crate) enum CandidateSceneSemantic {
     CandidateSelectedSurface,
     CandidateRank,
     CandidateText,
+    CandidateActionDetail,
     CandidatePersonalMark,
     NoticeIcon,
     SelectionAccent,
     Footer,
     FooterDivider,
+    FooterMode,
+    FooterPage,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -190,11 +200,14 @@ impl CandidateSceneSemantic {
             Self::CandidateSelectedSurface => "candidate.selected.surface",
             Self::CandidateRank => "candidate.rank",
             Self::CandidateText => "candidate.text",
+            Self::CandidateActionDetail => "candidate.action-detail",
             Self::CandidatePersonalMark => "candidate.personal-mark",
             Self::NoticeIcon => "notice.icon",
             Self::SelectionAccent => "selection.accent",
             Self::Footer => "footer",
             Self::FooterDivider => "footer.divider",
+            Self::FooterMode => "footer.mode",
+            Self::FooterPage => "footer.page",
         }
     }
 }
@@ -208,6 +221,7 @@ pub(crate) struct CandidateSceneItem {
     pub(crate) selection_accent: Option<CandidateSceneRect>,
     pub(crate) rank: Option<CandidateSceneRect>,
     pub(crate) text: CandidateSceneRect,
+    pub(crate) action_detail: Option<CandidateSceneRect>,
     pub(crate) metadata_line: CandidateSceneRect,
     pub(crate) personal_mark: Option<CandidateSceneRect>,
     pub(crate) notice_icon: Option<CandidateSceneRect>,
@@ -221,6 +235,8 @@ pub(crate) struct CandidateScene {
     pub(crate) items: Vec<CandidateSceneItem>,
     pub(crate) footer: Option<CandidateSceneRect>,
     pub(crate) footer_divider: Option<CandidateSceneRect>,
+    pub(crate) footer_mode: Option<CandidateSceneRect>,
+    pub(crate) footer_page: Option<CandidateSceneRect>,
 }
 
 /// Fixed inputs that contain no candidate text or platform window handles.
@@ -234,7 +250,8 @@ pub(crate) struct CandidateSceneRequest<'a> {
     /// Vertical scenes ignore this slice.
     pub(crate) horizontal_candidate_widths: &'a [i32],
     pub(crate) footer_width: i32,
-    pub(crate) footer_needed: bool,
+    pub(crate) footer_mode: bool,
+    pub(crate) footer_page: bool,
     pub(crate) selected_surface: bool,
     pub(crate) show_rank: bool,
     pub(crate) notice_icon: bool,
@@ -242,6 +259,7 @@ pub(crate) struct CandidateSceneRequest<'a> {
     pub(crate) rank_metrics: Option<CandidateSceneFontMetrics>,
     pub(crate) candidate_text_metrics: Option<CandidateSceneFontMetrics>,
     pub(crate) selected_text_metrics: Option<CandidateSceneFontMetrics>,
+    pub(crate) action_detail_metrics: Option<CandidateSceneActionDetailMetrics>,
 }
 
 /// Scales a reviewed 96-DPI token to physical pixels with deterministic
@@ -370,6 +388,7 @@ pub(crate) fn build_candidate_scene(
     spec: CandidateVisualSpec,
     request: CandidateSceneRequest<'_>,
 ) -> Option<CandidateScene> {
+    let footer_needed = request.footer_mode || request.footer_page;
     let invalid_metrics = [
         request.rank_metrics,
         request.candidate_text_metrics,
@@ -378,6 +397,9 @@ pub(crate) fn build_candidate_scene(
     .into_iter()
     .flatten()
     .any(|metrics| metrics.height <= 0 || metrics.ascent < 0 || metrics.ascent > metrics.height);
+    let invalid_action_detail = request
+        .action_detail_metrics
+        .is_some_and(|metrics| metrics.label_width <= 0 || metrics.detail_width <= 0);
     if request.width <= 0
         || request.height <= 0
         || (request.layout == CandidateSceneLayout::Horizontal
@@ -386,9 +408,10 @@ pub(crate) fn build_candidate_scene(
                     .horizontal_candidate_widths
                     .iter()
                     .any(|width| *width <= 0)
-                || (request.footer_needed && request.footer_width <= 0)))
+                || (footer_needed && request.footer_width <= 0)))
         || request.personalized.len() != request.candidate_count
         || invalid_metrics
+        || invalid_action_detail
     {
         return None;
     }
@@ -498,6 +521,29 @@ pub(crate) fn build_candidate_scene(
         if rank.is_none() {
             text.left = content.left;
         }
+        let action_detail = if index == 0 {
+            request.action_detail_metrics.and_then(|metrics| {
+                let gap = scale(spec.action_detail_gap);
+                (metrics
+                    .label_width
+                    .saturating_add(gap)
+                    .saturating_add(metrics.detail_width)
+                    <= text.width())
+                .then(|| {
+                    let detail_left = text.right.saturating_sub(metrics.detail_width);
+                    let detail = CandidateSceneRect {
+                        left: detail_left,
+                        top: metadata_line.top,
+                        right: text.right,
+                        bottom: metadata_line.bottom,
+                    };
+                    text.right = detail_left.saturating_sub(gap);
+                    detail
+                })
+            })
+        } else {
+            None
+        };
         let personal_mark = if request.personalized[index] {
             rank.and_then(|rank| personal_mark_rect(spec, request.dpi, rank))
         } else {
@@ -513,6 +559,7 @@ pub(crate) fn build_candidate_scene(
             || rank.is_some_and(|rank| rank.width() <= 0 || !bounds.contains(rank))
             || personal_mark.is_some_and(|mark| !bounds.contains(mark))
             || notice_icon.is_some_and(|icon| !bounds.contains(icon))
+            || action_detail.is_some_and(|detail| detail.width() <= 0 || !bounds.contains(detail))
         {
             return None;
         }
@@ -523,6 +570,7 @@ pub(crate) fn build_candidate_scene(
             selection_accent,
             rank,
             text,
+            action_detail,
             metadata_line,
             personal_mark,
             notice_icon,
@@ -531,7 +579,7 @@ pub(crate) fn build_candidate_scene(
     }
 
     let candidate_right_limit =
-        if request.footer_needed && request.layout == CandidateSceneLayout::Horizontal {
+        if footer_needed && request.layout == CandidateSceneLayout::Horizontal {
             client.right.saturating_sub(request.footer_width)
         } else {
             client.right.saturating_sub(padding)
@@ -544,7 +592,7 @@ pub(crate) fn build_candidate_scene(
         return None;
     }
 
-    let (footer, footer_divider) = if request.footer_needed {
+    let (footer, footer_divider, footer_mode, footer_page) = if footer_needed {
         let footer = match request.layout {
             CandidateSceneLayout::Horizontal => CandidateSceneRect {
                 left: client.right.saturating_sub(request.footer_width),
@@ -601,9 +649,31 @@ pub(crate) fn build_candidate_scene(
         {
             return None;
         }
-        (Some(footer), Some(divider))
+        let mode = request.footer_mode.then(|| CandidateSceneRect {
+            right: if request.footer_page {
+                footer
+                    .right
+                    .saturating_sub(scale(spec.footer_page_width))
+                    .max(footer.left)
+            } else {
+                footer.right
+            },
+            ..footer
+        });
+        let page = request.footer_page.then(|| CandidateSceneRect {
+            left: mode
+                .map(|mode| mode.right.saturating_add(scale(spec.footer_mode_gap)))
+                .unwrap_or(footer.left),
+            ..footer
+        });
+        if mode.is_some_and(|mode| mode.width() <= 0 || !footer.contains(mode))
+            || page.is_some_and(|page| page.width() <= 0 || !footer.contains(page))
+        {
+            return None;
+        }
+        (Some(footer), Some(divider), mode, page)
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     Some(CandidateScene {
@@ -611,6 +681,8 @@ pub(crate) fn build_candidate_scene(
         items,
         footer,
         footer_divider,
+        footer_mode,
+        footer_page,
     })
 }
 
@@ -641,6 +713,10 @@ mod tests {
             "candidate.text"
         );
         assert_eq!(
+            CandidateSceneSemantic::CandidateActionDetail.stable_id(),
+            "candidate.action-detail"
+        );
+        assert_eq!(
             CandidateSceneSemantic::CandidatePersonalMark.stable_id(),
             "candidate.personal-mark"
         );
@@ -652,6 +728,14 @@ mod tests {
         assert_eq!(
             CandidateSceneSemantic::FooterDivider.stable_id(),
             "footer.divider"
+        );
+        assert_eq!(
+            CandidateSceneSemantic::FooterMode.stable_id(),
+            "footer.mode"
+        );
+        assert_eq!(
+            CandidateSceneSemantic::FooterPage.stable_id(),
+            "footer.page"
         );
     }
 
@@ -667,7 +751,8 @@ mod tests {
                 candidate_count: 2,
                 horizontal_candidate_widths: &[100, 120],
                 footer_width: 62,
-                footer_needed: true,
+                footer_mode: false,
+                footer_page: true,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -684,6 +769,7 @@ mod tests {
                     height: 17,
                     ascent: 13,
                 }),
+                action_detail_metrics: None,
             },
         )
         .unwrap();
@@ -774,6 +860,8 @@ mod tests {
                 bottom: 41,
             })
         );
+        assert_eq!(scene.footer_page, scene.footer);
+        assert!(scene.footer_mode.is_none());
     }
 
     #[test]
@@ -788,7 +876,8 @@ mod tests {
                 candidate_count: 3,
                 horizontal_candidate_widths: &[],
                 footer_width: 93,
-                footer_needed: true,
+                footer_mode: false,
+                footer_page: true,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -796,6 +885,7 @@ mod tests {
                 rank_metrics: None,
                 candidate_text_metrics: None,
                 selected_text_metrics: None,
+                action_detail_metrics: None,
             },
         )
         .unwrap();
@@ -822,7 +912,8 @@ mod tests {
                 candidate_count: 1,
                 horizontal_candidate_widths: &[200],
                 footer_width: 0,
-                footer_needed: false,
+                footer_mode: false,
+                footer_page: false,
                 selected_surface: false,
                 show_rank: false,
                 notice_icon: true,
@@ -839,6 +930,7 @@ mod tests {
                     height: 17,
                     ascent: 13,
                 }),
+                action_detail_metrics: None,
             },
         )
         .unwrap();
@@ -860,6 +952,74 @@ mod tests {
     }
 
     #[test]
+    fn action_detail_and_footer_labels_receive_disjoint_semantic_regions() {
+        let scene = build_candidate_scene(
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+            CandidateSceneRequest {
+                layout: CandidateSceneLayout::Horizontal,
+                dpi: 96,
+                width: 480,
+                height: 46,
+                candidate_count: 1,
+                horizontal_candidate_widths: &[200],
+                footer_width: 108,
+                footer_mode: true,
+                footer_page: true,
+                selected_surface: true,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false],
+                rank_metrics: Some(CandidateSceneFontMetrics {
+                    height: 14,
+                    ascent: 11,
+                }),
+                candidate_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+                selected_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+                action_detail_metrics: Some(CandidateSceneActionDetailMetrics {
+                    label_width: 60,
+                    detail_width: 40,
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(scene.items[0].text.right, 146);
+        assert_eq!(
+            scene.items[0].action_detail,
+            Some(CandidateSceneRect {
+                left: 158,
+                top: 16,
+                right: 198,
+                bottom: 30,
+            })
+        );
+        assert_eq!(
+            scene.footer_mode,
+            Some(CandidateSceneRect {
+                left: 382,
+                top: 5,
+                right: 425,
+                bottom: 41,
+            })
+        );
+        assert_eq!(
+            scene.footer_page,
+            Some(CandidateSceneRect {
+                left: 429,
+                top: 5,
+                right: 473,
+                bottom: 41,
+            })
+        );
+    }
+
+    #[test]
     fn inconsistent_or_nonpositive_scene_requests_fail_closed() {
         let invalid_widths = build_candidate_scene(
             DEFAULT_CANDIDATE_VISUAL_SPEC,
@@ -871,7 +1031,8 @@ mod tests {
                 candidate_count: 2,
                 horizontal_candidate_widths: &[50],
                 footer_width: 0,
-                footer_needed: false,
+                footer_mode: false,
+                footer_page: false,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -879,6 +1040,7 @@ mod tests {
                 rank_metrics: None,
                 candidate_text_metrics: None,
                 selected_text_metrics: None,
+                action_detail_metrics: None,
             },
         );
         assert!(invalid_widths.is_none());
@@ -893,7 +1055,8 @@ mod tests {
                 candidate_count: 1,
                 horizontal_candidate_widths: &[],
                 footer_width: 0,
-                footer_needed: false,
+                footer_mode: false,
+                footer_page: false,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -901,6 +1064,7 @@ mod tests {
                 rank_metrics: None,
                 candidate_text_metrics: None,
                 selected_text_metrics: None,
+                action_detail_metrics: None,
             },
         );
         assert!(invalid_size.is_none());
@@ -915,7 +1079,8 @@ mod tests {
                 candidate_count: 2,
                 horizontal_candidate_widths: &[80, 80],
                 footer_width: 62,
-                footer_needed: true,
+                footer_mode: false,
+                footer_page: true,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -923,6 +1088,7 @@ mod tests {
                 rank_metrics: None,
                 candidate_text_metrics: None,
                 selected_text_metrics: None,
+                action_detail_metrics: None,
             },
         );
         assert!(overlapping_footer.is_none());
@@ -937,7 +1103,8 @@ mod tests {
                 candidate_count: 1,
                 horizontal_candidate_widths: &[100],
                 footer_width: 0,
-                footer_needed: false,
+                footer_mode: false,
+                footer_page: false,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -948,6 +1115,7 @@ mod tests {
                 }),
                 candidate_text_metrics: None,
                 selected_text_metrics: None,
+                action_detail_metrics: None,
             },
         );
         assert!(invalid_metrics.is_none());

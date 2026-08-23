@@ -27,8 +27,8 @@ use crate::candidate_snapshot::{
     layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
 use crate::candidate_ui::{
-    CandidateRgb, CandidateSceneFontMetrics, CandidateSceneItem, CandidateSceneLayout,
-    CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
+    CandidateRgb, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics, CandidateSceneItem,
+    CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
     build_candidate_scene, candidate_ui_scale,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
@@ -4839,7 +4839,6 @@ const POPUP_CORNER_DIAMETER_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.corner_
 const POPUP_BORDER_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.border_width;
 const POPUP_FOOTER_HEIGHT_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_height;
 const POPUP_FOOTER_PAGE_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_page_width;
-const POPUP_FOOTER_MODE_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_mode_gap;
 const POPUP_CANDIDATE_FONT_HEIGHT_LOGICAL: i32 =
     DEFAULT_CANDIDATE_VISUAL_SPEC.candidate_font_height;
 const POPUP_METADATA_FONT_HEIGHT_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.metadata_font_height;
@@ -6022,6 +6021,41 @@ unsafe fn selected_popup_font_metrics(hdc: HDC, font: HFONT) -> Option<PopupFont
     })
 }
 
+unsafe fn candidate_action_detail_metrics(
+    hdc: HDC,
+    label: &str,
+    detail: &str,
+    selected_font: HFONT,
+    metadata_font: HFONT,
+) -> Option<CandidateSceneActionDetailMetrics> {
+    if selected_font.is_invalid() || metadata_font.is_invalid() {
+        return None;
+    }
+    let detail = detail.encode_utf16().collect::<Vec<_>>();
+    let mut detail_size = SIZE::default();
+    unsafe {
+        let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+    }
+    if !unsafe { GetTextExtentPoint32W(hdc, &detail, &mut detail_size) }.as_bool() {
+        return None;
+    }
+    let label = label.encode_utf16().collect::<Vec<_>>();
+    let mut label_size = SIZE::default();
+    unsafe {
+        let _ = SelectObject(hdc, HGDIOBJ(selected_font.0));
+    }
+    if !unsafe { GetTextExtentPoint32W(hdc, &label, &mut label_size) }.as_bool()
+        || label_size.cx <= 0
+        || detail_size.cx <= 0
+    {
+        return None;
+    }
+    Some(CandidateSceneActionDetailMetrics {
+        label_width: label_size.cx,
+        detail_width: detail_size.cx,
+    })
+}
+
 unsafe fn paint_candidate_personal_mark(hdc: HDC, mark: RECT) {
     // A tiny rounded dot lives inside the existing rank column, so personal
     // recall remains recognizable without widening or reflowing candidates.
@@ -6060,7 +6094,6 @@ unsafe fn paint_candidate_personal_mark(hdc: HDC, mark: RECT) {
 unsafe fn paint_candidate_label(
     hdc: HDC,
     scene_item: &CandidateSceneItem,
-    dpi: u32,
     candidate: &str,
     action_detail: Option<&str>,
     candidate_font: HFONT,
@@ -6121,42 +6154,7 @@ unsafe fn paint_candidate_label(
             let _ = SelectObject(hdc, HGDIOBJ(font.0));
         }
     }
-    let mut detail_rect = None;
-    if let Some(detail) = action_detail {
-        let encoded = detail.encode_utf16().collect::<Vec<_>>();
-        let mut detail_size = SIZE::default();
-        let detail_measured = !metadata_font.is_invalid()
-            && unsafe {
-                let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-                GetTextExtentPoint32W(hdc, &encoded, &mut detail_size).as_bool()
-            };
-        if detail_measured {
-            let gap = popup_scale(dpi, POPUP_ACTION_DETAIL_GAP_LOGICAL);
-            let label_encoded = candidate.encode_utf16().collect::<Vec<_>>();
-            let mut label_size = SIZE::default();
-            let label_measured = !font.is_invalid()
-                && unsafe {
-                    let _ = SelectObject(hdc, HGDIOBJ(font.0));
-                    GetTextExtentPoint32W(hdc, &label_encoded, &mut label_size).as_bool()
-                };
-            if label_measured
-                && label_size
-                    .cx
-                    .saturating_add(gap)
-                    .saturating_add(detail_size.cx)
-                    <= content.right.saturating_sub(content.left)
-            {
-                let detail_left = content.right.saturating_sub(detail_size.cx);
-                detail_rect = Some(RECT {
-                    left: detail_left,
-                    top: rank.top,
-                    right: content.right,
-                    bottom: rank.bottom,
-                });
-                content.right = detail_left.saturating_sub(gap);
-            }
-        }
-    }
+    let detail_rect = scene_item.action_detail.map(candidate_scene_rect);
     if !font.is_invalid() {
         unsafe {
             let _ = SelectObject(hdc, HGDIOBJ(font.0));
@@ -6578,9 +6576,16 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     } else {
         None
     };
+    let action_detail_metrics = state
+        .display
+        .visible()
+        .first()
+        .zip(state.display.action_detail())
+        .and_then(|(label, detail)| unsafe {
+            candidate_action_detail_metrics(hdc, label, detail, selected_font, metadata_font)
+        });
     let pages = state.display.page_starts().len();
     let mode_label = candidate_popup_mode_label(&state.display);
-    let footer_needed = pages > 1 || mode_label.is_some();
     let horizontal_widths = if state.layout == CandidatePopupLayout::Horizontal {
         horizontal_candidate_widths(&state.display, state.dpi, client_width)
     } else {
@@ -6596,7 +6601,8 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             candidate_count: state.display.visible().len(),
             horizontal_candidate_widths: &horizontal_widths,
             footer_width: scale(candidate_popup_footer_logical_width(&state.display)),
-            footer_needed,
+            footer_mode: mode_label.is_some(),
+            footer_page: pages > 1,
             selected_surface: !state.display.is_notice(),
             show_rank: !state.display.is_notice(),
             notice_icon: notice_icon.is_some(),
@@ -6604,6 +6610,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             rank_metrics,
             candidate_text_metrics,
             selected_text_metrics,
+            action_detail_metrics,
         },
     );
 
@@ -6637,7 +6644,6 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                 paint_candidate_label(
                     hdc,
                     scene_item,
-                    state.dpi,
                     candidate,
                     (index == 0)
                         .then(|| state.display.action_detail())
@@ -6649,8 +6655,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             }
         }
 
-        if let (Some(footer), Some(divider)) = (scene.footer, scene.footer_divider) {
-            let mut footer = candidate_scene_rect(footer);
+        if let (Some(_footer), Some(divider)) = (scene.footer, scene.footer_divider) {
             let divider = candidate_scene_rect(divider);
             // SAFETY: the shared scene bounds the divider to the footer and
             // the local brush is released in this paint operation.
@@ -6661,14 +6666,8 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                     let _ = DeleteObject(HGDIOBJ(divider_brush.0));
                 }
             }
-            if let Some(mode_label) = mode_label {
-                let mut mode = footer;
-                let page_width = if pages > 1 {
-                    scale(POPUP_FOOTER_PAGE_WIDTH_LOGICAL)
-                } else {
-                    0
-                };
-                mode.right = mode.right.saturating_sub(page_width).max(mode.left);
+            if let (Some(mode_label), Some(mode)) = (mode_label, scene.footer_mode) {
+                let mut mode = candidate_scene_rect(mode);
                 let mut label = mode_label.encode_utf16().collect::<Vec<_>>();
                 // SAFETY: the mode label is bounded to the shared footer.
                 unsafe {
@@ -6683,11 +6682,8 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                         DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                     );
                 }
-                footer.left = mode
-                    .right
-                    .saturating_add(scale(POPUP_FOOTER_MODE_GAP_LOGICAL));
             }
-            if pages > 1 {
+            if let Some(page_bounds) = scene.footer_page {
                 let separator = match state.layout {
                     CandidatePopupLayout::Horizontal => "/",
                     CandidatePopupLayout::Vertical => " / ",
@@ -6703,6 +6699,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                 }
                 .encode_utf16()
                 .collect::<Vec<_>>();
+                let mut page_bounds = candidate_scene_rect(page_bounds);
                 // SAFETY: the page label is bounded to the shared footer.
                 unsafe {
                     if !metadata_font.is_invalid() {
@@ -6712,7 +6709,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                     let _ = DrawTextW(
                         hdc,
                         &mut page,
-                        &mut footer,
+                        &mut page_bounds,
                         DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                     );
                 }
@@ -26061,8 +26058,9 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                let footer_needed = display.page_starts().len() > 1
-                    || candidate_popup_mode_label(display).is_some();
+                let footer_mode = candidate_popup_mode_label(display).is_some();
+                let footer_page = display.page_starts().len() > 1;
+                let footer_needed = footer_mode || footer_page;
                 let scene = build_candidate_scene(
                     DEFAULT_CANDIDATE_VISUAL_SPEC,
                     CandidateSceneRequest {
@@ -26076,7 +26074,8 @@ mod tests {
                             dpi,
                             candidate_popup_footer_logical_width(display),
                         ),
-                        footer_needed,
+                        footer_mode,
+                        footer_page,
                         selected_surface: !display.is_notice(),
                         show_rank: !display.is_notice(),
                         notice_icon: display.notice_icon() == CandidateNoticeIcon::WishReceived,
@@ -26084,6 +26083,7 @@ mod tests {
                         rank_metrics: None,
                         candidate_text_metrics: None,
                         selected_text_metrics: None,
+                        action_detail_metrics: None,
                     },
                 )
                 .unwrap();
@@ -26093,6 +26093,8 @@ mod tests {
                 assert_eq!(scene.items.len(), display.visible().len());
                 assert_eq!(scene.footer.is_some(), footer_needed);
                 assert_eq!(scene.footer_divider.is_some(), footer_needed);
+                assert_eq!(scene.footer_mode.is_some(), footer_mode);
+                assert_eq!(scene.footer_page.is_some(), footer_page);
                 assert_eq!(
                     scene.items[0].selected_surface.is_some(),
                     !display.is_notice()
@@ -26342,7 +26344,8 @@ mod tests {
                 candidate_count: 1,
                 horizontal_candidate_widths: &[100],
                 footer_width: 0,
-                footer_needed: false,
+                footer_mode: false,
+                footer_page: false,
                 selected_surface: true,
                 show_rank: true,
                 notice_icon: false,
@@ -26353,6 +26356,7 @@ mod tests {
                 }),
                 candidate_text_metrics: Some(selected_text_metrics),
                 selected_text_metrics: Some(selected_text_metrics),
+                action_detail_metrics: None,
             },
         )
         .unwrap();
