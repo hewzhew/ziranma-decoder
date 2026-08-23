@@ -31,6 +31,8 @@ mod candidate_signature;
 mod candidate_slots;
 mod candidate_snapshot;
 mod candidate_ui;
+#[cfg(windows)]
+mod candidate_ui_gdi;
 mod capsule_replay;
 mod codec;
 mod composition;

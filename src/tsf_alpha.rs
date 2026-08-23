@@ -27,9 +27,12 @@ use crate::candidate_snapshot::{
     layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
 use crate::candidate_ui::{
-    CandidateRgb, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics, CandidateSceneItem,
+    CandidateRgb, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics,
     CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
     build_candidate_scene, candidate_ui_scale,
+};
+use crate::candidate_ui_gdi::{
+    CandidateSceneFonts, CandidateScenePaintContent, paint_candidate_scene,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -82,12 +85,11 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CombineRgn, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
+    DEFAULT_PITCH, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
     FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ,
     InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
-    TEXTMETRICW, TRANSPARENT, UpdateWindow,
+    PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetWindowRgn, TEXTMETRICW,
+    TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -134,15 +136,14 @@ use windows::Win32::UI::TextServices::{
     TfLBIClick,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DI_NORMAL,
-    DefWindowProcW, DestroyMenu, DestroyWindow, DrawIconEx, GWLP_USERDATA, GWLP_WNDPROC,
-    GetClientRect, GetForegroundWindow, GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON,
-    IsWindow, IsWindowVisible, KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MENU_ITEM_FLAGS,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
-    WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetForegroundWindow,
+    GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON, IsWindow, IsWindowVisible,
+    KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY,
+    WM_PAINT, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -5933,17 +5934,20 @@ fn popup_rgb(red: u8, green: u8, blue: u8) -> COLORREF {
 }
 
 const POPUP_BACKGROUND_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.background;
+#[cfg(test)]
 const POPUP_SELECTED_BACKGROUND_RGB: CandidateRgb =
     DEFAULT_CANDIDATE_VISUAL_SPEC.selected_background;
+#[cfg(test)]
 const POPUP_SELECTED_TEXT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.selected_text;
+#[cfg(test)]
 const POPUP_CANDIDATE_TEXT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.candidate_text;
+#[cfg(test)]
 const POPUP_SELECTED_RANK_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.selected_rank;
+#[cfg(test)]
 const POPUP_RANK_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.rank;
+#[cfg(test)]
 const POPUP_PAGE_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.page;
-const POPUP_SELECTION_ACCENT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.selection_accent;
-const POPUP_MODE_ACCENT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.mode_accent;
 const POPUP_BORDER_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.border;
-const POPUP_FOOTER_DIVIDER_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_divider;
 
 fn popup_color(color: CandidateRgb) -> COLORREF {
     popup_rgb(color.red, color.green, color.blue)
@@ -6056,240 +6060,6 @@ unsafe fn candidate_action_detail_metrics(
     })
 }
 
-unsafe fn paint_candidate_personal_mark(hdc: HDC, mark: RECT) {
-    // A tiny rounded dot lives inside the existing rank column, so personal
-    // recall remains recognizable without widening or reflowing candidates.
-    let diameter = mark.right.saturating_sub(mark.left).max(1);
-    // SAFETY: the region and brush are bounded to the current candidate row
-    // and released before returning.
-    let region = unsafe {
-        CreateRoundRectRgn(
-            mark.left,
-            mark.top,
-            mark.right,
-            mark.bottom,
-            diameter,
-            diameter,
-        )
-    };
-    if region.is_invalid() {
-        return;
-    }
-    // SAFETY: the fixed popup color creates one local GDI brush.
-    let brush = unsafe { CreateSolidBrush(popup_color(POPUP_MODE_ACCENT_RGB)) };
-    if !brush.is_invalid() {
-        // SAFETY: hdc, region, and brush remain valid for this bounded fill.
-        unsafe {
-            let _ = FillRgn(hdc, region, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-        }
-    }
-    // SAFETY: the region is no longer used after this call.
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(region.0));
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn paint_candidate_label(
-    hdc: HDC,
-    scene_item: &CandidateSceneItem,
-    candidate: &str,
-    action_detail: Option<&str>,
-    candidate_font: HFONT,
-    selected_font: HFONT,
-    metadata_font: HFONT,
-) {
-    let index = scene_item.index;
-    let selected = index == 0;
-    let show_rank = scene_item.rank.is_some();
-    let mut rank = candidate_scene_rect(scene_item.metadata_line);
-    let mut content = candidate_scene_rect(scene_item.text);
-    let baseline_aligned = scene_item.baseline_aligned;
-    let font = if selected {
-        selected_font
-    } else {
-        candidate_font
-    };
-    if show_rank {
-        let mut rank_label = (index + 1).to_string().encode_utf16().collect::<Vec<_>>();
-        if !metadata_font.is_invalid() {
-            // SAFETY: this font remains owned by the current paint operation.
-            unsafe {
-                let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-            }
-        }
-        // SAFETY: the paint DC and bounded label rectangle are valid.
-        unsafe {
-            let _ = SetTextColor(
-                hdc,
-                popup_color(if selected {
-                    POPUP_SELECTED_RANK_RGB
-                } else {
-                    POPUP_RANK_RGB
-                }),
-            );
-            let _ = DrawTextW(
-                hdc,
-                &mut rank_label,
-                &mut rank,
-                DT_RIGHT
-                    | DT_SINGLELINE
-                    | if baseline_aligned { DT_TOP } else { DT_VCENTER }
-                    | DT_NOPREFIX,
-            );
-        }
-        if let Some(mark) = scene_item.personal_mark {
-            // SAFETY: the marker is confined to the already measured rank
-            // rectangle and owns every temporary GDI object it creates.
-            unsafe {
-                paint_candidate_personal_mark(hdc, candidate_scene_rect(mark));
-            }
-        }
-    }
-
-    if !font.is_invalid() {
-        // SAFETY: this font remains owned by the current paint operation.
-        unsafe {
-            let _ = SelectObject(hdc, HGDIOBJ(font.0));
-        }
-    }
-    let detail_rect = scene_item.action_detail.map(candidate_scene_rect);
-    if !font.is_invalid() {
-        unsafe {
-            let _ = SelectObject(hdc, HGDIOBJ(font.0));
-        }
-    }
-    let mut text =
-        unsafe { candidate_popup_text(hdc, candidate, content.right.saturating_sub(content.left)) };
-    // SAFETY: the paint DC and bounded candidate rectangle are valid.
-    unsafe {
-        let _ = SetTextColor(
-            hdc,
-            popup_color(if selected {
-                POPUP_SELECTED_TEXT_RGB
-            } else {
-                POPUP_CANDIDATE_TEXT_RGB
-            }),
-        );
-        let _ = DrawTextW(
-            hdc,
-            &mut text,
-            &mut content,
-            DT_SINGLELINE
-                | if baseline_aligned { DT_TOP } else { DT_VCENTER }
-                | DT_NOPREFIX
-                | DT_END_ELLIPSIS,
-        );
-    }
-    if let (Some(mut detail_rect), Some(detail)) = (detail_rect, action_detail) {
-        let mut detail = detail.encode_utf16().collect::<Vec<_>>();
-        unsafe {
-            if !metadata_font.is_invalid() {
-                let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-            }
-            let _ = SetTextColor(hdc, popup_color(POPUP_RANK_RGB));
-            let _ = DrawTextW(
-                hdc,
-                &mut detail,
-                &mut detail_rect,
-                DT_RIGHT
-                    | DT_SINGLELINE
-                    | if baseline_aligned { DT_TOP } else { DT_VCENTER }
-                    | DT_NOPREFIX,
-            );
-        }
-    }
-}
-
-unsafe fn candidate_popup_text(hdc: HDC, candidate: &str, maximum_width: i32) -> Vec<u16> {
-    candidate_text_for_width(candidate, maximum_width, |text| {
-        let encoded = text.encode_utf16().collect::<Vec<_>>();
-        let mut size = SIZE::default();
-        // SAFETY: encoded and size remain valid for this read-only font
-        // measurement on the current paint DC.
-        unsafe { GetTextExtentPoint32W(hdc, &encoded, &mut size).as_bool() }.then_some(size.cx)
-    })
-    .encode_utf16()
-    .collect()
-}
-
-fn candidate_text_for_width(
-    candidate: &str,
-    maximum_width: i32,
-    mut measure: impl FnMut(&str) -> Option<i32>,
-) -> String {
-    let mut source = candidate.chars();
-    let characters = source
-        .by_ref()
-        .take(CANDIDATE_DISPLAY_MAX_CHARS)
-        .collect::<Vec<_>>();
-    let source_truncated = source.next().is_some();
-    let mut full = characters.iter().collect::<String>();
-    if source_truncated {
-        full.push('…');
-    }
-    let Some(full_width) = measure(&full) else {
-        return full;
-    };
-    if characters.is_empty() || full_width <= maximum_width {
-        return full;
-    }
-
-    let mut lower = 0;
-    let mut upper = characters.len();
-    while lower < upper {
-        let middle = lower + (upper - lower).div_ceil(2);
-        let mut trial = characters[..middle].iter().collect::<String>();
-        trial.push('…');
-        let Some(trial_width) = measure(&trial) else {
-            return full;
-        };
-        if trial_width <= maximum_width {
-            lower = middle;
-        } else {
-            upper = middle - 1;
-        }
-    }
-    let mut clipped = characters[..lower].iter().collect::<String>();
-    clipped.push('…');
-    clipped
-}
-
-unsafe fn fill_rounded_popup_rect(hdc: HDC, rectangle: RECT, radius: i32, color: COLORREF) {
-    if rectangle.right <= rectangle.left || rectangle.bottom <= rectangle.top {
-        return;
-    }
-    // SAFETY: the region and brush are local GDI objects bounded to the
-    // current paint DC and are both released before returning.
-    let region = unsafe {
-        CreateRoundRectRgn(
-            rectangle.left,
-            rectangle.top,
-            rectangle.right.saturating_add(1),
-            rectangle.bottom.saturating_add(1),
-            radius,
-            radius,
-        )
-    };
-    let brush = unsafe { CreateSolidBrush(color) };
-    if !region.is_invalid() && !brush.is_invalid() {
-        unsafe {
-            let _ = FillRgn(hdc, region, brush);
-        }
-    }
-    if !brush.is_invalid() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-        }
-    }
-    if !region.is_invalid() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(region.0));
-        }
-    }
-}
-
 unsafe fn paint_rounded_popup_border(hdc: HDC, client: RECT, dpi: u32, color: COLORREF) {
     let Some(geometry) = candidate_popup_border_geometry(client, dpi) else {
         return;
@@ -6342,23 +6112,6 @@ fn candidate_scene_rect(rect: CandidateSceneRect) -> RECT {
         top: rect.top,
         right: rect.right,
         bottom: rect.bottom,
-    }
-}
-
-unsafe fn paint_candidate_selection(
-    hdc: HDC,
-    selected: RECT,
-    accent: RECT,
-    dpi: u32,
-    selected_background: COLORREF,
-    selection_accent: COLORREF,
-) {
-    let scale = |logical: i32| popup_scale(dpi, logical);
-    unsafe {
-        fill_rounded_popup_rect(hdc, selected, scale(6), selected_background);
-    }
-    unsafe {
-        fill_rounded_popup_rect(hdc, accent, scale(4), selection_accent);
     }
 }
 
@@ -6454,26 +6207,6 @@ fn load_inline_wish_notice_icon(dpi: u32) -> Option<HICON> {
     Some(HICON(image.0))
 }
 
-unsafe fn paint_candidate_notice_icon(hdc: HDC, bounds: RECT, icon: HICON) {
-    let width = bounds.right.saturating_sub(bounds.left).max(0);
-    let height = bounds.bottom.saturating_sub(bounds.top).max(0);
-    // SAFETY: the shared resource icon and the current paint DC remain valid
-    // for this bounded draw call.
-    let _ = unsafe {
-        DrawIconEx(
-            hdc,
-            bounds.left,
-            bounds.top,
-            icon,
-            width,
-            height,
-            0,
-            None,
-            DI_NORMAL,
-        )
-    };
-}
-
 unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState) {
     state.mark_paint_entered();
     let mut paint = PAINTSTRUCT::default();
@@ -6522,22 +6255,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     }
 
     let scale = |logical: i32| popup_scale(state.dpi, logical);
-    let background = popup_color(POPUP_BACKGROUND_RGB);
-    let selected_background = popup_color(POPUP_SELECTED_BACKGROUND_RGB);
-    let selection_accent = popup_color(POPUP_SELECTION_ACCENT_RGB);
-    let mode_accent = popup_color(POPUP_MODE_ACCENT_RGB);
-    let page_color = popup_color(POPUP_PAGE_RGB);
     let border = popup_color(POPUP_BORDER_RGB);
-    let footer_divider = popup_color(POPUP_FOOTER_DIVIDER_RGB);
-
-    // SAFETY: each successful GDI allocation is released before EndPaint.
-    let background_brush = unsafe { CreateSolidBrush(background) };
-    if !background_brush.is_invalid() {
-        // SAFETY: paint DC and client rectangle are valid.
-        unsafe {
-            let _ = FillRect(hdc, &client, background_brush);
-        }
-    }
 
     // The selected candidate carries typographic emphasis while ranks and
     // pagination use a smaller metadata face.
@@ -6586,6 +6304,21 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
         });
     let pages = state.display.page_starts().len();
     let mode_label = candidate_popup_mode_label(&state.display);
+    let page_label = (pages > 1).then(|| {
+        let separator = match state.layout {
+            CandidatePopupLayout::Horizontal => "/",
+            CandidatePopupLayout::Vertical => " / ",
+        };
+        if state.display.may_have_more() {
+            format!(
+                "{}{separator}{}  ›",
+                state.display.current_page() + 1,
+                pages
+            )
+        } else {
+            format!("{}{separator}{}", state.display.current_page() + 1, pages)
+        }
+    });
     let horizontal_widths = if state.layout == CandidatePopupLayout::Horizontal {
         horizontal_candidate_widths(&state.display, state.dpi, client_width)
     } else {
@@ -6615,108 +6348,36 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     );
 
     if let Some(scene) = scene.as_ref() {
-        for (scene_item, candidate) in scene.items.iter().zip(state.display.visible()) {
-            let index = scene_item.index;
-            if let (Some(selected), Some(accent)) =
-                (scene_item.selected_surface, scene_item.selection_accent)
-            {
-                // SAFETY: the shared scene bounds both decorations to this
-                // candidate item and every temporary GDI object stays local.
-                unsafe {
-                    paint_candidate_selection(
-                        hdc,
-                        candidate_scene_rect(selected),
-                        candidate_scene_rect(accent),
-                        state.dpi,
-                        selected_background,
-                        selection_accent,
-                    );
-                }
-            }
-            if let (Some(bounds), Some(icon)) = (scene_item.notice_icon, notice_icon) {
-                unsafe {
-                    paint_candidate_notice_icon(hdc, candidate_scene_rect(bounds), icon);
-                }
-            }
-            // SAFETY: fonts and shared-scene paint rectangles remain owned by
-            // this WM_PAINT operation.
-            unsafe {
-                paint_candidate_label(
-                    hdc,
-                    scene_item,
-                    candidate,
-                    (index == 0)
-                        .then(|| state.display.action_detail())
-                        .flatten(),
-                    candidate_font,
-                    selected_font,
-                    metadata_font,
-                );
-            }
-        }
-
-        if let (Some(_footer), Some(divider)) = (scene.footer, scene.footer_divider) {
-            let divider = candidate_scene_rect(divider);
-            // SAFETY: the shared scene bounds the divider to the footer and
-            // the local brush is released in this paint operation.
-            let divider_brush = unsafe { CreateSolidBrush(footer_divider) };
-            if !divider_brush.is_invalid() {
-                unsafe {
-                    let _ = FillRect(hdc, &divider, divider_brush);
-                    let _ = DeleteObject(HGDIOBJ(divider_brush.0));
-                }
-            }
-            if let (Some(mode_label), Some(mode)) = (mode_label, scene.footer_mode) {
-                let mut mode = candidate_scene_rect(mode);
-                let mut label = mode_label.encode_utf16().collect::<Vec<_>>();
-                // SAFETY: the mode label is bounded to the shared footer.
-                unsafe {
-                    if !metadata_font.is_invalid() {
-                        let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-                    }
-                    let _ = SetTextColor(hdc, mode_accent);
-                    let _ = DrawTextW(
-                        hdc,
-                        &mut label,
-                        &mut mode,
-                        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-                    );
-                }
-            }
-            if let Some(page_bounds) = scene.footer_page {
-                let separator = match state.layout {
-                    CandidatePopupLayout::Horizontal => "/",
-                    CandidatePopupLayout::Vertical => " / ",
-                };
-                let mut page = if state.display.may_have_more() {
-                    format!(
-                        "{}{separator}{}  ›",
-                        state.display.current_page() + 1,
-                        pages
-                    )
-                } else {
-                    format!("{}{separator}{}", state.display.current_page() + 1, pages)
-                }
-                .encode_utf16()
-                .collect::<Vec<_>>();
-                let mut page_bounds = candidate_scene_rect(page_bounds);
-                // SAFETY: the page label is bounded to the shared footer.
-                unsafe {
-                    if !metadata_font.is_invalid() {
-                        let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-                    }
-                    let _ = SetTextColor(hdc, page_color);
-                    let _ = DrawTextW(
-                        hdc,
-                        &mut page,
-                        &mut page_bounds,
-                        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-                    );
-                }
-            }
+        unsafe {
+            paint_candidate_scene(
+                hdc,
+                state.dpi,
+                DEFAULT_CANDIDATE_VISUAL_SPEC,
+                scene,
+                CandidateSceneFonts {
+                    candidate: candidate_font,
+                    selected: selected_font,
+                    metadata: metadata_font,
+                },
+                CandidateScenePaintContent {
+                    candidates: state.display.visible(),
+                    action_detail: state.display.action_detail(),
+                    mode_label,
+                    page_label: page_label.as_deref(),
+                    notice_icon,
+                    max_candidate_characters: CANDIDATE_DISPLAY_MAX_CHARS,
+                },
+            );
         }
     } else {
         state.fail_pending_timing(CandidatePopupRenderPreflightError::PaintFailed);
+        let brush = unsafe { CreateSolidBrush(popup_color(POPUP_BACKGROUND_RGB)) };
+        if !brush.is_invalid() {
+            unsafe {
+                let _ = FillRect(hdc, &client, brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
+        }
     }
 
     let painted_client = scene
@@ -6742,12 +6403,6 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(font.0));
             }
-        }
-    }
-    if !background_brush.is_invalid() {
-        // SAFETY: the background brush is no longer used.
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(background_brush.0));
         }
     }
     let buffered = hdc == buffer_dc && !buffer_dc.is_invalid();
@@ -26388,26 +26043,6 @@ mod tests {
                 - horizontal_candidate_logical_width("输入法", false),
             POPUP_SELECTED_TEXT_INSET_LOGICAL - POPUP_TEXT_PADDING_LOGICAL
         );
-    }
-
-    #[test]
-    fn candidate_popup_uses_one_ellipsis_and_never_elides_when_measurement_fails() {
-        let width = |text: &str| Some(i32::try_from(text.chars().count()).unwrap() * 10);
-        assert_eq!(candidate_text_for_width("省略号", 30, width), "省略号");
-        assert_eq!(candidate_text_for_width("省略号", 20, width), "省…");
-        assert_eq!(candidate_text_for_width("省略号", 10, width), "…");
-        assert_eq!(candidate_text_for_width("省略号", 20, |_| None), "省略号");
-
-        let over_limit = "甲".repeat(CANDIDATE_DISPLAY_MAX_CHARS + 1);
-        let complete_prefix = candidate_text_for_width(&over_limit, 330, width);
-        assert_eq!(
-            complete_prefix.chars().count(),
-            CANDIDATE_DISPLAY_MAX_CHARS + 1
-        );
-        assert!(complete_prefix.ends_with('…'));
-        let clipped_prefix = candidate_text_for_width(&over_limit, 320, width);
-        assert_eq!(clipped_prefix.chars().count(), CANDIDATE_DISPLAY_MAX_CHARS);
-        assert!(clipped_prefix.ends_with('…'));
     }
 
     #[test]
