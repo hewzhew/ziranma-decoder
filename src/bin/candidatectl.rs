@@ -7715,14 +7715,97 @@ struct ExactPhraseLayerPreflightSummary {
     phrase_load: Duration,
     phrase_entries: usize,
     phrase_codes: usize,
+    catalog_audit: ExactPhraseCatalogAudit,
+    catalog_audit_duration: Duration,
     sampled_codes: usize,
-    sampled_without_existing_exact: usize,
-    sampled_after_existing_exact: usize,
     negative_control_codes: usize,
     repetitions: usize,
     baseline_latency: DurationSummary,
     preview_latency: DurationSummary,
     checksum: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactPhrasePreviewObservation {
+    existing_exact_prefix: usize,
+    target_rank: Option<usize>,
+    target_instances: usize,
+    guarded_rank_matches: bool,
+    existing_prefix_unchanged: bool,
+    preview_unique: bool,
+    preview_within_bound: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactPhraseCatalogAudit {
+    targets: usize,
+    without_existing_exact_prefix: usize,
+    after_existing_exact_prefix: usize,
+    target_ranks: [usize; EXACT_PHRASE_FIRST_PAGE],
+    targets_outside_first_page: usize,
+    missing_targets: usize,
+    repeated_targets: usize,
+    guarded_rank_mismatches: usize,
+    existing_prefix_changes: usize,
+    duplicate_previews: usize,
+    unbounded_previews: usize,
+}
+
+impl ExactPhraseCatalogAudit {
+    fn observe(&mut self, observation: ExactPhrasePreviewObservation) {
+        self.targets += 1;
+        if observation.existing_exact_prefix == 0 {
+            self.without_existing_exact_prefix += 1;
+        } else {
+            self.after_existing_exact_prefix += 1;
+        }
+        match observation.target_rank {
+            Some(rank @ 1..=EXACT_PHRASE_FIRST_PAGE) => self.target_ranks[rank - 1] += 1,
+            Some(_) => self.targets_outside_first_page += 1,
+            None => self.missing_targets += 1,
+        }
+        self.repeated_targets += usize::from(observation.target_instances > 1);
+        self.guarded_rank_mismatches += usize::from(!observation.guarded_rank_matches);
+        self.existing_prefix_changes += usize::from(!observation.existing_prefix_unchanged);
+        self.duplicate_previews += usize::from(!observation.preview_unique);
+        self.unbounded_previews += usize::from(!observation.preview_within_bound);
+    }
+
+    fn verify(self) -> Result<Self, Box<dyn std::error::Error>> {
+        let classified_targets = self.target_ranks.iter().sum::<usize>()
+            + self.targets_outside_first_page
+            + self.missing_targets;
+        let classified_prefixes =
+            self.without_existing_exact_prefix + self.after_existing_exact_prefix;
+        if self.targets == 0
+            || classified_targets != self.targets
+            || classified_prefixes != self.targets
+        {
+            return Err("exact phrase full-catalog audit produced an incomplete aggregate".into());
+        }
+        if self.targets_outside_first_page != 0
+            || self.missing_targets != 0
+            || self.repeated_targets != 0
+            || self.guarded_rank_mismatches != 0
+            || self.existing_prefix_changes != 0
+            || self.duplicate_previews != 0
+            || self.unbounded_previews != 0
+        {
+            return Err(format!(
+                "exact phrase full-catalog audit failed without candidate text: targets {}; outside first page {}; missing {}; repeated targets {}; guarded rank mismatches {}; existing prefix changes {}; duplicate previews {}; unbounded previews {}",
+                self.targets,
+                self.targets_outside_first_page,
+                self.missing_targets,
+                self.repeated_targets,
+                self.guarded_rank_mismatches,
+                self.existing_prefix_changes,
+                self.duplicate_previews,
+                self.unbounded_previews,
+            )
+            .into());
+        }
+        Ok(self)
+    }
 }
 
 struct ExactPhraseTsfPreflightRequest<'a> {
@@ -7842,22 +7925,44 @@ fn preflight_exact_phrase_layer(
     )?;
     writeln!(
         output,
-        "功能门：抽样 {} 个码（无既有整词 {}，跟随既有整词 {}）；负对照 {} 个码；既有整词前缀、第一页位置、去重和无层回退全部通过",
-        summary.sampled_codes,
-        summary.sampled_without_existing_exact,
-        summary.sampled_after_existing_exact,
+        "全目录功能门：{} 个目标码；无既有完整词前缀 {}，跟随既有完整词前缀 {}；离线审计 {:.3} ms",
+        summary.catalog_audit.targets,
+        summary.catalog_audit.without_existing_exact_prefix,
+        summary.catalog_audit.after_existing_exact_prefix,
+        duration_ms(summary.catalog_audit_duration),
+    )?;
+    writeln!(
+        output,
+        "全目录目标位次：第 1 项 {}；第 2 项 {}；第 3 项 {}；第 4 项 {}；第 5 项 {}；第 6 项 {}",
+        summary.catalog_audit.target_ranks[0],
+        summary.catalog_audit.target_ranks[1],
+        summary.catalog_audit.target_ranks[2],
+        summary.catalog_audit.target_ranks[3],
+        summary.catalog_audit.target_ranks[4],
+        summary.catalog_audit.target_ranks[5],
+    )?;
+    writeln!(
+        output,
+        "全目录异常：跨出第一页 {}，目标缺失 {}，目标重复 {}，守护位次不符 {}，既有前缀变化 {}，候选重复 {}，结果越界 {}；负对照抽样 {} 个码保持无层回退",
+        summary.catalog_audit.targets_outside_first_page,
+        summary.catalog_audit.missing_targets,
+        summary.catalog_audit.repeated_targets,
+        summary.catalog_audit.guarded_rank_mismatches,
+        summary.catalog_audit.existing_prefix_changes,
+        summary.catalog_audit.duplicate_previews,
+        summary.catalog_audit.unbounded_previews,
         summary.negative_control_codes,
     )?;
     writeln!(
         output,
-        "预热查询：{} 个目标码 × {} 次；样本 {}",
+        "热路径性能抽样：{} 个目标码 × {} 次；样本 {}",
         summary.sampled_codes, summary.repetitions, summary.baseline_latency.samples,
     )?;
     write_phrase_latency_report(&mut output, "既有两层", summary.baseline_latency);
     write_phrase_latency_report(&mut output, "三包预览", summary.preview_latency);
     writeln!(output, "结果校验和：{}", summary.checksum)?;
     output.push_str(
-        "边界：本预检认证真实三包与纯候选合并路径，但不创建运行时根、不写开关、不注册或调用 TSF，也不测窗口绘制和真实首帧。通过不等于允许安装或换代。\n本次操作：只读\n",
+        "口径：全目录离线审计与有界性能抽样分开；前者证明本包全部目标的结构安全，耗时不是日常按键热路径。边界：本预检认证真实三包与纯候选合并路径，但不创建运行时根、不写开关、不注册或调用 TSF，也不测窗口绘制和真实首帧。通过不等于允许安装或换代。\n本次操作：只读\n",
     );
     Ok(output)
 }
@@ -7915,29 +8020,23 @@ fn preflight_loaded_exact_phrase_layer(
         }
     }
 
+    let catalog_audit_started = Instant::now();
+    let mut catalog_audit = ExactPhraseCatalogAudit::default();
+    for entry in &phrase_entries {
+        catalog_audit.observe(inspect_exact_phrase_preview(
+            entry.code.as_str(),
+            entry.text.as_str(),
+            &core.snapshot,
+            &supplemental.snapshot,
+            &phrase.snapshot,
+        )?);
+    }
+    let catalog_audit = catalog_audit.verify()?;
+    let catalog_audit_duration = catalog_audit_started.elapsed();
+
     let sampled_codes = evenly_spaced_exact_short_codes(&phrase_entries, sample_limit);
     if sampled_codes.is_empty() {
         return Err("exact phrase preflight selected no target codes".into());
-    }
-    let mut sampled_without_existing_exact = 0_usize;
-    let mut sampled_after_existing_exact = 0_usize;
-    for code in &sampled_codes {
-        let expected = texts_by_code
-            .get(code.as_str())
-            .copied()
-            .ok_or("exact phrase sample is missing its expected identity")?;
-        verify_exact_phrase_preview(code, expected, core, supplemental, phrase)?;
-        let existing_exact = existing_exact_texts(
-            &core.snapshot,
-            &supplemental.snapshot,
-            code,
-            MAX_CANDIDATE_SNAPSHOT_RANK,
-        )?;
-        if existing_exact.is_empty() {
-            sampled_without_existing_exact += 1;
-        } else {
-            sampled_after_existing_exact += 1;
-        }
     }
 
     let phrase_codes = texts_by_code.keys().copied().collect::<HashSet<_>>();
@@ -8037,9 +8136,9 @@ fn preflight_loaded_exact_phrase_layer(
         phrase_load: load_durations[2],
         phrase_entries: phrase_entries.len(),
         phrase_codes: texts_by_code.len(),
+        catalog_audit,
+        catalog_audit_duration,
         sampled_codes: sampled_codes.len(),
-        sampled_without_existing_exact,
-        sampled_after_existing_exact,
         negative_control_codes: negative_codes.len(),
         repetitions,
         baseline_latency,
@@ -8048,58 +8147,48 @@ fn preflight_loaded_exact_phrase_layer(
     })
 }
 
-fn verify_exact_phrase_preview(
+fn inspect_exact_phrase_preview(
     code: &str,
     expected: &str,
-    core: &LoadedPackage,
-    supplemental: &LoadedPackage,
-    phrase: &LoadedPackage,
-) -> Result<(), Box<dyn std::error::Error>> {
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    phrase: &CandidateSnapshot,
+) -> Result<ExactPhrasePreviewObservation, Box<dyn std::error::Error>> {
     let baseline = layered_candidate_texts(
-        &core.snapshot,
-        &supplemental.snapshot,
+        core,
+        supplemental,
         code,
         EXACT_PHRASE_RANK_DEPTH,
         SupplementalCandidateLayerConfig {
             exact_promotions: 1,
         },
     )?;
-    let preview = preview_exact_phrase_candidates(
-        &core.snapshot,
-        &supplemental.snapshot,
-        &phrase.snapshot,
-        code,
-        EXACT_PHRASE_RANK_DEPTH,
-    )?;
-    let existing_exact = existing_exact_texts(
-        &core.snapshot,
-        &supplemental.snapshot,
-        code,
-        MAX_CANDIDATE_SNAPSHOT_RANK,
-    )?;
+    let preview =
+        preview_exact_phrase_candidates(core, supplemental, phrase, code, EXACT_PHRASE_RANK_DEPTH)?;
+    let existing_exact =
+        existing_exact_texts(core, supplemental, code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
     let stable_prefix = baseline
         .iter()
         .take_while(|candidate| existing_exact.contains(candidate.as_str()))
         .count();
-    if stable_prefix >= EXACT_PHRASE_FIRST_PAGE {
-        return Err("exact phrase target would fall outside the first page".into());
-    }
-    if baseline
+    let existing_prefix_unchanged = baseline
         .iter()
         .take(stable_prefix)
-        .ne(preview.iter().take(stable_prefix))
-    {
-        return Err("exact phrase preview changed the existing exact prefix".into());
-    }
-    if preview.get(stable_prefix).map(String::as_str) != Some(expected) {
-        return Err("exact phrase target did not occupy its guarded exact position".into());
-    }
-    if preview.len() > EXACT_PHRASE_RANK_DEPTH
-        || preview.iter().collect::<HashSet<_>>().len() != preview.len()
-    {
-        return Err("exact phrase preview is unbounded or contains duplicates".into());
-    }
-    Ok(())
+        .eq(preview.iter().take(stable_prefix));
+    let target_rank = candidate_rank(&preview, expected);
+    let target_instances = preview
+        .iter()
+        .filter(|candidate| candidate.as_str() == expected)
+        .count();
+    Ok(ExactPhrasePreviewObservation {
+        existing_exact_prefix: stable_prefix,
+        target_rank,
+        target_instances,
+        guarded_rank_matches: target_rank == Some(stable_prefix + 1),
+        existing_prefix_unchanged,
+        preview_unique: preview.iter().collect::<HashSet<_>>().len() == preview.len(),
+        preview_within_bound: preview.len() <= EXACT_PHRASE_RANK_DEPTH,
+    })
 }
 
 #[cfg(windows)]
@@ -16323,6 +16412,54 @@ mod tests {
                 .unwrap();
         assert_eq!(guarded.first().map(String::as_str), Some("在进来"));
         assert_eq!(guarded.get(1).map(String::as_str), Some("再进来"));
+
+        let promoted_observation = inspect_exact_phrase_preview(
+            code.as_str(),
+            "再进来",
+            &composed,
+            &supplemental,
+            &phrase,
+        )
+        .unwrap();
+        let guarded_observation =
+            inspect_exact_phrase_preview(code.as_str(), "再进来", &exact, &supplemental, &phrase)
+                .unwrap();
+        assert_eq!(promoted_observation.existing_exact_prefix, 0);
+        assert_eq!(promoted_observation.target_rank, Some(1));
+        assert_eq!(guarded_observation.existing_exact_prefix, 1);
+        assert_eq!(guarded_observation.target_rank, Some(2));
+
+        let mut audit = ExactPhraseCatalogAudit::default();
+        audit.observe(promoted_observation);
+        audit.observe(guarded_observation);
+        let audit = audit.verify().unwrap();
+        assert_eq!(audit.targets, 2);
+        assert_eq!(audit.without_existing_exact_prefix, 1);
+        assert_eq!(audit.after_existing_exact_prefix, 1);
+        assert_eq!(audit.target_ranks, [1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn exact_phrase_catalog_audit_fails_closed_with_aggregate_counts_only() {
+        let mut audit = ExactPhraseCatalogAudit::default();
+        audit.observe(ExactPhrasePreviewObservation {
+            existing_exact_prefix: 6,
+            target_rank: Some(7),
+            target_instances: 2,
+            guarded_rank_matches: true,
+            existing_prefix_unchanged: false,
+            preview_unique: false,
+            preview_within_bound: false,
+        });
+
+        let error = audit.verify().unwrap_err().to_string();
+        assert!(error.contains("targets 1"));
+        assert!(error.contains("outside first page 1"));
+        assert!(error.contains("repeated targets 1"));
+        assert!(error.contains("existing prefix changes 1"));
+        assert!(error.contains("duplicate previews 1"));
+        assert!(error.contains("unbounded previews 1"));
+        assert!(!error.contains("再进来"));
     }
 
     #[test]
@@ -17121,8 +17258,10 @@ mod tests {
         .unwrap();
         assert_eq!(summary.phrase_entries, 1);
         assert_eq!(summary.sampled_codes, 1);
-        assert_eq!(summary.sampled_without_existing_exact, 1);
-        assert_eq!(summary.sampled_after_existing_exact, 0);
+        assert_eq!(summary.catalog_audit.targets, 1);
+        assert_eq!(summary.catalog_audit.without_existing_exact_prefix, 1);
+        assert_eq!(summary.catalog_audit.after_existing_exact_prefix, 0);
+        assert_eq!(summary.catalog_audit.target_ranks, [1, 0, 0, 0, 0, 0]);
         assert_eq!(summary.negative_control_codes, 2);
         for filename in [
             CANDIDATE_PACKAGE_MANIFEST_FILE,
