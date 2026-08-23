@@ -28,9 +28,9 @@ mod windows_app {
 
     use crate::candidate_ui::{
         CandidateRgb, CandidateScene, CandidateSceneFontMetrics, CandidateSceneLayout,
-        CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC, allocate_horizontal_candidate_widths,
-        build_candidate_scene, candidate_horizontal_logical_width, candidate_ui_scale,
-        candidate_vertical_logical_width,
+        CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
+        allocate_horizontal_candidate_widths, build_candidate_scene,
+        candidate_horizontal_logical_width, candidate_ui_scale, candidate_vertical_logical_width,
     };
     use crate::candidate_ui_gdi::{
         CandidateSceneFonts, CandidateScenePaintContent, paint_candidate_scene,
@@ -39,12 +39,12 @@ mod windows_app {
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
+        DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, FrameRect,
         GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS,
         PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, TEXTMETRICW, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
     use windows::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
         DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, IDC_ARROW, LoadCursorW,
@@ -52,7 +52,8 @@ mod windows_app {
         SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
         SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
         WINDOW_EX_STYLE, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CAPTION,
+        WS_MINIMIZEBOX, WS_SYSMENU,
     };
     use windows::core::{PCWSTR, w};
 
@@ -135,6 +136,8 @@ mod windows_app {
         scenario_index: usize,
         last_hit: Option<String>,
         last_scene: Option<CandidateScene>,
+        drag_anchor: Option<(i32, i32)>,
+        selection: Option<CandidateSceneRect>,
     }
 
     impl Default for LabState {
@@ -145,6 +148,8 @@ mod windows_app {
                 scenario_index: 0,
                 last_hit: None,
                 last_scene: None,
+                drag_anchor: None,
+                selection: None,
             }
         }
     }
@@ -179,6 +184,8 @@ mod windows_app {
         fn reset_inspection(&mut self) {
             self.last_hit = None;
             self.last_scene = None;
+            self.drag_anchor = None;
+            self.selection = None;
         }
     }
 
@@ -286,25 +293,60 @@ mod windows_app {
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                let packed = lparam.0 as u32;
-                let x = i32::from(packed as u16 as i16);
-                let y = i32::from((packed >> 16) as u16 as i16);
+                let point = message_point(lparam);
                 APP_STATE.with(|slot| {
                     let mut slot = slot.borrow_mut();
                     let Some(state) = slot.as_mut() else {
                         return;
                     };
+                    state.drag_anchor = Some(point);
+                    state.selection = Some(selection_rect(point, point));
+                    state.last_hit = None;
+                });
+                unsafe {
+                    let _ = SetCapture(window);
+                }
+                refresh_window(window, false);
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let point = message_point(lparam);
+                let changed = APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(state) = slot.as_mut() else {
+                        return false;
+                    };
+                    let Some(anchor) = state.drag_anchor else {
+                        return false;
+                    };
+                    state.selection = Some(selection_rect(anchor, point));
+                    true
+                });
+                if changed {
+                    invalidate_window(window);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let point = message_point(lparam);
+                APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(state) = slot.as_mut() else {
+                        return;
+                    };
+                    let Some(anchor) = state.drag_anchor.take() else {
+                        return;
+                    };
+                    let selection = selection_rect(anchor, point);
+                    state.selection = Some(selection);
                     state.last_hit = state
                         .last_scene
                         .as_ref()
-                        .and_then(|scene| scene.semantic_hits_at(x, y).into_iter().next())
-                        .map(|hit| match hit.candidate_index {
-                            Some(index) => {
-                                format!("{} · 候选 {}", hit.semantic.stable_id(), index + 1)
-                            }
-                            None => hit.semantic.stable_id().to_owned(),
-                        });
+                        .and_then(|scene| selection_summary(scene, selection));
                 });
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
                 refresh_window(window, false);
                 LRESULT(0)
             }
@@ -321,6 +363,41 @@ mod windows_app {
         }
     }
 
+    fn message_point(lparam: LPARAM) -> (i32, i32) {
+        let packed = lparam.0 as u32;
+        (
+            i32::from(packed as u16 as i16),
+            i32::from((packed >> 16) as u16 as i16),
+        )
+    }
+
+    fn selection_rect(anchor: (i32, i32), point: (i32, i32)) -> CandidateSceneRect {
+        CandidateSceneRect {
+            left: anchor.0.min(point.0),
+            top: anchor.1.min(point.1),
+            right: anchor.0.max(point.0).saturating_add(1),
+            bottom: anchor.1.max(point.1).saturating_add(1),
+        }
+    }
+
+    fn selection_summary(scene: &CandidateScene, selection: CandidateSceneRect) -> Option<String> {
+        let hits = scene.semantic_hits_in(selection);
+        let first = hits.first()?;
+        let identity = match first.candidate_index {
+            Some(index) => format!("{} · 候选 {}", first.semantic.stable_id(), index + 1),
+            None => first.semantic.stable_id().to_owned(),
+        };
+        Some(format!("{identity} · 共 {} 层", hits.len()))
+    }
+
+    fn invalidate_window(window: HWND) {
+        // SAFETY: invalidation is bounded to this process-owned window and
+        // suppresses background erasure because painting is double buffered.
+        unsafe {
+            let _ = InvalidateRect(Some(window), None, false);
+        }
+    }
+
     fn refresh_window(window: HWND, resize: bool) {
         let (metrics, title) = APP_STATE.with(|slot| {
             let slot = slot.borrow();
@@ -334,8 +411,8 @@ mod windows_app {
         // SAFETY: the title is NUL-terminated for the synchronous call.
         unsafe {
             let _ = SetWindowTextW(window, PCWSTR(title.as_ptr()));
-            let _ = InvalidateRect(Some(window), None, false);
         }
+        invalidate_window(window);
     }
 
     fn window_title(state: &LabState) -> String {
@@ -349,7 +426,7 @@ mod windows_app {
             .map(|hit| format!(" · 命中 {hit}"))
             .unwrap_or_default();
         format!(
-            "候选窗实验室 · {} · {} DPI · {}{}    H 布局 / D 缩放 / S 场景 / 点击检查 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {}{}    H 布局 / D 缩放 / S 场景 / 拖拽圈选 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
@@ -590,6 +667,15 @@ mod windows_app {
                 fill_background(hdc, &client, DEFAULT_CANDIDATE_VISUAL_SPEC.background);
             }
         }
+        if let Some(selection) = snapshot.selection {
+            unsafe {
+                paint_selection_frame(
+                    hdc,
+                    selection,
+                    DEFAULT_CANDIDATE_VISUAL_SPEC.selection_accent,
+                );
+            }
+        }
         APP_STATE.with(|slot| {
             if let Some(state) = slot.borrow_mut().as_mut() {
                 state.last_scene = scene;
@@ -671,6 +757,25 @@ mod windows_app {
         if !brush.is_invalid() {
             unsafe {
                 let _ = FillRect(hdc, bounds, brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
+        }
+    }
+
+    unsafe fn paint_selection_frame(hdc: HDC, bounds: CandidateSceneRect, color: CandidateRgb) {
+        let bounds = RECT {
+            left: bounds.left,
+            top: bounds.top,
+            right: bounds.right,
+            bottom: bounds.bottom,
+        };
+        let color = COLORREF(
+            u32::from(color.red) | (u32::from(color.green) << 8) | (u32::from(color.blue) << 16),
+        );
+        let brush = unsafe { CreateSolidBrush(color) };
+        if !brush.is_invalid() {
+            unsafe {
+                let _ = FrameRect(hdc, &bounds, brush);
                 let _ = DeleteObject(HGDIOBJ(brush.0));
             }
         }
@@ -819,6 +924,32 @@ mod windows_app {
                 state.cycle_scenario();
                 assert_eq!(state.scenario(), expected);
             }
+        }
+
+        #[test]
+        fn drag_selection_is_direction_independent_and_keeps_clicks_nonempty() {
+            assert_eq!(
+                selection_rect((8, 9), (3, 2)),
+                CandidateSceneRect {
+                    left: 3,
+                    top: 2,
+                    right: 9,
+                    bottom: 10,
+                }
+            );
+            assert_eq!(
+                selection_rect((3, 2), (8, 9)),
+                selection_rect((8, 9), (3, 2))
+            );
+            assert_eq!(
+                selection_rect((5, 7), (5, 7)),
+                CandidateSceneRect {
+                    left: 5,
+                    top: 7,
+                    right: 6,
+                    bottom: 8,
+                }
+            );
         }
     }
 }

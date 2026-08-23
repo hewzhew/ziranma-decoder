@@ -178,6 +178,17 @@ impl CandidateSceneRect {
     fn contains_point(self, x: i32, y: i32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
+
+    fn intersects(self, other: Self) -> bool {
+        self.left < self.right
+            && self.top < self.bottom
+            && other.left < other.right
+            && other.top < other.bottom
+            && self.left < other.right
+            && other.left < self.right
+            && self.top < other.bottom
+            && other.top < self.bottom
+    }
 }
 
 /// Stable semantic identities exposed by the shared candidate scene.
@@ -259,21 +270,11 @@ pub(crate) struct CandidateSceneHit {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl CandidateScene {
-    /// Returns every semantic region at a physical-pixel point, ordered from
-    /// the most specific painted feature to its enclosing container.
-    ///
-    /// Rectangles follow GDI's right-and-bottom-exclusive convention. The
-    /// stable order makes overlapping regions deterministic for future native
-    /// inspection and annotation tools without changing production input.
-    pub(crate) fn semantic_hits_at(&self, x: i32, y: i32) -> Vec<CandidateSceneHit> {
-        if !self.client.contains_point(x, y) {
-            return Vec::new();
-        }
-
-        let mut hits = Vec::new();
+    fn semantic_regions(&self) -> Vec<CandidateSceneHit> {
+        let mut regions = Vec::new();
         let mut push = |semantic, candidate_index, bounds: Option<CandidateSceneRect>| {
-            if let Some(bounds) = bounds.filter(|bounds| bounds.contains_point(x, y)) {
-                hits.push(CandidateSceneHit {
+            if let Some(bounds) = bounds {
+                regions.push(CandidateSceneHit {
                     semantic,
                     candidate_index,
                     bounds,
@@ -294,9 +295,6 @@ impl CandidateScene {
         push(CandidateSceneSemantic::Footer, None, self.footer);
 
         for item in &self.items {
-            if !item.bounds.contains_point(x, y) {
-                continue;
-            }
             let candidate_index = Some(item.index);
             push(
                 CandidateSceneSemantic::CandidatePersonalMark,
@@ -338,9 +336,36 @@ impl CandidateScene {
                 candidate_index,
                 Some(item.bounds),
             );
-            break;
         }
-        hits
+        regions
+    }
+
+    /// Returns every semantic region at a physical-pixel point, ordered from
+    /// the most specific painted feature to its enclosing container.
+    ///
+    /// Rectangles follow GDI's right-and-bottom-exclusive convention. The
+    /// stable order makes overlapping regions deterministic for future native
+    /// inspection and annotation tools without changing production input.
+    pub(crate) fn semantic_hits_at(&self, x: i32, y: i32) -> Vec<CandidateSceneHit> {
+        if !self.client.contains_point(x, y) {
+            return Vec::new();
+        }
+        self.semantic_regions()
+            .into_iter()
+            .filter(|region| region.bounds.contains_point(x, y))
+            .collect()
+    }
+
+    /// Returns all semantic regions intersecting a nonempty physical-pixel
+    /// rectangle, preserving the same specificity order as point hits.
+    pub(crate) fn semantic_hits_in(&self, selection: CandidateSceneRect) -> Vec<CandidateSceneHit> {
+        if !self.client.intersects(selection) {
+            return Vec::new();
+        }
+        self.semantic_regions()
+            .into_iter()
+            .filter(|region| region.bounds.intersects(selection))
+            .collect()
     }
 }
 
@@ -1378,6 +1403,47 @@ mod tests {
         );
         assert!(semantics(480, 20).is_empty());
         assert!(semantics(20, 46).is_empty());
+
+        assert_eq!(
+            scene
+                .semantic_hits_in(CandidateSceneRect {
+                    left: 18,
+                    top: 21,
+                    right: 21,
+                    bottom: 24,
+                })
+                .into_iter()
+                .map(|hit| (hit.semantic, hit.candidate_index))
+                .collect::<Vec<_>>(),
+            vec![
+                (CandidateSceneSemantic::CandidatePersonalMark, Some(0)),
+                (CandidateSceneSemantic::CandidateRank, Some(0)),
+                (CandidateSceneSemantic::CandidateSelectedSurface, Some(0)),
+                (CandidateSceneSemantic::CandidateItem, Some(0)),
+            ]
+        );
+        let crossed_items = scene
+            .semantic_hits_in(CandidateSceneRect {
+                left: 104,
+                top: 5,
+                right: 106,
+                bottom: 10,
+            })
+            .into_iter()
+            .filter(|hit| hit.semantic == CandidateSceneSemantic::CandidateItem)
+            .map(|hit| hit.candidate_index.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(crossed_items, [0, 1]);
+        assert!(
+            scene
+                .semantic_hits_in(CandidateSceneRect {
+                    left: 20,
+                    top: 20,
+                    right: 20,
+                    bottom: 30,
+                })
+                .is_empty()
+        );
     }
 
     #[test]
