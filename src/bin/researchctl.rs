@@ -2477,6 +2477,8 @@ impl ResearchReview {
         )
         .unwrap();
 
+        self.render_followup_non_top_identities(&mut output);
+
         let mut non_top = self
             .selections
             .iter()
@@ -2651,6 +2653,85 @@ impl ResearchReview {
              非首选、取消和原码上屏只是待复查线索，不自动等于输入错误。",
         );
         output
+    }
+
+    fn render_followup_non_top_identities(&self, output: &mut String) {
+        let output_counts_by_code =
+            self.selections
+                .keys()
+                .fold(HashMap::<&str, usize>::new(), |mut counts, (code, _)| {
+                    *counts.entry(code.as_str()).or_insert(0) += 1;
+                    counts
+                });
+        let mut identities = self
+            .selections
+            .iter()
+            .filter(|(_, pattern)| {
+                pattern.selections >= 2
+                    && pattern.first_rank.is_some_and(|rank| rank > 1)
+                    && pattern.minimum_rank > 1
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by(|left, right| {
+            right
+                .1
+                .selections
+                .cmp(&left.1.selections)
+                .then_with(|| right.1.minimum_rank.cmp(&left.1.minimum_rank))
+                .then_with(|| right.1.maximum_rank.cmp(&left.1.maximum_rank))
+                .then_with(|| left.0.cmp(right.0))
+        });
+
+        output.push_str("\n反复提交仍未到首选的身份（只列实际观测，不自动判错）：\n");
+        if identities.is_empty() {
+            output.push_str("- 暂无。\n");
+            return;
+        }
+        for ((code, text), pattern) in identities.into_iter().take(MAX_REVIEW_ITEMS) {
+            let first_rank = pattern.first_rank.unwrap_or(pattern.maximum_rank);
+            let movement = if pattern.minimum_rank < first_rank {
+                "曾改善"
+            } else {
+                "未改善"
+            };
+            let blocker = match (
+                pattern.first_candidate_text_evidence,
+                pattern.first_global_top_text.as_deref(),
+            ) {
+                (CandidateTextEvidence::Verified, Some(blocker)) => format!(
+                    "首次可核对首选“{blocker}”（来源 {}）",
+                    pattern
+                        .first_global_top_provenance
+                        .map_or("缺失", |source| candidate_source_label(source.source()))
+                ),
+                (CandidateTextEvidence::Verified, None) => {
+                    "首次目标候选已核对，但缺少首页首选".to_owned()
+                }
+                (CandidateTextEvidence::Mismatched, _) => {
+                    "首次记录位置与提交文字不一致，不猜测阻挡项".to_owned()
+                }
+                (CandidateTextEvidence::Unavailable, _) => "首次现场不足，不猜测阻挡项".to_owned(),
+            };
+            let competing_outputs = output_counts_by_code
+                .get(code.as_str())
+                .copied()
+                .unwrap_or(1)
+                .saturating_sub(1);
+            let competing = if competing_outputs == 0 {
+                "同码未观察到其他已提交文字".to_owned()
+            } else {
+                format!("同码还观察到 {competing_outputs} 种其他已提交文字")
+            };
+            writeln!(
+                output,
+                "- {code} → “{text}”：提交 {} 次，观测中始终未到首选；首次第 {first_rank}，最好第 {}（{movement}）；{blocker}；{competing}；目标来源 {}；目标个性化 {}。",
+                pattern.selections,
+                pattern.minimum_rank,
+                candidate_source_label(pattern.dominant_source()),
+                render_candidate_personalization_counts(&pattern.personalization_frames),
+            )
+            .unwrap();
+        }
     }
 
     fn render_runtime_summary(
@@ -4915,6 +4996,63 @@ mod tests {
         let unidentified = render_scoped_private_review(None, &all);
         assert!(!unidentified.contains("最新运行身份的明文问题卡"));
         assert!(unidentified.contains("legacy-code"));
+    }
+
+    #[test]
+    fn private_review_names_repeated_non_top_identities_without_aggregate_text_leakage() {
+        let core = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let mut stuck = SelectionPattern {
+            selections: 3,
+            non_top_selections: 3,
+            first_rank: Some(4),
+            first_global_top_provenance: Some(core),
+            first_global_top_text: Some("公开阻挡项".to_owned()),
+            first_candidate_text_evidence: CandidateTextEvidence::Verified,
+            last_rank: Some(2),
+            minimum_rank: 2,
+            maximum_rank: 4,
+            manual_selections: 3,
+            provenance_observations: 3,
+            top_provenance_observations: 3,
+            ..SelectionPattern::default()
+        };
+        stuck.sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
+        stuck.top_sources[candidate_source_index(NativeCandidateSource::CoreExact)] = 3;
+        stuck.personalization_frames[0] = 1;
+
+        let mut review = ResearchReview {
+            batches: 1,
+            available_batches: 1,
+            ..ResearchReview::default()
+        };
+        review
+            .selections
+            .insert(("testcode".to_owned(), "目标短语".to_owned()), stuck);
+        review.selections.insert(
+            ("testcode".to_owned(), "同码文字".to_owned()),
+            SelectionPattern {
+                selections: 1,
+                first_rank: Some(1),
+                last_rank: Some(1),
+                minimum_rank: 1,
+                maximum_rank: 1,
+                ..SelectionPattern::default()
+            },
+        );
+
+        let rendered = review.render();
+        assert!(rendered.contains("反复提交仍未到首选的身份"));
+        assert!(rendered.contains(
+            "testcode → “目标短语”：提交 3 次，观测中始终未到首选；首次第 4，最好第 2（曾改善）"
+        ));
+        assert!(rendered.contains("首次可核对首选“公开阻挡项”（来源 核心整词）"));
+        assert!(rendered.contains("同码还观察到 1 种其他已提交文字"));
+        assert!(rendered.contains("目标个性化 持久精确 1"));
+
+        let aggregate = review.render_aggregate();
+        for private_text in ["testcode", "目标短语", "公开阻挡项", "同码文字"] {
+            assert!(!aggregate.contains(private_text));
+        }
     }
 
     #[test]
