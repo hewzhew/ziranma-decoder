@@ -117,6 +117,7 @@ mod windows_app {
     const FEEDBACK_SUMMARY_ID: i32 = 404;
     const FEEDBACK_HITS_ID: i32 = 405;
     const FEEDBACK_NOTE_ID: i32 = 406;
+    const FEEDBACK_REPLAY_ID: i32 = 407;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
 
     thread_local! {
@@ -146,6 +147,15 @@ mod windows_app {
                 Self::Everyday => "everyday",
                 Self::LongCandidate => "long-candidate",
                 Self::Personalized => "personalized",
+            }
+        }
+
+        fn from_stable_id(stable_id: &str) -> Option<Self> {
+            match stable_id {
+                "everyday" => Some(Self::Everyday),
+                "long-candidate" => Some(Self::LongCandidate),
+                "personalized" => Some(Self::Personalized),
+                _ => None,
             }
         }
 
@@ -217,6 +227,8 @@ mod windows_app {
         feedback_review: Option<Rc<RefCell<CandidateUiLabFeedbackReview>>>,
         feedback_window: Option<HWND>,
         feedback_owner: Option<HWND>,
+        feedback_replay_window: Option<HWND>,
+        feedback_replay_owner: Option<HWND>,
     }
 
     impl Default for LabState {
@@ -241,6 +253,8 @@ mod windows_app {
                 feedback_review: None,
                 feedback_window: None,
                 feedback_owner: None,
+                feedback_replay_window: None,
+                feedback_replay_owner: None,
             }
         }
     }
@@ -492,6 +506,19 @@ mod windows_app {
             if RegisterClassW(&feedback_class) == 0 {
                 return Err("无法注册候选窗反馈浏览窗口".to_owned());
             }
+            let feedback_replay_class_name = w!("ZiranmaCandidateUiLabFeedbackReplayWindow");
+            let feedback_replay_class = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                hInstance: instance,
+                lpszClassName: feedback_replay_class_name,
+                lpfnWndProc: Some(feedback_replay_window_proc),
+                hCursor: LoadCursorW(None, IDC_ARROW)
+                    .map_err(|_| "无法载入反馈重放窗口光标".to_owned())?,
+                ..Default::default()
+            };
+            if RegisterClassW(&feedback_replay_class) == 0 {
+                return Err("无法注册候选窗反馈重放窗口".to_owned());
+            }
             APP_STATE.with(|slot| slot.replace(Some(LabState::default())));
             let window = match CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -693,11 +720,13 @@ mod windows_app {
                     state.panel_owner = None;
                     state.comparison_owner = None;
                     state.feedback_owner = None;
+                    state.feedback_replay_owner = None;
                     Some([
                         state.note_window.take(),
                         state.panel_window.take(),
                         state.comparison_window.take(),
                         state.feedback_window.take(),
+                        state.feedback_replay_window.take(),
                     ])
                 });
                 for owned_window in owned_windows.into_iter().flatten().flatten() {
@@ -1563,9 +1592,10 @@ mod windows_app {
                             state.panel_window,
                             state.comparison_window,
                             state.feedback_window,
+                            state.feedback_replay_window,
                         ]
                     })
-                    .unwrap_or([None, None, None])
+                    .unwrap_or([None, None, None, None])
             });
             for companion in companions.into_iter().flatten() {
                 if IsWindow(Some(companion)).as_bool() {
@@ -1632,9 +1662,10 @@ mod windows_app {
                                         state.panel_window,
                                         state.comparison_window,
                                         state.feedback_window,
+                                        state.feedback_replay_window,
                                     ]
                                 })
-                                .unwrap_or([None, None, None])
+                                .unwrap_or([None, None, None, None])
                         });
                         for companion in companions.into_iter().flatten() {
                             if IsWindow(Some(companion)).as_bool() {
@@ -2025,6 +2056,7 @@ mod windows_app {
                         FEEDBACK_OPEN_ID => choose_and_load_feedback(window),
                         FEEDBACK_PREVIOUS_ID => navigate_feedback(window, false),
                         FEEDBACK_NEXT_ID => navigate_feedback(window, true),
+                        FEEDBACK_REPLAY_ID => toggle_feedback_replay(window),
                         _ => {}
                     }
                 }
@@ -2035,16 +2067,22 @@ mod windows_app {
                 LRESULT(0)
             }
             WM_DESTROY => {
-                APP_STATE.with(|slot| {
+                let replay = APP_STATE.with(|slot| {
                     let mut slot = slot.borrow_mut();
-                    let Some(state) = slot.as_mut() else {
-                        return;
-                    };
+                    let state = slot.as_mut()?;
                     if state.feedback_window == Some(window) {
                         state.feedback_window = None;
                         state.feedback_owner = None;
+                        state.feedback_replay_owner = None;
+                        return state.feedback_replay_window.take();
                     }
+                    None
                 });
+                if let Some(replay) =
+                    replay.filter(|replay| unsafe { IsWindow(Some(*replay)).as_bool() })
+                {
+                    let _ = unsafe { DestroyWindow(replay) };
+                }
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
@@ -2126,6 +2164,18 @@ mod windows_app {
                 create_control(
                     window,
                     w!("BUTTON"),
+                    w!("打开只读重放"),
+                    190,
+                    320,
+                    160,
+                    34,
+                    FEEDBACK_REPLAY_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
                     w!("上一条"),
                     370,
                     320,
@@ -2156,13 +2206,13 @@ mod windows_app {
         if !unsafe { IsWindow(Some(window)) }.as_bool() {
             return;
         }
-        let review = APP_STATE.with(|slot| {
+        let state = APP_STATE.with(|slot| {
             let slot = slot.borrow();
             let state = slot.as_ref()?;
             (state.feedback_window == Some(window) || state.feedback_window.is_none())
-                .then(|| state.feedback_review.clone())
+                .then(|| (state.feedback_review.clone(), state.feedback_replay_window))
         });
-        let Some(review) = review else {
+        let Some((review, replay)) = state else {
             return;
         };
         let snapshot = match review.as_ref() {
@@ -2178,6 +2228,21 @@ mod windows_app {
         }
         if let Ok(next) = unsafe { GetDlgItem(Some(window), FEEDBACK_NEXT_ID) } {
             let _ = unsafe { EnableWindow(next, snapshot.can_select_next) };
+        }
+        let replay_open = replay
+            .filter(|replay| unsafe { IsWindow(Some(*replay)) }.as_bool())
+            .is_some();
+        set_control_text(
+            window,
+            FEEDBACK_REPLAY_ID,
+            if replay_open {
+                "关闭只读重放"
+            } else {
+                "打开只读重放"
+            },
+        );
+        if let Ok(replay) = unsafe { GetDlgItem(Some(window), FEEDBACK_REPLAY_ID) } {
+            let _ = unsafe { EnableWindow(replay, review.is_some()) };
         }
     }
 
@@ -2205,6 +2270,7 @@ mod windows_app {
             }
         });
         sync_feedback_browser(window);
+        refresh_feedback_replay_for_browser(window);
     }
 
     fn navigate_feedback(window: HWND, next: bool) {
@@ -2225,6 +2291,7 @@ mod windows_app {
         };
         if changed {
             sync_feedback_browser(window);
+            refresh_feedback_replay_for_browser(window);
         }
     }
 
@@ -2277,6 +2344,196 @@ mod windows_app {
             if let Some(state) = slot.borrow_mut().as_mut() {
                 state.feedback_window = None;
                 state.feedback_owner = None;
+            }
+        });
+    }
+
+    fn toggle_feedback_replay(browser: HWND) {
+        let target = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot.as_ref()?;
+            (state.feedback_window == Some(browser) && state.feedback_review.is_some())
+                .then_some(state.feedback_replay_window)
+        });
+        let Some(existing) = target else {
+            return;
+        };
+        if let Some(existing) =
+            existing.filter(|window| unsafe { IsWindow(Some(*window)) }.as_bool())
+        {
+            let _ = unsafe { DestroyWindow(existing) };
+            sync_feedback_browser(browser);
+        } else {
+            open_feedback_replay(browser);
+        }
+    }
+
+    fn open_feedback_replay(browser: HWND) {
+        let context = APP_STATE.with(|slot| {
+            let review = slot
+                .borrow()
+                .as_ref()
+                .filter(|state| state.feedback_window == Some(browser))?
+                .feedback_review
+                .clone()?;
+            feedback_preview_context(&review.borrow())
+        });
+        if context.is_none() {
+            return notify_error(browser, "所选批注无法在固定公开场景中安全重放");
+        }
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.feedback_replay_owner = Some(browser);
+            }
+        });
+        let mut browser_rect = RECT::default();
+        let (x, y) = if unsafe { GetWindowRect(browser, &mut browser_rect) }.is_ok() {
+            (browser_rect.right.saturating_add(12), browser_rect.top)
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
+        let window = unsafe {
+            let module = match GetModuleHandleW(None) {
+                Ok(module) => module,
+                Err(_) => {
+                    clear_feedback_replay();
+                    return notify_error(browser, "无法读取反馈重放窗口模块");
+                }
+            };
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("ZiranmaCandidateUiLabFeedbackReplayWindow"),
+                w!("候选窗反馈只读重放"),
+                WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                x,
+                y,
+                640,
+                160,
+                Some(browser),
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        };
+        let window = match window {
+            Ok(window) => window,
+            Err(_) => {
+                clear_feedback_replay();
+                return notify_error(browser, "无法创建反馈重放窗口");
+            }
+        };
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.feedback_replay_window = Some(window);
+            }
+        });
+        if !refresh_feedback_replay_window(window, true) {
+            let _ = unsafe { DestroyWindow(window) };
+            return notify_error(browser, "所选批注无法在固定公开场景中安全重放");
+        }
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOW);
+        }
+        sync_feedback_browser(browser);
+    }
+
+    unsafe extern "system" fn feedback_replay_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CREATE => LRESULT(0),
+            WM_PAINT => {
+                unsafe { paint_feedback_replay_window(window) };
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let browser = APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let state = slot.as_mut()?;
+                    if state.feedback_replay_window == Some(window) {
+                        state.feedback_replay_window = None;
+                        return state.feedback_replay_owner.take();
+                    }
+                    None
+                });
+                if let Some(browser) =
+                    browser.filter(|browser| unsafe { IsWindow(Some(*browser)).as_bool() })
+                {
+                    sync_feedback_browser(browser);
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    fn refresh_feedback_replay_for_browser(browser: HWND) {
+        let replay = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot.as_ref()?;
+            (state.feedback_window == Some(browser))
+                .then_some(state.feedback_replay_window)
+                .flatten()
+        });
+        let Some(replay) = replay.filter(|replay| unsafe { IsWindow(Some(*replay)) }.as_bool())
+        else {
+            return;
+        };
+        if !refresh_feedback_replay_window(replay, true) {
+            let _ = unsafe { DestroyWindow(replay) };
+            notify_error(browser, "所选批注无法在固定公开场景中安全重放");
+        }
+    }
+
+    fn refresh_feedback_replay_window(window: HWND, resize: bool) -> bool {
+        let snapshot = APP_STATE.with(|slot| {
+            let review = slot
+                .borrow()
+                .as_ref()
+                .and_then(|state| state.feedback_review.clone())?;
+            let review = review.borrow();
+            let context = feedback_preview_context(&review)?;
+            let annotation = review.selected_annotation();
+            let variant = match annotation.variant_id.as_str() {
+                "baseline" => "A 基线",
+                "draft" => "B 草案",
+                _ => return None,
+            };
+            Some((
+                context,
+                format!(
+                    "反馈只读重放 · {}/{} · {} · {variant}",
+                    review.selected_index() + 1,
+                    review.len(),
+                    context.scenario.label(),
+                ),
+            ))
+        });
+        let Some((context, title)) = snapshot else {
+            return false;
+        };
+        if resize {
+            let metrics = frame_metrics_for_context(context);
+            resize_client(window, metrics.width, metrics.height);
+        }
+        set_window_text(window, &title);
+        invalidate_window(window);
+        true
+    }
+
+    fn clear_feedback_replay() {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.feedback_replay_window = None;
+                state.feedback_replay_owner = None;
             }
         });
     }
@@ -2443,18 +2700,68 @@ mod windows_app {
         )
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LabPreviewContext {
+        layout: CandidateSceneLayout,
+        dpi: u32,
+        scenario: LabScenario,
+        spec: CandidateVisualSpec,
+        selection: Option<CandidateSceneRect>,
+    }
+
+    fn preview_context_for_role(state: &LabState, role: LabPreviewRole) -> LabPreviewContext {
+        LabPreviewContext {
+            layout: state.layout,
+            dpi: state.dpi(),
+            scenario: state.scenario(),
+            spec: preview_spec_for_role(state, role),
+            selection: preview_selection_for_role(state, role),
+        }
+    }
+
+    fn feedback_preview_context(
+        review: &CandidateUiLabFeedbackReview,
+    ) -> Option<LabPreviewContext> {
+        let annotation = review.selected_annotation();
+        let context = LabPreviewContext {
+            layout: annotation.layout,
+            dpi: annotation.dpi,
+            scenario: LabScenario::from_stable_id(&annotation.scenario_id)?,
+            spec: annotation.visual_spec,
+            selection: Some(annotation.selection),
+        };
+        let metrics = frame_metrics_for_context(context);
+        let selection = annotation.selection;
+        (selection.left >= 0
+            && selection.top >= 0
+            && selection.right <= metrics.width
+            && selection.bottom <= metrics.height)
+            .then_some(context)
+    }
+
     fn frame_metrics(state: &LabState) -> LabFrameMetrics {
         frame_metrics_for_spec(state, state.active_spec())
     }
 
     fn frame_metrics_for_spec(state: &LabState, spec: CandidateVisualSpec) -> LabFrameMetrics {
-        let dpi = state.dpi();
-        let content = state.scenario().content();
+        frame_metrics_for_context(LabPreviewContext {
+            layout: state.layout,
+            dpi: state.dpi(),
+            scenario: state.scenario(),
+            spec,
+            selection: None,
+        })
+    }
+
+    fn frame_metrics_for_context(context: LabPreviewContext) -> LabFrameMetrics {
+        let dpi = context.dpi;
+        let spec = context.spec;
+        let content = context.scenario.content();
         let scale = |logical| candidate_ui_scale(dpi, logical);
         let footer_width = scale(content.footer_logical_width);
         let padding = scale(spec.outer_padding);
         let outer_width = padding.saturating_mul(2);
-        match state.layout {
+        match context.layout {
             CandidateSceneLayout::Horizontal => {
                 let natural = content.candidates.iter().enumerate().fold(
                     outer_width.saturating_add(footer_width),
@@ -2578,6 +2885,35 @@ mod windows_app {
     }
 
     unsafe fn paint_preview_window(window: HWND, role: LabPreviewRole) {
+        let context = APP_STATE.with(|slot| {
+            let state = slot.borrow().as_ref().cloned().unwrap_or_default();
+            preview_context_for_role(&state, role)
+        });
+        unsafe { paint_preview_context(window, context, role == LabPreviewRole::Active) };
+    }
+
+    unsafe fn paint_feedback_replay_window(window: HWND) {
+        let context = APP_STATE.with(|slot| {
+            let review = slot
+                .borrow()
+                .as_ref()
+                .and_then(|state| state.feedback_review.clone())?;
+            feedback_preview_context(&review.borrow())
+        });
+        if let Some(context) = context {
+            unsafe { paint_preview_context(window, context, false) };
+        } else {
+            let mut paint = PAINTSTRUCT::default();
+            let _ = unsafe { BeginPaint(window, &mut paint) };
+            let _ = unsafe { EndPaint(window, &paint) };
+        }
+    }
+
+    unsafe fn paint_preview_context(
+        window: HWND,
+        context: LabPreviewContext,
+        update_active_scene: bool,
+    ) {
         let mut paint = PAINTSTRUCT::default();
         let paint_dc = unsafe { BeginPaint(window, &mut paint) };
         if paint_dc.is_invalid() {
@@ -2609,10 +2945,9 @@ mod windows_app {
             }
         }
 
-        let snapshot = APP_STATE.with(|slot| slot.borrow().as_ref().cloned().unwrap_or_default());
-        let dpi = snapshot.dpi();
-        let spec = preview_spec_for_role(&snapshot, role);
-        let content = snapshot.scenario().content();
+        let dpi = context.dpi;
+        let spec = context.spec;
+        let content = context.scenario.content();
         let fonts = unsafe { create_fonts(dpi, spec) };
         let initial_font = [fonts.candidate, fonts.selected, fonts.metadata]
             .into_iter()
@@ -2629,8 +2964,8 @@ mod windows_app {
         let rank_metrics = unsafe { font_metrics(hdc, fonts.metadata) };
         let candidate_metrics = unsafe { font_metrics(hdc, fonts.candidate) };
         let selected_metrics = unsafe { font_metrics(hdc, fonts.selected) };
-        let metrics = frame_metrics_for_spec(&snapshot, spec);
-        let horizontal_widths = if snapshot.layout == CandidateSceneLayout::Horizontal {
+        let metrics = frame_metrics_for_context(context);
+        let horizontal_widths = if context.layout == CandidateSceneLayout::Horizontal {
             allocate_horizontal_candidate_widths(
                 spec,
                 dpi,
@@ -2646,7 +2981,7 @@ mod windows_app {
         let scene = build_candidate_scene(
             spec,
             CandidateSceneRequest {
-                layout: snapshot.layout,
+                layout: context.layout,
                 dpi,
                 width,
                 height,
@@ -2688,13 +3023,12 @@ mod windows_app {
                 fill_background(hdc, &client, spec.background);
             }
         }
-        let selection = preview_selection_for_role(&snapshot, role);
-        if let Some(selection) = selection {
+        if let Some(selection) = context.selection {
             unsafe {
                 paint_selection_frame(hdc, selection, spec.selection_accent);
             }
         }
-        if role == LabPreviewRole::Active {
+        if update_active_scene {
             APP_STATE.with(|slot| {
                 if let Some(state) = slot.borrow_mut().as_mut() {
                     state.last_scene = scene;
@@ -2911,7 +3245,7 @@ mod windows_app {
             assert_eq!(scene.client.bottom, metrics.height);
         }
 
-        fn test_feedback_review() -> CandidateUiLabFeedbackReview {
+        fn test_feedback_json() -> String {
             let state = LabState::default();
             let spec = state.active_spec();
             let content = state.scenario().content();
@@ -2953,7 +3287,12 @@ mod windows_app {
                 state.visual.active_variant().stable_id(),
                 state.layout,
                 state.dpi(),
-                scene.client,
+                CandidateSceneRect {
+                    left: 1,
+                    top: 1,
+                    right: 2,
+                    bottom: 2,
+                },
                 &scene,
                 spec,
             )
@@ -2961,8 +3300,12 @@ mod windows_app {
             let mut session = CandidateUiLabAnnotationSession::default();
             session.add(context.clone(), "第一条界面批注").unwrap();
             session.add(context, "第二条界面批注").unwrap();
+            session.to_canonical_json()
+        }
+
+        fn test_feedback_review() -> CandidateUiLabFeedbackReview {
             CandidateUiLabFeedbackReview::new(
-                parse_candidate_ui_lab_feedback(session.to_canonical_json().as_bytes()).unwrap(),
+                parse_candidate_ui_lab_feedback(test_feedback_json().as_bytes()).unwrap(),
             )
             .unwrap()
         }
@@ -2991,6 +3334,33 @@ mod windows_app {
             assert_eq!(second.note, "第二条界面批注");
             assert!(second.can_select_previous);
             assert!(!second.can_select_next);
+        }
+
+        #[test]
+        fn feedback_replay_context_is_exact_and_rejects_out_of_scene_selection() {
+            let review = test_feedback_review();
+            let annotation = review.selected_annotation();
+            let context = feedback_preview_context(&review).unwrap();
+            assert_eq!(context.layout, annotation.layout);
+            assert_eq!(context.dpi, annotation.dpi);
+            assert_eq!(context.scenario.stable_id(), annotation.scenario_id);
+            assert_eq!(context.spec, annotation.visual_spec);
+            assert_eq!(context.selection, Some(annotation.selection));
+            let metrics = frame_metrics_for_context(context);
+            assert!(annotation.selection.right <= metrics.width);
+            assert!(annotation.selection.bottom <= metrics.height);
+
+            let invalid = test_feedback_json().replacen(
+                "\"selection\":{\"left\":1,\"top\":1,\"right\":2,\"bottom\":2}",
+                "\"selection\":{\"left\":1,\"top\":1,\"right\":16000,\"bottom\":2}",
+                1,
+            );
+            assert_ne!(invalid, test_feedback_json());
+            let invalid = CandidateUiLabFeedbackReview::new(
+                parse_candidate_ui_lab_feedback(invalid.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            assert!(feedback_preview_context(&invalid).is_none());
         }
 
         #[test]
