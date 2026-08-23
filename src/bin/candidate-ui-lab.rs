@@ -72,12 +72,12 @@ mod windows_app {
         ES_WANTRETURN, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW,
         GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow, LoadCursorW, MB_ICONERROR,
         MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
-        SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
-        SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
-        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETFONT, WNDCLASSW,
-        WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_TOOLWINDOW, WS_MINIMIZEBOX,
-        WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
+        TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+        WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE,
+        WM_PAINT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+        WS_EX_TOOLWINDOW, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
 
@@ -92,6 +92,7 @@ mod windows_app {
     const PANEL_DECREASE_ID: i32 = 304;
     const PANEL_INCREASE_ID: i32 = 305;
     const PANEL_RESET_ID: i32 = 306;
+    const PANEL_COMPARE_ID: i32 = 307;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
 
     thread_local! {
@@ -187,6 +188,8 @@ mod windows_app {
         note_owner: Option<HWND>,
         panel_window: Option<HWND>,
         panel_owner: Option<HWND>,
+        comparison_window: Option<HWND>,
+        comparison_owner: Option<HWND>,
     }
 
     impl Default for LabState {
@@ -206,6 +209,8 @@ mod windows_app {
                 note_owner: None,
                 panel_window: None,
                 panel_owner: None,
+                comparison_window: None,
+                comparison_owner: None,
             }
         }
     }
@@ -221,6 +226,10 @@ mod windows_app {
 
         fn active_spec(&self) -> CandidateVisualSpec {
             self.visual.active_spec()
+        }
+
+        fn comparison_spec(&self) -> CandidateVisualSpec {
+            self.visual.comparison_spec()
         }
 
         fn cycle_dpi(&mut self) {
@@ -291,6 +300,12 @@ mod windows_app {
         Scene,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LabPreviewRole {
+        Active,
+        Comparison,
+    }
+
     fn apply_visual_command(state: &mut LabState, command: LabVisualCommand) -> LabVisualChange {
         match command {
             LabVisualCommand::ToggleVariant => {
@@ -322,6 +337,23 @@ mod windows_app {
                     LabVisualChange::None
                 }
             }
+        }
+    }
+
+    fn preview_spec_for_role(state: &LabState, role: LabPreviewRole) -> CandidateVisualSpec {
+        match role {
+            LabPreviewRole::Active => state.active_spec(),
+            LabPreviewRole::Comparison => state.comparison_spec(),
+        }
+    }
+
+    fn preview_selection_for_role(
+        state: &LabState,
+        role: LabPreviewRole,
+    ) -> Option<CandidateSceneRect> {
+        match role {
+            LabPreviewRole::Active => state.selection,
+            LabPreviewRole::Comparison => None,
         }
     }
 
@@ -379,6 +411,19 @@ mod windows_app {
             };
             if RegisterClassW(&panel_class) == 0 {
                 return Err("无法注册候选窗参数面板".to_owned());
+            }
+            let comparison_class_name = w!("ZiranmaCandidateUiLabComparisonWindow");
+            let comparison_class = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                hInstance: instance,
+                lpszClassName: comparison_class_name,
+                lpfnWndProc: Some(comparison_window_proc),
+                hCursor: LoadCursorW(None, IDC_ARROW)
+                    .map_err(|_| "无法载入 A/B 对照窗口光标".to_owned())?,
+                ..Default::default()
+            };
+            if RegisterClassW(&comparison_class) == 0 {
+                return Err("无法注册候选窗 A/B 对照窗口".to_owned());
             }
             APP_STATE.with(|slot| slot.replace(Some(LabState::default())));
             let window = match CreateWindowExW(
@@ -448,6 +493,10 @@ mod windows_app {
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            WM_MOVE => {
+                layout_owned_windows(window);
+                LRESULT(0)
+            }
             WM_KEYDOWN => {
                 if wparam.0 == usize::from(VK_ESCAPE.0) {
                     let _ = unsafe { DestroyWindow(window) };
@@ -455,6 +504,10 @@ mod windows_app {
                 }
                 if u32::try_from(wparam.0).unwrap_or_default() == 0x4e {
                     open_note_window(window);
+                    return LRESULT(0);
+                }
+                if u32::try_from(wparam.0).unwrap_or_default() == 0x43 {
+                    open_comparison_window(window);
                     return LRESULT(0);
                 }
                 if u32::try_from(wparam.0).unwrap_or_default() == 0x45 {
@@ -567,7 +620,12 @@ mod windows_app {
                     state.note_owner = None;
                     state.pending_annotation = None;
                     state.panel_owner = None;
-                    Some([state.note_window.take(), state.panel_window.take()])
+                    state.comparison_owner = None;
+                    Some([
+                        state.note_window.take(),
+                        state.panel_window.take(),
+                        state.comparison_window.take(),
+                    ])
                 });
                 for owned_window in owned_windows.into_iter().flatten().flatten() {
                     if unsafe { IsWindow(Some(owned_window)) }.as_bool() {
@@ -580,6 +638,118 @@ mod windows_app {
             }
             _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
         }
+    }
+
+    fn open_comparison_window(owner: HWND) {
+        let existing = APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|state| state.comparison_window)
+        });
+        if existing.is_some_and(|window| unsafe { IsWindow(Some(window)) }.as_bool()) {
+            if let Some(window) = existing {
+                let _ = unsafe { SetForegroundWindow(window) };
+            }
+            return;
+        }
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.comparison_owner = Some(owner);
+            }
+        });
+        let window = unsafe {
+            let module = match GetModuleHandleW(None) {
+                Ok(module) => module,
+                Err(_) => {
+                    clear_comparison_window();
+                    return notify_error(owner, "无法读取 A/B 对照窗口模块");
+                }
+            };
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("ZiranmaCandidateUiLabComparisonWindow"),
+                w!("候选窗 A/B 对照"),
+                WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                640,
+                160,
+                Some(owner),
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        };
+        let window = match window {
+            Ok(window) => window,
+            Err(_) => {
+                clear_comparison_window();
+                return notify_error(owner, "无法创建候选窗 A/B 对照窗口");
+            }
+        };
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.comparison_window = Some(window);
+            }
+        });
+        refresh_comparison_window(window, true);
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOW);
+        }
+        layout_owned_windows(owner);
+        sync_open_panel();
+    }
+
+    unsafe extern "system" fn comparison_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CREATE => LRESULT(0),
+            WM_PAINT => {
+                unsafe { paint_comparison_window(window) };
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_CLOSE => {
+                let owner = APP_STATE.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .and_then(|state| state.comparison_owner)
+                });
+                let _ = unsafe { DestroyWindow(window) };
+                if let Some(owner) = owner {
+                    layout_owned_windows(owner);
+                }
+                sync_open_panel();
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(state) = slot.as_mut() else {
+                        return;
+                    };
+                    if state.comparison_window == Some(window) {
+                        state.comparison_window = None;
+                        state.comparison_owner = None;
+                    }
+                });
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    fn clear_comparison_window() {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.comparison_window = None;
+                state.comparison_owner = None;
+            }
+        });
     }
 
     fn open_visual_panel(owner: HWND) {
@@ -641,6 +811,7 @@ mod windows_app {
         unsafe {
             let _ = ShowWindow(window, SW_SHOW);
         }
+        layout_owned_windows(owner);
     }
 
     unsafe extern "system" fn panel_window_proc(
@@ -666,7 +837,12 @@ mod windows_app {
                 LRESULT(0)
             }
             WM_CLOSE => {
+                let owner = APP_STATE
+                    .with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_owner));
                 let _ = unsafe { DestroyWindow(window) };
+                if let Some(owner) = owner {
+                    layout_owned_windows(owner);
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -767,6 +943,18 @@ mod windows_app {
                 create_control(
                     window,
                     w!("BUTTON"),
+                    w!("打开并排 A/B"),
+                    188,
+                    136,
+                    128,
+                    34,
+                    PANEL_COMPARE_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
                     w!("恢复 B 草案"),
                     326,
                     136,
@@ -850,6 +1038,26 @@ mod windows_app {
         if notification != BN_CLICKED {
             return;
         }
+        if id == PANEL_COMPARE_ID {
+            let target = APP_STATE.with(|slot| {
+                let slot = slot.borrow();
+                let state = slot.as_ref()?;
+                (state.panel_window == Some(window)).then_some(())?;
+                Some((state.panel_owner?, state.comparison_window))
+            });
+            if let Some((owner, comparison)) = target {
+                if let Some(comparison) =
+                    comparison.filter(|comparison| unsafe { IsWindow(Some(*comparison)) }.as_bool())
+                {
+                    let _ = unsafe { DestroyWindow(comparison) };
+                    layout_owned_windows(owner);
+                    sync_visual_panel(window);
+                } else {
+                    open_comparison_window(owner);
+                }
+            }
+            return;
+        }
         let result = APP_STATE.with(|slot| {
             let mut slot = slot.borrow_mut();
             let state = slot.as_mut()?;
@@ -877,13 +1085,13 @@ mod windows_app {
         if !unsafe { IsWindow(Some(window)) }.as_bool() {
             return;
         }
-        let visual = APP_STATE.with(|slot| {
+        let snapshot = APP_STATE.with(|slot| {
             let slot = slot.borrow();
             let state = slot.as_ref()?;
             (state.panel_window == Some(window) || state.panel_window.is_none())
-                .then_some(state.visual)
+                .then_some((state.visual, state.comparison_window))
         });
-        let Some(visual) = visual else {
+        let Some((visual, comparison)) = snapshot else {
             return;
         };
         let token = visual.selected_token();
@@ -901,6 +1109,18 @@ mod windows_app {
             bounds.step(),
         );
         set_control_text(window, PANEL_DETAILS_ID, &details);
+        let comparison_open = comparison
+            .filter(|comparison| unsafe { IsWindow(Some(*comparison)) }.as_bool())
+            .is_some();
+        set_control_text(
+            window,
+            PANEL_COMPARE_ID,
+            if comparison_open {
+                "关闭并排 A/B"
+            } else {
+                "打开并排 A/B"
+            },
+        );
         if let Ok(combo) = unsafe { GetDlgItem(Some(window), PANEL_TOKEN_ID) } {
             let _ = unsafe {
                 SendMessageW(
@@ -920,6 +1140,77 @@ mod windows_app {
                 state.panel_owner = None;
             }
         });
+    }
+
+    fn sync_open_panel() {
+        let panel =
+            APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_window));
+        if let Some(panel) = panel.filter(|panel| unsafe { IsWindow(Some(*panel)) }.as_bool()) {
+            sync_visual_panel(panel);
+        }
+    }
+
+    fn layout_owned_windows(owner: HWND) {
+        if !unsafe { IsWindow(Some(owner)) }.as_bool() {
+            return;
+        }
+        let mut owner_rect = RECT::default();
+        if unsafe { GetWindowRect(owner, &mut owner_rect) }.is_err() {
+            return;
+        }
+        let (comparison, panel) = APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|state| (state.comparison_window, state.panel_window))
+                .unwrap_or((None, None))
+        });
+        let comparison =
+            comparison.filter(|comparison| unsafe { IsWindow(Some(*comparison)) }.as_bool());
+        let comparison_size = comparison.map(|comparison| {
+            let mut rectangle = RECT::default();
+            if unsafe { GetWindowRect(comparison, &mut rectangle) }.is_ok() {
+                (
+                    rectangle.right.saturating_sub(rectangle.left).max(0),
+                    rectangle.bottom.saturating_sub(rectangle.top).max(0),
+                )
+            } else {
+                (0, 0)
+            }
+        });
+        let (comparison_position, panel_position) =
+            owned_window_positions(owner_rect, comparison_size);
+        if let (Some(comparison), Some((x, y))) = (comparison, comparison_position) {
+            let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+            unsafe {
+                let _ = SetWindowPos(comparison, None, x, y, 0, 0, flags);
+            }
+        }
+        let panel = panel.filter(|panel| unsafe { IsWindow(Some(*panel)) }.as_bool());
+        if let Some(panel) = panel {
+            let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+            unsafe {
+                let _ = SetWindowPos(panel, None, panel_position.0, panel_position.1, 0, 0, flags);
+            }
+        }
+    }
+
+    fn owned_window_positions(
+        owner: RECT,
+        comparison_size: Option<(i32, i32)>,
+    ) -> (Option<(i32, i32)>, (i32, i32)) {
+        const GAP: i32 = 12;
+        match comparison_size {
+            Some((_, comparison_height)) => {
+                let comparison = (owner.right.saturating_add(GAP), owner.top);
+                let comparison_bottom = owner.top.saturating_add(comparison_height.max(0));
+                let panel = (
+                    owner.left,
+                    owner.bottom.max(comparison_bottom).saturating_add(GAP),
+                );
+                (Some(comparison), panel)
+            }
+            None => (None, (owner.right.saturating_add(GAP), owner.top)),
+        }
     }
 
     fn open_note_window(owner: HWND) {
@@ -1002,10 +1293,16 @@ mod windows_app {
         });
         unsafe {
             let _ = EnableWindow(owner, false);
-            let panel =
-                APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_window));
-            if let Some(panel) = panel.filter(|panel| IsWindow(Some(*panel)).as_bool()) {
-                let _ = EnableWindow(panel, false);
+            let companions = APP_STATE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|state| [state.panel_window, state.comparison_window])
+                    .unwrap_or([None, None])
+            });
+            for companion in companions.into_iter().flatten() {
+                if IsWindow(Some(companion)).as_bool() {
+                    let _ = EnableWindow(companion, false);
+                }
             }
             let _ = ShowWindow(window, SW_SHOW);
             let _ = SetForegroundWindow(window);
@@ -1059,12 +1356,16 @@ mod windows_app {
                 {
                     unsafe {
                         let _ = EnableWindow(owner, true);
-                        let panel = APP_STATE.with(|slot| {
-                            slot.borrow().as_ref().and_then(|state| state.panel_window)
+                        let companions = APP_STATE.with(|slot| {
+                            slot.borrow()
+                                .as_ref()
+                                .map(|state| [state.panel_window, state.comparison_window])
+                                .unwrap_or([None, None])
                         });
-                        if let Some(panel) = panel.filter(|panel| IsWindow(Some(*panel)).as_bool())
-                        {
-                            let _ = EnableWindow(panel, true);
+                        for companion in companions.into_iter().flatten() {
+                            if IsWindow(Some(companion)).as_bool() {
+                                let _ = EnableWindow(companion, true);
+                            }
                         }
                         let _ = SetForegroundWindow(owner);
                     }
@@ -1364,13 +1665,39 @@ mod windows_app {
         invalidate_window(window);
     }
 
+    fn refresh_comparison_window(window: HWND, resize: bool) {
+        let (metrics, title) = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot.as_ref().cloned().unwrap_or_default();
+            (
+                frame_metrics_for_spec(&state, state.comparison_spec()),
+                comparison_window_title(&state),
+            )
+        });
+        if resize {
+            resize_client(window, metrics.width, metrics.height);
+        }
+        set_window_text(window, &title);
+        invalidate_window(window);
+    }
+
     fn refresh_visual_views(window: HWND, resize: bool) {
         refresh_window(window, resize);
-        let panel =
-            APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_window));
+        let (comparison, panel) = APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|state| (state.comparison_window, state.panel_window))
+                .unwrap_or((None, None))
+        });
+        if let Some(comparison) =
+            comparison.filter(|comparison| unsafe { IsWindow(Some(*comparison)) }.as_bool())
+        {
+            refresh_comparison_window(comparison, resize);
+        }
         if let Some(panel) = panel.filter(|panel| unsafe { IsWindow(Some(*panel)) }.as_bool()) {
             sync_visual_panel(panel);
         }
+        layout_owned_windows(window);
     }
 
     fn set_control_text(window: HWND, id: i32, text: &str) {
@@ -1404,7 +1731,7 @@ mod windows_app {
             format!(" · 批注 {}（仅内存）", state.annotations.len())
         };
         format!(
-            "候选窗实验室 · {} · {} DPI · {} · {}{}{}    P 参数 / H D S 场景 / 圈选 N 批注 / E 导出 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {} · {}{}{}    P 参数 / C 并排 / H D S 场景 / 圈选 N 批注 / E 导出 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
@@ -1414,8 +1741,25 @@ mod windows_app {
         )
     }
 
+    fn comparison_window_title(state: &LabState) -> String {
+        let layout = match state.layout {
+            CandidateSceneLayout::Horizontal => "横排",
+            CandidateSceneLayout::Vertical => "竖排",
+        };
+        format!(
+            "只读对照 · {} · {} DPI · {} · {}",
+            layout,
+            state.dpi(),
+            state.scenario().label(),
+            state.visual.comparison_variant().label(),
+        )
+    }
+
     fn frame_metrics(state: &LabState) -> LabFrameMetrics {
-        let spec = state.active_spec();
+        frame_metrics_for_spec(state, state.active_spec())
+    }
+
+    fn frame_metrics_for_spec(state: &LabState, spec: CandidateVisualSpec) -> LabFrameMetrics {
         let dpi = state.dpi();
         let content = state.scenario().content();
         let scale = |logical| candidate_ui_scale(dpi, logical);
@@ -1538,6 +1882,14 @@ mod windows_app {
     }
 
     unsafe fn paint_window(window: HWND) {
+        unsafe { paint_preview_window(window, LabPreviewRole::Active) };
+    }
+
+    unsafe fn paint_comparison_window(window: HWND) {
+        unsafe { paint_preview_window(window, LabPreviewRole::Comparison) };
+    }
+
+    unsafe fn paint_preview_window(window: HWND, role: LabPreviewRole) {
         let mut paint = PAINTSTRUCT::default();
         let paint_dc = unsafe { BeginPaint(window, &mut paint) };
         if paint_dc.is_invalid() {
@@ -1571,7 +1923,7 @@ mod windows_app {
 
         let snapshot = APP_STATE.with(|slot| slot.borrow().as_ref().cloned().unwrap_or_default());
         let dpi = snapshot.dpi();
-        let spec = snapshot.active_spec();
+        let spec = preview_spec_for_role(&snapshot, role);
         let content = snapshot.scenario().content();
         let fonts = unsafe { create_fonts(dpi, spec) };
         let initial_font = [fonts.candidate, fonts.selected, fonts.metadata]
@@ -1589,7 +1941,7 @@ mod windows_app {
         let rank_metrics = unsafe { font_metrics(hdc, fonts.metadata) };
         let candidate_metrics = unsafe { font_metrics(hdc, fonts.candidate) };
         let selected_metrics = unsafe { font_metrics(hdc, fonts.selected) };
-        let metrics = frame_metrics(&snapshot);
+        let metrics = frame_metrics_for_spec(&snapshot, spec);
         let horizontal_widths = if snapshot.layout == CandidateSceneLayout::Horizontal {
             allocate_horizontal_candidate_widths(
                 spec,
@@ -1648,16 +2000,19 @@ mod windows_app {
                 fill_background(hdc, &client, spec.background);
             }
         }
-        if let Some(selection) = snapshot.selection {
+        let selection = preview_selection_for_role(&snapshot, role);
+        if let Some(selection) = selection {
             unsafe {
                 paint_selection_frame(hdc, selection, spec.selection_accent);
             }
         }
-        APP_STATE.with(|slot| {
-            if let Some(state) = slot.borrow_mut().as_mut() {
-                state.last_scene = scene;
-            }
-        });
+        if role == LabPreviewRole::Active {
+            APP_STATE.with(|slot| {
+                if let Some(state) = slot.borrow_mut().as_mut() {
+                    state.last_scene = scene;
+                }
+            });
+        }
 
         if !previous_font.is_invalid() {
             unsafe {
@@ -1813,12 +2168,12 @@ mod windows_app {
         use super::*;
         use crate::candidate_ui_lab_visual::CandidateUiLabVariant;
 
-        fn assert_current_scene_builds(state: &LabState) {
+        fn assert_scene_builds(state: &LabState, spec: CandidateVisualSpec) {
             let content = state.scenario().content();
-            let metrics = frame_metrics(state);
+            let metrics = frame_metrics_for_spec(state, spec);
             let widths = if state.layout == CandidateSceneLayout::Horizontal {
                 allocate_horizontal_candidate_widths(
-                    state.active_spec(),
+                    spec,
                     state.dpi(),
                     metrics.width,
                     metrics.footer_width,
@@ -1830,7 +2185,7 @@ mod windows_app {
                 Vec::new()
             };
             let scene = build_candidate_scene(
-                state.active_spec(),
+                spec,
                 CandidateSceneRequest {
                     layout: state.layout,
                     dpi: state.dpi(),
@@ -1859,7 +2214,7 @@ mod windows_app {
                     state.layout,
                     metrics,
                     widths,
-                    state.active_spec(),
+                    spec,
                 )
             });
             assert_eq!(scene.items.len(), content.candidates.len());
@@ -1881,7 +2236,7 @@ mod windows_app {
                             scenario_index,
                             ..LabState::default()
                         };
-                        assert_current_scene_builds(&state);
+                        assert_scene_builds(&state, state.active_spec());
                     }
                 }
             }
@@ -1907,7 +2262,8 @@ mod windows_app {
                                     visual,
                                     ..LabState::default()
                                 };
-                                assert_current_scene_builds(&state);
+                                assert_scene_builds(&state, state.active_spec());
+                                assert_scene_builds(&state, state.comparison_spec());
                             }
                         }
                     }
@@ -1987,6 +2343,73 @@ mod windows_app {
             assert_eq!(
                 apply_visual_command(&mut state, LabVisualCommand::ResetDraft),
                 LabVisualChange::None
+            );
+        }
+
+        #[test]
+        fn comparison_preview_is_always_the_opposite_read_only_variant() {
+            let selection = CandidateSceneRect {
+                left: 2,
+                top: 3,
+                right: 8,
+                bottom: 9,
+            };
+            let mut state = LabState {
+                selection: Some(selection),
+                ..LabState::default()
+            };
+            let baseline = state.active_spec();
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::AdjustDraft(1)),
+                LabVisualChange::Scene
+            );
+            state.selection = Some(selection);
+            let draft = state.active_spec();
+            assert_ne!(draft, baseline);
+            assert_eq!(preview_spec_for_role(&state, LabPreviewRole::Active), draft);
+            assert_eq!(
+                preview_spec_for_role(&state, LabPreviewRole::Comparison),
+                baseline
+            );
+            assert_eq!(
+                preview_selection_for_role(&state, LabPreviewRole::Active),
+                Some(selection)
+            );
+            assert_eq!(
+                preview_selection_for_role(&state, LabPreviewRole::Comparison),
+                None
+            );
+
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::ToggleVariant),
+                LabVisualChange::Scene
+            );
+            assert_eq!(
+                preview_spec_for_role(&state, LabPreviewRole::Active),
+                baseline
+            );
+            assert_eq!(
+                preview_spec_for_role(&state, LabPreviewRole::Comparison),
+                draft
+            );
+        }
+
+        #[test]
+        fn owned_window_layout_keeps_comparison_beside_preview_and_panel_below() {
+            let owner = RECT {
+                left: 100,
+                top: 200,
+                right: 500,
+                bottom: 260,
+            };
+            assert_eq!(owned_window_positions(owner, None), (None, (512, 200)));
+            assert_eq!(
+                owned_window_positions(owner, Some((320, 100))),
+                (Some((512, 200)), (100, 312))
+            );
+            assert_eq!(
+                owned_window_positions(owner, Some((320, 20))),
+                (Some((512, 200)), (100, 272))
             );
         }
 

@@ -15,6 +15,13 @@ impl CandidateUiLabVariant {
             Self::Draft => "B 草案",
         }
     }
+
+    pub(crate) const fn other(self) -> Self {
+        match self {
+            Self::Baseline => Self::Draft,
+            Self::Draft => Self::Baseline,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,10 +197,22 @@ impl CandidateUiLabVisualState {
     }
 
     pub(crate) const fn active_spec(self) -> CandidateVisualSpec {
-        match self.active {
+        self.spec(self.active)
+    }
+
+    pub(crate) const fn spec(self, variant: CandidateUiLabVariant) -> CandidateVisualSpec {
+        match variant {
             CandidateUiLabVariant::Baseline => self.baseline,
             CandidateUiLabVariant::Draft => self.draft,
         }
+    }
+
+    pub(crate) const fn comparison_variant(self) -> CandidateUiLabVariant {
+        self.active.other()
+    }
+
+    pub(crate) const fn comparison_spec(self) -> CandidateVisualSpec {
+        self.spec(self.comparison_variant())
     }
 
     pub(crate) fn selected_token(self) -> CandidateUiLabToken {
@@ -287,11 +306,16 @@ mod tests {
         let mut state = CandidateUiLabVisualState::default();
         let baseline = state.active_spec();
         assert_eq!(state.active_variant(), CandidateUiLabVariant::Draft);
+        assert_eq!(state.comparison_variant(), CandidateUiLabVariant::Baseline);
+        assert_eq!(state.comparison_spec(), baseline);
         assert!(state.adjust_draft(1));
         assert_ne!(state.active_spec(), baseline);
+        assert_eq!(state.comparison_spec(), baseline);
         assert!(state.toggle_variant());
         assert_eq!(state.active_variant(), CandidateUiLabVariant::Baseline);
         assert_eq!(state.active_spec(), baseline);
+        assert_eq!(state.comparison_variant(), CandidateUiLabVariant::Draft);
+        assert_ne!(state.comparison_spec(), baseline);
         assert!(state.reset_draft());
         assert_eq!(state.active_variant(), CandidateUiLabVariant::Draft);
         assert_eq!(state.active_spec(), baseline);
