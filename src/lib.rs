@@ -72,12 +72,13 @@ mod wish_feedback;
 #[cfg(windows)]
 pub use tsf_alpha::{
     CandidatePopupRenderPreflightError, CandidatePopupRenderPreflightReport,
-    CandidatePopupRenderSample, CandidatePopupRenderScenario, TSF_ALPHA_CANDIDATE_PAGE_SIZE,
-    TSF_ALPHA_CLSID, TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID, TsfCandidatePreflightError,
+    CandidatePopupRenderSample, CandidatePopupRenderScenario, ExactPhrasePopupRenderPreflightError,
+    ExactPhrasePopupRenderPreflightReport, TSF_ALPHA_CANDIDATE_PAGE_SIZE, TSF_ALPHA_CLSID,
+    TSF_ALPHA_LANGID, TSF_ALPHA_PROFILE_GUID, TsfCandidatePreflightError,
     TsfCandidatePreflightReport, TsfExactPhrasePreflightReport, TsfExactShortPreflightReport,
     preflight_candidate_popup_rendering, preflight_candidate_snapshot,
-    preflight_exact_phrase_candidate_layers, preflight_exact_short_candidate_layer,
-    preflight_exact_short_candidate_layers,
+    preflight_exact_phrase_candidate_layers, preflight_exact_phrase_candidate_popup_rendering,
+    preflight_exact_short_candidate_layer, preflight_exact_short_candidate_layers,
 };
 
 pub use abbreviation::{

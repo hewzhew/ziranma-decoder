@@ -2957,6 +2957,48 @@ impl CandidatePopupRenderPreflightReport {
     }
 }
 
+/// Text-free evidence from painting one authenticated exact-phrase first page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactPhrasePopupRenderPreflightReport {
+    core_revision: String,
+    supplemental_revision: String,
+    phrase_revision: String,
+    input_keys: usize,
+    committed_characters: usize,
+    target_rank: usize,
+    rendering: CandidatePopupRenderPreflightReport,
+}
+
+impl ExactPhrasePopupRenderPreflightReport {
+    pub fn core_revision(&self) -> &str {
+        &self.core_revision
+    }
+
+    pub fn supplemental_revision(&self) -> &str {
+        &self.supplemental_revision
+    }
+
+    pub fn phrase_revision(&self) -> &str {
+        &self.phrase_revision
+    }
+
+    pub fn input_keys(&self) -> usize {
+        self.input_keys
+    }
+
+    pub fn committed_characters(&self) -> usize {
+        self.committed_characters
+    }
+
+    pub fn target_rank(&self) -> usize {
+        self.target_rank
+    }
+
+    pub fn rendering(&self) -> &CandidatePopupRenderPreflightReport {
+        &self.rendering
+    }
+}
+
 /// Sanitized failures from the isolated candidate-popup rendering preflight.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidatePopupRenderPreflightError {
@@ -3040,6 +3082,43 @@ impl fmt::Display for TsfCandidatePreflightError {
 }
 
 impl StdError for TsfCandidatePreflightError {}
+
+/// Sanitized failures from the authenticated exact-phrase popup preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactPhrasePopupRenderPreflightError {
+    Candidate(TsfCandidatePreflightError),
+    Rendering(CandidatePopupRenderPreflightError),
+}
+
+impl fmt::Display for ExactPhrasePopupRenderPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Candidate(error) => error.fmt(formatter),
+            Self::Rendering(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl StdError for ExactPhrasePopupRenderPreflightError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Candidate(error) => Some(error),
+            Self::Rendering(error) => Some(error),
+        }
+    }
+}
+
+impl From<TsfCandidatePreflightError> for ExactPhrasePopupRenderPreflightError {
+    fn from(error: TsfCandidatePreflightError) -> Self {
+        Self::Candidate(error)
+    }
+}
+
+impl From<CandidatePopupRenderPreflightError> for ExactPhrasePopupRenderPreflightError {
+    fn from(error: CandidatePopupRenderPreflightError) -> Self {
+        Self::Rendering(error)
+    }
+}
 
 /// Routes one snapshot candidate through a real system TSF synthetic context.
 ///
@@ -3224,21 +3303,24 @@ pub fn preflight_exact_short_candidate_layers(
     })
 }
 
-/// Routes a core, supplemental, and exact three-character phrase stack
-/// through the real system TSF Context path.
-///
-/// The phrase must occupy the position immediately after all existing exact
-/// words while remaining on the first six-item page. Rank one is committed by
-/// Space; later guarded ranks are committed by their ordinary number key.
-/// No runtime root, receipt, window, or current-user state is opened.
-pub fn preflight_exact_phrase_candidate_layers(
+struct PreparedExactPhrasePreflight {
+    core_revision: String,
+    supplemental_revision: String,
+    phrase_revision: String,
+    committed_characters: usize,
+    target_index: usize,
+    phrase_blueprint: CandidateProviderBlueprint,
+    preview: CandidateBatch,
+}
+
+fn prepare_exact_phrase_preflight(
     core: Arc<CandidateSnapshot>,
     supplemental: Arc<CandidateSnapshot>,
     supplemental_config: SupplementalCandidateLayerConfig,
     phrase: Arc<CandidateSnapshot>,
     probe_code: &str,
     expected_text: &str,
-) -> std::result::Result<TsfExactPhrasePreflightReport, TsfCandidatePreflightError> {
+) -> std::result::Result<PreparedExactPhrasePreflight, TsfCandidatePreflightError> {
     let committed_characters = validate_candidate_preflight_request(probe_code, expected_text)?;
     if probe_code.len() != 6
         || committed_characters != 3
@@ -3331,6 +3413,41 @@ pub fn preflight_exact_phrase_candidate_layers(
     drop(baseline_provider);
     drop(phrase_provider);
 
+    Ok(PreparedExactPhrasePreflight {
+        core_revision,
+        supplemental_revision,
+        phrase_revision,
+        committed_characters,
+        target_index,
+        phrase_blueprint,
+        preview,
+    })
+}
+
+/// Routes a core, supplemental, and exact three-character phrase stack
+/// through the real system TSF Context path.
+///
+/// The phrase must occupy the position immediately after all existing exact
+/// words while remaining on the first six-item page. Rank one is committed by
+/// Space; later guarded ranks are committed by their ordinary number key.
+/// No runtime root, receipt, window, or current-user state is opened.
+pub fn preflight_exact_phrase_candidate_layers(
+    core: Arc<CandidateSnapshot>,
+    supplemental: Arc<CandidateSnapshot>,
+    supplemental_config: SupplementalCandidateLayerConfig,
+    phrase: Arc<CandidateSnapshot>,
+    probe_code: &str,
+    expected_text: &str,
+) -> std::result::Result<TsfExactPhrasePreflightReport, TsfCandidatePreflightError> {
+    let prepared = prepare_exact_phrase_preflight(
+        core,
+        supplemental,
+        supplemental_config,
+        phrase,
+        probe_code,
+        expected_text,
+    )?;
+
     let _host_guard = SYNTHETIC_HOST_LOCK
         .lock()
         .map_err(|_| TsfCandidatePreflightError::HostBusy)?;
@@ -3338,22 +3455,22 @@ pub fn preflight_exact_phrase_candidate_layers(
         return Err(TsfCandidatePreflightError::HostBusy);
     }
     let result = run_candidate_preflight_with_selection(
-        phrase_blueprint,
+        prepared.phrase_blueprint,
         probe_code,
         expected_text,
-        PreflightSelection::FirstPageAt(target_index),
+        PreflightSelection::FirstPageAt(prepared.target_index),
     );
     if !can_unload_now() {
         return Err(TsfCandidatePreflightError::Cleanup);
     }
     let timings = result?;
     Ok(TsfExactPhrasePreflightReport {
-        core_revision,
-        supplemental_revision,
-        phrase_revision,
+        core_revision: prepared.core_revision,
+        supplemental_revision: prepared.supplemental_revision,
+        phrase_revision: prepared.phrase_revision,
         input_keys: probe_code.len(),
-        committed_characters,
-        target_rank: target_index + 1,
+        committed_characters: prepared.committed_characters,
+        target_rank: prepared.target_index + 1,
         first_page: timings.first_page,
         commit: timings.commit,
     })
@@ -5619,18 +5736,31 @@ pub fn preflight_candidate_popup_rendering(
         return Err(CandidatePopupRenderPreflightError::InvalidRepetitions);
     }
 
+    let displays = CandidatePopupRenderScenario::ALL
+        .map(|scenario| (scenario, candidate_popup_render_preflight_display(scenario)));
+    preflight_candidate_popup_displays(&displays, repetitions)
+}
+
+fn preflight_candidate_popup_displays(
+    displays: &[(CandidatePopupRenderScenario, CandidateDisplay)],
+    repetitions: usize,
+) -> std::result::Result<CandidatePopupRenderPreflightReport, CandidatePopupRenderPreflightError> {
+    if displays.is_empty()
+        || !(1..=MAX_CANDIDATE_POPUP_RENDER_PREFLIGHT_REPETITIONS).contains(&repetitions)
+    {
+        return Err(CandidatePopupRenderPreflightError::InvalidRepetitions);
+    }
+
     let anchor = RECT {
         left: 24,
         top: 24,
         right: 120,
         bottom: 56,
     };
-    let displays = CandidatePopupRenderScenario::ALL
-        .map(|scenario| (scenario, candidate_popup_render_preflight_display(scenario)));
     let mut samples = Vec::with_capacity(
         repetitions
             .saturating_mul(CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS.len())
-            .saturating_mul(CandidatePopupRenderScenario::ALL.len()),
+            .saturating_mul(displays.len()),
     );
     let mut hide_durations =
         Vec::with_capacity(repetitions.saturating_mul(CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS.len()));
@@ -5639,7 +5769,7 @@ pub fn preflight_candidate_popup_rendering(
     for _ in 0..repetitions {
         for requested_dpi in CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS {
             let mut popup = CandidatePopup::default();
-            for (scenario, display) in &displays {
+            for (scenario, display) in displays {
                 let mut completed = popup.render_preflight(
                     anchor,
                     display,
@@ -5686,6 +5816,50 @@ pub fn preflight_candidate_popup_rendering(
         samples,
         hide_durations,
         destroy_durations,
+    })
+}
+
+/// Paints the authenticated first page for one exact three-character phrase.
+///
+/// The same guarded provider preparation used by the real TSF Context
+/// preflight supplies the page and `PublicConsensusExact` marker. The popup is
+/// still process-local and ownerless; this does not represent an installed
+/// editor host. Candidate text is retained only for the duration of drawing
+/// and is absent from the returned report and its debug representation.
+pub fn preflight_exact_phrase_candidate_popup_rendering(
+    core: Arc<CandidateSnapshot>,
+    supplemental: Arc<CandidateSnapshot>,
+    supplemental_config: SupplementalCandidateLayerConfig,
+    phrase: Arc<CandidateSnapshot>,
+    probe_code: &str,
+    expected_text: &str,
+    repetitions: usize,
+) -> std::result::Result<ExactPhrasePopupRenderPreflightReport, ExactPhrasePopupRenderPreflightError>
+{
+    if !(1..=MAX_CANDIDATE_POPUP_RENDER_PREFLIGHT_REPETITIONS).contains(&repetitions) {
+        return Err(CandidatePopupRenderPreflightError::InvalidRepetitions.into());
+    }
+    let prepared = prepare_exact_phrase_preflight(
+        core,
+        supplemental,
+        supplemental_config,
+        phrase,
+        probe_code,
+        expected_text,
+    )?;
+    let display = CandidateDisplay::from_batch(prepared.preview, 0);
+    let rendering = preflight_candidate_popup_displays(
+        &[(CandidatePopupRenderScenario::InitialShow, display)],
+        repetitions,
+    )?;
+    Ok(ExactPhrasePopupRenderPreflightReport {
+        core_revision: prepared.core_revision,
+        supplemental_revision: prepared.supplemental_revision,
+        phrase_revision: prepared.phrase_revision,
+        input_keys: probe_code.len(),
+        committed_characters: prepared.committed_characters,
+        target_rank: prepared.target_index + 1,
+        rendering,
     })
 }
 
@@ -16824,6 +16998,69 @@ mod tests {
             .unwrap_err(),
             TsfCandidatePreflightError::ExactPhrasePageMismatch
         );
+    }
+
+    #[test]
+    fn exact_phrase_popup_preparation_reuses_the_guarded_page_and_source_marker() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+载进来\tzai jin lai\t300\n\
+再\tzai\t200\n\
+进来\tjin lai\t190\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n其他词\tqi ta ci\t100\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t80\n";
+        let snapshot = |revision: &str, payload: &str| {
+            Arc::new(
+                CandidatePackageManifest::from_payload(revision, false, payload)
+                    .unwrap()
+                    .load_snapshot(payload)
+                    .unwrap(),
+            )
+        };
+        let prepared = prepare_exact_phrase_preflight(
+            snapshot("popup-phrase-core-v1", CORE),
+            snapshot("popup-phrase-supplemental-v1", SUPPLEMENTAL),
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+            snapshot("popup-phrase-layer-v1", PHRASE),
+            "zljnll",
+            "再进来",
+        )
+        .unwrap();
+        assert_eq!(prepared.target_index, 1);
+        assert_eq!(prepared.preview.candidates[1], "再进来");
+        assert_eq!(
+            prepared.preview.provenance[1].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        let display = CandidateDisplay::from_batch(prepared.preview, 0);
+        assert!(display.visible().len() > 1);
+        assert!(display.visible().len() <= CANDIDATE_PAGE_SIZE);
+        assert_eq!(
+            display.visible_provenance()[1].source(),
+            NativeCandidateSource::PublicConsensusExact
+        );
+        assert!(candidate_popup_metrics(&display, 96, 1_920).width > 0);
+
+        let error = preflight_exact_phrase_candidate_popup_rendering(
+            snapshot("popup-invalid-core-v1", CORE),
+            snapshot("popup-invalid-supplemental-v1", SUPPLEMENTAL),
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+            snapshot("popup-invalid-layer-v1", PHRASE),
+            "zljnll",
+            "再进来",
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ExactPhrasePopupRenderPreflightError::Rendering(
+                CandidatePopupRenderPreflightError::InvalidRepetitions
+            )
+        );
+        assert!(!format!("{error:?}").contains("再进来"));
     }
 
     #[test]

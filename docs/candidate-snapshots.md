@@ -525,6 +525,28 @@ target\release\candidatectl.exe exact-phrase-tsf-preflight `
 桌面合成、屏幕首帧或实际应用呈现。命令不写槽位、状态或
 `exact-phrase-preflight.zep`，通过仍不构成 prepare、enable、安装或换代许可。
 
+下一条 `exact-phrase-popup-preflight` 已把可见候选窗验收入口准备好，但默认绝不运行。
+它先复用上面的真实 Context 稳定探针，再以同一核心、补充和三字快照重建该探针的
+第一页；目标必须继续携带 `PublicConsensusExact` 来源。页面随后经过生产
+`CandidatePopup` 的创建、布局、`WM_PAINT`、双缓冲、`BitBlt`、`EndPaint`、
+`DwmFlush`、隐藏和销毁路径，并固定覆盖 96/120/144/192 DPI。为了不制造大量闪窗，
+参数收紧为最多 4 个页面、每页最多 5 次，即最多 80 个短暂窗口；帮助文本和最终报告
+都会明确说明它是可见操作：
+
+```powershell
+target\release\candidatectl.exe exact-phrase-popup-preflight `
+  --core-package .local\candidate-rime-pinyin-simp-0c6861ef-v1 `
+  --supplemental-package .local\public-audit\wanxiang-fdda7afb\package-top100k-v1 `
+  --phrase-package .local\public-audit\wanxiang-fdda7afb\package-exact-phrase-train-span-v1 `
+  --sample-limit 1 --repetitions 1
+```
+
+当前阶段完成了共享页面、来源标记、参数上限、release guard 和窗口阶段完整性实现；
+报告类型本身不持有探针码或候选正文，自动测试覆盖共享页面、来源和失败关闭。猫猫
+没有在宝宝桌面上擅自运行上述命令，因此这里不虚构任何三字实包绘制耗时。即使未来
+显式运行通过，它仍只是“真实 TSF Context 提交”与“同页生产 popup 绘制”两条串行
+组件路径，不是已安装编辑器里的一次真实回调；`DwmFlush` 也不等于屏幕已经扫描显示。
+
 三包专项门之后新增了一个仍不可启用的运行时骨架。独立根内预留严格三行
 `exact-phrase.zcl`，并继续复用不可变 `slots.zcs`、`packages` 与普通包 `.zpf`；
 `load_candidate_runtime_snapshots_with_all_layers` 只在调用方显式给出该根时读取。启用
