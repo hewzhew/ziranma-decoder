@@ -63,15 +63,15 @@ mod windows_app {
     use windows::core::{PCWSTR, w};
     use ziranma_core::{
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
-        NativeAutomaticTranspositionTier, NativeCandidateSuppressionAction, NativeFeedbackEvent,
-        NativePersonalPhraseAdjacency, WindowsUserDataProtector, WishCaptureScope, WishCategory,
-        WishEventRole, WishFeedbackError, WishImportance, WishNote, WishNoteFileVersion,
-        WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot,
-        list_trashed_wish_packages, list_wish_packages, load_trashed_wish_note,
-        load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot, move_wish_to_trash,
-        native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
-        restore_wish_from_trash, save_or_replace_wish_note, trashed_wish_note_file_version,
-        wish_note_file_version,
+        NativeAutomaticTranspositionTier, NativeCandidateSuppressionAction, NativeCandidateView,
+        NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeShortExactAbstention,
+        WindowsUserDataProtector, WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError,
+        WishImportance, WishNote, WishNoteFileVersion, WishPackageInfo,
+        WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot, list_trashed_wish_packages,
+        list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
+        load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms,
+        repository_root_for_user_tool_executable, restore_wish_from_trash,
+        save_or_replace_wish_note, trashed_wish_note_file_version, wish_note_file_version,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -2655,7 +2655,10 @@ mod windows_app {
             ),
             NativeFeedbackEvent::CandidatesPresentedWithProvenance {
                 code,
+                view,
+                page_start,
                 candidates,
+                provenance,
                 automatic_transposition,
                 ..
             } => {
@@ -2671,6 +2674,16 @@ mod windows_app {
                 if let Some(decision) = automatic_transposition {
                     summary.push_str("　·　");
                     summary.push_str(&automatic_transposition_summary(decision));
+                }
+                if code.len() == 2
+                    && *view == NativeCandidateView::Ordinary
+                    && *page_start == 0
+                    && let Some(label) = provenance.first().and_then(|candidate| {
+                        short_exact_abstention_summary(candidate.short_exact_abstention())
+                    })
+                {
+                    summary.push_str("　·　");
+                    summary.push_str(label);
                 }
                 summary
             }
@@ -2769,6 +2782,21 @@ mod windows_app {
                 visible_rank,
                 inter_key_gaps_ms,
             ),
+        }
+    }
+
+    fn short_exact_abstention_summary(
+        decision: NativeShortExactAbstention,
+    ) -> Option<&'static str> {
+        match decision {
+            NativeShortExactAbstention::Unrecorded => None,
+            NativeShortExactAbstention::None => Some("两键个性化：未触发窄门"),
+            NativeShortExactAbstention::PersistentCompetition => {
+                Some("两键个性化：持久同码竞争，保留公开顺序")
+            }
+            NativeShortExactAbstention::SessionCompetition => {
+                Some("两键个性化：会话同码竞争，保留公开顺序")
+            }
         }
     }
 
@@ -4027,6 +4055,8 @@ mod windows_app {
 
         #[test]
         fn event_preview_uses_plain_user_facing_language() {
+            use ziranma_core::NativeCandidateProvenance;
+
             assert_eq!(
                 event_summary(&NativeFeedbackEvent::RawCodeCommitted {
                     code: "abc".to_owned(),
@@ -4049,6 +4079,32 @@ mod windows_app {
                     action: NativeCandidateSuppressionAction::Suppress,
                 }),
                 "个人候选　ab → 甲（已忘记）"
+            );
+            assert_eq!(
+                event_summary(&NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    code: "ab".to_owned(),
+                    view: NativeCandidateView::Ordinary,
+                    page_start: 0,
+                    candidates: vec!["甲".to_owned()],
+                    provenance: vec![NativeCandidateProvenance::default()],
+                    automatic_transposition: None,
+                    loaded_candidates: 1,
+                    tab_assembly: None,
+                    may_have_more: false,
+                }),
+                "候选　ab → 甲　·　两键个性化：未触发窄门"
+            );
+            assert_eq!(
+                short_exact_abstention_summary(NativeShortExactAbstention::PersistentCompetition),
+                Some("两键个性化：持久同码竞争，保留公开顺序")
+            );
+            assert_eq!(
+                short_exact_abstention_summary(NativeShortExactAbstention::SessionCompetition),
+                Some("两键个性化：会话同码竞争，保留公开顺序")
+            );
+            assert_eq!(
+                short_exact_abstention_summary(NativeShortExactAbstention::Unrecorded),
+                None
             );
             assert_eq!(
                 capture_scope_label(WishCaptureScope::RecentEpisodes),
