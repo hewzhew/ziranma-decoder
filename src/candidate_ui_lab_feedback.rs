@@ -3,6 +3,9 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 use crate::candidate_ui::{
     CandidateRgb, CandidateSceneLayout, CandidateSceneRect, CandidateSceneSemantic,
@@ -15,7 +18,7 @@ use crate::candidate_ui_lab_annotation::{
 };
 use crate::candidate_ui_lab_visual::reviewed_candidate_ui_lab_spec;
 
-const MAX_FEEDBACK_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CANDIDATE_UI_LAB_FEEDBACK_BYTES: usize = 1024 * 1024;
 const MAX_FEEDBACK_GROUPS: usize = MAX_CANDIDATE_UI_LAB_ANNOTATIONS;
 const MAX_FEEDBACK_HITS: usize = 64;
 const MAX_FEEDBACK_COORDINATE: i32 = 16_384;
@@ -32,6 +35,7 @@ pub(crate) enum CandidateUiLabFeedbackError {
     CountMismatch,
     GroupMismatch,
     TrailingData,
+    ReadFile,
 }
 
 impl std::fmt::Display for CandidateUiLabFeedbackError {
@@ -47,6 +51,7 @@ impl std::fmt::Display for CandidateUiLabFeedbackError {
             Self::CountMismatch => "候选窗实验反馈的条目计数不一致",
             Self::GroupMismatch => "候选窗实验反馈的规格分组不一致",
             Self::TrailingData => "候选窗实验反馈末尾包含额外数据",
+            Self::ReadFile => "无法读取所选候选窗实验反馈文件",
         })
     }
 }
@@ -85,6 +90,80 @@ pub(crate) struct CandidateUiLabFeedbackHit {
     pub(crate) bounds: CandidateSceneRect,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateUiLabFeedbackReviewError {
+    EmptyBatch,
+}
+
+impl std::fmt::Display for CandidateUiLabFeedbackReviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyBatch => "所选候选窗实验反馈没有可浏览的批注",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateUiLabFeedbackReview {
+    batch: CandidateUiLabFeedbackBatch,
+    selected_index: usize,
+}
+
+impl CandidateUiLabFeedbackReview {
+    pub(crate) fn new(
+        batch: CandidateUiLabFeedbackBatch,
+    ) -> Result<Self, CandidateUiLabFeedbackReviewError> {
+        if batch.annotations.is_empty() {
+            return Err(CandidateUiLabFeedbackReviewError::EmptyBatch);
+        }
+        Ok(Self {
+            batch,
+            selected_index: 0,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.batch.annotations.len()
+    }
+
+    pub(crate) const fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    pub(crate) fn selected_annotation(&self) -> &CandidateUiLabFeedbackAnnotation {
+        &self.batch.annotations[self.selected_index]
+    }
+
+    pub(crate) fn selected_group(&self) -> Option<&CandidateUiLabFeedbackSpecGroup> {
+        let annotation = self.selected_annotation();
+        self.batch.groups.iter().find(|group| {
+            group.variant_id == annotation.variant_id
+                && group.visual_spec_sha256 == annotation.visual_spec_sha256
+                && group.visual_spec == annotation.visual_spec
+        })
+    }
+
+    pub(crate) fn select(&mut self, index: usize) -> bool {
+        if index >= self.len() || index == self.selected_index {
+            return false;
+        }
+        self.selected_index = index;
+        true
+    }
+
+    pub(crate) fn select_previous(&mut self) -> bool {
+        self.selected_index
+            .checked_sub(1)
+            .is_some_and(|index| self.select(index))
+    }
+
+    pub(crate) fn select_next(&mut self) -> bool {
+        self.selected_index
+            .checked_add(1)
+            .is_some_and(|index| self.select(index))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedSpecGroup {
     value: CandidateUiLabFeedbackSpecGroup,
@@ -100,7 +179,7 @@ struct ParsedAnnotation {
 pub(crate) fn parse_candidate_ui_lab_feedback(
     input: &[u8],
 ) -> Result<CandidateUiLabFeedbackBatch, CandidateUiLabFeedbackError> {
-    if input.len() > MAX_FEEDBACK_BYTES {
+    if input.len() > MAX_CANDIDATE_UI_LAB_FEEDBACK_BYTES {
         return Err(CandidateUiLabFeedbackError::TooLarge);
     }
     let input = std::str::from_utf8(input).map_err(|_| CandidateUiLabFeedbackError::InvalidUtf8)?;
@@ -137,6 +216,20 @@ pub(crate) fn parse_candidate_ui_lab_feedback(
             .map(|annotation| annotation.value)
             .collect(),
     })
+}
+
+pub(crate) fn read_candidate_ui_lab_feedback_file(
+    path: &Path,
+) -> Result<CandidateUiLabFeedbackBatch, CandidateUiLabFeedbackError> {
+    let file = File::open(path).map_err(|_| CandidateUiLabFeedbackError::ReadFile)?;
+    let read_limit = u64::try_from(MAX_CANDIDATE_UI_LAB_FEEDBACK_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut input = Vec::with_capacity(MAX_CANDIDATE_UI_LAB_FEEDBACK_BYTES.min(64 * 1024));
+    file.take(read_limit)
+        .read_to_end(&mut input)
+        .map_err(|_| CandidateUiLabFeedbackError::ReadFile)?;
+    parse_candidate_ui_lab_feedback(&input)
 }
 
 fn parse_spec_groups(
@@ -692,6 +785,10 @@ fn hex_value(byte: u8) -> Result<u8, CandidateUiLabFeedbackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use crate::candidate_ui::{
         CandidateScene, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC, build_candidate_scene,
     };
@@ -699,6 +796,29 @@ mod tests {
         CandidateUiLabAnnotationContext, CandidateUiLabAnnotationSession,
         capture_candidate_ui_lab_annotation_context,
     };
+
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ziranma-candidate-ui-feedback-reader-test-{}-{sequence}",
+                std::process::id()
+            ));
+            assert!(!path.exists());
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct FeedbackFixture {
         json: String,
@@ -853,6 +973,63 @@ mod tests {
     }
 
     #[test]
+    fn explicit_file_reader_is_bounded_and_never_scans_for_an_input() {
+        let directory = TestDirectory::new();
+        let selected = directory.0.join("selected.json");
+        let ignored = directory.0.join("ignored.json");
+        let fixture = feedback_fixture();
+        fs::write(&selected, &fixture.json).unwrap();
+        fs::write(&ignored, b"not feedback").unwrap();
+        let parsed = read_candidate_ui_lab_feedback_file(&selected).unwrap();
+        assert_eq!(parsed.annotations.len(), 2);
+
+        fs::write(
+            &selected,
+            vec![b' '; MAX_CANDIDATE_UI_LAB_FEEDBACK_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            read_candidate_ui_lab_feedback_file(&selected),
+            Err(CandidateUiLabFeedbackError::TooLarge)
+        );
+
+        let missing = directory.0.join("private-path-marker.json");
+        let error = read_candidate_ui_lab_feedback_file(&missing).unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        assert_eq!(error, CandidateUiLabFeedbackError::ReadFile);
+        assert!(!rendered.contains("private-path-marker"));
+    }
+
+    #[test]
+    fn review_navigation_is_bounded_and_resolves_the_exact_spec_group() {
+        let fixture = feedback_fixture();
+        let batch = parse_candidate_ui_lab_feedback(fixture.json.as_bytes()).unwrap();
+        let mut review = CandidateUiLabFeedbackReview::new(batch).unwrap();
+        assert_eq!(review.len(), 2);
+        assert_eq!(review.selected_index(), 0);
+        assert_eq!(review.selected_annotation().variant_id, "baseline");
+        assert_eq!(review.selected_group().unwrap().annotation_count, 1);
+        assert!(!review.select_previous());
+        assert!(review.select_next());
+        assert_eq!(review.selected_index(), 1);
+        assert_eq!(review.selected_annotation().visual_spec, fixture.draft_spec);
+        assert_eq!(review.selected_group().unwrap().variant_id, "draft");
+        assert!(!review.select_next());
+        assert!(review.select_previous());
+        assert!(!review.select(0));
+        assert!(!review.select(usize::MAX));
+
+        let empty = parse_candidate_ui_lab_feedback(
+            b"{\"schema\":\"candidate-ui-lab-annotation-batch-v3\",\"annotation_schema\":\"candidate-ui-lab-annotation-v3\",\"count\":0,\"spec_groups\":[],\"annotations\":[]}",
+        )
+        .unwrap();
+        assert_eq!(
+            CandidateUiLabFeedbackReview::new(empty),
+            Err(CandidateUiLabFeedbackReviewError::EmptyBatch)
+        );
+    }
+
+    #[test]
     fn old_batch_annotation_and_visual_schemas_are_explicitly_unsupported() {
         let valid = feedback_fixture().json;
         let old_batch = valid.replacen(
@@ -971,7 +1148,7 @@ mod tests {
             Err(CandidateUiLabFeedbackError::TrailingData)
         );
         assert_eq!(
-            parse_candidate_ui_lab_feedback(&vec![b' '; MAX_FEEDBACK_BYTES + 1]),
+            parse_candidate_ui_lab_feedback(&vec![b' '; MAX_CANDIDATE_UI_LAB_FEEDBACK_BYTES + 1]),
             Err(CandidateUiLabFeedbackError::TooLarge)
         );
         assert_eq!(
