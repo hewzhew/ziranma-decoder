@@ -9,8 +9,8 @@ use ziranma_core::{
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
     NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
     NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
-    WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
-    WishFeedbackError, WishImportance, WishJournalContext, WishNote,
+    NativeShortExactAbstention, WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus,
+    WishEventRole, WishFeedbackError, WishImportance, WishJournalContext, WishNote,
     WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
     list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
     move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash, save_wish_note,
@@ -560,6 +560,14 @@ fn print_event(event: &NativeFeedbackEvent) {
                             (!evidence.is_empty()).then(|| format!("个人证据 {evidence}")),
                             (!ranking.is_empty())
                                 .then(|| format!("实际重排 {ranking}，{ranking_movement}")),
+                            short_exact_abstention_candidate_label(
+                                code,
+                                *view,
+                                *page_start,
+                                index,
+                                provenance.short_exact_abstention(),
+                            )
+                            .map(|label| format!("两键窄门 {label}")),
                         ]
                         .into_iter()
                         .flatten()
@@ -775,6 +783,28 @@ fn candidate_ranking_movement_label(movement: NativeCandidateRankingMovement) ->
         }
         NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool => "候选池外召回".to_owned(),
     }
+}
+
+fn short_exact_abstention_candidate_label(
+    code: &str,
+    view: NativeCandidateView,
+    page_start: usize,
+    page_index: usize,
+    decision: NativeShortExactAbstention,
+) -> Option<&'static str> {
+    if code.len() != 2
+        || view != NativeCandidateView::Ordinary
+        || page_start != 0
+        || page_index != 0
+    {
+        return None;
+    }
+    Some(match decision {
+        NativeShortExactAbstention::Unrecorded => "旧格式未记录",
+        NativeShortExactAbstention::None => "明确未触发",
+        NativeShortExactAbstention::PersistentCompetition => "持久同码竞争，保留公开顺序",
+        NativeShortExactAbstention::SessionCompetition => "会话同码竞争，保留公开顺序",
+    })
 }
 
 fn automatic_transposition_label(decision: &NativeAutomaticTranspositionDecision) -> String {
@@ -1080,6 +1110,58 @@ mod tests {
             ),
             "候选池外召回"
         );
+    }
+
+    #[test]
+    fn short_exact_abstention_label_is_limited_to_the_global_ordinary_top() {
+        assert_eq!(
+            short_exact_abstention_candidate_label(
+                "ab",
+                NativeCandidateView::Ordinary,
+                0,
+                0,
+                NativeShortExactAbstention::PersistentCompetition,
+            ),
+            Some("持久同码竞争，保留公开顺序")
+        );
+        assert_eq!(
+            short_exact_abstention_candidate_label(
+                "ab",
+                NativeCandidateView::Ordinary,
+                0,
+                0,
+                NativeShortExactAbstention::SessionCompetition,
+            ),
+            Some("会话同码竞争，保留公开顺序")
+        );
+        assert_eq!(
+            short_exact_abstention_candidate_label(
+                "ab",
+                NativeCandidateView::Ordinary,
+                0,
+                0,
+                NativeShortExactAbstention::Unrecorded,
+            ),
+            Some("旧格式未记录")
+        );
+        for (code, view, page_start, page_index) in [
+            ("abc", NativeCandidateView::Ordinary, 0, 0),
+            ("ab", NativeCandidateView::Shape, 0, 0),
+            ("ab", NativeCandidateView::TranspositionRecovery, 0, 0),
+            ("ab", NativeCandidateView::Ordinary, 6, 0),
+            ("ab", NativeCandidateView::Ordinary, 0, 1),
+        ] {
+            assert_eq!(
+                short_exact_abstention_candidate_label(
+                    code,
+                    view,
+                    page_start,
+                    page_index,
+                    NativeShortExactAbstention::PersistentCompetition,
+                ),
+                None
+            );
+        }
     }
 
     #[test]
