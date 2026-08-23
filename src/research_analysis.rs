@@ -807,7 +807,13 @@ impl EpisodeCandidateFrame {
             position_matches,
             index.and_then(|index| self.candidates.get(index)),
         ) {
-            (true, Some(candidate)) if candidate == committed_text => {
+            (true, Some(candidate))
+                if candidate == committed_text
+                    || (self.view == NativeCandidateView::Shape
+                        && self.tab_assembly.as_ref().is_some_and(|tab| {
+                            tab.selected_candidate_matches_completed_text(candidate, committed_text)
+                        })) =>
+            {
                 ResearchWishCandidateTextEvidence::Verified
             }
             (false, _) | (true, Some(_)) => ResearchWishCandidateTextEvidence::Mismatched,
@@ -2901,7 +2907,7 @@ mod tests {
                     22,
                     NativeFeedbackEvent::CandidateCommitted {
                         code: "qthplmj".to_owned(),
-                        text: "件".to_owned(),
+                        text: "零一二件".to_owned(),
                         view: NativeCandidateView::Shape,
                         source: NativeSelectionSource::FirstCandidate,
                         absolute_rank: 7,

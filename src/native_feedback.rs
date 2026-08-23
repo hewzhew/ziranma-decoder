@@ -368,6 +368,33 @@ impl NativeTabAssemblyState {
         &self.stroke_prefix
     }
 
+    /// Whether one visible Tab candidate is the final character of the text
+    /// committed when staged assembly completes.
+    ///
+    /// A completed Tab selection records the assembled text in the commit
+    /// event, while the immediately preceding candidate frame contains only
+    /// the character selected for the current position. Keeping this check on
+    /// the recorded structural state avoids treating that intentional shape
+    /// difference as corrupt candidate evidence.
+    pub fn selected_candidate_matches_completed_text(
+        &self,
+        selected_candidate: &str,
+        committed_text: &str,
+    ) -> bool {
+        if self.position != self.total_characters
+            || !(1..=MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS).contains(&self.total_characters)
+            || committed_text.chars().count() != self.total_characters
+        {
+            return false;
+        }
+        let mut selected_chars = selected_candidate.chars();
+        let Some(selected_character) = selected_chars.next() else {
+            return false;
+        };
+        selected_chars.next().is_none()
+            && committed_text.chars().nth(self.position - 1) == Some(selected_character)
+    }
+
     fn validate_and_measure(&self) -> Option<usize> {
         ((1..=MAX_FEEDBACK_TAB_ASSEMBLY_CHARACTERS).contains(&self.total_characters)
             && (1..=self.total_characters).contains(&self.position)
@@ -1996,6 +2023,21 @@ mod tests {
                 NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
             );
         }
+    }
+
+    #[test]
+    fn completed_tab_assembly_matches_the_visible_final_character_only() {
+        let complete = NativeTabAssemblyState::new(2, 2, "hs");
+        assert!(complete.selected_candidate_matches_completed_text("束", "收束"));
+        assert!(!complete.selected_candidate_matches_completed_text("收", "收束"));
+        assert!(!complete.selected_candidate_matches_completed_text("收束", "收束"));
+        assert!(!complete.selected_candidate_matches_completed_text("束", "束"));
+
+        let incomplete = NativeTabAssemblyState::new(1, 2, "");
+        assert!(!incomplete.selected_candidate_matches_completed_text("收", "收束"));
+
+        let single = NativeTabAssemblyState::new(1, 1, "nx");
+        assert!(single.selected_candidate_matches_completed_text("魂", "魂"));
     }
 
     #[test]

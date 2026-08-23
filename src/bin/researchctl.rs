@@ -9,9 +9,9 @@ use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
     NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
     NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
-    RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind,
-    ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage, ResearchSceneAnalysis,
-    ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch,
+    NativeTabAssemblyState, RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS,
+    ResearchHabitKind, ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage,
+    ResearchSceneAnalysis, ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch,
     ResearchWishCandidateTextEvidence, ResearchWishEpisodeKind, ResearchWishEvidenceKind,
     TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
@@ -802,6 +802,7 @@ struct PresentedFrame {
     page_start: usize,
     candidates: Vec<String>,
     provenance: Vec<NativeCandidateProvenance>,
+    tab_assembly: Option<NativeTabAssemblyState>,
     global_top_text: Option<String>,
     global_top_provenance: Option<NativeCandidateProvenance>,
 }
@@ -813,6 +814,7 @@ impl PresentedFrame {
         page_start: usize,
         candidates: Vec<String>,
         provenance: Vec<NativeCandidateProvenance>,
+        tab_assembly: Option<NativeTabAssemblyState>,
         previous: Option<&Self>,
     ) -> Self {
         let global_top_text = if page_start == 0 {
@@ -835,6 +837,7 @@ impl PresentedFrame {
             page_start,
             candidates,
             provenance,
+            tab_assembly,
             global_top_text,
             global_top_provenance,
         }
@@ -851,7 +854,15 @@ impl PresentedFrame {
         committed_text: &str,
     ) -> CandidateTextEvidence {
         match self.candidate_for_rank(absolute_rank) {
-            Some(candidate) if candidate == committed_text => CandidateTextEvidence::Verified,
+            Some(candidate)
+                if candidate == committed_text
+                    || (self.view == NativeCandidateView::Shape
+                        && self.tab_assembly.as_ref().is_some_and(|tab| {
+                            tab.selected_candidate_matches_completed_text(candidate, committed_text)
+                        })) =>
+            {
+                CandidateTextEvidence::Verified
+            }
             Some(_) => CandidateTextEvidence::Mismatched,
             None => CandidateTextEvidence::Unavailable,
         }
@@ -1445,6 +1456,7 @@ impl ResearchReview {
                         *page_start,
                         candidates.clone(),
                         Vec::new(),
+                        None,
                         frame.as_ref(),
                     ));
                 }
@@ -1472,6 +1484,7 @@ impl ResearchReview {
                         *page_start,
                         candidates.clone(),
                         provenance.clone(),
+                        tab_assembly.clone(),
                         frame.as_ref(),
                     ));
                 }
@@ -4356,6 +4369,7 @@ mod tests {
             vec!["first".to_owned(), "second".to_owned()],
             vec![alias, core],
             None,
+            None,
         );
         assert_eq!(first.global_top_text.as_deref(), Some("first"));
         assert_eq!(first.candidate_for_rank(2), Some("second"));
@@ -4366,6 +4380,7 @@ mod tests {
             6,
             vec!["seventh".to_owned()],
             vec![core],
+            None,
             Some(&first),
         );
         assert_eq!(second.global_top_text.as_deref(), Some("first"));
@@ -4377,6 +4392,7 @@ mod tests {
             6,
             vec!["other-seventh".to_owned()],
             vec![core],
+            None,
             Some(&second),
         );
         assert_eq!(changed_code.global_top_text, None);
@@ -4387,6 +4403,7 @@ mod tests {
             6,
             vec!["shape-seventh".to_owned()],
             vec![core],
+            None,
             Some(&second),
         );
         assert_eq!(changed_view.global_top_text, None);
@@ -4397,6 +4414,7 @@ mod tests {
             0,
             vec!["refreshed".to_owned()],
             vec![core],
+            None,
             Some(&second),
         );
         assert_eq!(
@@ -4404,6 +4422,32 @@ mod tests {
             Some("refreshed")
         );
         assert_eq!(refreshed_first.global_top_provenance, Some(core));
+    }
+
+    #[test]
+    fn private_review_verifies_completed_tab_text_against_its_final_character() {
+        let shape = NativeCandidateProvenance::new(NativeCandidateSource::Shape, false);
+        let frame = PresentedFrame::next(
+            "qthp",
+            NativeCandidateView::Shape,
+            6,
+            vec!["魂".to_owned()],
+            vec![shape],
+            Some(NativeTabAssemblyState::new(2, 2, "")),
+            None,
+        );
+        assert!(matches!(
+            frame.candidate_text_evidence(7, "雀魂"),
+            CandidateTextEvidence::Verified
+        ));
+        assert!(matches!(
+            frame.candidate_text_evidence(7, "雀魄"),
+            CandidateTextEvidence::Mismatched
+        ));
+        assert!(matches!(
+            frame.candidate_text_evidence(8, "雀魂"),
+            CandidateTextEvidence::Unavailable
+        ));
     }
 
     #[test]
@@ -4418,6 +4462,7 @@ mod tests {
                 "different-candidate".to_owned(),
             ],
             vec![core, core],
+            None,
             None,
         );
         let mut pattern = SelectionPattern::default();
@@ -4467,6 +4512,7 @@ mod tests {
             0,
             vec!["public-blocker".to_owned(), "public-target".to_owned()],
             vec![blocker, plain],
+            None,
             None,
         );
         let mut pattern = SelectionPattern::default();
@@ -5064,7 +5110,7 @@ mod tests {
                 21,
                 NativeFeedbackEvent::CandidateCommitted {
                     code: "qthplmj".to_owned(),
-                    text: "件".to_owned(),
+                    text: "零一二件".to_owned(),
                     view: NativeCandidateView::Shape,
                     source: NativeSelectionSource::FirstCandidate,
                     absolute_rank: 7,
@@ -5126,6 +5172,7 @@ mod tests {
 
         let analysis = analyze_linked_research(&[research], &[wish]).unwrap();
         let rendered = render_scene_analysis(&analysis);
+        assert!(rendered.contains("qthplmj → “零一二件”"));
         assert!(rendered.contains("第二页或更深；Tab 找字；空格首选"));
         assert!(rendered.contains("第 2 页，已加载 7；候选文字已核对"));
         assert!(rendered.contains("Tab 第 4/4 字，形码 h"));
