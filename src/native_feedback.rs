@@ -647,6 +647,20 @@ pub enum NativePersonalPhraseAdjacency {
     RangeUnavailable,
 }
 
+/// One explicit candidate-order label chosen from the native candidate
+/// popup. These actions are deliberately discrete so local ranking changes
+/// remain reversible and future research can distinguish a human label from
+/// an ordinary candidate commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCandidatePreferenceAction {
+    /// Give this exact code/text identity a strong positive preference.
+    Prefer,
+    /// Ignore personal promotion for this identity and use public ordering.
+    DeferToPublic,
+    /// Remove the preceding negative label and allow personal learning again.
+    RestorePersonalization,
+}
+
 /// One private event owned only by the active in-memory session.
 ///
 /// `Debug` and serialization are intentionally not implemented because the
@@ -692,6 +706,14 @@ pub enum NativeFeedbackEvent {
         code: String,
         text: String,
         action: NativeCandidateSuppressionAction,
+    },
+    /// One explicit, successfully applied candidate-order label from the
+    /// nonactivating native popup. Merely opening or dismissing the menu does
+    /// not produce this event.
+    CandidatePreferenceLabeled {
+        code: String,
+        text: String,
+        action: NativeCandidatePreferenceAction,
     },
     /// One completed candidate-popup paint. With immediate visibility the
     /// complete frame and the fully visible frame have the same duration.
@@ -843,6 +865,12 @@ impl NativeFeedbackEvent {
             Self::RawCodeCommitted { code } => valid_code(code).then_some(code.len()),
             Self::CompositionCancelled { code, .. } => valid_code(code).then_some(code.len()),
             Self::CandidateSuppressionChanged { code, text, .. } => {
+                if !valid_code(code) || !valid_text(text) {
+                    return None;
+                }
+                measure_private_strings([code.as_str(), text.as_str()].into_iter())
+            }
+            Self::CandidatePreferenceLabeled { code, text, .. } => {
                 if !valid_code(code) || !valid_text(text) {
                     return None;
                 }
@@ -1567,6 +1595,7 @@ impl NativeFeedbackSession {
                 NativeFeedbackEvent::SlowKeyPathTiming { .. } => {}
                 NativeFeedbackEvent::PostCommitBackspaceRouted => {}
                 NativeFeedbackEvent::CandidateSuppressionChanged { .. } => {}
+                NativeFeedbackEvent::CandidatePreferenceLabeled { .. } => {}
                 NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. } => {}
                 NativeFeedbackEvent::PersonalSelectionConfirmed { .. } => {}
                 NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
@@ -1770,6 +1799,7 @@ impl NativeFeedbackSession {
             | NativeFeedbackEvent::PostCommitBackspaceRouted
             | NativeFeedbackEvent::PersonalPhraseAdjacencyObserved { .. }
             | NativeFeedbackEvent::PersonalSelectionConfirmed { .. }
+            | NativeFeedbackEvent::CandidatePreferenceLabeled { .. }
             | NativeFeedbackEvent::ShortWordExtraKeyTiming { .. } => {}
         }
     }

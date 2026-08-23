@@ -7,10 +7,11 @@ use ziranma_core::WindowsUserDataProtector;
 use ziranma_core::{
     DataProtector, NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
-    NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
-    NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
-    NativeShortExactAbstention, WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus,
-    WishEventRole, WishFeedbackError, WishImportance, WishJournalContext, WishNote,
+    NativeCandidatePreferenceAction, NativeCandidateRankingMovement, NativeCandidateSource,
+    NativeCandidateSuppressionAction, NativeCandidateView, NativeFeedbackEvent,
+    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeShortExactAbstention,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAckStatus, WishEventRole,
+    WishFeedbackError, WishImportance, WishJournalContext, WishNote,
     WishPublicCandidateOrderPolicy, WishReviewStatus, dispatch_wish_command,
     list_trashed_wish_packages, list_wish_packages, load_wish_note, load_wish_snapshot,
     move_wish_to_trash, native_slow_key_remainder_ms, restore_wish_from_trash, save_wish_note,
@@ -624,6 +625,14 @@ fn print_event(event: &NativeFeedbackEvent) {
                 }
             );
         }
+        NativeFeedbackEvent::CandidatePreferenceLabeled { code, text, action } => println!(
+            "候选偏好  {code} → “{text}” [{}]",
+            match action {
+                NativeCandidatePreferenceAction::Prefer => "提高优先级",
+                NativeCandidatePreferenceAction::DeferToPublic => "降低到公共排序",
+                NativeCandidatePreferenceAction::RestorePersonalization => "重新允许个人学习",
+            }
+        ),
         NativeFeedbackEvent::CandidatePopupTiming {
             first_frame_ms,
             fully_visible_ms,

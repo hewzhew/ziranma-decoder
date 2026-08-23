@@ -27,7 +27,7 @@ use crate::candidate_snapshot::{
     layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
 use crate::candidate_ui::{
-    CandidateRgb, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics,
+    CandidateRgb, CandidateScene, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics,
     CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
     allocate_horizontal_candidate_widths, build_candidate_scene,
     candidate_horizontal_logical_width as shared_candidate_horizontal_logical_width,
@@ -52,30 +52,30 @@ use crate::{
     LoadedPersonalRanking, LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
     NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
     NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
-    NativeCancellationSource, NativeCandidatePersonalization, NativeCandidateProvenance,
-    NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
-    NativeCandidateView, NativeFeedbackAuthorization, NativeFeedbackClearResult,
-    NativeFeedbackContext, NativeFeedbackEvent, NativeFeedbackFreezeAuthorization,
-    NativeFeedbackFreezeError, NativeFeedbackLifecycle, NativeFeedbackLimits,
-    NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
-    NativeFeedbackStopResult, NativeFeedbackSummary, NativePersonalPhraseAdjacency,
-    NativeSelectionSource, NativeShortExactAbstention, NativeTabAssemblyState,
-    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
-    PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
-    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
-    PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
-    SupplementalCandidateLayerConfig, WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID,
-    WindowsUserDataProtector, WishCaptureScope, WishCategory, WishCommand, WishCommandAck,
-    WishCommandAckStatus, WishJournalAnchor, WishJournalContext, WishJournalSpan,
-    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex,
-    load_candidate_runtime_exact_short, load_candidate_runtime_exact_short_preflight,
-    load_candidate_runtime_exact_short_selection, load_candidate_runtime_snapshots_with_layers,
-    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
-    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
-    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
-    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
-    save_personal_ranking_batch, save_personal_ranking_checkpoint,
-    save_personal_ranking_suppression_action, save_wish_snapshot,
+    NativeCancellationSource, NativeCandidatePersonalization, NativeCandidatePreferenceAction,
+    NativeCandidateProvenance, NativeCandidateRankingMovement, NativeCandidateSource,
+    NativeCandidateSuppressionAction, NativeCandidateView, NativeFeedbackAuthorization,
+    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
+    NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError, NativeFeedbackLifecycle,
+    NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
+    NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
+    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeShortExactAbstention,
+    NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY,
+    PersonalContextRanking, PersonalRankingBatch, PersonalRankingSelection,
+    PersonalRankingSnapshot, PersonalRankingSuppressionAction,
+    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
+    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, SupplementalCandidateLayerConfig,
+    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
+    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
+    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
+    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_exact_short,
+    load_candidate_runtime_exact_short_preflight, load_candidate_runtime_exact_short_selection,
+    load_candidate_runtime_snapshots_with_layers, load_candidate_runtime_supplemental,
+    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
+    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
+    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
+    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
+    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -87,13 +87,13 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CombineRgn, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
-    FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetWindowRgn, TEXTMETRICW,
-    TRANSPARENT, UpdateWindow,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CombineRgn,
+    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL,
+    FW_SEMIBOLD, FillRect, FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW,
+    HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject,
+    SetBkMode, SetWindowRgn, TEXTMETRICW, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -143,11 +143,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetForegroundWindow,
     GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON, IsWindow, IsWindowVisible,
-    KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_NCDESTROY,
-    WM_PAINT, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MA_NOACTIVATE, MENU_ITEM_FLAGS, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
+    WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -2082,6 +2083,7 @@ fn project_overlay_decoder() -> &'static Decoder {
 
 #[derive(Clone, Default)]
 struct CandidateDisplay {
+    identity_code: Option<String>,
     candidates: Vec<String>,
     provenance: Vec<NativeCandidateProvenance>,
     personalized: Vec<bool>,
@@ -2228,6 +2230,7 @@ fn tab_phonetic_segments(code: &str) -> Option<Vec<&str>> {
 impl CandidateDisplay {
     fn actions(actions: &[InlineWishAction]) -> Self {
         Self {
+            identity_code: None,
             candidates: actions
                 .iter()
                 .map(|action| action.label.to_owned())
@@ -2257,6 +2260,7 @@ impl CandidateDisplay {
 
     fn notice_with_icon(label: &str, detail: &str, notice_icon: CandidateNoticeIcon) -> Self {
         Self {
+            identity_code: None,
             candidates: vec![label.to_owned()],
             provenance: vec![NativeCandidateProvenance::default()],
             personalized: vec![false],
@@ -2316,6 +2320,7 @@ impl CandidateDisplay {
                 .min((candidates.len() - 1) / CANDIDATE_PAGE_SIZE * CANDIDATE_PAGE_SIZE)
         };
         Self {
+            identity_code: None,
             candidates,
             provenance,
             personalized,
@@ -2334,6 +2339,13 @@ impl CandidateDisplay {
 
     fn with_mode(mut self, mode: CandidateDisplayMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    fn with_identity_code(mut self, code: &str) -> Self {
+        if !code.is_empty() {
+            self.identity_code = Some(code.to_owned());
+        }
         self
     }
 
@@ -2739,6 +2751,10 @@ fn personal_ranking_root_for_module(module_path: &Path) -> Option<PathBuf> {
 
 fn personal_ranking_suppression_root_for_module(module_path: &Path) -> Option<PathBuf> {
     installed_user_data_root_for_module(module_path, PERSONAL_RANKING_SUPPRESSION_DIRECTORY)
+}
+
+fn personal_tail_support_root_for_module(module_path: &Path) -> Option<PathBuf> {
+    installed_user_data_root_for_module(module_path, "personal-tail-support")
 }
 
 fn public_supplement_root_for_module(module_path: &Path) -> Option<PathBuf> {
@@ -3930,6 +3946,7 @@ struct PlannedKey {
     edit: Option<PendingDocumentEdit>,
     candidate_display: Option<CandidateDisplay>,
     selection_to_remember: Option<PlannedSelection>,
+    tail_support_to_remember: Option<PlannedSelection>,
     overruled_text_to_remember: Option<String>,
     feedback_after_success: Option<NativeFeedbackEvent>,
     action_after_success: Option<PlannedAction>,
@@ -4013,6 +4030,7 @@ fn plan_candidate_forget_ui(
         edit: None,
         candidate_display,
         selection_to_remember: None,
+        tail_support_to_remember: None,
         overruled_text_to_remember: None,
         feedback_after_success: None,
         action_after_success: None,
@@ -4243,6 +4261,10 @@ struct PendingPersonalSelection {
     previous_phrase_components: Vec<PersonalPhraseComponent>,
     previous_phrase_document: PersonalPhraseDocumentSnapshot,
     previous_left_context: Option<String>,
+}
+
+struct PendingTailSupportSelection {
+    selection: PlannedSelection,
 }
 
 /// One process-local correction hint created only when an immediately
@@ -4495,6 +4517,7 @@ fn plan_session_input(
         edit,
         candidate_display: None,
         selection_to_remember: None,
+        tail_support_to_remember: None,
         overruled_text_to_remember: None,
         feedback_after_success: None,
         action_after_success: None,
@@ -4548,6 +4571,7 @@ fn plan_tab_assembly_selection(
         edit,
         candidate_display: None,
         selection_to_remember,
+        tail_support_to_remember: None,
         overruled_text_to_remember: None,
         feedback_after_success,
         action_after_success: None,
@@ -4643,6 +4667,7 @@ fn plan_immediate_inline_wish(
         edit: Some(PendingDocumentEdit::Cancel),
         candidate_display: None,
         selection_to_remember: None,
+        tail_support_to_remember: None,
         overruled_text_to_remember: None,
         feedback_after_success: None,
         action_after_success: Some(PlannedAction::Wish(operation)),
@@ -5123,9 +5148,42 @@ struct CompletedCandidatePopupRenderTiming {
     sample: CandidatePopupRenderSample,
 }
 
+const CANDIDATE_PREFERENCE_MENU_PREFER: u32 = 41_001;
+const CANDIDATE_PREFERENCE_MENU_DEFER: u32 = 41_002;
+const CANDIDATE_PREFERENCE_MENU_RESTORE: u32 = 41_003;
+const MAX_PENDING_CANDIDATE_PREFERENCE_LABELS: usize = 32;
+const MANUAL_PREFERENCE_SUPPORT_VOTES: usize = 4;
+
+#[derive(Clone)]
+struct PendingCandidatePreferenceLabel {
+    code: String,
+    text: String,
+    action: NativeCandidatePreferenceAction,
+    context: NativeFeedbackContext,
+}
+
+#[derive(Default)]
+struct CandidatePreferenceQueue {
+    pending: VecDeque<PendingCandidatePreferenceLabel>,
+}
+
+impl CandidatePreferenceQueue {
+    fn push(&mut self, label: PendingCandidatePreferenceLabel) {
+        // Repeated clicks on one still-visible identity express the latest
+        // intent, not multiple independent training examples.
+        self.pending
+            .retain(|pending| pending.code != label.code || pending.text != label.text);
+        if self.pending.len() == MAX_PENDING_CANDIDATE_PREFERENCE_LABELS {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(label);
+    }
+}
+
 #[derive(Default)]
 struct CandidatePopupPaintState {
     display: CandidateDisplay,
+    scene: Option<CandidateScene>,
     dpi: u32,
     layout: CandidatePopupLayout,
     original_window_proc: isize,
@@ -5141,6 +5199,8 @@ struct CandidatePopupPaintState {
     corner_strategy: CandidatePopupCornerStrategy,
     transient_notice: bool,
     transient_hidden: bool,
+    preference_queue: Weak<RefCell<CandidatePreferenceQueue>>,
+    feedback_context: NativeFeedbackContext,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -5323,6 +5383,10 @@ impl CandidatePopup {
         self.paint.native_feedback_language_bar_state = native_feedback_language_bar_state;
     }
 
+    fn attach_preference_queue(&mut self, queue: Weak<RefCell<CandidatePreferenceQueue>>) {
+        self.paint.preference_queue = queue;
+    }
+
     fn show(
         &mut self,
         owner: HWND,
@@ -5386,7 +5450,9 @@ impl CandidatePopup {
             |request| request.requested_dpi,
         );
         self.paint.display = display.clone();
+        self.paint.scene = None;
         self.paint.dpi = dpi;
+        self.paint.feedback_context = feedback_context;
         self.feedback_context = feedback_context;
 
         // SAFETY: the anchor is initialized screen geometry from TSF.
@@ -6060,6 +6126,97 @@ fn candidate_scene_rect(rect: CandidateSceneRect) -> RECT {
     }
 }
 
+fn candidate_popup_candidate_at(
+    state: &CandidatePopupPaintState,
+    x: i32,
+    y: i32,
+) -> Option<(String, String)> {
+    if state.display.notice
+        || state.display.mode != CandidateDisplayMode::Normal
+        || state.display.view != InteractiveCandidateView::Primary
+        || state.feedback_context != NativeFeedbackContext::Eligible
+    {
+        return None;
+    }
+    let code = state.display.identity_code.as_ref()?.clone();
+    let visible_index = state
+        .scene
+        .as_ref()?
+        .semantic_hits_at(x, y)
+        .into_iter()
+        .find_map(|hit| hit.candidate_index)?;
+    let absolute_index = state.display.page_start.checked_add(visible_index)?;
+    let text = state.display.candidates.get(absolute_index)?.clone();
+    Some((code, text))
+}
+
+fn queue_candidate_popup_preference(
+    hwnd: HWND,
+    state: &mut CandidatePopupPaintState,
+    client_point: POINT,
+) -> bool {
+    let Some((code, text)) = candidate_popup_candidate_at(state, client_point.x, client_point.y)
+    else {
+        return false;
+    };
+    let Some(queue) = state.preference_queue.upgrade() else {
+        return false;
+    };
+    let Ok(menu) = NativeFeedbackPopupMenu::create() else {
+        return false;
+    };
+    if menu
+        .append(CANDIDATE_PREFERENCE_MENU_PREFER, MF_STRING.0, "提高优先级")
+        .and_then(|()| {
+            menu.append(
+                CANDIDATE_PREFERENCE_MENU_DEFER,
+                MF_STRING.0,
+                "降低优先级（使用公共排序）",
+            )
+        })
+        .and_then(|()| {
+            menu.append(
+                CANDIDATE_PREFERENCE_MENU_RESTORE,
+                MF_STRING.0,
+                "撤销降低，重新允许个人学习",
+            )
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let mut screen_point = client_point;
+    // SAFETY: this converts one stack-owned point for the live popup.
+    if !unsafe { ClientToScreen(hwnd, &mut screen_point) }.as_bool() {
+        return false;
+    }
+    let action = match menu.track(&screen_point) {
+        Some(CANDIDATE_PREFERENCE_MENU_PREFER) => NativeCandidatePreferenceAction::Prefer,
+        Some(CANDIDATE_PREFERENCE_MENU_DEFER) => NativeCandidatePreferenceAction::DeferToPublic,
+        Some(CANDIDATE_PREFERENCE_MENU_RESTORE) => {
+            NativeCandidatePreferenceAction::RestorePersonalization
+        }
+        _ => return false,
+    };
+    let Ok(mut queue) = queue.try_borrow_mut() else {
+        return false;
+    };
+    queue.push(PendingCandidatePreferenceLabel {
+        code,
+        text,
+        action,
+        context: state.feedback_context,
+    });
+    drop(queue);
+    state.display.mode_label_override = Some("已标记 · 下次输入生效".to_owned());
+    // SAFETY: only the popup's already allocated client area is invalidated;
+    // the editor remains the active keyboard window.
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    true
+}
+
 unsafe extern "system" fn candidate_popup_window_proc(
     hwnd: HWND,
     message: u32,
@@ -6070,6 +6227,20 @@ unsafe extern "system" fn candidate_popup_window_proc(
     // cleared during WM_NCDESTROY.
     let state_pointer =
         unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CandidatePopupPaintState;
+    if message == WM_MOUSEACTIVATE && !state_pointer.is_null() {
+        return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3));
+    }
+    if message == WM_RBUTTONUP && !state_pointer.is_null() {
+        let packed = u32::try_from(lparam.0).unwrap_or(lparam.0 as u32);
+        let point = POINT {
+            x: i32::from((packed as u16) as i16),
+            y: i32::from(((packed >> 16) as u16) as i16),
+        };
+        // SAFETY: the boxed state outlives this synchronous callback.
+        if queue_candidate_popup_preference(hwnd, unsafe { &mut *state_pointer }, point) {
+            return LRESULT(0);
+        }
+    }
     if message == WM_TIMER && wparam.0 == INLINE_WISH_NOTICE_TIMER_ID && !state_pointer.is_null() {
         // SAFETY: the popup owns this fixed timer and remains valid throughout
         // the synchronous window callback.
@@ -6291,6 +6462,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             action_detail_metrics,
         },
     );
+    state.scene = scene.clone();
 
     if let Some(scene) = scene.as_ref() {
         unsafe {
@@ -6618,6 +6790,12 @@ impl CandidateUiController {
     ) {
         if let Ok(mut popup) = self.popup.try_borrow_mut() {
             popup.attach_feedback(native_feedback, native_feedback_language_bar_state);
+        }
+    }
+
+    fn attach_preference_queue(&mut self, queue: Weak<RefCell<CandidatePreferenceQueue>>) {
+        if let Ok(mut popup) = self.popup.try_borrow_mut() {
+            popup.attach_preference_queue(queue);
         }
     }
 
@@ -8672,6 +8850,7 @@ fn native_feedback_event_code(event: &NativeFeedbackEvent) -> Option<&str> {
         | NativeFeedbackEvent::RawCodeCommitted { code }
         | NativeFeedbackEvent::CompositionCancelled { code, .. }
         | NativeFeedbackEvent::CandidateSuppressionChanged { code, .. }
+        | NativeFeedbackEvent::CandidatePreferenceLabeled { code, .. }
         | NativeFeedbackEvent::PersonalSelectionConfirmed { code, .. } => Some(code),
         NativeFeedbackEvent::ShortWordExtraKeyTiming { observed_code, .. } => Some(observed_code),
         NativeFeedbackEvent::CandidatePopupTiming { .. }
@@ -8890,6 +9069,17 @@ fn provider_verifies_personal_character_composition(
         }
     }
     characters.next().is_none()
+}
+
+fn provider_verifies_public_tail_support(
+    provider: &dyn CandidateProvider,
+    full_code: &str,
+    text: &str,
+) -> bool {
+    full_code.len() >= 4
+        && full_code.len().is_multiple_of(2)
+        && full_code.as_bytes().iter().all(u8::is_ascii_lowercase)
+        && provider.is_exact_full_code_candidate(full_code, text)
 }
 
 enum BackgroundPersistenceCommand {
@@ -9517,6 +9707,54 @@ impl PersonalRankingRuntime {
             )
     }
 
+    fn recall_repeated_public_tail_support_after_decision(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        candidates: &mut Vec<String>,
+        protected_prefix: usize,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+    ) -> Option<CandidateTextPromotion> {
+        self.snapshot
+            .recall_repeated_anchored_suffix_text_after_with_suppressions_decision(
+                code,
+                candidates,
+                protected_prefix,
+                suppressions,
+                |source_code, text| provider.is_exact_full_code_candidate(source_code, text),
+            )
+    }
+
+    fn has_repeated_public_tail_support(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+    ) -> bool {
+        self.snapshot
+            .has_repeated_anchored_suffix_candidate_with_suppressions(
+                code,
+                suppressions,
+                |source_code, text| provider.is_exact_full_code_candidate(source_code, text),
+            )
+    }
+
+    fn has_repeated_public_tail_support_for_text(
+        &self,
+        provider: &dyn CandidateProvider,
+        code: &str,
+        text: &str,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+    ) -> bool {
+        self.snapshot
+            .has_repeated_anchored_suffix_evidence_with_suppressions(
+                code,
+                text,
+                suppressions,
+                |source_code, text| provider.is_exact_full_code_candidate(source_code, text),
+            )
+    }
+
     fn has_repeated_anchored_suffix_evidence(
         &self,
         provider: &dyn CandidateProvider,
@@ -9628,12 +9866,15 @@ struct TsfTextService {
     candidate_cache: RefCell<CandidateCache>,
     selection_memory: RefCell<SessionSelectionMemory>,
     pending_personal_selection: RefCell<Option<PendingPersonalSelection>>,
+    pending_tail_support_selection: RefCell<Option<PendingTailSupportSelection>>,
     immediate_retype_correction: RefCell<Option<ImmediateRetypeCorrection>>,
     personal_phrase_composer: Rc<RefCell<PersonalPhraseComposer>>,
     personal_phrase_document_tracker: Rc<RefCell<PersonalPhraseDocumentTracker>>,
     personal_context_ranking: RefCell<PersonalContextRanking>,
     personal_left_context: RefCell<Option<String>>,
     personal_ranking: RefCell<PersonalRankingRuntime>,
+    personal_tail_support: RefCell<PersonalRankingRuntime>,
+    candidate_preference_queue: Rc<RefCell<CandidatePreferenceQueue>>,
     candidate_forget_state: RefCell<CandidateForgetState>,
     candidate_ui: Rc<RefCell<CandidateUiController>>,
     edit_telemetry: Arc<Mutex<EditSessionTelemetry>>,
@@ -10142,10 +10383,12 @@ impl TsfTextService {
         ));
         let mut candidate_ui =
             CandidateUiController::new(matches!(key_advice_mode, KeyAdviceMode::Foreground));
+        let candidate_preference_queue = Rc::new(RefCell::new(CandidatePreferenceQueue::default()));
         candidate_ui.attach_feedback(
             Arc::downgrade(&native_feedback),
             Rc::downgrade(&native_feedback_language_bar_state),
         );
+        candidate_ui.attach_preference_queue(Rc::downgrade(&candidate_preference_queue));
         let native_wish_commands = RefCell::new(NativeWishCommandController::new(
             matches!(key_advice_mode, KeyAdviceMode::Foreground),
             Rc::downgrade(&native_feedback_language_bar_state),
@@ -10160,6 +10403,7 @@ impl TsfTextService {
                     (
                         personal_ranking_root_for_module(&module),
                         personal_ranking_suppression_root_for_module(&module),
+                        personal_tail_support_root_for_module(&module),
                     )
                 })
             })
@@ -10174,6 +10418,7 @@ impl TsfTextService {
             candidate_cache: RefCell::new(CandidateCache::default()),
             selection_memory: RefCell::new(SessionSelectionMemory::default()),
             pending_personal_selection: RefCell::new(None),
+            pending_tail_support_selection: RefCell::new(None),
             immediate_retype_correction: RefCell::new(None),
             personal_phrase_composer: Rc::new(RefCell::new(PersonalPhraseComposer::default())),
             personal_phrase_document_tracker: Rc::new(RefCell::new(
@@ -10184,8 +10429,16 @@ impl TsfTextService {
             personal_ranking: RefCell::new(PersonalRankingRuntime::new_with_roots_and_persistence(
                 personal_ranking_roots.0,
                 personal_ranking_roots.1,
-                persistence,
+                persistence.clone(),
             )),
+            personal_tail_support: RefCell::new(
+                PersonalRankingRuntime::new_with_roots_and_persistence(
+                    personal_ranking_roots.2,
+                    None,
+                    persistence,
+                ),
+            ),
+            candidate_preference_queue,
             candidate_forget_state: RefCell::new(CandidateForgetState::Inactive),
             candidate_ui: Rc::new(RefCell::new(candidate_ui)),
             edit_telemetry: Arc::new(Mutex::new(EditSessionTelemetry::default())),
@@ -10244,7 +10497,14 @@ impl Drop for TsfTextService {
                 let _ = ranking.record(&phrase.selection.code, &phrase.selection.text);
             }
         }
+        if let Some(pending) = self.pending_tail_support_selection.get_mut().take() {
+            let _ = self
+                .personal_tail_support
+                .get_mut()
+                .record(&pending.selection.code, &pending.selection.text);
+        }
         let _ = self.personal_ranking.get_mut().flush();
+        let _ = self.personal_tail_support.get_mut().flush();
         if let Ok(mut feedback) = self.native_feedback.lock() {
             let _ = feedback.flush_research();
         }
@@ -10411,7 +10671,17 @@ impl TsfTextService_Impl {
                             .remembered_text(code)
                             .is_some_and(|text| !ranking.is_suppressed(code, text))
                 });
-        let load_limit = if contextual_search || exact_personal_search {
+        let tail_support_search = view == InteractiveCandidateView::Primary
+            && automatic_transposition_request.is_none()
+            && self
+                .personal_ranking
+                .try_borrow()
+                .ok()
+                .zip(self.personal_tail_support.try_borrow().ok())
+                .is_some_and(|(ranking, support)| {
+                    support.has_repeated_public_tail_support(provider, code, &ranking.suppressions)
+                });
+        let load_limit = if contextual_search || exact_personal_search || tail_support_search {
             limit.max(PERSONAL_CONTEXT_SEARCH_DEPTH)
         } else {
             limit
@@ -10488,8 +10758,40 @@ impl TsfTextService_Impl {
                     },
                 );
             }
+            let tail_support_promotion = if persistent_exact_promotion.is_none()
+                && persistent_anchored_promotion.is_none()
+                && session_exact_text.is_none()
+                && automatic_transposition_request.is_none()
+            {
+                self.personal_tail_support
+                    .try_borrow()
+                    .ok()
+                    .and_then(|support| {
+                        support.recall_repeated_public_tail_support_after_decision(
+                            provider,
+                            code,
+                            &mut batch.candidates,
+                            protected_prefix,
+                            &personal_ranking.suppressions,
+                        )
+                    })
+            } else {
+                None
+            };
+            if let Some(promotion) = tail_support_promotion {
+                mirror_candidate_promotion(
+                    &mut batch,
+                    promotion,
+                    if promotion.source_index.is_none() {
+                        NativeCandidatePersonalization::PERSISTENT_DISCOVERY
+                    } else {
+                        NativeCandidatePersonalization::PERSISTENT_ANCHORED
+                    },
+                );
+            }
             let personal_discovery_promotion = if persistent_exact_promotion.is_none()
                 && persistent_anchored_promotion.is_none()
+                && tail_support_promotion.is_none()
                 && session_exact_text.is_none()
                 && automatic_transposition_request.is_none()
             {
@@ -10510,7 +10812,8 @@ impl TsfTextService_Impl {
                 );
             }
             let persistent_anchored_discovered = persistent_anchored_promotion
-                .is_some_and(|promotion| promotion.source_index.is_none());
+                .is_some_and(|promotion| promotion.source_index.is_none())
+                || tail_support_promotion.is_some_and(|promotion| promotion.source_index.is_none());
             let session_anchored_promotion = if persistent_exact_promotion.is_none()
                 && session_exact_text.is_none()
                 && !persistent_anchored_discovered
@@ -10778,13 +11081,59 @@ impl TsfTextService_Impl {
         }
     }
 
+    fn confirm_pending_tail_support(&self) -> bool {
+        let pending = match self.pending_tail_support_selection.try_borrow_mut() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return false,
+        };
+        let Some(pending) = pending else {
+            return true;
+        };
+        let recorded = self
+            .personal_tail_support
+            .try_borrow_mut()
+            .map(|mut support| support.record(&pending.selection.code, &pending.selection.text))
+            .unwrap_or(false);
+        if !recorded
+            && let Ok(mut slot) = self.pending_tail_support_selection.try_borrow_mut()
+            && slot.is_none()
+        {
+            *slot = Some(pending);
+        }
+        recorded
+    }
+
+    fn retract_pending_tail_support(&self) -> bool {
+        self.pending_tail_support_selection
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .is_some()
+    }
+
+    fn stage_tail_support_after_success(
+        &self,
+        selection: PlannedSelection,
+        learning_context: NativeFeedbackContext,
+    ) {
+        let _ = self.confirm_pending_tail_support();
+        if learning_context != NativeFeedbackContext::Eligible {
+            return;
+        }
+        if let Ok(mut slot) = self.pending_tail_support_selection.try_borrow_mut()
+            && slot.is_none()
+        {
+            *slot = Some(PendingTailSupportSelection { selection });
+        }
+    }
+
     fn confirm_pending_personal_selection(&self) -> bool {
         let pending = match self.pending_personal_selection.try_borrow_mut() {
             Ok(mut slot) => slot.take(),
             Err(_) => return false,
         };
         let Some(pending) = pending else {
-            return true;
+            return self.confirm_pending_tail_support();
         };
         let preferred = self
             .personal_ranking
@@ -10864,7 +11213,7 @@ impl TsfTextService_Impl {
             selection_is_preferred,
             session_retained,
         );
-        true
+        self.confirm_pending_tail_support()
     }
 
     fn retract_pending_personal_selection(&self) -> bool {
@@ -10873,7 +11222,7 @@ impl TsfTextService_Impl {
             Err(_) => return false,
         };
         let Some(pending) = pending else {
-            return false;
+            return self.retract_pending_tail_support();
         };
         if let Some(phrase) = pending.phrase.as_ref() {
             self.restore_session_selection(
@@ -10898,16 +11247,22 @@ impl TsfTextService_Impl {
                 activated: false,
             });
         }
+        let _ = self.retract_pending_tail_support();
         true
     }
 
     fn should_route_pending_personal_key_down(&self) -> Result<bool> {
-        let has_pending = self
+        let has_personal_pending = self
             .pending_personal_selection
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .is_some();
-        Ok(has_pending && !self.has_active_logical_composition()?)
+        let has_tail_pending = self
+            .pending_tail_support_selection
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .is_some();
+        Ok((has_personal_pending || has_tail_pending) && !self.has_active_logical_composition()?)
     }
 
     fn resolve_pending_personal_selection_for_key(
@@ -10920,11 +11275,34 @@ impl TsfTextService_Impl {
                 .pending_personal_selection
                 .try_borrow()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
-            let Some(pending) = pending.as_ref() else {
-                return Ok(PendingPersonalKeyResolution::None);
-            };
-            pending.selection.retractable_by_immediate_backspace
+            pending
+                .as_ref()
+                .map(|pending| pending.selection.retractable_by_immediate_backspace)
+                .or_else(|| {
+                    self.pending_tail_support_selection
+                        .try_borrow()
+                        .ok()
+                        .and_then(|pending| {
+                            pending
+                                .as_ref()
+                                .map(|pending| pending.selection.retractable_by_immediate_backspace)
+                        })
+                })
+                .unwrap_or(false)
         };
+        if !self
+            .pending_personal_selection
+            .try_borrow()
+            .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+            .is_some()
+            && !self
+                .pending_tail_support_selection
+                .try_borrow()
+                .map_err(|_| lifecycle_error(E_UNEXPECTED))?
+                .is_some()
+        {
+            return Ok(PendingPersonalKeyResolution::None);
+        }
         let immediate_plain_backspace = vkey == VK_BACK.0
             && !modifiers.control
             && !modifiers.alt
@@ -11602,6 +11980,9 @@ impl TsfTextService_Impl {
         if let Ok(mut ranking) = self.personal_ranking.try_borrow_mut() {
             let _ = ranking.refresh();
         }
+        if let Ok(mut support) = self.personal_tail_support.try_borrow_mut() {
+            let _ = support.refresh();
+        }
         Ok(())
     }
 
@@ -11629,7 +12010,9 @@ impl TsfTextService_Impl {
             return Ok(None);
         }
         Ok(Some(
-            CandidateDisplay::from_batch(batch, session.candidate_page_start()).with_mode(mode),
+            CandidateDisplay::from_batch(batch, session.candidate_page_start())
+                .with_identity_code(session.phonetic())
+                .with_mode(mode),
         ))
     }
 
@@ -11722,7 +12105,19 @@ impl TsfTextService_Impl {
                     provider,
                     session.phonetic(),
                     &text,
-                );
+                )
+                || self
+                    .personal_tail_support
+                    .try_borrow()
+                    .map(|support| {
+                        support.has_repeated_public_tail_support_for_text(
+                            provider,
+                            session.phonetic(),
+                            &text,
+                            &ranking.suppressions,
+                        )
+                    })
+                    .unwrap_or(false);
             let selection_memory = self
                 .selection_memory
                 .try_borrow()
@@ -11850,6 +12245,95 @@ impl TsfTextService_Impl {
         drop(feedback);
         if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
             self.native_feedback_language_bar_state.notify();
+        }
+    }
+
+    fn record_candidate_preference_label(&self, label: &PendingCandidatePreferenceLabel) {
+        let Ok(mut feedback) = self.native_feedback.lock() else {
+            return;
+        };
+        if !feedback.is_accepting() {
+            return;
+        }
+        let result = feedback.record_at(
+            label.context,
+            NativeFeedbackEvent::CandidatePreferenceLabeled {
+                code: label.code.clone(),
+                text: label.text.clone(),
+                action: label.action,
+            },
+            native_feedback_monotonic_ms(),
+        );
+        drop(feedback);
+        if matches!(result, NativeFeedbackRecordResult::Stopped(_)) {
+            self.native_feedback_language_bar_state.notify();
+        }
+    }
+
+    fn apply_queued_candidate_preference_labels(&self) {
+        let labels = match self.candidate_preference_queue.try_borrow_mut() {
+            Ok(mut queue) => queue.pending.drain(..).collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        for label in labels {
+            let applied =
+                match label.action {
+                    NativeCandidatePreferenceAction::Prefer => {
+                        let recorded = self.personal_ranking.try_borrow_mut().ok().is_some_and(
+                            |mut ranking| {
+                                let restored = !ranking.is_suppressed(&label.code, &label.text)
+                                    || ranking.append_suppression_action(
+                                        PersonalRankingSuppressionActionKind::Restore,
+                                        &label.code,
+                                        &label.text,
+                                    );
+                                restored
+                                    && (0..MANUAL_PREFERENCE_SUPPORT_VOTES)
+                                        .all(|_| ranking.record(&label.code, &label.text))
+                                    && ranking.flush()
+                            },
+                        );
+                        if recorded && let Ok(mut memory) = self.selection_memory.try_borrow_mut() {
+                            memory.remember_text(&label.code, &label.text);
+                        }
+                        recorded
+                    }
+                    NativeCandidatePreferenceAction::DeferToPublic => {
+                        let saved = self.personal_ranking.try_borrow_mut().ok().is_some_and(
+                            |mut ranking| {
+                                ranking.is_suppressed(&label.code, &label.text)
+                                    || ranking.append_suppression_action(
+                                        PersonalRankingSuppressionActionKind::Suppress,
+                                        &label.code,
+                                        &label.text,
+                                    )
+                            },
+                        );
+                        if saved && let Ok(mut memory) = self.selection_memory.try_borrow_mut() {
+                            memory.forget_text(&label.code, &label.text);
+                        }
+                        saved
+                    }
+                    NativeCandidatePreferenceAction::RestorePersonalization => self
+                        .personal_ranking
+                        .try_borrow_mut()
+                        .ok()
+                        .is_some_and(|mut ranking| {
+                            !ranking.is_suppressed(&label.code, &label.text)
+                                || ranking.append_suppression_action(
+                                    PersonalRankingSuppressionActionKind::Restore,
+                                    &label.code,
+                                    &label.text,
+                                )
+                        }),
+                };
+            if applied {
+                self.record_candidate_preference_label(&label);
+            } else if let Ok(mut queue) = self.candidate_preference_queue.try_borrow_mut() {
+                // A transient persistence failure keeps the latest explicit
+                // label bounded and retryable at the next safe boundary.
+                queue.push(label);
+            }
         }
     }
 
@@ -12115,6 +12599,7 @@ impl TsfTextService_Impl {
                     after,
                     edit: None,
                     selection_to_remember: None,
+                    tail_support_to_remember: None,
                     feedback_after_success: Some(display.feedback_event(session.phonetic(), true)),
                     candidate_display: Some(display),
                     action_after_success: None,
@@ -12267,6 +12752,22 @@ impl TsfTextService_Impl {
             })
         })
         .flatten();
+        let tail_support_to_remember = (selection_to_remember.is_none()
+            && matches!(&input, CompositionInput::Confirm)
+            && session.candidate_page_start() == 0
+            && !session.recovery_mode()
+            && !session.tab_mode())
+        .then(|| {
+            selected_text.as_ref().and_then(|text| {
+                provider_verifies_public_tail_support(provider.as_ref(), session.phonetic(), text)
+                    .then(|| PlannedSelection {
+                        code: session.phonetic().to_owned(),
+                        text: text.clone(),
+                        retractable_by_immediate_backspace: true,
+                    })
+            })
+        })
+        .flatten();
         let selection_feedback = (!session.tab_assembly_mode())
             .then(|| {
                 selected_text.as_ref().and_then(|text| {
@@ -12370,6 +12871,7 @@ impl TsfTextService_Impl {
         }
         if !tab_assembly_selection {
             plan.selection_to_remember = selection_to_remember;
+            plan.tail_support_to_remember = tail_support_to_remember;
             plan.overruled_text_to_remember = overruled_text_to_remember;
             plan.feedback_after_success = selection_feedback
                 .or_else(|| {
@@ -12425,7 +12927,8 @@ impl TsfTextService_Impl {
             plan.after
                 .normalize_candidate_page(batch.candidates.len(), CANDIDATE_PAGE_SIZE);
             let mut display =
-                CandidateDisplay::from_batch(batch, plan.after.candidate_page_start());
+                CandidateDisplay::from_batch(batch, plan.after.candidate_page_start())
+                    .with_identity_code(plan.after.phonetic());
             if plan.after.tab_mode() {
                 display = shape_candidate_display(display, &plan.after);
             }
@@ -12455,6 +12958,9 @@ impl TsfTextService_Impl {
         let Some(context) = context.cloned() else {
             return Ok(false.into());
         };
+        if !self.has_active_logical_composition()? {
+            self.apply_queued_candidate_preference_labels();
+        }
         let key_started_at = Instant::now();
         let refresh_started_at = Instant::now();
         let begins_chinese_composition = self.input_mode.get() == InputMode::Chinese
@@ -12467,6 +12973,11 @@ impl TsfTextService_Impl {
             && let Ok(mut ranking) = self.personal_ranking.try_borrow_mut()
         {
             let _ = ranking.refresh_at_safe_boundary();
+        }
+        if begins_chinese_composition
+            && let Ok(mut support) = self.personal_tail_support.try_borrow_mut()
+        {
+            let _ = support.refresh_at_safe_boundary();
         }
         if begins_chinese_composition
             && let Some(provider) = self.candidate_provider.as_ref()
@@ -12540,6 +13051,7 @@ impl TsfTextService_Impl {
             edit,
             mut candidate_display,
             selection_to_remember,
+            tail_support_to_remember,
             overruled_text_to_remember,
             feedback_after_success,
             action_after_success,
@@ -12665,6 +13177,9 @@ impl TsfTextService_Impl {
         } else if breaks_personal_phrase {
             self.clear_personal_phrase_composer();
         }
+        if let Some(selection) = tail_support_to_remember {
+            self.stage_tail_support_after_success(selection, candidate_learning_context);
+        }
         if let Some(update) = personal_left_context_update {
             match update {
                 Some(text) => self.set_personal_left_context(&text),
@@ -12757,6 +13272,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         if let Ok(mut state) = self.candidate_forget_state.try_borrow_mut() {
             *state = CandidateForgetState::Inactive;
         }
+        self.apply_queued_candidate_preference_labels();
         let _ = self.confirm_pending_personal_selection();
         // A deactivated TSF service may remain cached by its host for a long
         // time, so `Drop` is not a timely durability boundary. Publish the
@@ -12765,6 +13281,9 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         // use the same synchronous fallback as the existing drop path.
         if let Ok(mut ranking) = self.personal_ranking.try_borrow_mut() {
             let _ = ranking.flush();
+        }
+        if let Ok(mut support) = self.personal_tail_support.try_borrow_mut() {
+            let _ = support.flush();
         }
         self.clear_immediate_retype_correction();
         self.clear_personal_phrase_composer();
@@ -22467,6 +22986,141 @@ mod tests {
             exact.provenance[0]
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+    }
+
+    #[test]
+    fn repeated_public_first_choice_teaches_only_the_guarded_anchored_tail_lane() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            CodeFamilyCandidateProvider,
+        ))));
+
+        for confirmation in 0..2 {
+            let mut session = CompositionSession::default();
+            session.apply(CompositionInput::Letters("jdjd".to_owned()));
+            *service.composition.borrow_mut() = session;
+            let plan = service
+                .plan_key(WPARAM(usize::from(VK_SPACE.0)), KeyModifiers::default())
+                .unwrap()
+                .expect("the public first candidate should commit");
+            assert!(plan.selection_to_remember.is_none());
+            let support = plan
+                .tail_support_to_remember
+                .expect("a verified complete public word should stage tail support");
+            assert_eq!(support.code, "jdjd");
+            assert_eq!(support.text, "讲讲");
+            service.stage_tail_support_after_success(support, NativeFeedbackContext::Eligible);
+            assert!(service.confirm_pending_tail_support());
+            assert!(
+                !service
+                    .personal_ranking
+                    .borrow()
+                    .has_evidence("jdjd", "讲讲"),
+                "passive first-choice evidence must not become exact personal ranking"
+            );
+
+            let short = service
+                .load_candidate_batch(
+                    &CodeFamilyCandidateProvider,
+                    "jdj",
+                    3,
+                    InteractiveCandidateView::Primary,
+                )
+                .unwrap();
+            if confirmation == 0 {
+                assert_eq!(short.candidates, ["简单", "降价", "讲讲"]);
+            } else {
+                assert_eq!(short.candidates, ["简单", "讲讲", "降价"]);
+                assert!(
+                    short.provenance[1]
+                        .personalization()
+                        .contains(NativeCandidatePersonalization::PERSISTENT_ANCHORED)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_candidate_labels_are_strong_reversible_and_recorded_as_human_actions() {
+        let _guard = test_lock();
+        let service = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
+            SelectionCandidateProvider,
+        ))));
+        assert_eq!(
+            service
+                .native_feedback
+                .lock()
+                .unwrap()
+                .start_rolling_memory(
+                    NativeFeedbackAuthorization::explicit_memory_only(),
+                    NativeFeedbackLimits::default(),
+                ),
+            NativeFeedbackStartResult::Started
+        );
+        let queue = |action| {
+            service
+                .candidate_preference_queue
+                .borrow_mut()
+                .push(PendingCandidatePreferenceLabel {
+                    code: "ab".to_owned(),
+                    text: "乙".to_owned(),
+                    action,
+                    context: NativeFeedbackContext::Eligible,
+                });
+            service.apply_queued_candidate_preference_labels();
+        };
+
+        queue(NativeCandidatePreferenceAction::Prefer);
+        let preferred = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(preferred.candidates, ["乙", "甲", "丙"]);
+
+        queue(NativeCandidatePreferenceAction::DeferToPublic);
+        let public = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(public.candidates, ["甲", "乙", "丙"]);
+
+        queue(NativeCandidatePreferenceAction::RestorePersonalization);
+        let restored = service
+            .load_candidate_batch(
+                &SelectionCandidateProvider,
+                "ab",
+                3,
+                InteractiveCandidateView::Primary,
+            )
+            .unwrap();
+        assert_eq!(restored.candidates, ["乙", "甲", "丙"]);
+        let actions = service
+            .native_feedback
+            .lock()
+            .unwrap()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                NativeFeedbackEvent::CandidatePreferenceLabeled { action, .. } => Some(*action),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            [
+                NativeCandidatePreferenceAction::Prefer,
+                NativeCandidatePreferenceAction::DeferToPublic,
+                NativeCandidatePreferenceAction::RestorePersonalization,
+            ]
         );
     }
 

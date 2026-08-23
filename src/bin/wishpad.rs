@@ -63,15 +63,16 @@ mod windows_app {
     use windows::core::{PCWSTR, w};
     use ziranma_core::{
         NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
-        NativeAutomaticTranspositionTier, NativeCandidateSuppressionAction, NativeCandidateView,
-        NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeShortExactAbstention,
-        WindowsUserDataProtector, WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError,
-        WishImportance, WishNote, WishNoteFileVersion, WishPackageInfo,
-        WishPublicCandidateOrderPolicy, WishReviewStatus, WishSnapshot, list_trashed_wish_packages,
-        list_wish_packages, load_trashed_wish_note, load_trashed_wish_snapshot, load_wish_note,
-        load_wish_snapshot, move_wish_to_trash, native_slow_key_remainder_ms,
-        repository_root_for_user_tool_executable, restore_wish_from_trash,
-        save_or_replace_wish_note, trashed_wish_note_file_version, wish_note_file_version,
+        NativeAutomaticTranspositionTier, NativeCandidatePreferenceAction,
+        NativeCandidateSuppressionAction, NativeCandidateView, NativeFeedbackEvent,
+        NativePersonalPhraseAdjacency, NativeShortExactAbstention, WindowsUserDataProtector,
+        WishCaptureScope, WishCategory, WishEventRole, WishFeedbackError, WishImportance, WishNote,
+        WishNoteFileVersion, WishPackageInfo, WishPublicCandidateOrderPolicy, WishReviewStatus,
+        WishSnapshot, list_trashed_wish_packages, list_wish_packages, load_trashed_wish_note,
+        load_trashed_wish_snapshot, load_wish_note, load_wish_snapshot, move_wish_to_trash,
+        native_slow_key_remainder_ms, repository_root_for_user_tool_executable,
+        restore_wish_from_trash, save_or_replace_wish_note, trashed_wish_note_file_version,
+        wish_note_file_version,
     };
 
     const WISHPAD_ICON_RESOURCE_ID: usize = 101;
@@ -2711,6 +2712,18 @@ mod windows_app {
                 match action {
                     NativeCandidateSuppressionAction::Suppress => "已忘记",
                     NativeCandidateSuppressionAction::Restore => "已恢复",
+                }
+            ),
+            NativeFeedbackEvent::CandidatePreferenceLabeled { code, text, action } => format!(
+                "候选偏好　{} → {}（{}）",
+                compact_text(code, 28),
+                compact_text(text, 40),
+                match action {
+                    NativeCandidatePreferenceAction::Prefer => "提高优先级",
+                    NativeCandidatePreferenceAction::DeferToPublic => "降低到公共排序",
+                    NativeCandidatePreferenceAction::RestorePersonalization => {
+                        "重新允许个人学习"
+                    }
                 }
             ),
             NativeFeedbackEvent::CandidatePopupTiming {

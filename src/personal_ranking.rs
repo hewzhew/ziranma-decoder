@@ -919,6 +919,21 @@ impl PersonalRankingSnapshot {
     }
 
     #[cfg(any(windows, test))]
+    pub(crate) fn has_repeated_anchored_suffix_candidate_with_suppressions(
+        &self,
+        code: &str,
+        suppressions: &PersonalRankingSuppressionSnapshot,
+        mut eligible_complete_candidate: impl FnMut(&str, &str) -> bool,
+    ) -> bool {
+        self.preferred_repeated_anchored_suffix_text_where(
+            code,
+            suppressions,
+            &mut eligible_complete_candidate,
+        )
+        .is_some()
+    }
+
+    #[cfg(any(windows, test))]
     fn preferred_anchored_suffix_text_where<'a>(
         &'a self,
         code: &str,

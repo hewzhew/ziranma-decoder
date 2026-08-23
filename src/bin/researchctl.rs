@@ -1703,6 +1703,9 @@ impl ResearchReview {
                     }
                     frame = None;
                 }
+                NativeFeedbackEvent::CandidatePreferenceLabeled { .. } => {
+                    frame = None;
+                }
                 NativeFeedbackEvent::CandidatePopupTiming {
                     first_frame_ms,
                     fully_visible_ms,
@@ -5461,7 +5464,7 @@ mod tests {
             "个人选择确认：已观察 2；成为持久首选 1，已记录但尚未胜出 1；会话选择保留 1，未保留 1。V1–V18 不补猜"
         ));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V21 1"));
+        assert!(aggregate.contains("反馈格式：V22 1"));
         assert!(aggregate.contains("两键多义窄门 1/1 批"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(

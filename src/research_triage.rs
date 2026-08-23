@@ -515,6 +515,9 @@ fn observe_snapshot(report: &mut ResearchIssueTriage, snapshot: &WishSnapshot) {
                 }
                 frame = None;
             }
+            NativeFeedbackEvent::CandidatePreferenceLabeled { .. } => {
+                frame = None;
+            }
             NativeFeedbackEvent::CandidatePopupTiming {
                 first_frame_ms,
                 fully_visible_ms,
