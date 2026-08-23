@@ -44,12 +44,13 @@ use ziranma_core::{
     PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
     PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SentenceCandidate, ShortWordExtraKeyCorrectionDecision, SupplementalCandidateLayerConfig,
-    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
-    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_rime_target,
-    audit_public_supplemental_layer, candidate_package_authentication_sha256,
-    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
-    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    SentenceCandidate, ShortWordExtraKeyCorrectionDecision, ShortWordExtraKeyCorrectionKeepReason,
+    SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
+    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
+    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
+    candidate_package_authentication_sha256, candidate_package_storage_id,
+    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
+    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
     layered_short_word_extra_key_correction_decision, load_candidate_runtime_snapshots_with_layers,
     load_current_candidate_snapshot, normalize_pinyin_tone_marks, parse_lexicon_tsv,
@@ -12474,6 +12475,12 @@ fn benchmark_candidate_layers(
     let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
     let correction_audits =
         audit_four_character_correction_gate(&core, &supplemental, &supplemental_entries, 256)?;
+    let short_correction_audits = audit_short_word_extra_key_correction_gate(
+        &core,
+        &supplemental,
+        &supplemental_entries,
+        256,
+    )?;
     let config = SupplementalCandidateLayerConfig { exact_promotions };
     let codes = layer_benchmark_codes()?;
     let correction_codes = four_character_correction_benchmark_codes()?;
@@ -12617,8 +12624,25 @@ fn benchmark_candidate_layers(
             audit.exact_protection_failures,
         )?;
     }
+    let mut short_correction_audit_summary = String::new();
+    for (index, character_count) in [2, 3].into_iter().enumerate() {
+        let audit = short_correction_audits[index];
+        writeln!(
+            short_correction_audit_summary,
+            "短词公开合成（{character_count} 字邻键多按）：样本 {}；恢复提示 {}，目标首项 {}，目标可见 {}，两层冲突 {}，单层缺证据 {}，无恢复 {}，合成目标码偏离 {}，干净码保护失败 {}",
+            audit.samples,
+            audit.offered,
+            audit.target_first,
+            audit.target_visible,
+            audit.conflicting_codes,
+            audit.missing_independent_evidence,
+            audit.no_recovery,
+            audit.synthetic_target_code_misses,
+            audit.clean_code_protection_failures,
+        )?;
+    }
     Ok(format!(
-        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n短词邻键多按门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n{correction_audit_summary}候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
+        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n短词邻键多按门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n{correction_audit_summary}{short_correction_audit_summary}候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
         codes.len(),
         core_latency.samples,
         duration_ms(core_build),
@@ -12895,6 +12919,137 @@ fn audit_four_character_correction_gate(
                         return Err(
                             "four-character audit produced an unsupported input shape".into()
                         );
+                    }
+                },
+            }
+        }
+    }
+    Ok(audits)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShortWordExtraKeyCorrectionAudit {
+    samples: usize,
+    offered: usize,
+    target_first: usize,
+    target_visible: usize,
+    conflicting_codes: usize,
+    missing_independent_evidence: usize,
+    no_recovery: usize,
+    synthetic_target_code_misses: usize,
+    clean_code_protection_failures: usize,
+}
+
+fn synthesize_short_word_neighbor_extra_key(
+    intended_code: &str,
+    sample_index: usize,
+) -> Option<String> {
+    if !matches!(intended_code.len(), 4 | 6)
+        || !intended_code.as_bytes().iter().all(u8::is_ascii_lowercase)
+    {
+        return None;
+    }
+    let insertion_index = sample_index % (intended_code.len() + 1);
+    let anchor_index = insertion_index.min(intended_code.len() - 1);
+    let anchor = intended_code.as_bytes()[anchor_index];
+    let neighbor = (b'a'..=b'z').find(|&key| are_qwerty_neighbors(anchor, key))?;
+    let mut observed = intended_code.as_bytes().to_vec();
+    observed.insert(insertion_index, neighbor);
+    String::from_utf8(observed).ok()
+}
+
+fn audit_short_word_extra_key_correction_gate(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    supplemental_entries: &[ziranma_core::LexiconEntry],
+    sample_limit_per_length: usize,
+) -> Result<[ShortWordExtraKeyCorrectionAudit; 2], Box<dyn std::error::Error>> {
+    let mut selected_codes = [HashSet::new(), HashSet::new()];
+    let mut samples = [Vec::new(), Vec::new()];
+    for entry in supplemental_entries {
+        let character_count = entry.text.chars().count();
+        let length_index = match character_count {
+            2 => 0,
+            3 => 1,
+            _ => continue,
+        };
+        if samples[length_index].len() == sample_limit_per_length
+            || entry.syllable_codes.len() != character_count
+            || selected_codes[length_index].contains(entry.code.as_str())
+        {
+            continue;
+        }
+        let core_top = core.exact_full_code_texts(entry.code.as_str(), 1)?;
+        let supplemental_top = supplemental.exact_full_code_texts(entry.code.as_str(), 1)?;
+        if core_top.first() != Some(&entry.text) || supplemental_top.first() != Some(&entry.text) {
+            continue;
+        }
+        selected_codes[length_index].insert(entry.code.as_str().to_owned());
+        samples[length_index].push((entry.text.clone(), entry.code.as_str().to_owned()));
+        if samples
+            .iter()
+            .all(|samples| samples.len() == sample_limit_per_length)
+        {
+            break;
+        }
+    }
+
+    let mut audits = [ShortWordExtraKeyCorrectionAudit::default(); 2];
+    for (length_index, selected) in samples.into_iter().enumerate() {
+        for (sample_index, (target_text, intended_code)) in selected.into_iter().enumerate() {
+            let audit = &mut audits[length_index];
+            audit.samples += 1;
+            if !matches!(
+                layered_short_word_extra_key_correction_decision(
+                    core,
+                    Some(supplemental),
+                    &intended_code,
+                    1,
+                )?,
+                ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+                    ShortWordExtraKeyCorrectionKeepReason::UnsupportedInputShape
+                )
+            ) {
+                audit.clean_code_protection_failures += 1;
+            }
+            let observed = synthesize_short_word_neighbor_extra_key(&intended_code, sample_index)
+                .ok_or("short-word audit could not synthesize a selected extra key")?;
+            match layered_short_word_extra_key_correction_decision(
+                core,
+                Some(supplemental),
+                &observed,
+                MAX_CANDIDATE_SNAPSHOT_RANK,
+            )? {
+                ShortWordExtraKeyCorrectionDecision::Offer(offer) => {
+                    audit.offered += 1;
+                    audit.synthetic_target_code_misses +=
+                        usize::from(offer.intended_code != intended_code);
+                    audit.target_first += usize::from(
+                        offer
+                            .candidates
+                            .first()
+                            .map(|candidate| candidate.text.as_str())
+                            == Some(target_text.as_str()),
+                    );
+                    audit.target_visible += usize::from(
+                        offer
+                            .candidates
+                            .iter()
+                            .any(|candidate| candidate.text == target_text),
+                    );
+                }
+                ShortWordExtraKeyCorrectionDecision::KeepOrdinary(reason) => match reason {
+                    ShortWordExtraKeyCorrectionKeepReason::UnsupportedInputShape => {
+                        return Err("short-word audit produced an unsupported error shape".into());
+                    }
+                    ShortWordExtraKeyCorrectionKeepReason::MissingIndependentPublicEvidence => {
+                        audit.missing_independent_evidence += 1;
+                    }
+                    ShortWordExtraKeyCorrectionKeepReason::NoNeighborExtraKeyRecovery => {
+                        audit.no_recovery += 1;
+                    }
+                    ShortWordExtraKeyCorrectionKeepReason::ConflictingIntendedCodes => {
+                        audit.conflicting_codes += 1;
                     }
                 },
             }
@@ -14981,6 +15136,52 @@ mod tests {
             synthesize_four_character_edit(intended, SyntheticFourCharacterEdit::ExtraKey, 4)
                 .unwrap();
         assert_eq!(extra, "abcdeefgh");
+    }
+
+    #[test]
+    fn short_word_synthetic_audit_covers_two_and_three_character_consensus() {
+        for intended in ["keyi", "mafmmk"] {
+            for sample_index in 0..=intended.len() {
+                let observed =
+                    synthesize_short_word_neighbor_extra_key(intended, sample_index).unwrap();
+                let insertion_index = sample_index % (intended.len() + 1);
+                assert_eq!(observed.len(), intended.len() + 1);
+                let mut restored = observed.as_bytes().to_vec();
+                let extra = restored.remove(insertion_index);
+                assert_eq!(std::str::from_utf8(&restored).unwrap(), intended);
+                let anchor_index = insertion_index.min(intended.len() - 1);
+                assert!(are_qwerty_neighbors(
+                    extra,
+                    intended.as_bytes()[anchor_index]
+                ));
+            }
+        }
+
+        const PUBLIC: &str = "text\tpinyin\tfrequency\n\
+可以\tke yi\t1000\n\
+辛苦\txin ku\t900\n\
+麻烦猫\tma fan mao\t800\n";
+        let core = snapshot_from_payload("short-audit-core-v1", PUBLIC).unwrap();
+        let supplemental = snapshot_from_payload("short-audit-supplemental-v1", PUBLIC).unwrap();
+        let entries = parse_lexicon_tsv(PUBLIC).unwrap();
+        let audits =
+            audit_short_word_extra_key_correction_gate(&core, &supplemental, &entries, 16).unwrap();
+
+        assert_eq!(audits[0].samples, 2);
+        assert_eq!(audits[0].offered, 2);
+        assert_eq!(audits[0].target_first, 2);
+        assert_eq!(audits[0].target_visible, 2);
+        assert_eq!(audits[1].samples, 1);
+        assert_eq!(audits[1].offered, 1);
+        assert_eq!(audits[1].target_first, 1);
+        assert_eq!(audits[1].target_visible, 1);
+        for audit in audits {
+            assert_eq!(audit.conflicting_codes, 0);
+            assert_eq!(audit.missing_independent_evidence, 0);
+            assert_eq!(audit.no_recovery, 0);
+            assert_eq!(audit.synthetic_target_code_misses, 0);
+            assert_eq!(audit.clean_code_protection_failures, 0);
+        }
     }
 
     #[test]
