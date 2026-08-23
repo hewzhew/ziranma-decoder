@@ -287,6 +287,10 @@ impl CandidateUiLabTokenBounds {
         self.step
     }
 
+    pub(crate) const fn contains(self, value: i32) -> bool {
+        value >= self.minimum && value <= self.maximum
+    }
+
     fn shifted(self, value: i32, steps: i32) -> i32 {
         value
             .saturating_add(self.step.saturating_mul(steps))
@@ -481,6 +485,21 @@ fn valid_draft(spec: CandidateVisualSpec) -> bool {
         && spec.metadata_font_height <= spec.row_height
 }
 
+pub(crate) fn reviewed_candidate_ui_lab_spec(spec: CandidateVisualSpec) -> bool {
+    let mut reconstructed = DEFAULT_CANDIDATE_VISUAL_SPEC;
+    for token in CandidateUiLabToken::ALL {
+        let value = token.value(spec);
+        if !token.bounds().contains(value) {
+            return false;
+        }
+        token.set(&mut reconstructed, value);
+    }
+    for role in CandidateUiLabColorRole::ALL {
+        role.set(&mut reconstructed, role.value(spec));
+    }
+    reconstructed == spec && valid_draft(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +598,34 @@ mod tests {
             CandidateUiLabColorRole::ALL[CandidateUiLabColorRole::ALL.len() - 1]
         );
         assert!(!state.select_color_role(CandidateUiLabColorRole::ALL.len() - 1));
+    }
+
+    #[test]
+    fn reviewed_spec_accepts_only_reachable_lab_drafts() {
+        assert!(reviewed_candidate_ui_lab_spec(
+            DEFAULT_CANDIDATE_VISUAL_SPEC
+        ));
+        let mut visual = CandidateUiLabVisualState::default();
+        for _ in CandidateUiLabToken::ALL {
+            for steps in [i32::MIN, i32::MAX] {
+                visual.reset_draft();
+                let _ = visual.adjust_draft(steps);
+                assert!(reviewed_candidate_ui_lab_spec(visual.active_spec()));
+            }
+            visual.reset_draft();
+            visual.cycle_token();
+        }
+        let mut color = DEFAULT_CANDIDATE_VISUAL_SPEC.background;
+        color.red = color.red.wrapping_add(1);
+        assert!(visual.set_draft_color(color));
+        assert!(reviewed_candidate_ui_lab_spec(visual.active_spec()));
+
+        let mut unsupported = DEFAULT_CANDIDATE_VISUAL_SPEC;
+        unsupported.footer_height += 1;
+        assert!(!reviewed_candidate_ui_lab_spec(unsupported));
+        let mut out_of_bounds = DEFAULT_CANDIDATE_VISUAL_SPEC;
+        out_of_bounds.selection_accent_width = 9;
+        assert!(!reviewed_candidate_ui_lab_spec(out_of_bounds));
     }
 
     #[test]

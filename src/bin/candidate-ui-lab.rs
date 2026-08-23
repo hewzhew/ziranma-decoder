@@ -18,6 +18,9 @@ mod candidate_ui_gdi;
 #[path = "../candidate_ui_lab_annotation.rs"]
 mod candidate_ui_lab_annotation;
 #[cfg(windows)]
+#[path = "../candidate_ui_lab_feedback.rs"]
+mod candidate_ui_lab_feedback;
+#[cfg(windows)]
 #[path = "../candidate_ui_lab_visual.rs"]
 mod candidate_ui_lab_visual;
 

@@ -19,7 +19,7 @@ use crate::candidate_ui::{
     CandidateVisualSpec,
 };
 
-pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_SCHEMA: &str = "candidate-ui-lab-annotation-v2";
+pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_SCHEMA: &str = "candidate-ui-lab-annotation-v3";
 pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_BATCH_SCHEMA: &str =
     "candidate-ui-lab-annotation-batch-v3";
 pub(crate) const CANDIDATE_UI_LAB_VISUAL_SPEC_SCHEMA: &str = "candidate-ui-lab-visual-spec-v1";
@@ -293,7 +293,7 @@ impl CandidateUiLabAnnotation {
         let mut output = String::new();
         let _ = write!(
             output,
-            "{{\"schema\":\"{}\",\"scenario\":\"{}\",\"variant\":\"{}\",\"layout\":\"{}\",\"dpi\":{},\"selection\":{{\"left\":{},\"top\":{},\"right\":{},\"bottom\":{}}},\"visual_spec_sha256\":\"{}\",\"hits\":[",
+            "{{\"schema\":\"{}\",\"scenario\":\"{}\",\"variant\":\"{}\",\"layout\":\"{}\",\"dpi\":{},\"selection\":{{\"left\":{},\"top\":{},\"right\":{},\"bottom\":{}}},\"visual_spec_sha256\":\"{}\",\"visual_spec\":{},\"hits\":[",
             CANDIDATE_UI_LAB_ANNOTATION_SCHEMA,
             json_escape(&context.scenario_id),
             json_escape(&context.variant_id),
@@ -304,6 +304,7 @@ impl CandidateUiLabAnnotation {
             context.selection.right,
             context.selection.bottom,
             context.visual_spec_sha256,
+            candidate_visual_spec_canonical_json(context.visual_spec),
         );
         for (index, hit) in context.hits.iter().enumerate() {
             if index > 0 {
@@ -501,7 +502,7 @@ fn push_visual_spec_color_json(output: &mut String, name: &str, color: Candidate
     );
 }
 
-fn candidate_visual_spec_sha256(spec: CandidateVisualSpec) -> String {
+pub(crate) fn candidate_visual_spec_sha256(spec: CandidateVisualSpec) -> String {
     // Keep this destructure exhaustive so a newly added visual token cannot be
     // silently omitted from the annotation binding.
     let CandidateVisualSpec {
@@ -774,9 +775,10 @@ mod tests {
             .add(context, "  字号\r\n想再清楚一点 \"呀\"  ")
             .unwrap();
         let json = session.annotations()[0].to_canonical_json();
-        assert!(json.starts_with("{\"schema\":\"candidate-ui-lab-annotation-v2\""));
+        assert!(json.starts_with("{\"schema\":\"candidate-ui-lab-annotation-v3\""));
         assert!(json.contains("\"scenario\":\"long-candidate\""));
         assert!(json.contains("\"variant\":\"draft\""));
+        assert!(json.contains("\"visual_spec\":{\"schema\":\"candidate-ui-lab-visual-spec-v1\""));
         assert!(json.contains("字号\\n想再清楚一点 \\\"呀\\\""));
         assert!(!json.contains("春风"));
         assert!(!json.contains("\r"));
@@ -938,7 +940,7 @@ mod tests {
 
         let json = session.to_canonical_json();
         assert!(json.starts_with(
-            "{\"schema\":\"candidate-ui-lab-annotation-batch-v3\",\"annotation_schema\":\"candidate-ui-lab-annotation-v2\""
+            "{\"schema\":\"candidate-ui-lab-annotation-batch-v3\",\"annotation_schema\":\"candidate-ui-lab-annotation-v3\""
         ));
         let (group_summary, _) = json.split_once(",\"annotations\":[").unwrap();
         assert!(
@@ -1004,7 +1006,7 @@ mod tests {
         assert!(payload.len() < MAX_CANDIDATE_UI_LAB_EXPORT_BYTES);
         assert_eq!(
             payload.matches("\"visual_spec\":").count(),
-            MAX_CANDIDATE_UI_LAB_ANNOTATIONS
+            MAX_CANDIDATE_UI_LAB_ANNOTATIONS * 2
         );
     }
 
