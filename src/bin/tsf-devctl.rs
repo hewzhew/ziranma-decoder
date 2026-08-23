@@ -3478,6 +3478,42 @@ mod tests {
             bundle_id
         }
 
+        fn snapshot_tree(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>, std::time::SystemTime)> {
+            fn visit(
+                root: &Path,
+                directory: &Path,
+                snapshot: &mut Vec<(PathBuf, bool, Vec<u8>, std::time::SystemTime)>,
+            ) {
+                let mut entries = fs::read_dir(directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for path in entries {
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    let is_directory = metadata.is_dir();
+                    let bytes = if metadata.is_file() {
+                        fs::read(&path).unwrap()
+                    } else {
+                        Vec::new()
+                    };
+                    snapshot.push((
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        is_directory,
+                        bytes,
+                        metadata.modified().unwrap(),
+                    ));
+                    if is_directory {
+                        visit(root, &path, snapshot);
+                    }
+                }
+            }
+
+            let mut snapshot = Vec::new();
+            visit(root, root, &mut snapshot);
+            snapshot
+        }
+
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3544,6 +3580,47 @@ mod tests {
         fs::write(root.0.join("cargo-target").join("cache.bin"), [0_u8; 1024]).unwrap();
         fs::create_dir(root.0.join("probe-target")).unwrap();
         fs::write(root.0.join("probe-target").join("probe.bin"), [0_u8; 2048]).unwrap();
+        let state_before_status = snapshot_tree(&root.0);
+        let status = std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-StatusOnly")
+            .arg("-UserToolsRoot")
+            .arg(&root.0)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "status report failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status_stdout = String::from_utf8_lossy(&status.stdout);
+        for expected in [
+            "IME user tool status",
+            "Current:",
+            "Previous:",
+            "This action: read only",
+        ] {
+            assert!(
+                status_stdout.contains(expected),
+                "status report omitted {expected:?}: {status_stdout}"
+            );
+        }
+        assert_eq!(
+            snapshot_tree(&root.0),
+            state_before_status,
+            "read-only status must preserve every managed entry, byte, and last-write time"
+        );
+        assert!(
+            !root.0.join("refresh.lock").exists(),
+            "read-only status must not create a refresh lock"
+        );
         let state_before_space = fs::read(root.0.join("slots.zut")).unwrap();
         let builds_before_space = fs::read_dir(root.0.join("builds")).unwrap().count();
         let space = std::process::Command::new(&powershell)
