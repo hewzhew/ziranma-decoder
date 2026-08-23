@@ -8224,14 +8224,24 @@ fn inspect_exact_phrase_preview(
             exact_promotions: 1,
         },
     )?;
-    let preview =
-        preview_exact_phrase_candidates(core, supplemental, phrase, code, EXACT_PHRASE_RANK_DEPTH)?;
+    let phrase_exact = phrase.exact_full_code_texts(code, 1)?;
     let existing_exact =
         existing_exact_texts(core, supplemental, code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
-    let stable_prefix = baseline
-        .iter()
-        .take_while(|candidate| existing_exact.contains(candidate.as_str()))
-        .count();
+    let (preview, stable_prefix) = match phrase_exact.first() {
+        Some(candidate) => merge_exact_phrase_candidate_into_baseline(
+            &baseline,
+            &existing_exact,
+            candidate,
+            EXACT_PHRASE_RANK_DEPTH,
+        ),
+        None => {
+            let stable_prefix = baseline
+                .iter()
+                .take_while(|candidate| existing_exact.contains(candidate.as_str()))
+                .count();
+            (baseline.clone(), stable_prefix)
+        }
+    };
     let existing_prefix_unchanged = baseline
         .iter()
         .take(stable_prefix)
@@ -9079,10 +9089,18 @@ fn preview_exact_phrase_candidates(
     let supplemental_exact =
         supplemental.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
     let existing_exact = core_exact
-        .iter()
-        .chain(&supplemental_exact)
-        .map(String::as_str)
+        .into_iter()
+        .chain(supplemental_exact)
         .collect::<HashSet<_>>();
+    Ok(merge_exact_phrase_candidate_into_baseline(&baseline, &existing_exact, candidate, limit).0)
+}
+
+fn merge_exact_phrase_candidate_into_baseline(
+    baseline: &[String],
+    existing_exact: &HashSet<String>,
+    candidate: &str,
+    limit: usize,
+) -> (Vec<String>, usize) {
     let stable_prefix = baseline
         .iter()
         .take_while(|item| existing_exact.contains(item.as_str()))
@@ -9096,7 +9114,7 @@ fn preview_exact_phrase_candidates(
     for item in baseline.iter().skip(stable_prefix) {
         push_unique_candidate(&mut preview, &mut seen, item, limit);
     }
-    Ok(preview)
+    (preview, stable_prefix)
 }
 
 fn push_unique_candidate(
