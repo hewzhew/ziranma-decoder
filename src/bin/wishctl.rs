@@ -940,6 +940,7 @@ mod tests {
         assert_eq!(wish_schema_version_label(18), "V18");
         assert_eq!(wish_schema_version_label(19), "V19");
         assert_eq!(wish_schema_version_label(20), "V20");
+        assert_eq!(wish_schema_version_label(21), "V21");
     }
 
     #[test]

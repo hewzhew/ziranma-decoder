@@ -28,8 +28,9 @@ use crate::{
     NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
     NativeCandidateProvenance, NativeCandidateRankingMovement, NativeCandidateSource,
     NativeCandidateSuppressionAction, NativeCandidateView, NativeFeedbackEvent,
-    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeTabAssemblyState,
-    TranspositionCalibrationLabel, TranspositionCalibrationObservation, candidate_sha256_hex,
+    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeShortExactAbstention,
+    NativeTabAssemblyState, TranspositionCalibrationLabel, TranspositionCalibrationObservation,
+    candidate_sha256_hex,
 };
 
 pub const WISH_SCHEMA_V1: &str = "ziranma-wish-v1";
@@ -52,6 +53,7 @@ pub const WISH_SCHEMA_V17: &str = "ziranma-wish-v17";
 pub const WISH_SCHEMA_V18: &str = "ziranma-wish-v18";
 pub const WISH_SCHEMA_V19: &str = "ziranma-wish-v19";
 pub const WISH_SCHEMA_V20: &str = "ziranma-wish-v20";
+pub const WISH_SCHEMA_V21: &str = "ziranma-wish-v21";
 pub const WISH_PACKAGE_FILE_SUFFIX: &str = ".ziw";
 pub const WISH_NOTE_FILE_SUFFIX: &str = ".note.ziw";
 pub const MAX_WISH_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -60,7 +62,7 @@ pub const MAX_WISH_NOTE_BYTES: usize = 8 * 1024;
 const MAX_WISH_EVENTS: usize = 4_096;
 const MAX_WISH_PLAINTEXT_BYTES: usize = 1536 * 1024;
 const MAX_WISH_STRING_BYTES: usize = 64 * 1024;
-pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 20;
+pub const CURRENT_WISH_SCHEMA_VERSION: u8 = 21;
 const WISH_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-v1\0";
 const WISH_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-v2\0";
 const WISH_PLAINTEXT_MAGIC_V3: &[u8] = b"ziranma-wish-v3\0";
@@ -81,6 +83,7 @@ const WISH_PLAINTEXT_MAGIC_V17: &[u8] = b"ziranma-wish-v17\0";
 const WISH_PLAINTEXT_MAGIC_V18: &[u8] = b"ziranma-wish-v18\0";
 const WISH_PLAINTEXT_MAGIC_V19: &[u8] = b"ziranma-wish-v19\0";
 const WISH_PLAINTEXT_MAGIC_V20: &[u8] = b"ziranma-wish-v20\0";
+const WISH_PLAINTEXT_MAGIC_V21: &[u8] = b"ziranma-wish-v21\0";
 const WISH_PROTECTED_MAGIC: &[u8] = b"ziranma-wish-dpapi-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V1: &[u8] = b"ziranma-wish-note-v1\0";
 const WISH_NOTE_PLAINTEXT_MAGIC_V2: &[u8] = b"ziranma-wish-note-v2\0";
@@ -561,6 +564,10 @@ impl WishSnapshot {
         self.source_schema_version >= 20
     }
 
+    pub fn supports_short_exact_abstention(&self) -> bool {
+        self.source_schema_version >= 21
+    }
+
     pub fn category(&self) -> WishCategory {
         self.category
     }
@@ -836,7 +843,7 @@ impl WishSnapshot {
     fn render_with_event_version(&self, event_version: u8) -> Result<Vec<u8>, WishFeedbackError> {
         self.validate()?;
         let mut output = Vec::new();
-        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V20);
+        output.extend_from_slice(WISH_PLAINTEXT_MAGIC_V21);
         output.push(self.capture_scope.encoded());
         output.push(self.category.encoded());
         put_usize(&mut output, self.focus_event_start)?;
@@ -906,7 +913,10 @@ impl WishSnapshot {
             return Err(WishFeedbackError::InvalidPlaintext);
         }
         let mut reader = SliceReader::new(input);
-        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V20) {
+        let version = if input.starts_with(WISH_PLAINTEXT_MAGIC_V21) {
+            reader.expect(WISH_PLAINTEXT_MAGIC_V21)?;
+            21
+        } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V20) {
             reader.expect(WISH_PLAINTEXT_MAGIC_V20)?;
             20
         } else if input.starts_with(WISH_PLAINTEXT_MAGIC_V19) {
@@ -1953,6 +1963,16 @@ fn render_event(
                 ) {
                     return Err(WishFeedbackError::InvalidSnapshot);
                 }
+                if version >= 21 {
+                    if !provenance.short_exact_abstention().is_recorded() {
+                        return Err(WishFeedbackError::InvalidSnapshot);
+                    }
+                    output.push(short_exact_abstention_tag(
+                        provenance.short_exact_abstention(),
+                    )?);
+                } else if provenance.short_exact_abstention().is_abstention() {
+                    return Err(WishFeedbackError::InvalidSnapshot);
+                }
             }
             output.push(u8::from(automatic_transposition.is_some()));
             if let Some(decision) = automatic_transposition {
@@ -2226,7 +2246,12 @@ fn parse_event(
                 } else {
                     NativeCandidateProvenance::new(source, reader.boolean()?)
                 };
-                provenance.push(item);
+                let short_exact_abstention = if version >= 21 {
+                    parse_short_exact_abstention(reader.byte()?)?
+                } else {
+                    NativeShortExactAbstention::Unrecorded
+                };
+                provenance.push(item.with_short_exact_abstention(short_exact_abstention));
             }
             let automatic_transposition = if matches!(tag, 9 | 12) {
                 if reader.boolean()? {
@@ -2373,6 +2398,28 @@ fn parse_candidate_ranking_movement(
             absolute_rank => Ok(NativeCandidateRankingMovement::MovedFrom { absolute_rank }),
         },
         3 => Ok(NativeCandidateRankingMovement::RecalledFromOutsideLoadedPool),
+        _ => Err(WishFeedbackError::InvalidSnapshot),
+    }
+}
+
+fn short_exact_abstention_tag(
+    decision: NativeShortExactAbstention,
+) -> Result<u8, WishFeedbackError> {
+    match decision {
+        NativeShortExactAbstention::Unrecorded => Err(WishFeedbackError::InvalidSnapshot),
+        NativeShortExactAbstention::None => Ok(1),
+        NativeShortExactAbstention::PersistentCompetition => Ok(2),
+        NativeShortExactAbstention::SessionCompetition => Ok(3),
+    }
+}
+
+fn parse_short_exact_abstention(
+    value: u8,
+) -> Result<NativeShortExactAbstention, WishFeedbackError> {
+    match value {
+        1 => Ok(NativeShortExactAbstention::None),
+        2 => Ok(NativeShortExactAbstention::PersistentCompetition),
+        3 => Ok(NativeShortExactAbstention::SessionCompetition),
         _ => Err(WishFeedbackError::InvalidSnapshot),
     }
 }
@@ -2934,13 +2981,15 @@ mod tests {
             18
         } else if magic == WISH_PLAINTEXT_MAGIC_V19 {
             19
-        } else {
+        } else if magic == WISH_PLAINTEXT_MAGIC_V20 {
             20
+        } else {
+            21
         };
         let current = snapshot.render_with_event_version(event_version).unwrap();
         let mut rendered = Vec::with_capacity(magic.len() + current.len());
         rendered.extend_from_slice(magic);
-        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V20.len()..]);
+        rendered.extend_from_slice(&current[WISH_PLAINTEXT_MAGIC_V21.len()..]);
         rendered
     }
 
@@ -2969,6 +3018,19 @@ mod tests {
                 }
             }
         }
+        if source_schema_version < 21 {
+            for event in &mut expected.events {
+                if let NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                    provenance, ..
+                } = &mut event.event
+                {
+                    for item in provenance {
+                        *item = item
+                            .with_short_exact_abstention(NativeShortExactAbstention::Unrecorded);
+                    }
+                }
+            }
+        }
         assert!(*parsed == expected);
     }
 
@@ -2976,13 +3038,13 @@ mod tests {
     fn private_snapshot_round_trips_without_debug_surface() {
         let snapshot = private_snapshot();
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V21));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.events().len(), 2);
         assert_eq!(parsed.capture_scope(), WishCaptureScope::RecentWindow);
         assert_eq!(parsed.category(), WishCategory::Other);
         assert_eq!(parsed.focus_event_range(), 0..2);
-        assert_eq!(parsed.source_schema_version(), 20);
+        assert_eq!(parsed.source_schema_version(), 21);
         assert!(parsed.supports_slow_key_path_timing());
         assert!(parsed.supports_post_commit_backspace_routing());
         assert!(parsed.supports_precise_candidate_personalization());
@@ -2994,6 +3056,7 @@ mod tests {
         assert!(parsed.supports_candidate_ranking_movement());
         assert!(parsed.supports_personal_selection_confirmation());
         assert!(parsed.supports_short_word_extra_key_timing());
+        assert!(parsed.supports_short_exact_abstention());
         assert_eq!(
             parsed.public_candidate_order_policy(),
             WishPublicCandidateOrderPolicy::Unrecorded
@@ -3146,7 +3209,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V21));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_candidate_suppression_actions());
         assert!(matches!(
@@ -3188,7 +3251,7 @@ mod tests {
             snapshot.source_events += 1;
 
             let rendered = snapshot.render().unwrap();
-            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
+            assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V21));
             let parsed = WishSnapshot::parse(&rendered).unwrap();
             assert!(parsed.supports_personal_phrase_adjacency());
             assert!(matches!(
@@ -3217,7 +3280,7 @@ mod tests {
 
         let mut falsely_downgraded = Vec::with_capacity(rendered.len());
         falsely_downgraded.extend_from_slice(WISH_PLAINTEXT_MAGIC_V15);
-        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V20.len()..]);
+        falsely_downgraded.extend_from_slice(&rendered[WISH_PLAINTEXT_MAGIC_V21.len()..]);
         assert!(WishSnapshot::parse(&falsely_downgraded).is_err());
 
         let mut unknown_adjacency = rendered.clone();
@@ -3286,11 +3349,12 @@ mod tests {
         });
         snapshot.source_events += 1;
 
-        let rendered = snapshot.render().unwrap();
+        let rendered = render_current_body_with_magic(&snapshot, WISH_PLAINTEXT_MAGIC_V20);
         assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert_eq!(parsed.source_schema_version(), 20);
         assert!(parsed.supports_short_word_extra_key_timing());
+        assert!(!parsed.supports_short_exact_abstention());
         assert!(matches!(
             parsed.events().last().map(WishEvent::event),
             Some(NativeFeedbackEvent::ShortWordExtraKeyTiming {
@@ -3308,6 +3372,67 @@ mod tests {
         let legacy = render_current_body_with_magic(&private_snapshot(), WISH_PLAINTEXT_MAGIC_V19);
         let parsed_legacy = WishSnapshot::parse(&legacy).unwrap();
         assert!(!parsed_legacy.supports_short_word_extra_key_timing());
+    }
+
+    #[test]
+    fn v21_round_trips_short_exact_abstention_and_v20_keeps_it_unrecorded() {
+        let mut snapshot = private_snapshot();
+        snapshot.events[0].event = NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+            code: "ab".to_owned(),
+            view: NativeCandidateView::Ordinary,
+            page_start: 0,
+            candidates: vec!["甲".to_owned(), "乙".to_owned()],
+            provenance: vec![
+                NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false)
+                    .with_short_exact_abstention(NativeShortExactAbstention::PersistentCompetition),
+                NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false),
+            ],
+            automatic_transposition: None,
+            loaded_candidates: 2,
+            tab_assembly: None,
+            may_have_more: false,
+        };
+
+        let rendered = snapshot.render().unwrap();
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V21));
+        let parsed = WishSnapshot::parse(&rendered).unwrap();
+        assert_eq!(parsed.source_schema_version(), 21);
+        assert!(parsed.supports_short_exact_abstention());
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
+            parsed.events()[0].event()
+        else {
+            panic!("candidate provenance event missing");
+        };
+        assert_eq!(
+            provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::PersistentCompetition
+        );
+        assert_eq!(
+            provenance[1].short_exact_abstention(),
+            NativeShortExactAbstention::None
+        );
+        assert!(snapshot.render_with_event_version(20).is_err());
+        assert!(parse_short_exact_abstention(u8::MAX).is_err());
+
+        let mut legacy = snapshot.clone();
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
+            &mut legacy.events[0].event
+        else {
+            panic!("candidate provenance event missing");
+        };
+        provenance[0] = NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false);
+        let rendered_legacy = render_current_body_with_magic(&legacy, WISH_PLAINTEXT_MAGIC_V20);
+        let parsed_legacy = WishSnapshot::parse(&rendered_legacy).unwrap();
+        assert!(!parsed_legacy.supports_short_exact_abstention());
+        let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =
+            parsed_legacy.events()[0].event()
+        else {
+            panic!("candidate provenance event missing");
+        };
+        assert_eq!(
+            provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::Unrecorded
+        );
     }
 
     #[test]
@@ -3474,7 +3599,7 @@ mod tests {
         snapshot.source_events += 1;
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V21));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed == snapshot);
         assert!(matches!(
@@ -3600,7 +3725,7 @@ mod tests {
         };
 
         let rendered = snapshot.render().unwrap();
-        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V20));
+        assert!(rendered.starts_with(WISH_PLAINTEXT_MAGIC_V21));
         let parsed = WishSnapshot::parse(&rendered).unwrap();
         assert!(parsed.supports_candidate_ranking_movement());
         let NativeFeedbackEvent::CandidatesPresentedWithProvenance { provenance, .. } =

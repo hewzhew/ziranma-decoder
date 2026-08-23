@@ -152,6 +152,33 @@ pub enum NativeCandidateRankingMovement {
     RecalledFromOutsideLoadedPool,
 }
 
+/// Why context-free exact personalization deliberately abstained for one
+/// two-key full-syllable candidate frame.
+///
+/// This decision is attached only to the first candidate's provenance. It is
+/// separate from ranking personalization because abstention preserves the
+/// public order instead of moving a candidate. Legacy wish snapshots use the
+/// explicit `Unrecorded` state and must never be read as evidence that the gate
+/// did or did not fire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeShortExactAbstention {
+    Unrecorded,
+    #[default]
+    None,
+    PersistentCompetition,
+    SessionCompetition,
+}
+
+impl NativeShortExactAbstention {
+    pub fn is_recorded(self) -> bool {
+        self != Self::Unrecorded
+    }
+
+    pub fn is_abstention(self) -> bool {
+        matches!(self, Self::PersistentCompetition | Self::SessionCompetition)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeCandidatePersonalization(u8);
 
@@ -203,6 +230,7 @@ pub struct NativeCandidateProvenance {
     personalization: NativeCandidatePersonalization,
     ranking_personalization: NativeCandidatePersonalization,
     ranking_movement: NativeCandidateRankingMovement,
+    short_exact_abstention: NativeShortExactAbstention,
 }
 
 impl Default for NativeCandidateProvenance {
@@ -212,6 +240,7 @@ impl Default for NativeCandidateProvenance {
             personalization: NativeCandidatePersonalization::NONE,
             ranking_personalization: NativeCandidatePersonalization::NONE,
             ranking_movement: NativeCandidateRankingMovement::Unchanged,
+            short_exact_abstention: NativeShortExactAbstention::None,
         }
     }
 }
@@ -227,6 +256,7 @@ impl NativeCandidateProvenance {
             },
             ranking_personalization: NativeCandidatePersonalization::NONE,
             ranking_movement: NativeCandidateRankingMovement::Unchanged,
+            short_exact_abstention: NativeShortExactAbstention::None,
         }
     }
 
@@ -239,6 +269,7 @@ impl NativeCandidateProvenance {
             personalization,
             ranking_personalization: NativeCandidatePersonalization::NONE,
             ranking_movement: NativeCandidateRankingMovement::Unchanged,
+            short_exact_abstention: NativeShortExactAbstention::None,
         }
     }
 
@@ -254,6 +285,7 @@ impl NativeCandidateProvenance {
             personalization,
             ranking_personalization,
             ranking_movement: NativeCandidateRankingMovement::Unrecorded,
+            short_exact_abstention: NativeShortExactAbstention::Unrecorded,
         })
     }
 
@@ -279,6 +311,7 @@ impl NativeCandidateProvenance {
             personalization,
             ranking_personalization,
             ranking_movement,
+            short_exact_abstention: NativeShortExactAbstention::None,
         })
     }
 
@@ -300,6 +333,22 @@ impl NativeCandidateProvenance {
 
     pub fn ranking_movement(self) -> NativeCandidateRankingMovement {
         self.ranking_movement
+    }
+
+    pub fn short_exact_abstention(self) -> NativeShortExactAbstention {
+        self.short_exact_abstention
+    }
+
+    pub(crate) fn with_short_exact_abstention(
+        mut self,
+        decision: NativeShortExactAbstention,
+    ) -> Self {
+        self.short_exact_abstention = decision;
+        self
+    }
+
+    pub(crate) fn set_short_exact_abstention(&mut self, decision: NativeShortExactAbstention) {
+        self.short_exact_abstention = decision;
     }
 
     pub(crate) fn add_personalization(&mut self, reason: NativeCandidatePersonalization) {
@@ -731,6 +780,18 @@ impl NativeFeedbackEvent {
                 tab_assembly,
                 ..
             } => {
+                let mut abstention_positions =
+                    provenance
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, candidate)| {
+                            candidate
+                                .short_exact_abstention()
+                                .is_abstention()
+                                .then_some(index)
+                        });
+                let abstention_position = abstention_positions.next();
+                let multiple_abstentions = abstention_positions.next().is_some();
                 if !valid_code(code)
                     || candidates.is_empty()
                     || candidates.len() > MAX_FEEDBACK_CANDIDATES_PER_PAGE
@@ -740,6 +801,14 @@ impl NativeFeedbackEvent {
                     || *loaded_candidates > MAX_CANDIDATE_SNAPSHOT_RANK
                     || (automatic_transposition.is_some() && *view != NativeCandidateView::Ordinary)
                     || (tab_assembly.is_some() && *view != NativeCandidateView::Shape)
+                    || multiple_abstentions
+                    || abstention_position.is_some_and(|index| {
+                        index != 0
+                            || code.len() != 2
+                            || *view != NativeCandidateView::Ordinary
+                            || *page_start != 0
+                            || automatic_transposition.is_some()
+                    })
                 {
                     return None;
                 }
@@ -2023,6 +2092,118 @@ mod tests {
             ),
             NativeFeedbackRecordResult::Stopped(NativeFeedbackStopReason::InvalidEvent)
         );
+    }
+
+    #[test]
+    fn short_exact_abstention_is_content_free_and_belongs_only_to_the_global_top() {
+        let marked = |decision| {
+            NativeCandidateProvenance::new(NativeCandidateSource::CoreExact, false)
+                .with_short_exact_abstention(decision)
+        };
+        let event = |code: &str,
+                     view: NativeCandidateView,
+                     page_start: usize,
+                     provenance: Vec<NativeCandidateProvenance>| {
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code: code.to_owned(),
+                view,
+                page_start,
+                candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                provenance,
+                automatic_transposition: None,
+                loaded_candidates: page_start + 2,
+                tab_assembly: None,
+                may_have_more: false,
+            }
+        };
+
+        for decision in [
+            NativeShortExactAbstention::PersistentCompetition,
+            NativeShortExactAbstention::SessionCompetition,
+        ] {
+            assert!(
+                event(
+                    "ab",
+                    NativeCandidateView::Ordinary,
+                    0,
+                    vec![marked(decision), NativeCandidateProvenance::default()],
+                )
+                .validate_and_measure()
+                .is_some()
+            );
+        }
+
+        for invalid in [
+            event(
+                "ab",
+                NativeCandidateView::Ordinary,
+                0,
+                vec![
+                    NativeCandidateProvenance::default(),
+                    marked(NativeShortExactAbstention::PersistentCompetition),
+                ],
+            ),
+            event(
+                "ab",
+                NativeCandidateView::Ordinary,
+                0,
+                vec![
+                    marked(NativeShortExactAbstention::PersistentCompetition),
+                    marked(NativeShortExactAbstention::SessionCompetition),
+                ],
+            ),
+            event(
+                "abc",
+                NativeCandidateView::Ordinary,
+                0,
+                vec![
+                    marked(NativeShortExactAbstention::PersistentCompetition),
+                    NativeCandidateProvenance::default(),
+                ],
+            ),
+            event(
+                "ab",
+                NativeCandidateView::Shape,
+                0,
+                vec![
+                    marked(NativeShortExactAbstention::PersistentCompetition),
+                    NativeCandidateProvenance::default(),
+                ],
+            ),
+            event(
+                "ab",
+                NativeCandidateView::Ordinary,
+                1,
+                vec![
+                    marked(NativeShortExactAbstention::PersistentCompetition),
+                    NativeCandidateProvenance::default(),
+                ],
+            ),
+            NativeFeedbackEvent::CandidatesPresentedWithProvenance {
+                code: "ab".to_owned(),
+                view: NativeCandidateView::Ordinary,
+                page_start: 0,
+                candidates: vec!["甲".to_owned(), "乙".to_owned()],
+                provenance: vec![
+                    marked(NativeShortExactAbstention::PersistentCompetition),
+                    NativeCandidateProvenance::default(),
+                ],
+                automatic_transposition: Some(NativeAutomaticTranspositionDecision::new(
+                    0,
+                    20,
+                    NativeAutomaticTranspositionTier::Shadow,
+                    NativeAutomaticTranspositionTier::Shadow,
+                    NativeAutomaticTranspositionOutcome::Suppressed,
+                    None,
+                    None,
+                )),
+                loaded_candidates: 2,
+                tab_assembly: None,
+                may_have_more: false,
+            },
+        ] {
+            assert_eq!(invalid.validate_and_measure(), None);
+        }
     }
 
     #[test]

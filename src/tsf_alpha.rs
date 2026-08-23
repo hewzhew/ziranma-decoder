@@ -47,22 +47,23 @@ use crate::{
     NativeFeedbackFreezeError, NativeFeedbackLifecycle, NativeFeedbackLimits,
     NativeFeedbackRecordResult, NativeFeedbackSession, NativeFeedbackStartResult,
     NativeFeedbackStopResult, NativeFeedbackSummary, NativePersonalPhraseAdjacency,
-    NativeSelectionSource, NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH,
-    PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking, PersonalRankingBatch,
-    PersonalRankingSelection, PersonalRankingSnapshot, PersonalRankingSuppressionAction,
-    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
-    RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, SupplementalCandidateLayerConfig,
-    WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
-    WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
-    WishJournalAnchor, WishJournalContext, WishJournalSpan, WishPublicCandidateOrderPolicy,
-    WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex, load_candidate_runtime_exact_short,
-    load_candidate_runtime_exact_short_preflight, load_candidate_runtime_exact_short_selection,
-    load_candidate_runtime_snapshots_with_layers, load_candidate_runtime_supplemental,
-    load_candidate_runtime_supplemental_selection, load_current_explicit_alias_snapshot,
-    load_explicit_alias_slot_state, load_personal_ranking, load_personal_ranking_suppressions,
-    parse_lexicon_tsv, parse_stroke_sequence_tsv, refresh_personal_ranking,
-    refresh_personal_ranking_suppressions, research_feedback_enabled, save_personal_ranking_batch,
-    save_personal_ranking_checkpoint, save_personal_ranking_suppression_action, save_wish_snapshot,
+    NativeSelectionSource, NativeShortExactAbstention, NativeTabAssemblyState,
+    PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking,
+    PersonalRankingBatch, PersonalRankingSelection, PersonalRankingSnapshot,
+    PersonalRankingSuppressionAction, PersonalRankingSuppressionActionKind,
+    PersonalRankingSuppressionSnapshot, RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory,
+    SupplementalCandidateLayerConfig, WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID,
+    WindowsUserDataProtector, WishCaptureScope, WishCategory, WishCommand, WishCommandAck,
+    WishCommandAckStatus, WishJournalAnchor, WishJournalContext, WishJournalSpan,
+    WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, candidate_sha256_hex,
+    load_candidate_runtime_exact_short, load_candidate_runtime_exact_short_preflight,
+    load_candidate_runtime_exact_short_selection, load_candidate_runtime_snapshots_with_layers,
+    load_candidate_runtime_supplemental, load_candidate_runtime_supplemental_selection,
+    load_current_explicit_alias_snapshot, load_explicit_alias_slot_state, load_personal_ranking,
+    load_personal_ranking_suppressions, parse_lexicon_tsv, parse_stroke_sequence_tsv,
+    refresh_personal_ranking, refresh_personal_ranking_suppressions, research_feedback_enabled,
+    save_personal_ranking_batch, save_personal_ranking_checkpoint,
+    save_personal_ranking_suppression_action, save_wish_snapshot,
 };
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, COLORREF, E_INVALIDARG, E_POINTER,
@@ -10038,17 +10039,26 @@ impl PersonalRankingRuntime {
             .is_some()
     }
 
-    fn has_competing_exact_texts(&self, code: &str, session_text: Option<&str>) -> bool {
-        self.snapshot
+    fn short_exact_abstention(
+        &self,
+        code: &str,
+        session_text: Option<&str>,
+    ) -> NativeShortExactAbstention {
+        if self
+            .snapshot
             .has_competing_texts_with_suppressions(code, &self.suppressions)
-            || session_text.is_some_and(|text| {
-                !self.suppressions.is_suppressed(code, text)
-                    && self.snapshot.has_other_text_with_suppressions(
-                        code,
-                        text,
-                        &self.suppressions,
-                    )
-            })
+        {
+            NativeShortExactAbstention::PersistentCompetition
+        } else if session_text.is_some_and(|text| {
+            !self.suppressions.is_suppressed(code, text)
+                && self
+                    .snapshot
+                    .has_other_text_with_suppressions(code, text, &self.suppressions)
+        }) {
+            NativeShortExactAbstention::SessionCompetition
+        } else {
+            NativeShortExactAbstention::None
+        }
     }
 
     fn has_anchored_suffix_evidence(
@@ -10931,7 +10941,10 @@ impl TsfTextService_Impl {
             .try_borrow()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))?
             .clone();
-        let context_free_short_exact_blocked = if code.len() == 2 {
+        let short_exact_abstention = if code.len() == 2
+            && view == InteractiveCandidateView::Primary
+            && automatic_transposition_request.is_none()
+        {
             let personal_ranking = self
                 .personal_ranking
                 .try_borrow()
@@ -10940,10 +10953,12 @@ impl TsfTextService_Impl {
                 .selection_memory
                 .try_borrow()
                 .map_err(|_| lifecycle_error(E_UNEXPECTED))?;
-            personal_ranking.has_competing_exact_texts(code, selection_memory.remembered_text(code))
+            personal_ranking.short_exact_abstention(code, selection_memory.remembered_text(code))
         } else {
-            false
+            NativeShortExactAbstention::None
         };
+        let context_free_short_exact_blocked =
+            short_exact_abstention != NativeShortExactAbstention::None;
         let contextual_search = view == InteractiveCandidateView::Primary
             && automatic_transposition_request.is_none()
             && left_context.as_deref().is_some_and(|previous| {
@@ -11152,6 +11167,11 @@ impl TsfTextService_Impl {
             batch.ranking_origins.truncate(batch.candidates.len());
         }
         batch.protected_prefix_len = batch.protected_prefix_len.min(batch.candidates.len());
+        if short_exact_abstention != NativeShortExactAbstention::None
+            && let Some(first) = batch.provenance.first_mut()
+        {
+            first.set_short_exact_abstention(short_exact_abstention);
+        }
         Ok(batch)
     }
 
@@ -14320,12 +14340,18 @@ mod tests {
             !stale_writer.is_suppressed("ab", "丙词"),
             "a runtime that has not refreshed must remain a faithful stale-host simulation"
         );
-        assert!(stale_writer.has_competing_exact_texts("ab", None));
+        assert_eq!(
+            stale_writer.short_exact_abstention("ab", None),
+            NativeShortExactAbstention::PersistentCompetition
+        );
         assert!(stale_writer.record("ab", "丙词"));
         assert!(stale_writer.flush());
         assert!(stale_writer.refresh());
         assert!(stale_writer.is_suppressed("ab", "丙词"));
-        assert!(!stale_writer.has_competing_exact_texts("ab", None));
+        assert_eq!(
+            stale_writer.short_exact_abstention("ab", None),
+            NativeShortExactAbstention::None
+        );
 
         let mut restarted = PersonalRankingRuntime::new_with_roots(
             Some(ranking_root.clone()),
@@ -14334,7 +14360,10 @@ mod tests {
         assert!(restarted.has_evidence("ab", "丙词"));
         assert!(restarted.is_suppressed("ab", "丙词"));
         assert!(!restarted.is_suppressed("cd", "丙词"));
-        assert!(!restarted.has_competing_exact_texts("ab", None));
+        assert_eq!(
+            restarted.short_exact_abstention("ab", None),
+            NativeShortExactAbstention::None
+        );
 
         let mut same_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
         assert!(restarted.promote_texts_after("ab", &mut same_code, 0));
@@ -14353,7 +14382,10 @@ mod tests {
 
         let restored =
             PersonalRankingRuntime::new_with_roots(Some(ranking_root), Some(suppression_root));
-        assert!(restored.has_competing_exact_texts("ab", None));
+        assert_eq!(
+            restored.short_exact_abstention("ab", None),
+            NativeShortExactAbstention::PersistentCompetition
+        );
         let mut same_code = vec!["甲词".to_owned(), "乙词".to_owned(), "丙词".to_owned()];
         assert!(restored.promote_texts_after("ab", &mut same_code, 0));
         assert_eq!(same_code, ["丙词", "甲词", "乙词"]);
@@ -24090,6 +24122,11 @@ mod tests {
                 .ranking_personalization()
                 .contains(NativeCandidatePersonalization::LEFT_CONTEXT)
         );
+        assert_eq!(
+            matching.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::PersistentCompetition,
+            "the top provenance keeps both the applied context cause and the context-free abstention"
+        );
         assert!(
             !matching.provenance[1]
                 .personalization()
@@ -24129,6 +24166,10 @@ mod tests {
             .unwrap();
         assert_eq!(unrelated.candidates[0], "吧");
         assert!(unrelated.provenance[0].ranking_personalization().is_empty());
+        assert_eq!(
+            unrelated.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::PersistentCompetition
+        );
     }
 
     #[test]
@@ -24153,6 +24194,10 @@ mod tests {
                 .ranking_personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
         );
+        assert_eq!(
+            one_short_preference.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::None
+        );
 
         assert!(service.personal_ranking.borrow_mut().record("ui", "是"));
         let competing_short = service
@@ -24169,6 +24214,10 @@ mod tests {
                 .provenance
                 .iter()
                 .all(|candidate| candidate.ranking_personalization().is_empty())
+        );
+        assert_eq!(
+            competing_short.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::PersistentCompetition
         );
 
         assert!(
@@ -24192,6 +24241,10 @@ mod tests {
             after_forget.provenance[0]
                 .ranking_personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT)
+        );
+        assert_eq!(
+            after_forget.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::None
         );
 
         assert!(service.personal_ranking.borrow_mut().record("uiub", "失手"));
@@ -24241,6 +24294,10 @@ mod tests {
                 .all(|candidate| candidate.personalization().is_empty()),
             "a distinct pending session choice must not temporarily replace the stable public order"
         );
+        assert_eq!(
+            competing_session.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::SessionCompetition
+        );
 
         assert!(
             service
@@ -24264,6 +24321,10 @@ mod tests {
                 .personalization()
                 .contains(NativeCandidatePersonalization::PERSISTENT_EXACT),
             "suppressing the competing session identity must restore the remaining exact evidence"
+        );
+        assert_eq!(
+            suppressed_session.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::None
         );
     }
 
@@ -24292,6 +24353,10 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.personalization().is_empty())
         );
+        assert_eq!(
+            absent_competitor.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::PersistentCompetition
+        );
 
         let protected = ComObject::new(TsfTextService::counted_for_process_test(Some(Arc::new(
             ProtectedSelectionCandidateProvider,
@@ -24313,6 +24378,10 @@ mod tests {
                 .provenance
                 .iter()
                 .all(|candidate| candidate.personalization().is_empty())
+        );
+        assert_eq!(
+            protected_batch.provenance[0].short_exact_abstention(),
+            NativeShortExactAbstention::PersistentCompetition
         );
     }
 

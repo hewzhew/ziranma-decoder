@@ -9,11 +9,11 @@ use ziranma_core::{
     CURRENT_WISH_SCHEMA_VERSION, NativeCandidatePersonalization, NativeCandidateProvenance,
     NativeCandidateRankingMovement, NativeCandidateSource, NativeCandidateSuppressionAction,
     NativeCandidateView, NativeFeedbackEvent, NativePersonalPhraseAdjacency, NativeSelectionSource,
-    NativeTabAssemblyState, RESEARCH_FEEDBACK_DIRECTORY, RESEARCH_TRIAGE_VISIBLE_LATENCY_MS,
-    ResearchHabitKind, ResearchHalfPairAnalysis, ResearchInputScene, ResearchIssueTriage,
-    ResearchSceneAnalysis, ResearchSelectionConfirmation, ResearchSelectionConfirmationMatch,
-    ResearchWishCandidateTextEvidence, ResearchWishEpisodeKind, ResearchWishEvidenceKind,
-    TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
+    NativeShortExactAbstention, NativeTabAssemblyState, RESEARCH_FEEDBACK_DIRECTORY,
+    RESEARCH_TRIAGE_VISIBLE_LATENCY_MS, ResearchHabitKind, ResearchHalfPairAnalysis,
+    ResearchInputScene, ResearchIssueTriage, ResearchSceneAnalysis, ResearchSelectionConfirmation,
+    ResearchSelectionConfirmationMatch, ResearchWishCandidateTextEvidence, ResearchWishEpisodeKind,
+    ResearchWishEvidenceKind, TranspositionCalibrationLabel, WishCaptureScope, WishJournalContext,
     WishPublicCandidateOrderPolicy, WishRuntimeIdentity, WishSnapshot, analyze_linked_research,
     analyze_research_issue_signals, analyze_research_issue_signals_for_runtime,
     analyze_runtime_half_pairs, list_wish_packages, native_slow_key_remainder_ms,
@@ -1418,6 +1418,7 @@ struct ResearchReview {
     personal_phrase_adjacency_capable_batches: usize,
     personal_selection_confirmation_capable_batches: usize,
     short_word_extra_key_timing_capable_batches: usize,
+    short_exact_abstention_capable_batches: usize,
     public_consensus_source_capable_batches: usize,
     public_candidate_order_policy_capable_batches: usize,
     public_candidate_order_policies: [usize; PUBLIC_CANDIDATE_ORDER_POLICY_KIND_COUNT],
@@ -1446,6 +1447,11 @@ struct ResearchReview {
     short_word_extra_key_continued_same_batch: usize,
     short_word_extra_key_raw_or_cancelled_same_batch: usize,
     short_word_extra_key_unresolved_at_batch_end: usize,
+    short_exact_commits: usize,
+    short_exact_persistent_competition: usize,
+    short_exact_session_competition: usize,
+    short_exact_no_abstention: usize,
+    short_exact_abstention_unavailable: usize,
     runtime_batches: HashMap<WishRuntimeIdentity, usize>,
     unidentified_runtime_batches: usize,
     personalized_top_bypass: PersonalizedTopBypassAudit,
@@ -1478,6 +1484,8 @@ impl ResearchReview {
             usize::from(snapshot.supports_personal_selection_confirmation());
         self.short_word_extra_key_timing_capable_batches +=
             usize::from(snapshot.supports_short_word_extra_key_timing());
+        self.short_exact_abstention_capable_batches +=
+            usize::from(snapshot.supports_short_exact_abstention());
         self.public_consensus_source_capable_batches +=
             usize::from(snapshot.supports_public_consensus_candidate_source());
         self.public_candidate_order_policy_capable_batches +=
@@ -1602,6 +1610,12 @@ impl ResearchReview {
                         matching_frame.and_then(|frame| frame.provenance_for_rank(*absolute_rank));
                     let global_top_provenance =
                         matching_frame.and_then(|frame| frame.global_top_provenance);
+                    if code.len() == 2 && *view == NativeCandidateView::Ordinary {
+                        self.observe_short_exact_commit(
+                            snapshot.supports_short_exact_abstention(),
+                            global_top_provenance,
+                        );
+                    }
                     let candidate_text_evidence = matching_frame
                         .map_or(CandidateTextEvidence::Unavailable, |frame| {
                             frame.candidate_text_evidence(*absolute_rank, text)
@@ -1813,6 +1827,39 @@ impl ResearchReview {
         self.frames_allowing_more_load += usize::from(may_have_more);
     }
 
+    fn observe_short_exact_commit(
+        &mut self,
+        supports_short_exact_abstention: bool,
+        global_top_provenance: Option<NativeCandidateProvenance>,
+    ) {
+        self.short_exact_commits += 1;
+        let decision = if supports_short_exact_abstention {
+            global_top_provenance
+                .map(NativeCandidateProvenance::short_exact_abstention)
+                .unwrap_or(NativeShortExactAbstention::Unrecorded)
+        } else {
+            NativeShortExactAbstention::Unrecorded
+        };
+        self.observe_short_exact_decision(decision);
+    }
+
+    fn observe_short_exact_decision(&mut self, decision: NativeShortExactAbstention) {
+        match decision {
+            NativeShortExactAbstention::PersistentCompetition => {
+                self.short_exact_persistent_competition += 1;
+            }
+            NativeShortExactAbstention::SessionCompetition => {
+                self.short_exact_session_competition += 1;
+            }
+            NativeShortExactAbstention::None => {
+                self.short_exact_no_abstention += 1;
+            }
+            NativeShortExactAbstention::Unrecorded => {
+                self.short_exact_abstention_unavailable += 1;
+            }
+        }
+    }
+
     fn observe_code_shape(
         &mut self,
         code: &str,
@@ -1847,7 +1894,7 @@ impl ResearchReview {
         .unwrap();
         writeln!(
             output,
-            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；个人选择确认结果 {}/{} 批；短词多按完整时序 {}/{} 批；公开共识来源字段 {}/{} 批。",
+            "诊断能力覆盖：慢按键分段 {}/{} 批；提交后退格 {}/{} 批；精确个性化证据 {}/{} 批；实际个人重排原因 {}/{} 批；个人重排原始位次 {}/{} 批；显式遗忘/恢复动作 {}/{} 批；个人短语文档邻接 {}/{} 批；个人选择确认结果 {}/{} 批；短词多按完整时序 {}/{} 批；两键多义窄门 {}/{} 批；公开共识来源字段 {}/{} 批。",
             self.slow_key_timing_capable_batches,
             self.batches,
             self.post_commit_backspace_capable_batches,
@@ -1866,11 +1913,14 @@ impl ResearchReview {
             self.batches,
             self.short_word_extra_key_timing_capable_batches,
             self.batches,
+            self.short_exact_abstention_capable_batches,
+            self.batches,
             self.public_consensus_source_capable_batches,
             self.batches,
         )
         .unwrap();
         self.render_short_word_extra_key_timing(output);
+        self.render_short_exact_abstention(output);
         writeln!(
             output,
             "个人选择确认：已观察 {}；成为持久首选 {}，已记录但尚未胜出 {}；会话选择保留 {}，未保留 {}。V1–V18 不补猜。",
@@ -1942,6 +1992,28 @@ impl ResearchReview {
             self.short_word_extra_key_continued_same_batch,
             self.short_word_extra_key_raw_or_cancelled_same_batch,
             self.short_word_extra_key_unresolved_at_batch_end,
+        )
+        .unwrap();
+    }
+
+    fn render_short_exact_abstention(&self, output: &mut String) {
+        if self.short_exact_abstention_capable_batches == 0 {
+            writeln!(
+                output,
+                "两键精确个性化窄门：尚无 V21 批次；普通两键提交 {} 次均不补猜是否因同码竞争而保留公开顺序。",
+                self.short_exact_commits,
+            )
+            .unwrap();
+            return;
+        }
+        writeln!(
+            output,
+            "两键精确个性化窄门：普通两键提交 {}；持久同码竞争 {}、会话同码竞争 {}、明确未触发 {}、旧格式或首选证据缺失 {}。该字段只解释为何保留公开顺序，不自动判定首选正确或错误。",
+            self.short_exact_commits,
+            self.short_exact_persistent_competition,
+            self.short_exact_session_competition,
+            self.short_exact_no_abstention,
+            self.short_exact_abstention_unavailable,
         )
         .unwrap();
     }
@@ -3530,6 +3602,14 @@ fn render_wish_candidate_evidence(
         }
         None => output.push_str("；目标来源未记录"),
     }
+    if episode.code().len() == 2 && episode.candidate_view() == Some(NativeCandidateView::Ordinary)
+    {
+        output.push_str("；两键窄门 ");
+        output.push_str(match evidence.global_top_provenance() {
+            Some(provenance) => short_exact_abstention_label(provenance.short_exact_abstention()),
+            None => "首选证据缺失",
+        });
+    }
     if episode.rank().is_some_and(|rank| rank > 1) {
         match evidence.global_top_provenance() {
             Some(provenance) => {
@@ -3559,6 +3639,15 @@ fn candidate_view_label(view: NativeCandidateView) -> &'static str {
         NativeCandidateView::Ordinary => "普通候选",
         NativeCandidateView::TranspositionRecovery => "换序恢复",
         NativeCandidateView::Shape => "Tab 找字",
+    }
+}
+
+fn short_exact_abstention_label(decision: NativeShortExactAbstention) -> &'static str {
+    match decision {
+        NativeShortExactAbstention::Unrecorded => "旧格式未记录",
+        NativeShortExactAbstention::None => "明确未触发",
+        NativeShortExactAbstention::PersistentCompetition => "持久同码竞争，保留公开顺序",
+        NativeShortExactAbstention::SessionCompetition => "会话同码竞争，保留公开顺序",
     }
 }
 
@@ -4102,6 +4191,44 @@ mod tests {
         for private_value in ["kehyi", "keyi", "可以", "可坏一"] {
             assert!(!rendered.contains(private_value));
         }
+    }
+
+    #[test]
+    fn short_exact_abstention_summary_separates_decisions_without_private_text() {
+        let mut review = ResearchReview {
+            batches: 2,
+            short_exact_abstention_capable_batches: 1,
+            short_exact_commits: 5,
+            ..ResearchReview::default()
+        };
+        for decision in [
+            NativeShortExactAbstention::PersistentCompetition,
+            NativeShortExactAbstention::SessionCompetition,
+            NativeShortExactAbstention::None,
+            NativeShortExactAbstention::Unrecorded,
+            NativeShortExactAbstention::Unrecorded,
+        ] {
+            review.observe_short_exact_decision(decision);
+        }
+
+        let mut rendered = String::new();
+        review.render_short_exact_abstention(&mut rendered);
+        assert!(rendered.contains(
+            "普通两键提交 5；持久同码竞争 1、会话同码竞争 1、明确未触发 1、旧格式或首选证据缺失 2"
+        ));
+        assert!(rendered.contains("不自动判定首选正确或错误"));
+        for private_value in ["ab", "把", "吧"] {
+            assert!(!rendered.contains(private_value));
+        }
+
+        assert_eq!(
+            short_exact_abstention_label(NativeShortExactAbstention::PersistentCompetition),
+            "持久同码竞争，保留公开顺序"
+        );
+        assert_eq!(
+            short_exact_abstention_label(NativeShortExactAbstention::SessionCompetition),
+            "会话同码竞争，保留公开顺序"
+        );
     }
 
     #[test]
@@ -5334,7 +5461,8 @@ mod tests {
             "个人选择确认：已观察 2；成为持久首选 1，已记录但尚未胜出 1；会话选择保留 1，未保留 1。V1–V18 不补猜"
         ));
         assert!(aggregate.contains("个人候选生命周期（仅成功落盘动作）：遗忘 1，恢复 1"));
-        assert!(aggregate.contains("反馈格式：V20 1"));
+        assert!(aggregate.contains("反馈格式：V21 1"));
+        assert!(aggregate.contains("两键多义窄门 1/1 批"));
         assert!(aggregate.contains("公开共识来源字段 1/1 批"));
         assert!(aggregate.contains(
             "公开候选冷排序策略：V13 字段 1/1 批；保守核心优先 1，实验跨词典共识 0，旧格式或未记录 0"
