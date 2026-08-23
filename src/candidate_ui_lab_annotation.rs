@@ -21,7 +21,8 @@ use crate::candidate_ui::{
 
 pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_SCHEMA: &str = "candidate-ui-lab-annotation-v2";
 pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_BATCH_SCHEMA: &str =
-    "candidate-ui-lab-annotation-batch-v2";
+    "candidate-ui-lab-annotation-batch-v3";
+pub(crate) const CANDIDATE_UI_LAB_VISUAL_SPEC_SCHEMA: &str = "candidate-ui-lab-visual-spec-v1";
 pub(crate) const MAX_CANDIDATE_UI_LAB_ANNOTATIONS: usize = 64;
 pub(crate) const MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS: usize = 240;
 const MAX_CANDIDATE_UI_LAB_HITS: usize = 64;
@@ -39,6 +40,7 @@ pub(crate) struct CandidateUiLabAnnotationContext {
     pub(crate) dpi: u32,
     pub(crate) selection: CandidateSceneRect,
     pub(crate) visual_spec_sha256: String,
+    pub(crate) visual_spec: CandidateVisualSpec,
     pub(crate) hits: Vec<CandidateSceneHit>,
 }
 
@@ -130,7 +132,7 @@ impl CandidateUiLabAnnotationSession {
             CANDIDATE_UI_LAB_ANNOTATION_SCHEMA,
             self.annotations.len(),
         );
-        for (index, ((variant_id, visual_spec_sha256), annotation_count)) in
+        for (index, ((variant_id, visual_spec_sha256, visual_spec_json), annotation_count)) in
             spec_groups.iter().enumerate()
         {
             if index > 0 {
@@ -138,10 +140,11 @@ impl CandidateUiLabAnnotationSession {
             }
             let _ = write!(
                 output,
-                "{{\"variant\":\"{}\",\"visual_spec_sha256\":\"{}\",\"annotation_count\":{}}}",
+                "{{\"variant\":\"{}\",\"visual_spec_sha256\":\"{}\",\"annotation_count\":{},\"visual_spec\":{}}}",
                 json_escape(variant_id),
                 visual_spec_sha256,
                 annotation_count,
+                visual_spec_json,
             );
         }
         output.push_str("],\"annotations\":[");
@@ -155,7 +158,7 @@ impl CandidateUiLabAnnotationSession {
         output
     }
 
-    fn spec_groups(&self) -> BTreeMap<(String, String), usize> {
+    fn spec_groups(&self) -> BTreeMap<(String, String, String), usize> {
         let mut groups = BTreeMap::new();
         for annotation in &self.annotations {
             let context = &annotation.context;
@@ -163,6 +166,7 @@ impl CandidateUiLabAnnotationSession {
                 .entry((
                     context.variant_id.clone(),
                     context.visual_spec_sha256.clone(),
+                    candidate_visual_spec_canonical_json(context.visual_spec),
                 ))
                 .or_insert(0) += 1;
         }
@@ -274,6 +278,7 @@ pub(crate) fn capture_candidate_ui_lab_annotation_context(
         dpi,
         selection,
         visual_spec_sha256: candidate_visual_spec_sha256(spec),
+        visual_spec: spec,
         hits,
     })
 }
@@ -359,6 +364,141 @@ fn normalize_note(note: &str) -> Result<String, CandidateUiLabAnnotationError> {
         return Err(CandidateUiLabAnnotationError::UnsupportedNoteControl);
     }
     Ok(normalized.to_owned())
+}
+
+fn candidate_visual_spec_canonical_json(spec: CandidateVisualSpec) -> String {
+    // Keep this destructure exhaustive so a newly added visual token cannot be
+    // silently omitted from the reconstructable batch receipt.
+    let CandidateVisualSpec {
+        outer_padding,
+        row_height,
+        text_padding,
+        selected_text_inset,
+        rank_width,
+        rank_gap,
+        footer_content_inset,
+        horizontal_max_width,
+        horizontal_min_width,
+        horizontal_min_item_width,
+        horizontal_text_max_width,
+        horizontal_selected_text_max_width,
+        vertical_min_width,
+        vertical_text_max_width,
+        vertical_max_width,
+        vertical_rounding_slack,
+        action_min_width,
+        action_detail_gap,
+        notice_icon_size,
+        notice_icon_gap,
+        corner_diameter,
+        border_width,
+        selected_surface_height,
+        selected_surface_left_inset,
+        selected_surface_right_inset,
+        selected_surface_corner_diameter,
+        selection_accent_width,
+        selection_accent_fallback_height,
+        selection_accent_left_inset,
+        selection_accent_corner_diameter,
+        personal_mark_size,
+        footer_height,
+        footer_vertical_inset,
+        footer_divider_inset,
+        footer_divider_width,
+        footer_page_width,
+        footer_mode_gap,
+        candidate_font_height,
+        metadata_font_height,
+        background,
+        selected_background,
+        selected_text,
+        candidate_text,
+        selected_rank,
+        rank,
+        page,
+        selection_accent,
+        mode_accent,
+        border,
+        footer_divider,
+    } = spec;
+    let mut output = format!("{{\"schema\":\"{CANDIDATE_UI_LAB_VISUAL_SPEC_SCHEMA}\"");
+    macro_rules! integer {
+        ($name:literal, $value:expr) => {
+            let _ = write!(output, ",\"{}\":{}", $name, $value);
+        };
+    }
+    integer!("outer_padding", outer_padding);
+    integer!("row_height", row_height);
+    integer!("text_padding", text_padding);
+    integer!("selected_text_inset", selected_text_inset);
+    integer!("rank_width", rank_width);
+    integer!("rank_gap", rank_gap);
+    integer!("footer_content_inset", footer_content_inset);
+    integer!("horizontal_max_width", horizontal_max_width);
+    integer!("horizontal_min_width", horizontal_min_width);
+    integer!("horizontal_min_item_width", horizontal_min_item_width);
+    integer!("horizontal_text_max_width", horizontal_text_max_width);
+    integer!(
+        "horizontal_selected_text_max_width",
+        horizontal_selected_text_max_width
+    );
+    integer!("vertical_min_width", vertical_min_width);
+    integer!("vertical_text_max_width", vertical_text_max_width);
+    integer!("vertical_max_width", vertical_max_width);
+    integer!("vertical_rounding_slack", vertical_rounding_slack);
+    integer!("action_min_width", action_min_width);
+    integer!("action_detail_gap", action_detail_gap);
+    integer!("notice_icon_size", notice_icon_size);
+    integer!("notice_icon_gap", notice_icon_gap);
+    integer!("corner_diameter", corner_diameter);
+    integer!("border_width", border_width);
+    integer!("selected_surface_height", selected_surface_height);
+    integer!("selected_surface_left_inset", selected_surface_left_inset);
+    integer!("selected_surface_right_inset", selected_surface_right_inset);
+    integer!(
+        "selected_surface_corner_diameter",
+        selected_surface_corner_diameter
+    );
+    integer!("selection_accent_width", selection_accent_width);
+    integer!(
+        "selection_accent_fallback_height",
+        selection_accent_fallback_height
+    );
+    integer!("selection_accent_left_inset", selection_accent_left_inset);
+    integer!(
+        "selection_accent_corner_diameter",
+        selection_accent_corner_diameter
+    );
+    integer!("personal_mark_size", personal_mark_size);
+    integer!("footer_height", footer_height);
+    integer!("footer_vertical_inset", footer_vertical_inset);
+    integer!("footer_divider_inset", footer_divider_inset);
+    integer!("footer_divider_width", footer_divider_width);
+    integer!("footer_page_width", footer_page_width);
+    integer!("footer_mode_gap", footer_mode_gap);
+    integer!("candidate_font_height", candidate_font_height);
+    integer!("metadata_font_height", metadata_font_height);
+    push_visual_spec_color_json(&mut output, "background", background);
+    push_visual_spec_color_json(&mut output, "selected_background", selected_background);
+    push_visual_spec_color_json(&mut output, "selected_text", selected_text);
+    push_visual_spec_color_json(&mut output, "candidate_text", candidate_text);
+    push_visual_spec_color_json(&mut output, "selected_rank", selected_rank);
+    push_visual_spec_color_json(&mut output, "rank", rank);
+    push_visual_spec_color_json(&mut output, "page", page);
+    push_visual_spec_color_json(&mut output, "selection_accent", selection_accent);
+    push_visual_spec_color_json(&mut output, "mode_accent", mode_accent);
+    push_visual_spec_color_json(&mut output, "border", border);
+    push_visual_spec_color_json(&mut output, "footer_divider", footer_divider);
+    output.push('}');
+    output
+}
+
+fn push_visual_spec_color_json(output: &mut String, name: &str, color: CandidateRgb) {
+    let _ = write!(
+        output,
+        ",\"{}\":{{\"red\":{},\"green\":{},\"blue\":{}}}",
+        name, color.red, color.green, color.blue,
+    );
 }
 
 fn candidate_visual_spec_sha256(spec: CandidateVisualSpec) -> String {
@@ -590,6 +730,11 @@ mod tests {
         );
         assert!(!context.hits.is_empty());
         assert_eq!(context.visual_spec_sha256.len(), 64);
+        assert_eq!(context.visual_spec, DEFAULT_CANDIDATE_VISUAL_SPEC);
+        assert_eq!(
+            context.visual_spec_sha256,
+            candidate_visual_spec_sha256(context.visual_spec)
+        );
 
         let mut changed = DEFAULT_CANDIDATE_VISUAL_SPEC;
         changed.rank_gap += 1;
@@ -638,6 +783,78 @@ mod tests {
     }
 
     #[test]
+    fn visual_spec_receipt_is_complete_canonical_and_changes_with_the_draft() {
+        let json = candidate_visual_spec_canonical_json(DEFAULT_CANDIDATE_VISUAL_SPEC);
+        assert!(
+            json.starts_with("{\"schema\":\"candidate-ui-lab-visual-spec-v1\",\"outer_padding\":5")
+        );
+        assert!(json.ends_with("\"footer_divider\":{\"red\":66,\"green\":70,\"blue\":78}}"));
+        assert!(!json.chars().any(char::is_whitespace));
+        for field in [
+            "outer_padding",
+            "row_height",
+            "text_padding",
+            "selected_text_inset",
+            "rank_width",
+            "rank_gap",
+            "footer_content_inset",
+            "horizontal_max_width",
+            "horizontal_min_width",
+            "horizontal_min_item_width",
+            "horizontal_text_max_width",
+            "horizontal_selected_text_max_width",
+            "vertical_min_width",
+            "vertical_text_max_width",
+            "vertical_max_width",
+            "vertical_rounding_slack",
+            "action_min_width",
+            "action_detail_gap",
+            "notice_icon_size",
+            "notice_icon_gap",
+            "corner_diameter",
+            "border_width",
+            "selected_surface_height",
+            "selected_surface_left_inset",
+            "selected_surface_right_inset",
+            "selected_surface_corner_diameter",
+            "selection_accent_width",
+            "selection_accent_fallback_height",
+            "selection_accent_left_inset",
+            "selection_accent_corner_diameter",
+            "personal_mark_size",
+            "footer_height",
+            "footer_vertical_inset",
+            "footer_divider_inset",
+            "footer_divider_width",
+            "footer_page_width",
+            "footer_mode_gap",
+            "candidate_font_height",
+            "metadata_font_height",
+            "background",
+            "selected_background",
+            "selected_text",
+            "candidate_text",
+            "selected_rank",
+            "rank",
+            "page",
+            "selection_accent",
+            "mode_accent",
+            "border",
+            "footer_divider",
+        ] {
+            let needle = format!("\"{field}\":");
+            assert_eq!(json.matches(&needle).count(), 1, "field {field}");
+        }
+
+        let mut changed = DEFAULT_CANDIDATE_VISUAL_SPEC;
+        changed.rank_gap += 1;
+        let changed_json = candidate_visual_spec_canonical_json(changed);
+        assert_ne!(json, changed_json);
+        assert!(json.contains("\"rank_gap\":4"));
+        assert!(changed_json.contains("\"rank_gap\":5"));
+    }
+
+    #[test]
     fn batch_groups_are_stable_by_variant_and_complete_visual_spec() {
         let scene = test_scene();
         let selection = scene.client;
@@ -675,7 +892,10 @@ mod tests {
         .unwrap();
         let default_hash = draft_default.visual_spec_sha256.clone();
         let changed_hash = draft_changed.visual_spec_sha256.clone();
+        let default_spec_json = candidate_visual_spec_canonical_json(DEFAULT_CANDIDATE_VISUAL_SPEC);
+        let changed_spec_json = candidate_visual_spec_canonical_json(changed_spec);
         assert_ne!(default_hash, changed_hash);
+        assert_ne!(default_spec_json, changed_spec_json);
 
         let mut session = CandidateUiLabAnnotationSession::default();
         session
@@ -692,23 +912,41 @@ mod tests {
         let groups = session.spec_groups();
         assert_eq!(groups.len(), 3);
         assert_eq!(
-            groups.get(&("baseline".to_owned(), default_hash.clone())),
+            groups.get(&(
+                "baseline".to_owned(),
+                default_hash.clone(),
+                default_spec_json.clone()
+            )),
             Some(&1)
         );
         assert_eq!(
-            groups.get(&("draft".to_owned(), default_hash.clone())),
+            groups.get(&(
+                "draft".to_owned(),
+                default_hash.clone(),
+                default_spec_json.clone()
+            )),
             Some(&2)
         );
         assert_eq!(
-            groups.get(&("draft".to_owned(), changed_hash.clone())),
+            groups.get(&(
+                "draft".to_owned(),
+                changed_hash.clone(),
+                changed_spec_json.clone()
+            )),
             Some(&1)
         );
 
         let json = session.to_canonical_json();
         assert!(json.starts_with(
-            "{\"schema\":\"candidate-ui-lab-annotation-batch-v2\",\"annotation_schema\":\"candidate-ui-lab-annotation-v2\""
+            "{\"schema\":\"candidate-ui-lab-annotation-batch-v3\",\"annotation_schema\":\"candidate-ui-lab-annotation-v2\""
         ));
         let (group_summary, _) = json.split_once(",\"annotations\":[").unwrap();
+        assert!(
+            group_summary
+                .contains("\"visual_spec\":{\"schema\":\"candidate-ui-lab-visual-spec-v1\"")
+        );
+        assert!(group_summary.contains("\"rank_gap\":4"));
+        assert!(group_summary.contains("\"rank_gap\":5"));
         assert!(!group_summary.contains("draft-default-first"));
         assert!(!group_summary.contains("baseline-default"));
         assert!(!group_summary.contains("draft-changed"));
@@ -736,6 +974,38 @@ mod tests {
         let reordered_json = reordered.to_canonical_json();
         let (reordered_group_summary, _) = reordered_json.split_once(",\"annotations\":[").unwrap();
         assert_eq!(group_summary, reordered_group_summary);
+    }
+
+    #[test]
+    fn maximum_unique_spec_session_stays_inside_the_export_limit() {
+        let scene = test_scene();
+        let note = "界".repeat(MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS);
+        let mut session = CandidateUiLabAnnotationSession::default();
+        for index in 0..MAX_CANDIDATE_UI_LAB_ANNOTATIONS {
+            let mut spec = DEFAULT_CANDIDATE_VISUAL_SPEC;
+            spec.background.red = u8::try_from(index).unwrap();
+            let context = capture_candidate_ui_lab_annotation_context(
+                "everyday",
+                "draft",
+                CandidateSceneLayout::Horizontal,
+                96,
+                scene.client,
+                &scene,
+                spec,
+            )
+            .unwrap();
+            session.add(context, &note).unwrap();
+        }
+        assert_eq!(
+            session.spec_groups().len(),
+            MAX_CANDIDATE_UI_LAB_ANNOTATIONS
+        );
+        let payload = session.to_canonical_json();
+        assert!(payload.len() < MAX_CANDIDATE_UI_LAB_EXPORT_BYTES);
+        assert_eq!(
+            payload.matches("\"visual_spec\":").count(),
+            MAX_CANDIDATE_UI_LAB_ANNOTATIONS
+        );
     }
 
     #[test]
