@@ -44,6 +44,9 @@ mod windows_app {
         PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, TEXTMETRICW, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
     use windows::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -200,6 +203,9 @@ mod windows_app {
         // SAFETY: this process owns the registered class, state, window and
         // message loop for their complete lifetimes.
         unsafe {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).map_err(
+                |_| "无法启用逐显示器 DPI；实验室拒绝显示可能被二次缩放的预览".to_owned(),
+            )?;
             let module = GetModuleHandleW(None).map_err(|_| "无法读取实验室模块".to_owned())?;
             let instance = HINSTANCE(module.0);
             let class_name = w!("ZiranmaCandidateUiLabWindow");
