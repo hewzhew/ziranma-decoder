@@ -1,10 +1,15 @@
 //! Bounded, deterministic annotations for the public-data-only candidate UI lab.
 //!
-//! This module does not open files, inspect TSF state, or retain candidate
-//! text. Persistence is a separate explicit step; the first consumer keeps a
-//! bounded session in memory.
+//! This module never inspects TSF state or retains candidate text. Sessions are
+//! bounded in memory; only an explicit export writes one bounded, non-replacing
+//! batch into a caller-selected local directory.
 
 use std::fmt::Write as _;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -14,10 +19,15 @@ use crate::candidate_ui::{
 };
 
 pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_SCHEMA: &str = "candidate-ui-lab-annotation-v1";
+pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_BATCH_SCHEMA: &str =
+    "candidate-ui-lab-annotation-batch-v1";
 pub(crate) const MAX_CANDIDATE_UI_LAB_ANNOTATIONS: usize = 64;
 pub(crate) const MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS: usize = 240;
 const MAX_CANDIDATE_UI_LAB_HITS: usize = 64;
+const MAX_CANDIDATE_UI_LAB_EXPORT_BYTES: usize = 1024 * 1024;
+const MAX_CANDIDATE_UI_LAB_EXPORT_ATTEMPTS: usize = 128;
 const REVIEWED_DPIS: [u32; 4] = [96, 120, 144, 192];
+static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CandidateUiLabAnnotationContext {
@@ -47,6 +57,19 @@ pub(crate) enum CandidateUiLabAnnotationError {
     SessionFull,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateUiLabExportError {
+    EmptySession,
+    PayloadTooLarge,
+    ClockUnavailable,
+    CreateDirectory,
+    CreateTemporaryFile,
+    WriteTemporaryFile,
+    SyncTemporaryFile,
+    PublishFile,
+    NameSpaceExhausted,
+}
+
 impl std::fmt::Display for CandidateUiLabAnnotationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -58,6 +81,22 @@ impl std::fmt::Display for CandidateUiLabAnnotationError {
             Self::NoteTooLong => "批注超过 240 个字符",
             Self::UnsupportedNoteControl => "批注包含不支持的控制字符",
             Self::SessionFull => "本次实验已达到 64 条批注上限",
+        })
+    }
+}
+
+impl std::fmt::Display for CandidateUiLabExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptySession => "本次实验还没有可导出的批注",
+            Self::PayloadTooLarge => "本次实验的批注导出超过固定容量上限",
+            Self::ClockUnavailable => "无法生成本地导出文件名",
+            Self::CreateDirectory => "无法准备本地批注目录",
+            Self::CreateTemporaryFile => "无法创建本地批注临时文件",
+            Self::WriteTemporaryFile => "无法完整写入本地批注临时文件",
+            Self::SyncTemporaryFile => "无法同步本地批注临时文件",
+            Self::PublishFile => "无法原子发布本地批注文件",
+            Self::NameSpaceExhausted => "无法找到未使用的本地批注文件名",
         })
     }
 }
@@ -76,6 +115,25 @@ impl CandidateUiLabAnnotationSession {
         &self.annotations
     }
 
+    pub(crate) fn to_canonical_json(&self) -> String {
+        let mut output = String::new();
+        let _ = write!(
+            output,
+            "{{\"schema\":\"{}\",\"annotation_schema\":\"{}\",\"count\":{},\"annotations\":[",
+            CANDIDATE_UI_LAB_ANNOTATION_BATCH_SCHEMA,
+            CANDIDATE_UI_LAB_ANNOTATION_SCHEMA,
+            self.annotations.len(),
+        );
+        for (index, annotation) in self.annotations.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(&annotation.to_canonical_json());
+        }
+        output.push_str("]}");
+        output
+    }
+
     pub(crate) fn add(
         &mut self,
         context: CandidateUiLabAnnotationContext,
@@ -89,6 +147,65 @@ impl CandidateUiLabAnnotationSession {
             .push(CandidateUiLabAnnotation { context, note });
         Ok(())
     }
+}
+
+pub(crate) fn export_candidate_ui_lab_annotations(
+    session: &CandidateUiLabAnnotationSession,
+    directory: &Path,
+) -> Result<PathBuf, CandidateUiLabExportError> {
+    if session.annotations.is_empty() {
+        return Err(CandidateUiLabExportError::EmptySession);
+    }
+    let payload = session.to_canonical_json();
+    if payload.len() > MAX_CANDIDATE_UI_LAB_EXPORT_BYTES {
+        return Err(CandidateUiLabExportError::PayloadTooLarge);
+    }
+    fs::create_dir_all(directory).map_err(|_| CandidateUiLabExportError::CreateDirectory)?;
+    let unix_milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CandidateUiLabExportError::ClockUnavailable)?
+        .as_millis();
+    let process_id = std::process::id();
+    for _ in 0..MAX_CANDIDATE_UI_LAB_EXPORT_ATTEMPTS {
+        let sequence = EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("candidate-ui-lab-{unix_milliseconds}-{process_id}-{sequence}");
+        let destination = directory.join(format!("{stem}.json"));
+        if destination.exists() {
+            continue;
+        }
+        let temporary = directory.join(format!(".{stem}.tmp"));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(CandidateUiLabExportError::CreateTemporaryFile),
+        };
+        if file.write_all(payload.as_bytes()).is_err() {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(CandidateUiLabExportError::WriteTemporaryFile);
+        }
+        if file.sync_all().is_err() {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(CandidateUiLabExportError::SyncTemporaryFile);
+        }
+        drop(file);
+        match fs::rename(&temporary, &destination) {
+            Ok(()) => return Ok(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temporary);
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(CandidateUiLabExportError::PublishFile);
+            }
+        }
+    }
+    Err(CandidateUiLabExportError::NameSpaceExhausted)
 }
 
 pub(crate) fn capture_candidate_ui_lab_annotation_context(
@@ -355,6 +472,28 @@ mod tests {
         CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC, build_candidate_scene,
     };
 
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ziranma-candidate-ui-lab-export-test-{}-{sequence}",
+                std::process::id()
+            ));
+            assert!(!path.exists());
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn test_scene() -> CandidateScene {
         build_candidate_scene(
             DEFAULT_CANDIDATE_VISUAL_SPEC,
@@ -451,6 +590,43 @@ mod tests {
         assert!(json.contains("字号\\n想再清楚一点 \\\"呀\\\""));
         assert!(!json.contains("春风"));
         assert!(!json.contains("\r"));
+    }
+
+    #[test]
+    fn batch_export_is_explicit_atomic_and_never_reuses_a_filename() {
+        let directory = TestDirectory::new();
+        let mut session = CandidateUiLabAnnotationSession::default();
+        assert_eq!(
+            export_candidate_ui_lab_annotations(&session, &directory.0),
+            Err(CandidateUiLabExportError::EmptySession)
+        );
+        assert!(!directory.0.exists());
+
+        let scene = test_scene();
+        let context = capture_candidate_ui_lab_annotation_context(
+            "everyday",
+            CandidateSceneLayout::Horizontal,
+            96,
+            scene.client,
+            &scene,
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+        )
+        .unwrap();
+        session.add(context, "数字与正文需要再对齐一点").unwrap();
+        let expected = session.to_canonical_json();
+        let first = export_candidate_ui_lab_annotations(&session, &directory.0).unwrap();
+        let second = export_candidate_ui_lab_annotations(&session, &directory.0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), expected);
+        assert_eq!(fs::read_to_string(&second).unwrap(), expected);
+        let entries = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("json")
+        }));
     }
 
     #[test]

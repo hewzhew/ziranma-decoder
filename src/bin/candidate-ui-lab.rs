@@ -29,6 +29,7 @@ fn main() {
 mod windows_app {
     use std::cell::RefCell;
     use std::ffi::c_void;
+    use std::path::PathBuf;
 
     use crate::candidate_ui::{
         CandidateRgb, CandidateScene, CandidateSceneFontMetrics, CandidateSceneLayout,
@@ -42,6 +43,7 @@ mod windows_app {
     use crate::candidate_ui_lab_annotation::{
         CandidateUiLabAnnotationContext, CandidateUiLabAnnotationSession,
         MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS, capture_candidate_ui_lab_annotation_context,
+        export_candidate_ui_lab_annotations,
     };
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
@@ -63,12 +65,13 @@ mod windows_app {
         DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE,
         ES_WANTRETURN, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW,
         GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow, LoadCursorW, MB_ICONERROR,
-        MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW, SET_WINDOW_POS_FLAGS, SW_SHOW,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos,
-        SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-        WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
-        WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
+        SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
+        SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_BORDER,
+        WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP,
+        WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
 
@@ -332,6 +335,10 @@ mod windows_app {
                 }
                 if u32::try_from(wparam.0).unwrap_or_default() == 0x4e {
                     open_note_window(window);
+                    return LRESULT(0);
+                }
+                if u32::try_from(wparam.0).unwrap_or_default() == 0x45 {
+                    export_annotations(window);
                     return LRESULT(0);
                 }
                 let changed = APP_STATE.with(|slot| {
@@ -754,6 +761,33 @@ mod windows_app {
         });
     }
 
+    fn export_annotations(window: HWND) {
+        let session = APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|state| state.annotations.clone())
+                .ok_or_else(|| "候选窗实验室尚未准备好".to_owned())
+        });
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => return notify_error(window, &error),
+        };
+        match export_candidate_ui_lab_annotations(&session, &annotation_export_directory()) {
+            Ok(path) => notify_information(
+                window,
+                &format!("已将 {} 条批注保存到：\n{}", session.len(), path.display()),
+            ),
+            Err(error) => notify_error(window, &error.to_string()),
+        }
+    }
+
+    fn annotation_export_directory() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local")
+            .join("ui-lab")
+            .join("wishes")
+    }
+
     fn notify_error(window: HWND, message: &str) {
         let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
         unsafe {
@@ -762,6 +796,18 @@ mod windows_app {
                 PCWSTR(message.as_ptr()),
                 w!("候选窗实验室"),
                 MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+
+    fn notify_information(window: HWND, message: &str) {
+        let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        unsafe {
+            let _ = MessageBoxW(
+                Some(window),
+                PCWSTR(message.as_ptr()),
+                w!("候选窗实验室"),
+                MB_OK | MB_ICONINFORMATION,
             );
         }
     }
@@ -834,7 +880,7 @@ mod windows_app {
             format!(" · 批注 {}（仅内存）", state.annotations.len())
         };
         format!(
-            "候选窗实验室 · {} · {} DPI · {}{}{}    H 布局 / D 缩放 / S 场景 / 拖拽圈选 / N 批注 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {}{}{}    H 布局 / D 缩放 / S 场景 / 拖拽圈选 / N 批注 / E 导出 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
