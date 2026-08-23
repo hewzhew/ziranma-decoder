@@ -26,6 +26,10 @@ use crate::candidate_snapshot::{
     layered_candidate_query_with_consensus_sources, layered_candidate_query_with_sources,
     layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
+use crate::candidate_ui::{
+    CandidateRgb, CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest,
+    DEFAULT_CANDIDATE_VISUAL_SPEC, build_candidate_scene, candidate_ui_scale,
+};
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
 use crate::{
@@ -4793,12 +4797,7 @@ struct CandidateElementState {
     shown: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum CandidatePopupLayout {
-    #[default]
-    Horizontal,
-    Vertical,
-}
+type CandidatePopupLayout = CandidateSceneLayout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CandidatePopupMetrics {
@@ -4808,40 +4807,42 @@ struct CandidatePopupMetrics {
 }
 
 fn popup_scale(dpi: u32, logical: i32) -> i32 {
-    i32::try_from(
-        i64::from(logical)
-            .saturating_mul(i64::from(dpi.max(96)))
-            .saturating_add(48)
-            / 96,
-    )
-    .unwrap_or(i32::MAX)
+    candidate_ui_scale(dpi, logical)
 }
 
-const POPUP_OUTER_PADDING_LOGICAL: i32 = 5;
-const POPUP_ROW_HEIGHT_LOGICAL: i32 = 36;
-const POPUP_TEXT_PADDING_LOGICAL: i32 = 7;
-const POPUP_SELECTED_TEXT_INSET_LOGICAL: i32 = 13;
-const POPUP_RANK_WIDTH_LOGICAL: i32 = 16;
-const POPUP_RANK_GAP_LOGICAL: i32 = 4;
-const POPUP_FOOTER_CONTENT_INSET_LOGICAL: i32 = 10;
-const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = 760;
-const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 = 70;
-const POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL: i32 = 144;
-const POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL: i32 = 288;
-const POPUP_VERTICAL_TEXT_MAX_WIDTH_LOGICAL: i32 = 594;
-const POPUP_VERTICAL_MAX_WIDTH_LOGICAL: i32 = 660;
-const POPUP_VERTICAL_ROUNDING_SLACK_LOGICAL: i32 = 2;
-const POPUP_ACTION_MIN_WIDTH_LOGICAL: i32 = 210;
-const POPUP_ACTION_DETAIL_GAP_LOGICAL: i32 = 12;
-const POPUP_NOTICE_ICON_SIZE_LOGICAL: i32 = 24;
-const POPUP_NOTICE_ICON_GAP_LOGICAL: i32 = 7;
-const POPUP_CORNER_DIAMETER_LOGICAL: i32 = 16;
-const POPUP_BORDER_WIDTH_LOGICAL: i32 = 1;
-const POPUP_SELECTED_SURFACE_HEIGHT_LOGICAL: i32 = 28;
-const POPUP_SELECTION_ACCENT_WIDTH_LOGICAL: i32 = 3;
-const POPUP_SELECTION_ACCENT_FALLBACK_HEIGHT_LOGICAL: i32 = 14;
-const POPUP_SELECTION_ACCENT_LEFT_INSET_LOGICAL: i32 = 5;
-const POPUP_PERSONAL_MARK_SIZE_LOGICAL: i32 = 3;
+const POPUP_OUTER_PADDING_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.outer_padding;
+const POPUP_ROW_HEIGHT_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.row_height;
+const POPUP_TEXT_PADDING_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.text_padding;
+const POPUP_SELECTED_TEXT_INSET_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.selected_text_inset;
+const POPUP_RANK_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.rank_width;
+const POPUP_RANK_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.rank_gap;
+const POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_max_width;
+const POPUP_HORIZONTAL_MIN_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_min_width;
+const POPUP_HORIZONTAL_MIN_ITEM_WIDTH_LOGICAL: i32 =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_min_item_width;
+const POPUP_HORIZONTAL_TEXT_MAX_WIDTH_LOGICAL: i32 =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_text_max_width;
+const POPUP_HORIZONTAL_SELECTED_TEXT_MAX_WIDTH_LOGICAL: i32 =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.horizontal_selected_text_max_width;
+const POPUP_VERTICAL_MIN_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_min_width;
+const POPUP_VERTICAL_TEXT_MAX_WIDTH_LOGICAL: i32 =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_text_max_width;
+const POPUP_VERTICAL_MAX_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_max_width;
+const POPUP_VERTICAL_ROUNDING_SLACK_LOGICAL: i32 =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.vertical_rounding_slack;
+const POPUP_ACTION_MIN_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.action_min_width;
+const POPUP_ACTION_DETAIL_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.action_detail_gap;
+const POPUP_NOTICE_ICON_SIZE_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.notice_icon_size;
+const POPUP_NOTICE_ICON_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.notice_icon_gap;
+const POPUP_CORNER_DIAMETER_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.corner_diameter;
+const POPUP_BORDER_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.border_width;
+const POPUP_PERSONAL_MARK_SIZE_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.personal_mark_size;
+const POPUP_FOOTER_HEIGHT_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_height;
+const POPUP_FOOTER_PAGE_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_page_width;
+const POPUP_FOOTER_MODE_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_mode_gap;
+const POPUP_CANDIDATE_FONT_HEIGHT_LOGICAL: i32 =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.candidate_font_height;
+const POPUP_METADATA_FONT_HEIGHT_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.metadata_font_height;
 
 fn candidate_popup_corner_diameter(dpi: u32) -> i32 {
     popup_scale(dpi, POPUP_CORNER_DIAMETER_LOGICAL)
@@ -4973,9 +4974,10 @@ fn candidate_popup_mode_logical_width(display: &CandidateDisplay) -> i32 {
 fn candidate_popup_footer_logical_width(display: &CandidateDisplay) -> i32 {
     let mode_width = candidate_popup_mode_logical_width(display);
     match (mode_width > 0, display.page_starts().len() > 1) {
-        (true, true) => mode_width.saturating_add(48),
+        (true, true) => mode_width.saturating_add(POPUP_FOOTER_PAGE_WIDTH_LOGICAL),
         (true, false) => mode_width,
-        (false, true) => 62,
+        (false, true) => POPUP_FOOTER_PAGE_WIDTH_LOGICAL
+            .saturating_add(POPUP_TEXT_PADDING_LOGICAL.saturating_mul(2)),
         (false, false) => 0,
     }
 }
@@ -5070,7 +5072,7 @@ fn candidate_popup_metrics(
             });
     let desired_horizontal_width = horizontal_content_width
         .saturating_add(footer_width)
-        .max(popup_scale(dpi, 280));
+        .max(popup_scale(dpi, POPUP_HORIZONTAL_MIN_WIDTH_LOGICAL));
     let horizontal_limit = popup_scale(dpi, POPUP_HORIZONTAL_MAX_WIDTH_LOGICAL)
         .min(available_width.max(1).saturating_mul(4) / 5);
     let minimum_candidate_width =
@@ -5109,7 +5111,11 @@ fn candidate_popup_metrics(
     }
 
     let rows = i32::try_from(display.visible().len()).unwrap_or(5);
-    let footer_height = if footer_needed { 24 } else { 0 };
+    let footer_height = if footer_needed {
+        POPUP_FOOTER_HEIGHT_LOGICAL
+    } else {
+        0
+    };
     let vertical_candidate_width = display
         .visible()
         .iter()
@@ -5125,7 +5131,7 @@ fn candidate_popup_metrics(
                 .saturating_add(popup_scale(dpi, POPUP_VERTICAL_ROUNDING_SLACK_LOGICAL))
                 .max(footer_width),
         )
-        .max(popup_scale(dpi, 360));
+        .max(popup_scale(dpi, POPUP_VERTICAL_MIN_WIDTH_LOGICAL));
     CandidatePopupMetrics {
         layout: CandidatePopupLayout::Vertical,
         width: desired_vertical_width
@@ -5927,32 +5933,33 @@ fn popup_rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     COLORREF(u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16))
 }
 
-const POPUP_BACKGROUND_RGB: (u8, u8, u8) = (31, 32, 35);
-const POPUP_SELECTED_BACKGROUND_RGB: (u8, u8, u8) = (44, 47, 53);
-const POPUP_SELECTED_TEXT_RGB: (u8, u8, u8) = (250, 251, 253);
-const POPUP_CANDIDATE_TEXT_RGB: (u8, u8, u8) = (218, 223, 230);
-const POPUP_SELECTED_RANK_RGB: (u8, u8, u8) = (198, 205, 215);
-const POPUP_RANK_RGB: (u8, u8, u8) = (143, 151, 164);
-const POPUP_PAGE_RGB: (u8, u8, u8) = (130, 139, 153);
-const POPUP_SELECTION_ACCENT_RGB: (u8, u8, u8) = (72, 180, 232);
-const POPUP_MODE_ACCENT_RGB: (u8, u8, u8) = (147, 184, 241);
-const POPUP_BORDER_RGB: (u8, u8, u8) = (58, 62, 69);
-const POPUP_FOOTER_DIVIDER_RGB: (u8, u8, u8) = (66, 70, 78);
+const POPUP_BACKGROUND_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.background;
+const POPUP_SELECTED_BACKGROUND_RGB: CandidateRgb =
+    DEFAULT_CANDIDATE_VISUAL_SPEC.selected_background;
+const POPUP_SELECTED_TEXT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.selected_text;
+const POPUP_CANDIDATE_TEXT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.candidate_text;
+const POPUP_SELECTED_RANK_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.selected_rank;
+const POPUP_RANK_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.rank;
+const POPUP_PAGE_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.page;
+const POPUP_SELECTION_ACCENT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.selection_accent;
+const POPUP_MODE_ACCENT_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.mode_accent;
+const POPUP_BORDER_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.border;
+const POPUP_FOOTER_DIVIDER_RGB: CandidateRgb = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_divider;
 
-fn popup_color((red, green, blue): (u8, u8, u8)) -> COLORREF {
-    popup_rgb(red, green, blue)
+fn popup_color(color: CandidateRgb) -> COLORREF {
+    popup_rgb(color.red, color.green, color.blue)
 }
 
 #[cfg(test)]
-fn popup_attention_lightness((red, green, blue): (u8, u8, u8)) -> u32 {
+fn popup_attention_lightness(color: CandidateRgb) -> u32 {
     2_126_u32
-        .saturating_mul(u32::from(red))
-        .saturating_add(7_152_u32.saturating_mul(u32::from(green)))
-        .saturating_add(722_u32.saturating_mul(u32::from(blue)))
+        .saturating_mul(u32::from(color.red))
+        .saturating_add(7_152_u32.saturating_mul(u32::from(color.green)))
+        .saturating_add(722_u32.saturating_mul(u32::from(color.blue)))
 }
 
 #[cfg(test)]
-fn popup_relative_luminance((red, green, blue): (u8, u8, u8)) -> f64 {
+fn popup_relative_luminance(color: CandidateRgb) -> f64 {
     let linear = |channel: u8| {
         let channel = f64::from(channel) / 255.0;
         if channel <= 0.04045 {
@@ -5961,11 +5968,11 @@ fn popup_relative_luminance((red, green, blue): (u8, u8, u8)) -> f64 {
             ((channel + 0.055) / 1.055).powf(2.4)
         }
     };
-    0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue)
 }
 
 #[cfg(test)]
-fn popup_contrast_ratio(foreground: (u8, u8, u8), background: (u8, u8, u8)) -> f64 {
+fn popup_contrast_ratio(foreground: CandidateRgb, background: CandidateRgb) -> f64 {
     let foreground = popup_relative_luminance(foreground);
     let background = popup_relative_luminance(background);
     (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
@@ -6399,54 +6406,24 @@ unsafe fn paint_rounded_popup_border(hdc: HDC, client: RECT, dpi: u32, color: CO
     }
 }
 
-fn candidate_selection_rects(
-    item: RECT,
-    dpi: u32,
-    selected_text_metrics: Option<PopupFontMetrics>,
-) -> (RECT, RECT) {
-    let scale = |logical: i32| popup_scale(dpi, logical);
-    let center_vertical = |bounds: RECT, height: i32| {
-        let available = bounds.bottom.saturating_sub(bounds.top).max(0);
-        let height = height.clamp(0, available);
-        let top = bounds
-            .top
-            .saturating_add(available.saturating_sub(height) / 2);
-        (top, top.saturating_add(height))
-    };
-    let (selected_top, selected_bottom) =
-        center_vertical(item, scale(POPUP_SELECTED_SURFACE_HEIGHT_LOGICAL));
-    let selected = RECT {
-        left: item.left.saturating_add(scale(1)),
-        top: selected_top,
-        right: item.right.saturating_sub(scale(5)),
-        bottom: selected_bottom,
-    };
-    let accent_height = selected_text_metrics
-        .map(|metrics| metrics.height)
-        .unwrap_or_else(|| scale(POPUP_SELECTION_ACCENT_FALLBACK_HEIGHT_LOGICAL));
-    let (accent_top, accent_bottom) = center_vertical(item, accent_height);
-    let accent_left = selected
-        .left
-        .saturating_add(scale(POPUP_SELECTION_ACCENT_LEFT_INSET_LOGICAL));
-    let accent = RECT {
-        left: accent_left,
-        top: accent_top,
-        right: accent_left.saturating_add(scale(POPUP_SELECTION_ACCENT_WIDTH_LOGICAL)),
-        bottom: accent_bottom,
-    };
-    (selected, accent)
+fn candidate_scene_rect(rect: CandidateSceneRect) -> RECT {
+    RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
 }
 
 unsafe fn paint_candidate_selection(
     hdc: HDC,
-    item: RECT,
+    selected: RECT,
+    accent: RECT,
     dpi: u32,
-    selected_text_metrics: Option<PopupFontMetrics>,
     selected_background: COLORREF,
     selection_accent: COLORREF,
 ) {
     let scale = |logical: i32| popup_scale(dpi, logical);
-    let (selected, accent) = candidate_selection_rects(item, dpi, selected_text_metrics);
     unsafe {
         fill_rounded_popup_rect(hdc, selected, scale(6), selected_background);
     }
@@ -6641,9 +6618,19 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
 
     // The selected candidate carries typographic emphasis while ranks and
     // pagination use a smaller metadata face.
-    let candidate_font = unsafe { create_candidate_popup_font(state.dpi, 17, FW_NORMAL.0) };
-    let selected_font = unsafe { create_candidate_popup_font(state.dpi, 17, FW_SEMIBOLD.0) };
-    let metadata_font = unsafe { create_candidate_popup_font(state.dpi, 14, FW_NORMAL.0) };
+    let candidate_font = unsafe {
+        create_candidate_popup_font(state.dpi, POPUP_CANDIDATE_FONT_HEIGHT_LOGICAL, FW_NORMAL.0)
+    };
+    let selected_font = unsafe {
+        create_candidate_popup_font(
+            state.dpi,
+            POPUP_CANDIDATE_FONT_HEIGHT_LOGICAL,
+            FW_SEMIBOLD.0,
+        )
+    };
+    let metadata_font = unsafe {
+        create_candidate_popup_font(state.dpi, POPUP_METADATA_FONT_HEIGHT_LOGICAL, FW_NORMAL.0)
+    };
     let initial_font = [candidate_font, selected_font, metadata_font]
         .into_iter()
         .find(|font| !font.is_invalid())
@@ -6660,252 +6647,172 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     }
     let selected_text_metrics = unsafe { selected_popup_font_metrics(hdc, selected_font) };
 
-    let padding = scale(POPUP_OUTER_PADDING_LOGICAL);
-    let row_height = scale(POPUP_ROW_HEIGHT_LOGICAL);
     let text_padding = scale(POPUP_TEXT_PADDING_LOGICAL);
-    match state.layout {
-        CandidatePopupLayout::Horizontal => {
-            let mut left = padding;
-            let widths = horizontal_candidate_widths(&state.display, state.dpi, client.right);
-            for ((index, candidate), width) in
-                state.display.visible().iter().enumerate().zip(widths)
-            {
-                let mut item = RECT {
-                    left,
-                    top: padding,
-                    right: left.saturating_add(width),
-                    bottom: padding.saturating_add(row_height),
-                };
-                if index == 0 && !state.display.is_notice() {
-                    // SAFETY: the selected decoration is bounded to this
-                    // candidate item and uses only local GDI objects.
-                    unsafe {
-                        paint_candidate_selection(
-                            hdc,
-                            item,
-                            state.dpi,
-                            selected_text_metrics,
-                            selected_background,
-                            selection_accent,
-                        );
-                    }
-                }
-                let notice_inset = unsafe {
-                    paint_candidate_notice_icon(hdc, item, state.dpi, state.display.notice_icon())
-                };
-                item.left = item
-                    .left
-                    .saturating_add(if index == 0 && !state.display.is_notice() {
-                        scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
-                    } else {
-                        text_padding
-                    })
-                    .saturating_add(notice_inset);
-                item.right = item.right.saturating_sub(text_padding);
-                // SAFETY: fonts and paint rectangles remain owned by this
-                // WM_PAINT operation.
-                unsafe {
-                    paint_candidate_label(
-                        hdc,
-                        item,
-                        state.dpi,
-                        index,
-                        candidate,
-                        (index == 0)
-                            .then(|| state.display.action_detail())
-                            .flatten(),
-                        !state.display.is_notice(),
-                        index == 0,
-                        state
-                            .display
-                            .visible_personalized()
-                            .get(index)
-                            .copied()
-                            .unwrap_or(false),
-                        candidate_font,
-                        selected_font,
-                        metadata_font,
-                    );
-                }
-                left = left.saturating_add(width);
-            }
-        }
-        CandidatePopupLayout::Vertical => {
-            for (index, candidate) in state.display.visible().iter().enumerate() {
-                let top = padding.saturating_add(
-                    row_height.saturating_mul(i32::try_from(index).unwrap_or(i32::MAX)),
-                );
-                let mut row = RECT {
-                    left: padding,
-                    top,
-                    right: client.right.saturating_sub(padding),
-                    bottom: top.saturating_add(row_height),
-                };
-                if index == 0 && !state.display.is_notice() {
-                    // SAFETY: the selected decoration is bounded to this row
-                    // and uses only local GDI objects.
-                    unsafe {
-                        paint_candidate_selection(
-                            hdc,
-                            row,
-                            state.dpi,
-                            selected_text_metrics,
-                            selected_background,
-                            selection_accent,
-                        );
-                    }
-                }
-                let notice_inset = unsafe {
-                    paint_candidate_notice_icon(hdc, row, state.dpi, state.display.notice_icon())
-                };
-                row.left = row
-                    .left
-                    .saturating_add(if index == 0 && !state.display.is_notice() {
-                        scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
-                    } else {
-                        text_padding
-                    })
-                    .saturating_add(notice_inset);
-                row.right = row.right.saturating_sub(text_padding);
-                // SAFETY: fonts and paint rectangles remain owned by this
-                // WM_PAINT operation.
-                unsafe {
-                    paint_candidate_label(
-                        hdc,
-                        row,
-                        state.dpi,
-                        index,
-                        candidate,
-                        (index == 0)
-                            .then(|| state.display.action_detail())
-                            .flatten(),
-                        !state.display.is_notice(),
-                        index == 0,
-                        state
-                            .display
-                            .visible_personalized()
-                            .get(index)
-                            .copied()
-                            .unwrap_or(false),
-                        candidate_font,
-                        selected_font,
-                        metadata_font,
-                    );
-                }
-            }
-        }
-    }
-
     let pages = state.display.page_starts().len();
     let mode_label = candidate_popup_mode_label(&state.display);
-    if pages > 1 || mode_label.is_some() {
-        let footer_width = scale(candidate_popup_footer_logical_width(&state.display));
-        let mut footer = match state.layout {
-            CandidatePopupLayout::Horizontal => RECT {
-                left: client.right.saturating_sub(footer_width),
-                top: padding,
-                right: client.right.saturating_sub(text_padding),
-                bottom: padding.saturating_add(row_height),
-            },
-            CandidatePopupLayout::Vertical => RECT {
-                left: padding,
-                top: padding.saturating_add(row_height.saturating_mul(
-                    i32::try_from(state.display.visible().len()).unwrap_or(i32::MAX),
-                )),
-                right: client.right.saturating_sub(text_padding),
-                bottom: client.bottom.saturating_sub(scale(2)),
-            },
-        };
-        let divider = match state.layout {
-            CandidatePopupLayout::Horizontal => RECT {
-                left: footer.left,
-                top: footer.top.saturating_add(scale(7)),
-                right: footer.left.saturating_add(scale(1)),
-                bottom: footer.bottom.saturating_sub(scale(7)),
-            },
-            CandidatePopupLayout::Vertical => RECT {
-                left: footer.left,
-                top: footer.top,
-                right: footer.right,
-                bottom: footer.top.saturating_add(scale(1)),
-            },
-        };
-        // SAFETY: the local divider brush and bounded footer rectangle are
-        // valid for this paint operation.
-        let divider_brush = unsafe { CreateSolidBrush(footer_divider) };
-        if !divider_brush.is_invalid() {
-            unsafe {
-                let _ = FillRect(hdc, &divider, divider_brush);
-                let _ = DeleteObject(HGDIOBJ(divider_brush.0));
-            }
-        }
-        match state.layout {
-            CandidatePopupLayout::Horizontal => {
-                footer.left = footer
-                    .left
-                    .saturating_add(scale(POPUP_FOOTER_CONTENT_INSET_LOGICAL));
-            }
-            CandidatePopupLayout::Vertical => {
-                footer.top = footer.top.saturating_add(scale(2));
-            }
-        }
-        if let Some(mode_label) = mode_label {
-            let mut mode = footer;
-            let page_width = if pages > 1 { scale(48) } else { 0 };
-            mode.right = mode.right.saturating_sub(page_width).max(mode.left);
-            let mut label = mode_label.encode_utf16().collect::<Vec<_>>();
-            // SAFETY: the mode label is bounded to the footer rectangle.
-            unsafe {
-                if !metadata_font.is_invalid() {
-                    let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+    let footer_needed = pages > 1 || mode_label.is_some();
+    let horizontal_widths = if state.layout == CandidatePopupLayout::Horizontal {
+        horizontal_candidate_widths(&state.display, state.dpi, client_width)
+    } else {
+        Vec::new()
+    };
+    let scene = build_candidate_scene(
+        DEFAULT_CANDIDATE_VISUAL_SPEC,
+        CandidateSceneRequest {
+            layout: state.layout,
+            dpi: state.dpi,
+            width: client_width,
+            height: client_height,
+            candidate_count: state.display.visible().len(),
+            horizontal_candidate_widths: &horizontal_widths,
+            footer_width: scale(candidate_popup_footer_logical_width(&state.display)),
+            footer_needed,
+            selected_surface: !state.display.is_notice(),
+            selected_text_height: selected_text_metrics.map(|metrics| metrics.height),
+        },
+    );
+
+    if let Some(scene) = scene.as_ref() {
+        for (scene_item, candidate) in scene.items.iter().zip(state.display.visible()) {
+            let index = scene_item.index;
+            let mut item = candidate_scene_rect(scene_item.bounds);
+            if let (Some(selected), Some(accent)) =
+                (scene_item.selected_surface, scene_item.selection_accent)
+            {
+                // SAFETY: the shared scene bounds both decorations to this
+                // candidate item and every temporary GDI object stays local.
+                unsafe {
+                    paint_candidate_selection(
+                        hdc,
+                        candidate_scene_rect(selected),
+                        candidate_scene_rect(accent),
+                        state.dpi,
+                        selected_background,
+                        selection_accent,
+                    );
                 }
-                let _ = SetTextColor(hdc, mode_accent);
-                let _ = DrawTextW(
-                    hdc,
-                    &mut label,
-                    &mut mode,
-                    DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-                );
             }
-            footer.left = mode.right.saturating_add(scale(4));
-        }
-        if pages > 1 {
-            let separator = match state.layout {
-                CandidatePopupLayout::Horizontal => "/",
-                CandidatePopupLayout::Vertical => " / ",
+            let notice_inset = unsafe {
+                paint_candidate_notice_icon(hdc, item, state.dpi, state.display.notice_icon())
             };
-            let mut page = if state.display.may_have_more() {
-                format!(
-                    "{}{separator}{}  ›",
-                    state.display.current_page() + 1,
-                    pages
-                )
-            } else {
-                format!("{}{separator}{}", state.display.current_page() + 1, pages)
-            }
-            .encode_utf16()
-            .collect::<Vec<_>>();
-            // SAFETY: the page label is bounded to the remaining footer.
+            item.left = item
+                .left
+                .saturating_add(if index == 0 && !state.display.is_notice() {
+                    scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
+                } else {
+                    text_padding
+                })
+                .saturating_add(notice_inset);
+            item.right = item.right.saturating_sub(text_padding);
+            // SAFETY: fonts and shared-scene paint rectangles remain owned by
+            // this WM_PAINT operation.
             unsafe {
-                if !metadata_font.is_invalid() {
-                    let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
-                }
-                let _ = SetTextColor(hdc, page_color);
-                let _ = DrawTextW(
+                paint_candidate_label(
                     hdc,
-                    &mut page,
-                    &mut footer,
-                    DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    item,
+                    state.dpi,
+                    index,
+                    candidate,
+                    (index == 0)
+                        .then(|| state.display.action_detail())
+                        .flatten(),
+                    !state.display.is_notice(),
+                    index == 0,
+                    state
+                        .display
+                        .visible_personalized()
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false),
+                    candidate_font,
+                    selected_font,
+                    metadata_font,
                 );
             }
         }
+
+        if let (Some(footer), Some(divider)) = (scene.footer, scene.footer_divider) {
+            let mut footer = candidate_scene_rect(footer);
+            let divider = candidate_scene_rect(divider);
+            // SAFETY: the shared scene bounds the divider to the footer and
+            // the local brush is released in this paint operation.
+            let divider_brush = unsafe { CreateSolidBrush(footer_divider) };
+            if !divider_brush.is_invalid() {
+                unsafe {
+                    let _ = FillRect(hdc, &divider, divider_brush);
+                    let _ = DeleteObject(HGDIOBJ(divider_brush.0));
+                }
+            }
+            if let Some(mode_label) = mode_label {
+                let mut mode = footer;
+                let page_width = if pages > 1 {
+                    scale(POPUP_FOOTER_PAGE_WIDTH_LOGICAL)
+                } else {
+                    0
+                };
+                mode.right = mode.right.saturating_sub(page_width).max(mode.left);
+                let mut label = mode_label.encode_utf16().collect::<Vec<_>>();
+                // SAFETY: the mode label is bounded to the shared footer.
+                unsafe {
+                    if !metadata_font.is_invalid() {
+                        let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+                    }
+                    let _ = SetTextColor(hdc, mode_accent);
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut label,
+                        &mut mode,
+                        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+                }
+                footer.left = mode
+                    .right
+                    .saturating_add(scale(POPUP_FOOTER_MODE_GAP_LOGICAL));
+            }
+            if pages > 1 {
+                let separator = match state.layout {
+                    CandidatePopupLayout::Horizontal => "/",
+                    CandidatePopupLayout::Vertical => " / ",
+                };
+                let mut page = if state.display.may_have_more() {
+                    format!(
+                        "{}{separator}{}  ›",
+                        state.display.current_page() + 1,
+                        pages
+                    )
+                } else {
+                    format!("{}{separator}{}", state.display.current_page() + 1, pages)
+                }
+                .encode_utf16()
+                .collect::<Vec<_>>();
+                // SAFETY: the page label is bounded to the shared footer.
+                unsafe {
+                    if !metadata_font.is_invalid() {
+                        let _ = SelectObject(hdc, HGDIOBJ(metadata_font.0));
+                    }
+                    let _ = SetTextColor(hdc, page_color);
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut page,
+                        &mut footer,
+                        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+                }
+            }
+        }
+    } else {
+        state.fail_pending_timing(CandidatePopupRenderPreflightError::PaintFailed);
     }
 
+    let painted_client = scene
+        .as_ref()
+        .map(|scene| candidate_scene_rect(scene.client))
+        .unwrap_or(client);
     if state.corner_strategy.uses_custom_region() {
         // SAFETY: the compatibility border is bounded to this popup's paint
         // DC and shares its corner geometry with the fallback window region.
         unsafe {
-            paint_rounded_popup_border(hdc, client, state.dpi, border);
+            paint_rounded_popup_border(hdc, painted_client, state.dpi, border);
         }
     }
     if !previous_font.is_invalid() {
@@ -26221,6 +26128,69 @@ mod tests {
     }
 
     #[test]
+    fn shared_scene_consumes_production_metrics_at_every_preflight_dpi() {
+        let displays = [
+            candidate_popup_render_preflight_display(CandidatePopupRenderScenario::InitialShow),
+            candidate_popup_render_preflight_display(
+                CandidatePopupRenderScenario::LongCandidateRedraw,
+            ),
+        ];
+        for display in &displays {
+            for dpi in CANDIDATE_POPUP_RENDER_PREFLIGHT_DPIS {
+                let metrics = candidate_popup_metrics(display, dpi, popup_scale(dpi, 1_920));
+                let widths = if metrics.layout == CandidatePopupLayout::Horizontal {
+                    horizontal_candidate_widths(display, dpi, metrics.width)
+                } else {
+                    Vec::new()
+                };
+                let footer_needed = display.page_starts().len() > 1
+                    || candidate_popup_mode_label(display).is_some();
+                let scene = build_candidate_scene(
+                    DEFAULT_CANDIDATE_VISUAL_SPEC,
+                    CandidateSceneRequest {
+                        layout: metrics.layout,
+                        dpi,
+                        width: metrics.width,
+                        height: metrics.height,
+                        candidate_count: display.visible().len(),
+                        horizontal_candidate_widths: &widths,
+                        footer_width: popup_scale(
+                            dpi,
+                            candidate_popup_footer_logical_width(display),
+                        ),
+                        footer_needed,
+                        selected_surface: !display.is_notice(),
+                        selected_text_height: None,
+                    },
+                )
+                .unwrap();
+
+                assert_eq!(scene.client.right, metrics.width);
+                assert_eq!(scene.client.bottom, metrics.height);
+                assert_eq!(scene.items.len(), display.visible().len());
+                assert_eq!(scene.footer.is_some(), footer_needed);
+                assert_eq!(scene.footer_divider.is_some(), footer_needed);
+                assert_eq!(
+                    scene.items[0].selected_surface.is_some(),
+                    !display.is_notice()
+                );
+                match metrics.layout {
+                    CandidatePopupLayout::Horizontal => {
+                        for (item, width) in scene.items.iter().zip(&widths) {
+                            assert_eq!(item.bounds.right - item.bounds.left, *width);
+                        }
+                    }
+                    CandidatePopupLayout::Vertical => {
+                        for items in scene.items.windows(2) {
+                            assert_eq!(items[0].bounds.bottom, items[1].bounds.top);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn candidate_popup_prefers_a_compact_horizontal_row() {
         let display = CandidateDisplay::from_candidates(
             ["亲", "秦", "琴", "去年", "勤", "青年", "芹"]
@@ -26484,26 +26454,38 @@ mod tests {
 
     #[test]
     fn candidate_selection_surface_keeps_breathing_room() {
-        let item = RECT {
-            left: 0,
-            top: 0,
-            right: 100,
-            bottom: POPUP_ROW_HEIGHT_LOGICAL,
-        };
         let selected_text_metrics = PopupFontMetrics {
             height: 17,
             ascent: 13,
         };
-        let (selected, accent) = candidate_selection_rects(item, 96, Some(selected_text_metrics));
+        let scene = build_candidate_scene(
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+            CandidateSceneRequest {
+                layout: CandidatePopupLayout::Horizontal,
+                dpi: 96,
+                width: 110,
+                height: 46,
+                candidate_count: 1,
+                horizontal_candidate_widths: &[100],
+                footer_width: 0,
+                footer_needed: false,
+                selected_surface: true,
+                selected_text_height: Some(selected_text_metrics.height),
+            },
+        )
+        .unwrap();
+        let item = candidate_scene_rect(scene.items[0].bounds);
+        let selected = candidate_scene_rect(scene.items[0].selected_surface.unwrap());
+        let accent = candidate_scene_rect(scene.items[0].selection_accent.unwrap());
 
-        assert_eq!(selected.left, 1);
-        assert_eq!(selected.top, 4);
-        assert_eq!(selected.right, 95);
-        assert_eq!(selected.bottom, 32);
-        assert_eq!(accent.left, 6);
-        assert_eq!(accent.top, 9);
-        assert_eq!(accent.right, 9);
-        assert_eq!(accent.bottom, 26);
+        assert_eq!(selected.left, 6);
+        assert_eq!(selected.top, 9);
+        assert_eq!(selected.right, 100);
+        assert_eq!(selected.bottom, 37);
+        assert_eq!(accent.left, 11);
+        assert_eq!(accent.top, 14);
+        assert_eq!(accent.right, 14);
+        assert_eq!(accent.bottom, 31);
         assert!(
             (accent.top + accent.bottom - selected.top - selected.bottom).abs() <= 1,
             "odd font heights may land half a pixel above the even selection surface"

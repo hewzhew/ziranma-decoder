@@ -30,6 +30,7 @@ mod candidate_runtime;
 mod candidate_signature;
 mod candidate_slots;
 mod candidate_snapshot;
+mod candidate_ui;
 mod capsule_replay;
 mod codec;
 mod composition;
