@@ -509,9 +509,11 @@ target\release\candidatectl.exe exact-phrase-layer-preflight `
 
 `exact-phrase-tsf-preflight` 随后把相同三包送入真实 Windows TSF 合成 Context。命令
 在创建 Context 前重新执行四源绑定、六键唯一形状和上述全目录前缀、去重、第一页
-门，并执行有界负对照；再从三字层全码序等距取锚点，每个锚点最多检查 64 个候选码，只保留能在
-第一页稳定提交的探针。首项用空格，后续项用普通数字键；正式计时总量固定不超过
-640 次。发现与报告均不输出探针码或候选正文：
+门，并执行有界负对照；随后先为全目录实际存在的每个目标位次桶安排至少一个探针，
+剩余名额才按全码序分散取样。请求探针数若少于非空位次桶数，会在创建 Context 前
+失败；每个探针最多检查 64 个候选码，只保留能在第一页稳定提交者。首项用空格，
+后续项用普通数字键；正式计时总量固定不超过 640 次。发现与报告均不输出探针码或
+候选正文：
 
 ```powershell
 target\release\candidatectl.exe exact-phrase-tsf-preflight `
@@ -521,14 +523,14 @@ target\release\candidatectl.exe exact-phrase-tsf-preflight `
   --sample-limit 16 --repetitions 5
 ```
 
-两次固定 release 运行均重新认证上述三份 SHA-256，并各自完成 16 个发现预热与 80 个
-计时提交。第一次的第一页状态 median/p95 为 24.991/32.306 ms，提交为
-0.012/0.018 ms，首键至提交为 25.003/32.318 ms；第二次依次为
-25.278/33.595 ms、0.013/0.018 ms 和 25.290/33.609 ms。三字层加载分别为
-5.244 和 5.213 ms。当前公开包的 16 个等距稳定探针全部位于第 1 项，所以这组实包
-性能证据只覆盖空格提交；第 2 项数字键提交已由真实 Context 的聚焦合成回归验证，
-但不能冒充实包位次或性能分布。该计时截止同步候选状态与提交，不包含候选窗绘制、
-桌面合成、屏幕首帧或实际应用呈现。命令不写槽位、状态或
+固定 release 分层运行重新认证上述三份 SHA-256，检查 16 个码并完成 16 个发现预热与
+80 个计时提交；位次分布为第 1 项 75 次、第 2 项 5 次，其余为 0。由此，当前公开
+实包里的一个第 2 项分支已在五次重复中通过普通数字键真实提交，不再只由聚焦合成
+回归代替。第一页状态 median/p95 为 27.718/39.783 ms，提交为 0.014/0.020 ms，
+首键至提交为 27.730/39.799 ms。更早的等距策略曾连续选出 16 个第 1 项探针，现已
+由全目录位次分层策略取代；旧结果只保留为发现抽样盲点的历史证据，不再代表当前门。
+该计时截止同步候选状态与提交，不包含候选窗绘制、桌面合成、屏幕首帧或实际应用
+呈现。命令不写槽位、状态或
 `exact-phrase-preflight.zep`，通过仍不构成 prepare、enable、安装或换代许可。
 
 下一条 `exact-phrase-popup-preflight` 已把可见候选窗验收入口准备好，但默认绝不运行。
@@ -544,10 +546,12 @@ target\release\candidatectl.exe exact-phrase-popup-preflight `
   --core-package .local\candidate-rime-pinyin-simp-0c6861ef-v1 `
   --supplemental-package .local\public-audit\wanxiang-fdda7afb\package-top100k-v1 `
   --phrase-package .local\public-audit\wanxiang-fdda7afb\package-exact-phrase-train-span-v1 `
-  --sample-limit 1 --repetitions 1
+  --sample-limit 2 --repetitions 1
 ```
 
 当前阶段完成了共享页面、来源标记、参数上限、release guard 和窗口阶段完整性实现；
+当前固定三包有两个非空目标位次桶，因此可见门至少请求 2 个页面；更少会在创建窗口前
+失败关闭。参数的通用解析上限仍为 1–4，供只有一个位次桶的其他认证包使用。
 报告类型本身不持有探针码或候选正文，自动测试覆盖共享页面、来源和失败关闭。猫猫
 没有在宝宝桌面上擅自运行上述命令，因此这里不虚构任何三字实包绘制耗时。即使未来
 显式运行通过，它仍只是“真实 TSF Context 提交”与“同页生产 popup 绘制”两条串行

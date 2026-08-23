@@ -7716,6 +7716,7 @@ struct ExactPhraseLayerPreflightSummary {
     phrase_entries: usize,
     phrase_codes: usize,
     catalog_audit: ExactPhraseCatalogAudit,
+    catalog_codes_by_rank: [Vec<String>; EXACT_PHRASE_FIRST_PAGE],
     catalog_audit_duration: Duration,
     sampled_codes: usize,
     negative_control_codes: usize,
@@ -7723,6 +7724,49 @@ struct ExactPhraseLayerPreflightSummary {
     baseline_latency: DurationSummary,
     preview_latency: DurationSummary,
     checksum: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactPhraseTsfProbeSource {
+    RankBucket { rank_index: usize, anchor: usize },
+    Catalog { anchor: usize },
+}
+
+fn plan_exact_phrase_tsf_probe_sources(
+    rank_counts: [usize; EXACT_PHRASE_FIRST_PAGE],
+    catalog_len: usize,
+    sample_limit: usize,
+) -> Result<Vec<ExactPhraseTsfProbeSource>, Box<dyn std::error::Error>> {
+    if catalog_len == 0
+        || sample_limit == 0
+        || sample_limit > catalog_len
+        || rank_counts.iter().sum::<usize>() != catalog_len
+    {
+        return Err("exact phrase TSF probe plan has an invalid aggregate".into());
+    }
+    let populated_ranks = rank_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count != 0)
+        .collect::<Vec<_>>();
+    if sample_limit < populated_ranks.len() {
+        return Err("exact phrase TSF probe count is below the authenticated rank coverage".into());
+    }
+
+    let mut plan = Vec::with_capacity(sample_limit);
+    for (rank_index, count) in populated_ranks {
+        plan.push(ExactPhraseTsfProbeSource::RankBucket {
+            rank_index,
+            anchor: count / 2,
+        });
+    }
+    let remaining = sample_limit - plan.len();
+    for index in 0..remaining {
+        plan.push(ExactPhraseTsfProbeSource::Catalog {
+            anchor: index * catalog_len / remaining,
+        });
+    }
+    Ok(plan)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -8022,16 +8066,32 @@ fn preflight_loaded_exact_phrase_layer(
 
     let catalog_audit_started = Instant::now();
     let mut catalog_audit = ExactPhraseCatalogAudit::default();
+    let mut catalog_codes_by_rank: [Vec<String>; EXACT_PHRASE_FIRST_PAGE] =
+        std::array::from_fn(|_| Vec::new());
     for entry in &phrase_entries {
-        catalog_audit.observe(inspect_exact_phrase_preview(
+        let observation = inspect_exact_phrase_preview(
             entry.code.as_str(),
             entry.text.as_str(),
             &core.snapshot,
             &supplemental.snapshot,
             &phrase.snapshot,
-        )?);
+        )?;
+        if let Some(rank @ 1..=EXACT_PHRASE_FIRST_PAGE) = observation.target_rank {
+            catalog_codes_by_rank[rank - 1].push(entry.code.as_str().to_owned());
+        }
+        catalog_audit.observe(observation);
     }
     let catalog_audit = catalog_audit.verify()?;
+    for codes in &mut catalog_codes_by_rank {
+        codes.sort_unstable();
+    }
+    if catalog_codes_by_rank
+        .iter()
+        .map(Vec::len)
+        .ne(catalog_audit.target_ranks)
+    {
+        return Err("exact phrase full-catalog rank index disagrees with its aggregate".into());
+    }
     let catalog_audit_duration = catalog_audit_started.elapsed();
 
     let sampled_codes = evenly_spaced_exact_short_codes(&phrase_entries, sample_limit);
@@ -8137,6 +8197,7 @@ fn preflight_loaded_exact_phrase_layer(
         phrase_entries: phrase_entries.len(),
         phrase_codes: texts_by_code.len(),
         catalog_audit,
+        catalog_codes_by_rank,
         catalog_audit_duration,
         sampled_codes: sampled_codes.len(),
         negative_control_codes: negative_codes.len(),
@@ -8196,13 +8257,18 @@ fn discover_exact_phrase_tsf_probes(
     core: &LoadedPackage,
     supplemental: &LoadedPackage,
     phrase: &LoadedPackage,
+    catalog_codes_by_rank: &[Vec<String>; EXACT_PHRASE_FIRST_PAGE],
     sample_limit: usize,
 ) -> Result<(Vec<ExactPhraseTsfProbe>, usize), Box<dyn std::error::Error>> {
-    let phrase_entries = parse_lexicon_tsv(&phrase.payload_text)?;
-    let all_codes = evenly_spaced_exact_short_codes(&phrase_entries, phrase_entries.len());
-    if sample_limit > all_codes.len() {
-        return Err("exact phrase TSF preflight package exposes too few distinct codes".into());
-    }
+    let all_codes = catalog_codes_by_rank
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let rank_counts = std::array::from_fn(|index| catalog_codes_by_rank[index].len());
+    let plan = plan_exact_phrase_tsf_probe_sources(rank_counts, all_codes.len(), sample_limit)?;
 
     let expected_core_revision = core.snapshot.revision();
     let expected_supplemental_revision = supplemental.snapshot.revision();
@@ -8211,17 +8277,26 @@ fn discover_exact_phrase_tsf_probes(
         exact_promotions: 1,
     };
     let mut probes = Vec::<ExactPhraseTsfProbe>::with_capacity(sample_limit);
-    let mut inspected = BTreeSet::<usize>::new();
-    let per_anchor_scan = all_codes.len().min(EXACT_PHRASE_TSF_MAX_SCAN_PER_ANCHOR);
-    for sample_index in 0..sample_limit {
-        let anchor = sample_index * all_codes.len() / sample_limit;
+    let mut inspected = BTreeSet::<String>::new();
+    for source in plan {
+        let (candidate_codes, anchor, required_rank) = match source {
+            ExactPhraseTsfProbeSource::RankBucket { rank_index, anchor } => (
+                catalog_codes_by_rank[rank_index].as_slice(),
+                anchor,
+                Some(rank_index + 1),
+            ),
+            ExactPhraseTsfProbeSource::Catalog { anchor } => (all_codes.as_slice(), anchor, None),
+        };
+        let per_anchor_scan = candidate_codes
+            .len()
+            .min(EXACT_PHRASE_TSF_MAX_SCAN_PER_ANCHOR);
         let mut selected = None;
         for offset in 0..per_anchor_scan {
-            let code_index = (anchor + offset) % all_codes.len();
-            if !inspected.insert(code_index) {
+            let code_index = (anchor + offset) % candidate_codes.len();
+            let code = &candidate_codes[code_index];
+            if !inspected.insert(code.clone()) {
                 continue;
             }
-            let code = &all_codes[code_index];
             let expected_text = phrase
                 .snapshot
                 .exact_full_code_texts(code, 1)?
@@ -8246,6 +8321,12 @@ fn discover_exact_phrase_tsf_probes(
                     {
                         return Err("exact phrase TSF preflight runtime identity changed".into());
                     }
+                    if required_rank.is_some_and(|rank| rank != report.target_rank()) {
+                        return Err(
+                            "exact phrase TSF preflight disagrees with the authenticated rank bucket"
+                                .into(),
+                        );
+                    }
                     selected = Some(ExactPhraseTsfProbe {
                         code: code.clone(),
                         expected_text,
@@ -8262,7 +8343,7 @@ fn discover_exact_phrase_tsf_probes(
             }
         }
         probes.push(selected.ok_or(
-            "exact phrase TSF preflight found too few page-stable probes within the bounded scan",
+            "exact phrase TSF preflight found too few rank-stratified page-stable probes within the bounded scan",
         )?);
     }
     Ok((probes, inspected.len()))
@@ -8311,8 +8392,13 @@ fn run_exact_phrase_tsf_preflight(
         1,
         [core_load, supplemental_load, phrase_load],
     )?;
-    let (probes, inspected_codes) =
-        discover_exact_phrase_tsf_probes(&core, &supplemental, &phrase, request.sample_limit)?;
+    let (probes, inspected_codes) = discover_exact_phrase_tsf_probes(
+        &core,
+        &supplemental,
+        &phrase,
+        &layer_summary.catalog_codes_by_rank,
+        request.sample_limit,
+    )?;
     let expected_core_revision = core.snapshot.revision();
     let expected_supplemental_revision = supplemental.snapshot.revision();
     let expected_phrase_revision = phrase.snapshot.revision();
@@ -8413,7 +8499,7 @@ fn render_exact_phrase_tsf_preflight_report(summary: &ExactPhraseTsfPreflightSum
     .unwrap();
     writeln!(
         output,
-        "工作负载：等距锚点 {} 个；每锚点最多检查 64 个码；实际检查 {} 个码；每码发现预热 1 次；重复 {}；计时样本 {}；页宽 {}",
+        "工作负载：位次分层探针 {} 个；每探针最多检查 64 个码；实际检查 {} 个码；每码发现预热 1 次；重复 {}；计时样本 {}；页宽 {}",
         summary.requested_probes,
         summary.inspected_codes,
         summary.repetitions,
@@ -8488,8 +8574,13 @@ fn preflight_exact_phrase_popup(
         1,
         [core_load, supplemental_load, phrase_load],
     )?;
-    let (probes, inspected_codes) =
-        discover_exact_phrase_tsf_probes(&core, &supplemental, &phrase, request.sample_limit)?;
+    let (probes, inspected_codes) = discover_exact_phrase_tsf_probes(
+        &core,
+        &supplemental,
+        &phrase,
+        &layer_summary.catalog_codes_by_rank,
+        request.sample_limit,
+    )?;
 
     let expected_core_revision = core.snapshot.revision();
     let expected_supplemental_revision = supplemental.snapshot.revision();
@@ -16463,6 +16554,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_tsf_probe_plan_covers_each_authenticated_rank_bucket_first() {
+        let plan = plan_exact_phrase_tsf_probe_sources([2_797, 2, 0, 0, 0, 0], 2_799, 16).unwrap();
+        assert_eq!(plan.len(), 16);
+        assert_eq!(
+            plan[0],
+            ExactPhraseTsfProbeSource::RankBucket {
+                rank_index: 0,
+                anchor: 1_398,
+            }
+        );
+        assert_eq!(
+            plan[1],
+            ExactPhraseTsfProbeSource::RankBucket {
+                rank_index: 1,
+                anchor: 1,
+            }
+        );
+        assert!(
+            plan[2..]
+                .iter()
+                .all(|source| matches!(source, ExactPhraseTsfProbeSource::Catalog { .. }))
+        );
+
+        let error = plan_exact_phrase_tsf_probe_sources([2_797, 2, 0, 0, 0, 0], 2_799, 1)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "exact phrase TSF probe count is below the authenticated rank coverage"
+        );
+    }
+
+    #[test]
     fn exact_phrase_composition_audit_distinguishes_page_local_and_cross_page_movement() {
         let before = (1..=10)
             .map(|index| format!("候选{index}"))
@@ -17262,6 +17386,11 @@ mod tests {
         assert_eq!(summary.catalog_audit.without_existing_exact_prefix, 1);
         assert_eq!(summary.catalog_audit.after_existing_exact_prefix, 0);
         assert_eq!(summary.catalog_audit.target_ranks, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            summary.catalog_codes_by_rank[0],
+            vec![code.as_str().to_owned()]
+        );
+        assert!(summary.catalog_codes_by_rank[1..].iter().all(Vec::is_empty));
         assert_eq!(summary.negative_control_codes, 2);
         for filename in [
             CANDIDATE_PACKAGE_MANIFEST_FILE,
