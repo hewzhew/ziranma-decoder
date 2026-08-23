@@ -200,7 +200,11 @@ TSF 组合与普通文档编辑能否处在同一可定位事件流里。查看�
 保留近 30 秒兜底。明确保存后才使用 Windows 当前用户 DPAPI 加密写入本地。
 达到内存上限时分批淘汰最旧事件，不会阻塞输入；保存失败也不影响输入和候选窗。
 Windows 11 现代输入指示器并不可靠展示第三方语言栏项目，因此语言栏菜单只作
-可选入口；`wish-ime.cmd mark` 通过 TSF 当前用户全局 compartment 发送无正文整数
+可选入口。文本服务激活和内部中英切换现在还会同步标准 TSF
+`KEYBOARD_OPENCLOSE` 与 `KEYBOARD_INPUTMODE_CONVERSION` compartment：中文发布
+打开及 `NATIVE`，英文发布关闭并只清除 `NATIVE`，其他转换位保持不动；这让系统和
+辅助工具能读取真实模式，但不保证 Windows 11 一定显示第三方猫图标。
+`wish-ime.cmd mark` 通过 TSF 当前用户全局 compartment 发送无正文整数
 命令，`wishpad` 则是按需打开的本地“猫猫应愿”管理器。输入码、候选、留言、
 路径和快照都不进入控制通道，不注册全局快捷键，也不连接网络。真实 Codex 与
 密码控件仍需逐步验收；任何本机注册仍需要用户明确确认。

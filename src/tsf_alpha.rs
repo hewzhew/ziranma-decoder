@@ -103,6 +103,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::TextServices::{
     CLSID_TF_ThreadMgr, GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
     GUID_LBI_INPUTMODE, GUID_PROP_INPUTSCOPE, IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET,
     IS_CHAT, IS_CHAT_WITHOUT_EMOJI, IS_CHINESE_FULLWIDTH, IS_CHINESE_HALFWIDTH, IS_DEFAULT,
     IS_NATIVE_SCRIPT, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN, IS_PASSWORD, IS_PRIVATE, IS_SEARCH,
@@ -117,10 +118,10 @@ use windows::Win32::UI::TextServices::{
     ITfThreadMgrEventSink_Impl, ITfUIElement, ITfUIElement_Impl, ITfUIElementMgr, InputScope,
     TF_AE_NONE, TF_ANCHOR_END, TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR,
     TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
-    TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_GRAVITY_BACKWARD, TF_IAS_NO_DEFAULT_COMPOSITION, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT,
-    TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STATUS_DISABLED, TF_LBI_STATUS_HIDDEN,
-    TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_STYLE_SHOWNINTRAY,
+    TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE,
+    TF_ES_SYNC, TF_GRAVITY_BACKWARD, TF_IAS_NO_DEFAULT_COMPOSITION, TF_LANGBARITEMINFO,
+    TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STATUS_DISABLED,
+    TF_LBI_STATUS_HIDDEN, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_STYLE_SHOWNINTRAY,
     TF_LBI_STYLE_TEXTCOLORICON, TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_LBMENUF_CHECKED, TF_LBMENUF_GRAYED,
     TF_LBMENUF_SEPARATOR, TF_POPF_ALL, TF_SELECTION, TF_SELECTIONSTYLE, TF_TF_MOVESTART,
     TfLBIClick,
@@ -8828,6 +8829,128 @@ impl Drop for NativeFeedbackLanguageBarController {
     }
 }
 
+struct NativeInputModeCompartmentController {
+    enabled: bool,
+    input_mode: Rc<Cell<InputMode>>,
+    open_guid: GUID,
+    conversion_guid: GUID,
+    client_id: u32,
+    manager: Option<ITfCompartmentMgr>,
+    open: Option<ITfCompartment>,
+    conversion: Option<ITfCompartment>,
+}
+
+impl NativeInputModeCompartmentController {
+    fn new(enabled: bool, input_mode: Rc<Cell<InputMode>>) -> Self {
+        Self::new_with_guids(
+            enabled,
+            input_mode,
+            GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+            GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+        )
+    }
+
+    fn new_with_guids(
+        enabled: bool,
+        input_mode: Rc<Cell<InputMode>>,
+        open_guid: GUID,
+        conversion_guid: GUID,
+    ) -> Self {
+        Self {
+            enabled,
+            input_mode,
+            open_guid,
+            conversion_guid,
+            client_id: 0,
+            manager: None,
+            open: None,
+            conversion: None,
+        }
+    }
+
+    fn activate(&mut self, thread_manager: &ITfThreadMgr, client_id: u32) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.manager.is_some()
+            || self.open.is_some()
+            || self.conversion.is_some()
+            || self.client_id != 0
+        {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        let manager: ITfCompartmentMgr = thread_manager.cast()?;
+        // SAFETY: both fixed compartments are integer-valued TSF input-mode
+        // state owned by this text-service thread. No document text is read.
+        let open = unsafe { manager.GetCompartment(&self.open_guid) }?;
+        let conversion = unsafe { manager.GetCompartment(&self.conversion_guid) }?;
+        self.client_id = client_id;
+        self.manager = Some(manager);
+        self.open = Some(open);
+        self.conversion = Some(conversion);
+        if let Err(error) = self.publish_current() {
+            self.deactivate();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn publish_current(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let open = self
+            .open
+            .as_ref()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?;
+        let conversion = self
+            .conversion
+            .as_ref()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?;
+        let mode = self.input_mode.get();
+        let open_value = match mode {
+            InputMode::Chinese => 1_i32,
+            InputMode::English => 0_i32,
+        };
+        let old_conversion = read_input_mode_compartment_i32(conversion).unwrap_or(0);
+        let mut conversion_value = u32::from_ne_bytes(old_conversion.to_ne_bytes());
+        match mode {
+            InputMode::Chinese => conversion_value |= TF_CONVERSIONMODE_NATIVE,
+            InputMode::English => conversion_value &= !TF_CONVERSIONMODE_NATIVE,
+        }
+        let conversion_value = i32::from_ne_bytes(conversion_value.to_ne_bytes());
+        // SAFETY: both values are bounded VT_I4 state. SetValue synchronously
+        // copies each live VARIANT for this text service's client id.
+        unsafe {
+            open.SetValue(self.client_id, &VARIANT::from(open_value))?;
+            conversion.SetValue(self.client_id, &VARIANT::from(conversion_value))
+        }
+    }
+
+    fn deactivate(&mut self) {
+        // Standard input-mode compartments intentionally outlive the item
+        // objects. Releasing our interfaces is enough; clearing them here
+        // would publish a false mode transition during text-service teardown.
+        self.conversion = None;
+        self.open = None;
+        self.manager = None;
+        self.client_id = 0;
+    }
+}
+
+impl Drop for NativeInputModeCompartmentController {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
+
+fn read_input_mode_compartment_i32(compartment: &ITfCompartment) -> Option<i32> {
+    // SAFETY: GetValue initializes a VARIANT owned by the returned value.
+    unsafe { compartment.GetValue() }
+        .ok()
+        .and_then(|value| i32::try_from(&value).ok())
+}
+
 struct NativeWishCommandShared {
     state: Weak<NativeFeedbackLanguageBarState>,
     command_guid: GUID,
@@ -9983,6 +10106,7 @@ struct TsfTextService {
     native_feedback_context: Arc<Mutex<NativeFeedbackContextCache>>,
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
     native_feedback_language_bar: RefCell<NativeFeedbackLanguageBarController>,
+    input_mode_compartments: RefCell<NativeInputModeCompartmentController>,
     native_wish_commands: RefCell<NativeWishCommandController>,
     input_mode: Rc<Cell<InputMode>>,
     shift_tap_armed: Cell<bool>,
@@ -10438,6 +10562,10 @@ impl TsfTextService {
             matches!(key_advice_mode, KeyAdviceMode::Foreground),
             Rc::downgrade(&native_feedback_language_bar_state),
         ));
+        let input_mode_compartments = RefCell::new(NativeInputModeCompartmentController::new(
+            matches!(key_advice_mode, KeyAdviceMode::Foreground),
+            Rc::clone(&input_mode),
+        ));
         let personal_ranking_roots = matches!(key_advice_mode, KeyAdviceMode::Foreground)
             .then(|| {
                 module_path().ok().map(|module| {
@@ -10479,6 +10607,7 @@ impl TsfTextService {
                 matches!(key_advice_mode, KeyAdviceMode::Foreground),
                 Rc::clone(&native_feedback_language_bar_state),
             )),
+            input_mode_compartments,
             native_wish_commands,
             native_feedback_language_bar_state,
             input_mode,
@@ -11517,6 +11646,11 @@ impl TsfTextService_Impl {
         self.clear_personal_phrase_composer();
         self.clear_personal_left_context();
         self.input_mode.set(self.input_mode.get().toggled());
+        if let Ok(compartments) = self.input_mode_compartments.try_borrow() {
+            // The text service remains usable if a host declines the optional
+            // standard status compartments; the next mode transition retries.
+            let _ = compartments.publish_current();
+        }
         self.native_feedback_language_bar_state.notify();
         Ok(())
     }
@@ -11827,6 +11961,11 @@ impl TsfTextService_Impl {
         drop(activation);
         if let Ok(mut candidate_ui) = self.candidate_ui.try_borrow_mut() {
             candidate_ui.activate(&ui_thread_manager);
+        }
+        if let Ok(mut compartments) = self.input_mode_compartments.try_borrow_mut() {
+            // Standard TSF mode publication is optional for activation: hosts
+            // that reject it must not lose the input method itself.
+            let _ = compartments.activate(&ui_thread_manager, client_id);
         }
         if let Ok(mut language_bar) = self.native_feedback_language_bar.try_borrow_mut() {
             // The language-bar surface is optional. Failure keeps feedback
@@ -12984,6 +13123,11 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             .try_borrow_mut()
             .map_err(|_| lifecycle_error(E_UNEXPECTED))
             .and_then(|mut language_bar| language_bar.deactivate());
+        let input_mode_compartment_result = self
+            .input_mode_compartments
+            .try_borrow_mut()
+            .map(|mut compartments| compartments.deactivate())
+            .map_err(|_| lifecycle_error(E_UNEXPECTED));
         let wish_command_result = self
             .native_wish_commands
             .try_borrow_mut()
@@ -13043,6 +13187,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         feedback_context_result?;
         native_feedback_result?;
         wish_command_result?;
+        input_mode_compartment_result?;
         language_bar_result?;
         candidate_ui_result
     }
@@ -19990,6 +20135,59 @@ mod tests {
         drop(state);
         drop(feedback);
         assert_eq!(ACTIVE_COM_OBJECTS.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn input_mode_controller_publishes_standard_open_and_native_state() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let mode = Rc::new(Cell::new(InputMode::Chinese));
+        let open_guid = GUID::from_u128(0x7209886e_a3dc_4af4_8d42_8edcddc0f793);
+        let conversion_guid = GUID::from_u128(0xc4a7958f_7e55_44f6_ae5a_ca18bc161a0f);
+        let mut controller = NativeInputModeCompartmentController::new_with_guids(
+            true,
+            Rc::clone(&mode),
+            open_guid,
+            conversion_guid,
+        );
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        controller
+            .activate(&thread_manager, client_id)
+            .expect("input-mode compartment publication");
+
+        let manager: ITfCompartmentMgr = thread_manager.cast().unwrap();
+        let open = unsafe { manager.GetCompartment(&open_guid) }.unwrap();
+        let conversion = unsafe { manager.GetCompartment(&conversion_guid) }.unwrap();
+        assert_eq!(read_input_mode_compartment_i32(&open), Some(1));
+        assert_eq!(
+            read_input_mode_compartment_i32(&conversion),
+            Some(TF_CONVERSIONMODE_NATIVE as i32)
+        );
+
+        unsafe { conversion.SetValue(client_id, &VARIANT::from(8_i32)) }.unwrap();
+        controller.publish_current().unwrap();
+        assert_eq!(read_input_mode_compartment_i32(&conversion), Some(9));
+
+        mode.set(InputMode::English);
+        controller.publish_current().unwrap();
+        assert_eq!(read_input_mode_compartment_i32(&open), Some(0));
+        assert_eq!(read_input_mode_compartment_i32(&conversion), Some(8));
+
+        controller.deactivate();
+        assert!(controller.manager.is_none());
+        assert!(controller.open.is_none());
+        assert!(controller.conversion.is_none());
+        unsafe {
+            manager.ClearCompartment(client_id, &open_guid).unwrap();
+            manager
+                .ClearCompartment(client_id, &conversion_guid)
+                .unwrap();
+            thread_manager.Deactivate().unwrap();
+        }
     }
 
     #[test]

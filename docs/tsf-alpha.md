@@ -369,6 +369,13 @@ PE/Authenticode 签名。
   “中”或“A”；现代任务栏使用随系统文字颜色变化的 16×16 复合单色图标：
   左侧猫脸保持不变，右侧独立徽记随输入模式显示“中”或“A”，两块区域互不
   遮挡；仅内存反馈正在记录时在底部显示一个圆点；
+- 服务激活与内部中英切换同步线程级标准 TSF compartment：中文令
+  `GUID_COMPARTMENT_KEYBOARD_OPENCLOSE=1`，并在
+  `GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION` 中加入
+  `TF_CONVERSIONMODE_NATIVE`；英文令前者为 0、只清除后者的 `NATIVE` 位，保留
+  全/半角、标点等其他转换位。停用只释放接口而不清 compartment，避免退出宿主时
+  制造一次假的模式变化。它使 Windows 与辅助工具可读到真实状态，但不保证现代
+  输入指示器一定呈现第三方图标；
 - Windows 11 现代输入指示器不保证为纯 `BTN_MENU` 项目调用 `InitMenu`。输入
   模式项目因此同时声明 `BTN_BUTTON` 和 `BTN_MENU`：现代路径在左键或右键
   `OnClick` 中创建短生命周期的原生 Win32 菜单，经典语言栏仍使用 `InitMenu`。
@@ -517,6 +524,12 @@ V1/V2/V3/V4/V5 继续兼容读取。
 Weasel 则同时声明按钮与菜单并在点击路径主动弹出菜单；Alpha 只借鉴这一交互
 边界，不复制其实现代码。原生弹出菜单以当前前台窗口为 owner，在用户点击期间
 同步存在，关闭后立即销毁，不建立后台窗口或常驻线程。
+
+同一 SampleIME 的 `CompositionProcessorEngine.cpp` 还把输入法开关和
+`TF_CONVERSIONMODE_NATIVE` 保持双向一致。Alpha 当前先完成内部模式到这两个标准
+compartment 的发布；反向变化暂不直接改写活动组合，因为 compartment 回调没有可安全
+提交或撤销预编辑的 edit context。若以后接受系统侧模式命令，必须先在真实 Context
+中补齐“活动组合如何结束”的独立事务测试，不能只改一个布尔值留下悬空预编辑。
 
 ## 安装、升级与回退边界
 
