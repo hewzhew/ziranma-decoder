@@ -14,6 +14,9 @@ mod candidate_ui;
 #[cfg(windows)]
 #[path = "../candidate_ui_gdi.rs"]
 mod candidate_ui_gdi;
+#[cfg(windows)]
+#[path = "../candidate_ui_lab_annotation.rs"]
+mod candidate_ui_lab_annotation;
 
 #[cfg(windows)]
 fn main() {
@@ -25,6 +28,7 @@ fn main() {
 #[cfg(windows)]
 mod windows_app {
     use std::cell::RefCell;
+    use std::ffi::c_void;
 
     use crate::candidate_ui::{
         CandidateRgb, CandidateScene, CandidateSceneFontMetrics, CandidateSceneLayout,
@@ -34,6 +38,10 @@ mod windows_app {
     };
     use crate::candidate_ui_gdi::{
         CandidateSceneFonts, CandidateScenePaintContent, paint_candidate_scene,
+    };
+    use crate::candidate_ui_lab_annotation::{
+        CandidateUiLabAnnotationContext, CandidateUiLabAnnotationSession,
+        MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS, capture_candidate_ui_lab_annotation_context,
     };
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
@@ -47,21 +55,29 @@ mod windows_app {
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        EnableWindow, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, IDC_ARROW, LoadCursorW,
-        MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
-        SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-        WINDOW_EX_STYLE, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CAPTION,
-        WS_MINIMIZEBOX, WS_SYSMENU,
+        BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+        DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE,
+        ES_WANTRETURN, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW,
+        GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow, LoadCursorW, MB_ICONERROR,
+        MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW, SET_WINDOW_POS_FLAGS, SW_SHOW,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos,
+        SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+        WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
 
     const DPIS: [u32; 4] = [96, 120, 144, 192];
     const MAX_CANDIDATE_CHARACTERS: usize = 32;
+    const NOTE_EDIT_ID: i32 = 201;
+    const NOTE_SAVE_ID: i32 = 202;
+    const NOTE_CANCEL_ID: i32 = 203;
+    const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
 
     thread_local! {
         static APP_STATE: RefCell<Option<LabState>> = const { RefCell::new(None) };
@@ -82,6 +98,14 @@ mod windows_app {
                 Self::Everyday => "日常短词",
                 Self::LongCandidate => "长候选",
                 Self::Personalized => "个人标记",
+            }
+        }
+
+        const fn stable_id(self) -> &'static str {
+            match self {
+                Self::Everyday => "everyday",
+                Self::LongCandidate => "long-candidate",
+                Self::Personalized => "personalized",
             }
         }
 
@@ -141,6 +165,10 @@ mod windows_app {
         last_scene: Option<CandidateScene>,
         drag_anchor: Option<(i32, i32)>,
         selection: Option<CandidateSceneRect>,
+        annotations: CandidateUiLabAnnotationSession,
+        pending_annotation: Option<CandidateUiLabAnnotationContext>,
+        note_window: Option<HWND>,
+        note_owner: Option<HWND>,
     }
 
     impl Default for LabState {
@@ -153,6 +181,10 @@ mod windows_app {
                 last_scene: None,
                 drag_anchor: None,
                 selection: None,
+                annotations: CandidateUiLabAnnotationSession::default(),
+                pending_annotation: None,
+                note_window: None,
+                note_owner: None,
             }
         }
     }
@@ -189,6 +221,7 @@ mod windows_app {
             self.last_scene = None;
             self.drag_anchor = None;
             self.selection = None;
+            self.pending_annotation = None;
         }
     }
 
@@ -220,6 +253,18 @@ mod windows_app {
             };
             if RegisterClassW(&class) == 0 {
                 return Err("无法注册候选窗实验室窗口".to_owned());
+            }
+            let note_class_name = w!("ZiranmaCandidateUiLabNoteWindow");
+            let note_class = WNDCLASSW {
+                hInstance: instance,
+                lpszClassName: note_class_name,
+                lpfnWndProc: Some(note_window_proc),
+                hCursor: LoadCursorW(None, IDC_ARROW)
+                    .map_err(|_| "无法载入批注窗口光标".to_owned())?,
+                ..Default::default()
+            };
+            if RegisterClassW(&note_class) == 0 {
+                return Err("无法注册候选窗批注窗口".to_owned());
             }
             APP_STATE.with(|slot| slot.replace(Some(LabState::default())));
             let window = match CreateWindowExW(
@@ -255,6 +300,11 @@ mod windows_app {
                 if result == 0 {
                     break;
                 }
+                let note_window = APP_STATE
+                    .with(|slot| slot.borrow().as_ref().and_then(|state| state.note_window));
+                if note_window.is_some_and(|window| IsDialogMessageW(window, &message).as_bool()) {
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -278,6 +328,10 @@ mod windows_app {
             WM_KEYDOWN => {
                 if wparam.0 == usize::from(VK_ESCAPE.0) {
                     let _ = unsafe { DestroyWindow(window) };
+                    return LRESULT(0);
+                }
+                if u32::try_from(wparam.0).unwrap_or_default() == 0x4e {
+                    open_note_window(window);
                     return LRESULT(0);
                 }
                 let changed = APP_STATE.with(|slot| {
@@ -361,11 +415,354 @@ mod windows_app {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let note_window = APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let state = slot.as_mut()?;
+                    state.note_owner = None;
+                    state.pending_annotation = None;
+                    state.note_window.take()
+                });
+                if let Some(note_window) = note_window
+                    .filter(|note_window| unsafe { IsWindow(Some(*note_window)) }.as_bool())
+                {
+                    let _ = unsafe { DestroyWindow(note_window) };
+                }
                 APP_STATE.with(|slot| slot.replace(None));
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    fn open_note_window(owner: HWND) {
+        let existing =
+            APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.note_window));
+        if existing.is_some_and(|window| unsafe { IsWindow(Some(window)) }.as_bool()) {
+            if let Some(window) = existing {
+                let _ = unsafe { SetForegroundWindow(window) };
+            }
+            return;
+        }
+
+        let context = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot
+                .as_ref()
+                .ok_or_else(|| "候选窗实验室尚未准备好".to_owned())?;
+            let selection = state
+                .selection
+                .ok_or_else(|| "请先在候选窗上圈选需要批注的区域".to_owned())?;
+            let scene = state
+                .last_scene
+                .as_ref()
+                .ok_or_else(|| "候选窗预览尚未完成绘制".to_owned())?;
+            capture_candidate_ui_lab_annotation_context(
+                state.scenario().stable_id(),
+                state.layout,
+                state.dpi(),
+                selection,
+                scene,
+                DEFAULT_CANDIDATE_VISUAL_SPEC,
+            )
+            .map_err(|error| error.to_string())
+        });
+        let context = match context {
+            Ok(context) => context,
+            Err(error) => return notify_error(owner, &error),
+        };
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.pending_annotation = Some(context);
+                state.note_owner = Some(owner);
+            }
+        });
+
+        let window = unsafe {
+            let module = match GetModuleHandleW(None) {
+                Ok(module) => module,
+                Err(_) => {
+                    clear_pending_note();
+                    return notify_error(owner, "无法读取批注窗口模块");
+                }
+            };
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                w!("ZiranmaCandidateUiLabNoteWindow"),
+                w!("给这个区域写一句批注"),
+                WS_CAPTION | WS_SYSMENU,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                520,
+                270,
+                Some(owner),
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        };
+        let window = match window {
+            Ok(window) => window,
+            Err(_) => {
+                clear_pending_note();
+                return notify_error(owner, "无法创建批注输入窗口");
+            }
+        };
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.note_window = Some(window);
+            }
+        });
+        unsafe {
+            let _ = EnableWindow(owner, false);
+            let _ = ShowWindow(window, SW_SHOW);
+            let _ = SetForegroundWindow(window);
+            if let Ok(editor) = GetDlgItem(Some(window), NOTE_EDIT_ID) {
+                let _ = SetFocus(Some(editor));
+            }
+        }
+    }
+
+    unsafe extern "system" fn note_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CREATE => {
+                if create_note_controls(window) {
+                    LRESULT(0)
+                } else {
+                    LRESULT(-1)
+                }
+            }
+            WM_COMMAND => {
+                match (wparam.0 & 0xffff) as i32 {
+                    NOTE_SAVE_ID => save_note(window),
+                    NOTE_CANCEL_ID => {
+                        let _ = unsafe { DestroyWindow(window) };
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let owner = APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let state = slot.as_mut()?;
+                    if state.note_window != Some(window) {
+                        return None;
+                    }
+                    state.note_window = None;
+                    state.pending_annotation = None;
+                    state.note_owner.take()
+                });
+                if let Some(owner) =
+                    owner.filter(|owner| unsafe { IsWindow(Some(*owner)) }.as_bool())
+                {
+                    unsafe {
+                        let _ = EnableWindow(owner, true);
+                        let _ = SetForegroundWindow(owner);
+                    }
+                    refresh_window(owner, false);
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    fn create_note_controls(window: HWND) -> bool {
+        let instance = unsafe { GetModuleHandleW(None) }
+            .ok()
+            .map(|module| HINSTANCE(module.0));
+        let controls = unsafe {
+            [
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    w!("这条批注只关联当前公开合成预览，并暂存在本次实验中。"),
+                    20,
+                    18,
+                    470,
+                    28,
+                    0,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("EDIT"),
+                    PCWSTR::null(),
+                    20,
+                    50,
+                    470,
+                    120,
+                    NOTE_EDIT_ID,
+                    WS_BORDER.0 as i32
+                        | WS_TABSTOP.0 as i32
+                        | WS_VSCROLL.0 as i32
+                        | ES_LEFT
+                        | ES_MULTILINE
+                        | ES_AUTOVSCROLL
+                        | ES_WANTRETURN,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("加入本次实验"),
+                    276,
+                    188,
+                    104,
+                    34,
+                    NOTE_SAVE_ID,
+                    BS_DEFPUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("取消"),
+                    390,
+                    188,
+                    100,
+                    34,
+                    NOTE_CANCEL_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+            ]
+        };
+        if controls.iter().any(Result::is_err) {
+            return false;
+        }
+        if let Ok(editor) = unsafe { GetDlgItem(Some(window), NOTE_EDIT_ID) } {
+            let _ = unsafe {
+                SendMessageW(
+                    editor,
+                    EDIT_SET_LIMIT_TEXT,
+                    Some(WPARAM(MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS * 2)),
+                    None,
+                )
+            };
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn create_control(
+        parent: HWND,
+        class_name: PCWSTR,
+        label: PCWSTR,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        id: i32,
+        extra_style: i32,
+        instance: Option<HINSTANCE>,
+    ) -> windows::core::Result<HWND> {
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class_name,
+                label,
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WINDOW_STYLE(u32::try_from(extra_style).unwrap_or_default()),
+                x,
+                y,
+                width,
+                height,
+                Some(parent),
+                (id != 0).then_some(HMENU(id as usize as *mut c_void)),
+                instance,
+                None,
+            )
+        }
+    }
+
+    fn save_note(window: HWND) {
+        let note = match read_note(window) {
+            Ok(note) => note,
+            Err(error) => return notify_error(window, &error),
+        };
+        let result = APP_STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let state = slot
+                .as_mut()
+                .ok_or_else(|| "候选窗实验室尚未准备好".to_owned())?;
+            let context = state
+                .pending_annotation
+                .clone()
+                .ok_or_else(|| "这次圈选已经失效，请重新圈选".to_owned())?;
+            state
+                .annotations
+                .add(context, &note)
+                .map_err(|error| error.to_string())?;
+            debug_assert!(
+                !state
+                    .annotations
+                    .annotations()
+                    .last()
+                    .expect("the just-added annotation exists")
+                    .to_canonical_json()
+                    .is_empty()
+            );
+            state.pending_annotation = None;
+            Ok::<_, String>(())
+        });
+        match result {
+            Ok(()) => {
+                let _ = unsafe { DestroyWindow(window) };
+            }
+            Err(error) => notify_error(window, &error),
+        }
+    }
+
+    fn read_note(window: HWND) -> Result<String, String> {
+        let editor = unsafe { GetDlgItem(Some(window), NOTE_EDIT_ID) }
+            .map_err(|_| "无法读取批注输入框".to_owned())?;
+        let length = unsafe { GetWindowTextLengthW(editor) };
+        let maximum = i32::try_from(MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS.saturating_mul(2))
+            .unwrap_or(i32::MAX);
+        if !(0..=maximum).contains(&length) {
+            return Err("批注超过输入上限".to_owned());
+        }
+        let mut buffer = vec![0_u16; usize::try_from(length).unwrap_or(0).saturating_add(1)];
+        let copied = unsafe { GetWindowTextW(editor, &mut buffer) };
+        if copied < 0 {
+            return Err("无法读取批注输入框".to_owned());
+        }
+        buffer.truncate(usize::try_from(copied).unwrap_or(0));
+        String::from_utf16(&buffer).map_err(|_| "批注不是有效文字".to_owned())
+    }
+
+    fn clear_pending_note() {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.pending_annotation = None;
+                state.note_owner = None;
+                state.note_window = None;
+            }
+        });
+    }
+
+    fn notify_error(window: HWND, message: &str) {
+        let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        unsafe {
+            let _ = MessageBoxW(
+                Some(window),
+                PCWSTR(message.as_ptr()),
+                w!("候选窗实验室"),
+                MB_OK | MB_ICONERROR,
+            );
         }
     }
 
@@ -431,12 +828,18 @@ mod windows_app {
             .as_deref()
             .map(|hit| format!(" · 命中 {hit}"))
             .unwrap_or_default();
+        let annotations = if state.annotations.len() == 0 {
+            String::new()
+        } else {
+            format!(" · 批注 {}（仅内存）", state.annotations.len())
+        };
         format!(
-            "候选窗实验室 · {} · {} DPI · {}{}    H 布局 / D 缩放 / S 场景 / 拖拽圈选 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {}{}{}    H 布局 / D 缩放 / S 场景 / 拖拽圈选 / N 批注 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
-            hit
+            hit,
+            annotations,
         )
     }
 
