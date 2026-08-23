@@ -108,6 +108,7 @@ enum Options {
     },
     BuildShortConsensusLayer(Box<ShortConsensusLayerBuildOptions>),
     BuildPhraseLayer(Box<PhraseLayerBuildOptions>),
+    BuildExactPhraseLayer(Box<ExactPhraseLayerBuildOptions>),
     MergePublicPackages {
         base: PathBuf,
         overlay: PathBuf,
@@ -426,6 +427,21 @@ struct ShortConsensusLayerBuildOptions {
     base_declaration: PublicSourceDeclaration,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ExactPhraseLayerBuildOptions {
+    source: PathBuf,
+    core_payload: PathBuf,
+    supplemental_payload: PathBuf,
+    fit_corpus: PathBuf,
+    output: PathBuf,
+    revision: String,
+    entry_limit: usize,
+    source_declaration: PublicSourceDeclaration,
+    core_declaration: PublicSourceDeclaration,
+    supplemental_declaration: PublicSourceDeclaration,
+    fit_declaration: PublicSourceDeclaration,
+}
+
 struct PreflightSummary {
     revision: String,
     input_keys: usize,
@@ -490,6 +506,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowlist_declaration: &allowlist_declaration,
                 base_declaration: &base_declaration,
             })?
+        }
+        Options::BuildExactPhraseLayer(options) => {
+            build_exact_phrase_layer_public_package(*options)?
         }
         Options::MergePublicPackages {
             base,
@@ -899,6 +918,7 @@ fn parse_options(
         "build-rime-slice" => parse_build_rime_slice(arguments),
         "build-short-consensus-layer" => parse_build_short_consensus_layer(arguments),
         "build-phrase-layer" => parse_build_phrase_layer(arguments),
+        "build-exact-phrase-layer" => parse_build_exact_phrase_layer(arguments),
         "merge-public-packages" => parse_merge_public_packages(arguments),
         "diagnose-public-miss" => parse_diagnose_public_miss(arguments),
         "compare" => parse_compare(arguments),
@@ -1441,6 +1461,138 @@ fn parse_build_phrase_layer(
                 license: base_license.ok_or("build-phrase-layer requires --base-license")?,
                 url: base_url.ok_or("build-phrase-layer requires --base-url")?,
                 sha256: base_sha256.ok_or("build-phrase-layer requires --base-sha256")?,
+            },
+        },
+    )))
+}
+
+fn parse_build_exact_phrase_layer(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut fit_corpus = None;
+    let mut output = None;
+    let mut revision = None;
+    let mut entry_limit = None;
+    let mut source_id = None;
+    let mut source_license = None;
+    let mut source_url = None;
+    let mut source_sha256 = None;
+    let mut core_id = None;
+    let mut core_license = None;
+    let mut core_url = None;
+    let mut core_sha256 = None;
+    let mut supplemental_id = None;
+    let mut supplemental_license = None;
+    let mut supplemental_url = None;
+    let mut supplemental_sha256 = None;
+    let mut fit_id = None;
+    let mut fit_license = None;
+    let mut fit_url = None;
+    let mut fit_sha256 = None;
+    let mut public = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--output" => set_path(&mut output, &mut arguments, "--output")?,
+            "--revision" => set_value(&mut revision, &mut arguments, "--revision")?,
+            "--entry-limit" => set_usize(&mut entry_limit, &mut arguments, "--entry-limit")?,
+            "--source-id" => set_value(&mut source_id, &mut arguments, "--source-id")?,
+            "--source-license" => {
+                set_value(&mut source_license, &mut arguments, "--source-license")?
+            }
+            "--source-url" => set_value(&mut source_url, &mut arguments, "--source-url")?,
+            "--source-sha256" => set_value(&mut source_sha256, &mut arguments, "--source-sha256")?,
+            "--core-id" => set_value(&mut core_id, &mut arguments, "--core-id")?,
+            "--core-license" => set_value(&mut core_license, &mut arguments, "--core-license")?,
+            "--core-url" => set_value(&mut core_url, &mut arguments, "--core-url")?,
+            "--core-sha256" => set_value(&mut core_sha256, &mut arguments, "--core-sha256")?,
+            "--supplemental-id" => {
+                set_value(&mut supplemental_id, &mut arguments, "--supplemental-id")?
+            }
+            "--supplemental-license" => set_value(
+                &mut supplemental_license,
+                &mut arguments,
+                "--supplemental-license",
+            )?,
+            "--supplemental-url" => {
+                set_value(&mut supplemental_url, &mut arguments, "--supplemental-url")?
+            }
+            "--supplemental-sha256" => set_value(
+                &mut supplemental_sha256,
+                &mut arguments,
+                "--supplemental-sha256",
+            )?,
+            "--fit-id" => set_value(&mut fit_id, &mut arguments, "--fit-id")?,
+            "--fit-license" => set_value(&mut fit_license, &mut arguments, "--fit-license")?,
+            "--fit-url" => set_value(&mut fit_url, &mut arguments, "--fit-url")?,
+            "--fit-sha256" => set_value(&mut fit_sha256, &mut arguments, "--fit-sha256")?,
+            "--public" => {
+                if public {
+                    return Err("--public can be given only once".into());
+                }
+                public = true;
+            }
+            _ => {
+                return Err(
+                    "unknown build-exact-phrase-layer argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    if !public {
+        return Err("build-exact-phrase-layer requires explicit --public".into());
+    }
+    let entry_limit = entry_limit.ok_or("build-exact-phrase-layer requires --entry-limit")?;
+    if !(1..=MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES).contains(&entry_limit) {
+        return Err("build-exact-phrase-layer --entry-limit is outside the fixed bound".into());
+    }
+    Ok(Options::BuildExactPhraseLayer(Box::new(
+        ExactPhraseLayerBuildOptions {
+            source: source.ok_or("build-exact-phrase-layer requires --source")?,
+            core_payload: core_payload.ok_or("build-exact-phrase-layer requires --core-payload")?,
+            supplemental_payload: supplemental_payload
+                .ok_or("build-exact-phrase-layer requires --supplemental-payload")?,
+            fit_corpus: fit_corpus.ok_or("build-exact-phrase-layer requires --fit-corpus")?,
+            output: output.ok_or("build-exact-phrase-layer requires --output")?,
+            revision: revision.ok_or("build-exact-phrase-layer requires --revision")?,
+            entry_limit,
+            source_declaration: PublicSourceDeclaration {
+                id: source_id.ok_or("build-exact-phrase-layer requires --source-id")?,
+                license: source_license
+                    .ok_or("build-exact-phrase-layer requires --source-license")?,
+                url: source_url.ok_or("build-exact-phrase-layer requires --source-url")?,
+                sha256: source_sha256.ok_or("build-exact-phrase-layer requires --source-sha256")?,
+            },
+            core_declaration: PublicSourceDeclaration {
+                id: core_id.ok_or("build-exact-phrase-layer requires --core-id")?,
+                license: core_license.ok_or("build-exact-phrase-layer requires --core-license")?,
+                url: core_url.ok_or("build-exact-phrase-layer requires --core-url")?,
+                sha256: core_sha256.ok_or("build-exact-phrase-layer requires --core-sha256")?,
+            },
+            supplemental_declaration: PublicSourceDeclaration {
+                id: supplemental_id.ok_or("build-exact-phrase-layer requires --supplemental-id")?,
+                license: supplemental_license
+                    .ok_or("build-exact-phrase-layer requires --supplemental-license")?,
+                url: supplemental_url
+                    .ok_or("build-exact-phrase-layer requires --supplemental-url")?,
+                sha256: supplemental_sha256
+                    .ok_or("build-exact-phrase-layer requires --supplemental-sha256")?,
+            },
+            fit_declaration: PublicSourceDeclaration {
+                id: fit_id.ok_or("build-exact-phrase-layer requires --fit-id")?,
+                license: fit_license.ok_or("build-exact-phrase-layer requires --fit-license")?,
+                url: fit_url.ok_or("build-exact-phrase-layer requires --fit-url")?,
+                sha256: fit_sha256.ok_or("build-exact-phrase-layer requires --fit-sha256")?,
             },
         },
     )))
@@ -3034,6 +3186,9 @@ fn print_usage() {
         "  build-phrase-layer --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --output <NEW_PACKAGE_DIR> --revision <REV> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --allowlist-id <ID> --allowlist-license <SPDX> --allowlist-url <HTTPS_URL> --allowlist-sha256 <SHA256> --base-id <ID> --base-license <SPDX> --base-url <HTTPS_URL> --base-sha256 <SHA256> --public"
     );
     eprintln!(
+        "  build-exact-phrase-layer --source <TONED_RIME.dict.yaml> --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --output <NEW_PACKAGE_DIR> --revision <REV> --entry-limit <1..50000> --source-id <ID> --source-license <SPDX> --source-url <HTTPS_URL> --source-sha256 <SHA256> --core-id <ID> --core-license <SPDX> --core-url <HTTPS_URL> --core-sha256 <SHA256> --supplemental-id <ID> --supplemental-license <SPDX> --supplemental-url <HTTPS_URL> --supplemental-sha256 <SHA256> --fit-id <ID> --fit-license <SPDX> --fit-url <HTTPS_URL> --fit-sha256 <SHA256> --public"
+    );
+    eprintln!(
         "  merge-public-packages --base <PACKAGE_DIR> --overlay <PACKAGE_DIR> --output <NEW_PACKAGE_DIR> --revision <REV> --public"
     );
     eprintln!(
@@ -3508,6 +3663,116 @@ fn build_phrase_layer_public_package(
         base_entries.len(),
         available_entries,
         entry_limit,
+    )?;
+    Ok(report)
+}
+
+fn build_exact_phrase_layer_public_package(
+    options: ExactPhraseLayerBuildOptions,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = read_explicit_text(
+        &options.source,
+        "public exact-phrase Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let core_text = read_explicit_text(
+        &options.core_payload,
+        "core public exact-phrase payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        &options.supplemental_payload,
+        "supplemental public exact-phrase payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        &options.fit_corpus,
+        "public exact-phrase fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+
+    // Selection depends on all four exact byte streams. Authenticate every
+    // material before parsing or creating the output directory so a late pin
+    // failure cannot leave a plausible partial package behind.
+    let materials = vec![
+        verified_source_material(
+            &options.source_declaration,
+            source_text.as_bytes(),
+            "public exact-phrase Rime source",
+        )?,
+        verified_source_material(
+            &options.core_declaration,
+            core_text.as_bytes(),
+            "core public exact-phrase payload",
+        )?,
+        verified_source_material(
+            &options.supplemental_declaration,
+            supplemental_text.as_bytes(),
+            "supplemental public exact-phrase payload",
+        )?,
+        verified_source_material(
+            &options.fit_declaration,
+            fit_text.as_bytes(),
+            "public exact-phrase fit corpus",
+        )?,
+    ];
+    if materials
+        .iter()
+        .map(CandidateSourceMaterial::sha256)
+        .collect::<HashSet<_>>()
+        .len()
+        != materials.len()
+    {
+        return Err("build-exact-phrase-layer requires four distinct public materials".into());
+    }
+
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
+    let fit = parse_ud_conllu(&fit_text)?;
+    let fit_spans = select_public_han_span_rank_probes(
+        &fit,
+        &core_entries,
+        EXACT_PHRASE_CHARACTERS,
+        EXACT_PHRASE_MAX_TOKENS,
+    );
+    let mut existing_entries = core_entries.clone();
+    existing_entries.extend(supplemental_entries.iter().cloned());
+    let selected = select_exact_phrase_source_entries(
+        &source_text,
+        &fit_spans.probes,
+        &existing_entries,
+        options.entry_limit,
+    )?;
+    if selected.entries.is_empty() {
+        return Err("build-exact-phrase-layer selected no new public identities".into());
+    }
+    let stats = selected.stats;
+    let mut entries = selected.entries;
+    entries.sort_by(|left, right| {
+        left.code
+            .as_str()
+            .cmp(right.code.as_str())
+            .then_with(|| left.text.cmp(&right.text))
+            .then_with(|| right.frequency.cmp(&left.frequency))
+    });
+    let payload = serialize_lexicon_payload(&entries);
+    let mut report =
+        write_multi_source_public_package(&options.output, &options.revision, materials, &payload)?;
+    writeln!(
+        report,
+        "三字精确层：训练可编码 span {}（身份 {}）；来源匹配身份 {}；多音词面 {}；来源同码歧义 {}；既有身份 {}；上限外 {}；写入 {} 条",
+        fit_spans.code_coverable_instances,
+        fit_spans.code_coverable_identities,
+        stats.matched_identities,
+        stats.ambiguous_surfaces,
+        stats.ambiguous_codes,
+        stats.existing_identities,
+        stats.dropped_by_entry_cap,
+        entries.len(),
+    )?;
+    writeln!(
+        report,
+        "运行时状态：独立实验包；未接入、未安装、未启用；当前 TSF 候选保持不变"
     )?;
     Ok(report)
 }
@@ -13636,6 +13901,73 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_layer_build_parser_requires_four_pins_and_public_intent() {
+        let arguments = [
+            "build-exact-phrase-layer",
+            "--source",
+            "source.yaml",
+            "--core-payload",
+            "core.tsv",
+            "--supplemental-payload",
+            "supplemental.tsv",
+            "--fit-corpus",
+            "train.conllu",
+            "--output",
+            "package",
+            "--revision",
+            "exact-phrase-v1",
+            "--entry-limit",
+            "5000",
+            "--source-id",
+            "wanxiang-jichu",
+            "--source-license",
+            "CC-BY-4.0",
+            "--source-url",
+            "https://example.com/source",
+            "--source-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--core-id",
+            "rime-core",
+            "--core-license",
+            "Apache-2.0",
+            "--core-url",
+            "https://example.com/core",
+            "--core-sha256",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "--supplemental-id",
+            "wanxiang-top100k",
+            "--supplemental-license",
+            "CC-BY-4.0",
+            "--supplemental-url",
+            "https://example.com/supplemental",
+            "--supplemental-sha256",
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            "--fit-id",
+            "ud-gsdsimp-train",
+            "--fit-license",
+            "CC-BY-SA-4.0",
+            "--fit-url",
+            "https://example.com/train",
+            "--fit-sha256",
+            "4444444444444444444444444444444444444444444444444444444444444444",
+            "--public",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+
+        let Options::BuildExactPhraseLayer(parsed) = parse_options(arguments.clone()).unwrap()
+        else {
+            panic!("expected build-exact-phrase-layer options");
+        };
+        assert_eq!(parsed.entry_limit, 5000);
+        assert_eq!(parsed.source, PathBuf::from("source.yaml"));
+        assert_eq!(parsed.core_declaration.id, "rime-core");
+        assert_eq!(parsed.supplemental_declaration.id, "wanxiang-top100k");
+        assert_eq!(parsed.fit_declaration.id, "ud-gsdsimp-train");
+        assert!(parse_options(arguments[..arguments.len() - 1].to_vec()).is_err());
+    }
+
+    #[test]
     fn short_consensus_build_parser_requires_three_pins_and_public_intent() {
         let arguments = vec![
             "build-short-consensus-layer",
@@ -15289,6 +15621,104 @@ mod tests {
                 fs::read(package_b.join(filename)).unwrap(),
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_phrase_layer_build_pins_four_materials_and_is_deterministic() {
+        const SOURCE: &str = "---\n...\n再进来\tzài jìn lái\t20\n";
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+再\tzai\t100\n进来\tjin lai\t90\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n其他词\tqi ta ci\t80\n";
+        const FIT: &str = "# sent_id = fit\n\
+1\t再\t_\tADV\t_\t_\t2\tadvmod\t_\t_\n\
+2\t进来\t_\tVERB\t_\t_\t0\troot\t_\t_\n\n";
+        let root = temporary_test_root();
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.yaml");
+        let core = root.join("core.tsv");
+        let supplemental = root.join("supplemental.tsv");
+        let fit = root.join("train.conllu");
+        let package_a = root.join("package-a");
+        let package_b = root.join("package-b");
+        fs::write(&source, SOURCE).unwrap();
+        fs::write(&core, CORE).unwrap();
+        fs::write(&supplemental, SUPPLEMENTAL).unwrap();
+        fs::write(&fit, FIT).unwrap();
+        let declaration = |id: &str, contents: &str| PublicSourceDeclaration {
+            id: id.to_owned(),
+            license: "CC-BY-4.0".to_owned(),
+            url: format!("https://example.com/{id}"),
+            sha256: candidate_sha256_hex(contents.as_bytes()),
+        };
+        let source_declaration = declaration("source", SOURCE);
+        let core_declaration = declaration("core", CORE);
+        let supplemental_declaration = declaration("supplemental", SUPPLEMENTAL);
+        let fit_declaration = declaration("fit", FIT);
+        let build = |output: PathBuf| {
+            build_exact_phrase_layer_public_package(ExactPhraseLayerBuildOptions {
+                source: source.clone(),
+                core_payload: core.clone(),
+                supplemental_payload: supplemental.clone(),
+                fit_corpus: fit.clone(),
+                output,
+                revision: "exact-phrase-v1".to_owned(),
+                entry_limit: 10,
+                source_declaration: source_declaration.clone(),
+                core_declaration: core_declaration.clone(),
+                supplemental_declaration: supplemental_declaration.clone(),
+                fit_declaration: fit_declaration.clone(),
+            })
+        };
+
+        let report = build(package_a.clone()).unwrap();
+        build(package_b.clone()).unwrap();
+        let loaded = load_public_package_directory(&package_a).unwrap();
+        let code = encode_pinyin_phrase("zai jin lai").unwrap().full_code;
+        assert_eq!(loaded.provenance.source_count(), 4);
+        assert_eq!(loaded.snapshot.entry_count(), 1);
+        assert_eq!(
+            loaded
+                .snapshot
+                .exact_full_code_texts(code.as_str(), 10)
+                .unwrap(),
+            vec!["再进来"]
+        );
+        assert!(report.contains("写入 1 条"));
+        assert!(report.contains("未接入、未安装、未启用"));
+        assert!(!report.contains("再进来"));
+        for filename in [
+            CANDIDATE_PACKAGE_MANIFEST_FILE,
+            CANDIDATE_PACKAGE_PAYLOAD_FILE,
+            CANDIDATE_PACKAGE_PROVENANCE_FILE,
+        ] {
+            assert_eq!(
+                fs::read(package_a.join(filename)).unwrap(),
+                fs::read(package_b.join(filename)).unwrap(),
+            );
+        }
+
+        let failed_output = root.join("failed-package");
+        let mut bad_fit = fit_declaration;
+        bad_fit.sha256 = "0".repeat(64);
+        assert!(
+            build_exact_phrase_layer_public_package(ExactPhraseLayerBuildOptions {
+                source,
+                core_payload: core,
+                supplemental_payload: supplemental,
+                fit_corpus: fit,
+                output: failed_output.clone(),
+                revision: "exact-phrase-v1".to_owned(),
+                entry_limit: 10,
+                source_declaration,
+                core_declaration,
+                supplemental_declaration,
+                fit_declaration: bad_fit,
+            })
+            .is_err()
+        );
+        assert!(!failed_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }

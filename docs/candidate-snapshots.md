@@ -397,9 +397,9 @@ cargo run --release --bin candidatectl -- length-coverage-audit `
   --held-out-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu
 ```
 
-当前候选包 provenance 只绑定一个词典来源。若将 UD train 真正用于挑选长词，
-输出包就依赖第二个公开来源；在多来源哈希、许可和选择参数能够一起被认证以前，
-切片器不会提供这种构建模式。留出审计可以评价假设，但不能绕过来源绑定生成包。
+普通万象切片包的 provenance 只绑定一个词典来源。若将 UD train 真正用于挑选长词，
+输出包还依赖核心、补充和训练语料，不能继续冒充单来源切片。通用切片器仍不提供这种
+模式；下述专用三字构建器会把四份材料一起认证，留出审计本身则始终不能绕过来源绑定。
 
 ### 三字精确短语层审计
 
@@ -441,6 +441,40 @@ cargo run --release --bin candidatectl -- exact-phrase-layer-audit `
 “独立层假设值得进入多来源认证和宿主预检”，不是自动发布许可；日用包、槽位和
 TSF 均未改变，像“再进来”这类未被训练侧公开 span 选中的个人目标仍交给新版精确
 记忆验证，不能借本审计逐条硬编码。
+
+证据门通过后，`build-exact-phrase-layer` 才允许生成一个仍不接入运行时的实验包。
+它必须在创建输出目录前逐一核对四份公开材料，任一哈希错误、材料摘要重复、解析失败
+或选层为空都不留下部分包：
+
+```powershell
+cargo run --release --bin candidatectl -- build-exact-phrase-layer `
+  --source .local/public-audit/wanxiang-fdda7afb/jichu.dict.yaml `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top100k-v1/lexicon.tsv `
+  --fit-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu `
+  --output .local/public-audit/wanxiang-fdda7afb/package-exact-phrase-train-span-v1 `
+  --revision wanxiang-gsdsimp-exact-phrase-span-v1 --entry-limit 5000 `
+  --source-id wanxiang-jichu-fdda7afb --source-license CC-BY-4.0 `
+  --source-url https://github.com/amzxyz/rime_wanxiang `
+  --source-sha256 9d14c0c49588d63b16c554df4711bed5da822c63de9d50f4759c53542138ac00 `
+  --core-id rime-pinyin-simp-0c6861ef-core-payload --core-license Apache-2.0 `
+  --core-url https://raw.githubusercontent.com/rime/rime-pinyin-simp/0c6861ef7420ee780270ca6d993d18d4101049d0/pinyin_simp.dict.yaml `
+  --core-sha256 fec5d5173127d568a047655b2f92a94c4e546c91565d7fd14808fbf71266b834 `
+  --supplemental-id wanxiang-jichu-fdda7afb-top100k-payload `
+  --supplemental-license CC-BY-4.0 `
+  --supplemental-url https://github.com/amzxyz/rime_wanxiang `
+  --supplemental-sha256 96b36073b0386ef84bd6347fe9c91a118bfcfa79c13eb6b73b18c1c9bc98f382 `
+  --fit-id ud-chinese-gsdsimp-4231dfd-train --fit-license CC-BY-SA-4.0 `
+  --fit-url https://raw.githubusercontent.com/UniversalDependencies/UD_Chinese-GSDSimp/4231dfd59866fa5999ad4a6bc1fdecd7985b3b59/zh_gsdsimp-ud-train.conllu `
+  --fit-sha256 956636fe612a1166e8b19e7413fee2e73d68231aca2f0455be2c616b947d629d `
+  --public
+```
+
+固定材料生成的包版本为 `wanxiang-gsdsimp-exact-phrase-span-v1`，发布 SHA-256 为
+`570abd32582e695e5a4d042a2c4cb1a67a6bb137cf52c1f72c6e9f41b19a181e`。包级
+`verify`、通用 TSF 候选 `preflight` 和四源 `inspect` 均通过；输出只保存在 Git
+忽略的公开审计目录。通用预检只证明包本身可加载和提交一个三字词，不证明三层合并
+顺序、真实首帧或热切换，因此仍不能安装或启用。
 
 ### 同修订固定短语表审计
 
