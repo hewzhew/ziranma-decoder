@@ -34,8 +34,10 @@ fn main() {
 #[cfg(windows)]
 mod windows_app {
     use std::cell::RefCell;
-    use std::ffi::c_void;
+    use std::ffi::{OsString, c_void};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use crate::candidate_ui::{
         CandidateRgb, CandidateScene, CandidateSceneFontMetrics, CandidateSceneLayout,
@@ -50,6 +52,9 @@ mod windows_app {
         CandidateUiLabAnnotationContext, CandidateUiLabAnnotationSession,
         MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS, capture_candidate_ui_lab_annotation_context,
         export_candidate_ui_lab_annotations,
+    };
+    use crate::candidate_ui_lab_feedback::{
+        CandidateUiLabFeedbackReview, read_candidate_ui_lab_feedback_file,
     };
     use crate::candidate_ui_lab_visual::{
         CandidateUiLabColorRole, CandidateUiLabToken, CandidateUiLabVisualState,
@@ -66,6 +71,8 @@ mod windows_app {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Controls::Dialogs::{
         CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW, CommDlgExtendedError,
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
     };
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -77,17 +84,17 @@ mod windows_app {
         BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
         CBN_SELCHANGE, CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
         DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE,
-        ES_WANTRETURN, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow, LoadCursorW, MB_ICONERROR,
-        MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
-        SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
+        ES_READONLY, ES_WANTRETURN, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect,
+        GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow,
+        LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, PostQuitMessage,
+        RegisterClassW, SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
         TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
         WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE,
         WM_PAINT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
         WS_EX_TOOLWINDOW, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
-    use windows::core::{PCWSTR, w};
+    use windows::core::{PCWSTR, PWSTR, w};
 
     const DPIS: [u32; 4] = [96, 120, 144, 192];
     const MAX_CANDIDATE_CHARACTERS: usize = 32;
@@ -104,6 +111,12 @@ mod windows_app {
     const PANEL_COLOR_ID: i32 = 308;
     const PANEL_COLOR_DETAILS_ID: i32 = 309;
     const PANEL_COLOR_PICK_ID: i32 = 310;
+    const FEEDBACK_OPEN_ID: i32 = 401;
+    const FEEDBACK_PREVIOUS_ID: i32 = 402;
+    const FEEDBACK_NEXT_ID: i32 = 403;
+    const FEEDBACK_SUMMARY_ID: i32 = 404;
+    const FEEDBACK_HITS_ID: i32 = 405;
+    const FEEDBACK_NOTE_ID: i32 = 406;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
 
     thread_local! {
@@ -201,6 +214,9 @@ mod windows_app {
         panel_owner: Option<HWND>,
         comparison_window: Option<HWND>,
         comparison_owner: Option<HWND>,
+        feedback_review: Option<Rc<RefCell<CandidateUiLabFeedbackReview>>>,
+        feedback_window: Option<HWND>,
+        feedback_owner: Option<HWND>,
     }
 
     impl Default for LabState {
@@ -222,6 +238,9 @@ mod windows_app {
                 panel_owner: None,
                 comparison_window: None,
                 comparison_owner: None,
+                feedback_review: None,
+                feedback_window: None,
+                feedback_owner: None,
             }
         }
     }
@@ -460,6 +479,19 @@ mod windows_app {
             if RegisterClassW(&comparison_class) == 0 {
                 return Err("无法注册候选窗 A/B 对照窗口".to_owned());
             }
+            let feedback_class_name = w!("ZiranmaCandidateUiLabFeedbackWindow");
+            let feedback_class = WNDCLASSW {
+                hInstance: instance,
+                lpszClassName: feedback_class_name,
+                lpfnWndProc: Some(feedback_window_proc),
+                hCursor: LoadCursorW(None, IDC_ARROW)
+                    .map_err(|_| "无法载入反馈浏览窗口光标".to_owned())?,
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                ..Default::default()
+            };
+            if RegisterClassW(&feedback_class) == 0 {
+                return Err("无法注册候选窗反馈浏览窗口".to_owned());
+            }
             APP_STATE.with(|slot| slot.replace(Some(LabState::default())));
             let window = match CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -498,8 +530,8 @@ mod windows_app {
                 let dialog_windows = APP_STATE.with(|slot| {
                     slot.borrow()
                         .as_ref()
-                        .map(|state| [state.note_window, state.panel_window])
-                        .unwrap_or([None, None])
+                        .map(|state| [state.note_window, state.panel_window, state.feedback_window])
+                        .unwrap_or([None, None, None])
                 });
                 if dialog_windows
                     .into_iter()
@@ -551,6 +583,10 @@ mod windows_app {
                 }
                 if u32::try_from(wparam.0).unwrap_or_default() == 0x50 {
                     open_visual_panel(window);
+                    return LRESULT(0);
+                }
+                if u32::try_from(wparam.0).unwrap_or_default() == 0x4f {
+                    open_feedback_browser(window);
                     return LRESULT(0);
                 }
                 let change = APP_STATE.with(|slot| {
@@ -656,10 +692,12 @@ mod windows_app {
                     state.pending_annotation = None;
                     state.panel_owner = None;
                     state.comparison_owner = None;
+                    state.feedback_owner = None;
                     Some([
                         state.note_window.take(),
                         state.panel_window.take(),
                         state.comparison_window.take(),
+                        state.feedback_window.take(),
                     ])
                 });
                 for owned_window in owned_windows.into_iter().flatten().flatten() {
@@ -1520,8 +1558,14 @@ mod windows_app {
             let companions = APP_STATE.with(|slot| {
                 slot.borrow()
                     .as_ref()
-                    .map(|state| [state.panel_window, state.comparison_window])
-                    .unwrap_or([None, None])
+                    .map(|state| {
+                        [
+                            state.panel_window,
+                            state.comparison_window,
+                            state.feedback_window,
+                        ]
+                    })
+                    .unwrap_or([None, None, None])
             });
             for companion in companions.into_iter().flatten() {
                 if IsWindow(Some(companion)).as_bool() {
@@ -1583,8 +1627,14 @@ mod windows_app {
                         let companions = APP_STATE.with(|slot| {
                             slot.borrow()
                                 .as_ref()
-                                .map(|state| [state.panel_window, state.comparison_window])
-                                .unwrap_or([None, None])
+                                .map(|state| {
+                                    [
+                                        state.panel_window,
+                                        state.comparison_window,
+                                        state.feedback_window,
+                                    ]
+                                })
+                                .unwrap_or([None, None, None])
                         });
                         for companion in companions.into_iter().flatten() {
                             if IsWindow(Some(companion)).as_bool() {
@@ -1817,6 +1867,420 @@ mod windows_app {
             .join("wishes")
     }
 
+    struct FeedbackBrowserSnapshot {
+        title: String,
+        summary: String,
+        hits: String,
+        note: String,
+        can_select_previous: bool,
+        can_select_next: bool,
+    }
+
+    fn feedback_browser_snapshot(
+        review: Option<&CandidateUiLabFeedbackReview>,
+    ) -> FeedbackBrowserSnapshot {
+        let Some(review) = review else {
+            return FeedbackBrowserSnapshot {
+                title: "反馈浏览".to_owned(),
+                summary: "尚未选择反馈文件。这里仅打开宝宝明确选择的一份 v3 JSON。".to_owned(),
+                hits: "不会扫描目录、改写文件或影响当前 A/B 草案。".to_owned(),
+                note: "选择文件后，这里会显示批注内容。".to_owned(),
+                can_select_previous: false,
+                can_select_next: false,
+            };
+        };
+        let annotation = review.selected_annotation();
+        let index = review.selected_index();
+        let count = review.len();
+        let scenario = match annotation.scenario_id.as_str() {
+            "everyday" => "日常短词",
+            "long-candidate" => "长候选",
+            "personalized" => "个人标记",
+            _ => "未知场景",
+        };
+        let variant = match annotation.variant_id.as_str() {
+            "baseline" => "A 基线",
+            "draft" => "B 草案",
+            _ => "未知方案",
+        };
+        let layout = match annotation.layout {
+            CandidateSceneLayout::Horizontal => "横排",
+            CandidateSceneLayout::Vertical => "竖排",
+        };
+        let hash = annotation
+            .visual_spec_sha256
+            .get(..12)
+            .unwrap_or(&annotation.visual_spec_sha256);
+        let group_count = review
+            .selected_group()
+            .map(|group| group.annotation_count)
+            .unwrap_or_default();
+        let summary = format!(
+            "{scenario} · {layout} · {} DPI · {variant}\r\n规格 {hash}… · 同规格批注 {group_count} 条",
+            annotation.dpi,
+        );
+        let primary_hit = annotation.hits.first().map_or_else(
+            || "没有语义区域".to_owned(),
+            |hit| match hit.candidate_index {
+                Some(candidate_index) => format!(
+                    "主命中 {} · 候选 {}",
+                    hit.semantic.stable_id(),
+                    candidate_index + 1
+                ),
+                None => format!("主命中 {}", hit.semantic.stable_id()),
+            },
+        );
+        FeedbackBrowserSnapshot {
+            title: format!("反馈浏览 · {}/{count}", index + 1),
+            summary,
+            hits: format!(
+                "{primary_hit} · 共 {} 层 · 圈选 {}×{} px",
+                annotation.hits.len(),
+                annotation.selection.right - annotation.selection.left,
+                annotation.selection.bottom - annotation.selection.top,
+            ),
+            note: annotation.note.clone(),
+            can_select_previous: index > 0,
+            can_select_next: index + 1 < count,
+        }
+    }
+
+    fn open_feedback_browser(owner: HWND) {
+        let existing = APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|state| state.feedback_window)
+        });
+        if existing.is_some_and(|window| unsafe { IsWindow(Some(window)) }.as_bool()) {
+            if let Some(window) = existing {
+                sync_feedback_browser(window);
+                let _ = unsafe { SetForegroundWindow(window) };
+            }
+            return;
+        }
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.feedback_owner = Some(owner);
+            }
+        });
+        let window = unsafe {
+            let module = match GetModuleHandleW(None) {
+                Ok(module) => module,
+                Err(_) => {
+                    clear_feedback_browser();
+                    return notify_error(owner, "无法读取反馈浏览窗口模块");
+                }
+            };
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+                w!("ZiranmaCandidateUiLabFeedbackWindow"),
+                w!("反馈浏览"),
+                WS_CAPTION | WS_SYSMENU,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                620,
+                420,
+                Some(owner),
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        };
+        let window = match window {
+            Ok(window) => window,
+            Err(_) => {
+                clear_feedback_browser();
+                return notify_error(owner, "无法创建反馈浏览窗口");
+            }
+        };
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.feedback_window = Some(window);
+            }
+        });
+        sync_feedback_browser(window);
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOW);
+            let _ = SetForegroundWindow(window);
+        }
+    }
+
+    unsafe extern "system" fn feedback_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CREATE => {
+                if create_feedback_browser_controls(window) {
+                    LRESULT(0)
+                } else {
+                    LRESULT(-1)
+                }
+            }
+            WM_COMMAND => {
+                if u32::try_from((wparam.0 >> 16) & 0xffff).unwrap_or_default() == BN_CLICKED {
+                    match (wparam.0 & 0xffff) as i32 {
+                        FEEDBACK_OPEN_ID => choose_and_load_feedback(window),
+                        FEEDBACK_PREVIOUS_ID => navigate_feedback(window, false),
+                        FEEDBACK_NEXT_ID => navigate_feedback(window, true),
+                        _ => {}
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(state) = slot.as_mut() else {
+                        return;
+                    };
+                    if state.feedback_window == Some(window) {
+                        state.feedback_window = None;
+                        state.feedback_owner = None;
+                    }
+                });
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    fn create_feedback_browser_controls(window: HWND) -> bool {
+        let instance = unsafe { GetModuleHandleW(None) }
+            .ok()
+            .map(|module| HINSTANCE(module.0));
+        let controls = unsafe {
+            [
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    w!("只读查看一份候选窗实验反馈"),
+                    20,
+                    16,
+                    560,
+                    26,
+                    0,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    20,
+                    48,
+                    560,
+                    48,
+                    FEEDBACK_SUMMARY_ID,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    20,
+                    102,
+                    560,
+                    28,
+                    FEEDBACK_HITS_ID,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("EDIT"),
+                    PCWSTR::null(),
+                    20,
+                    138,
+                    560,
+                    164,
+                    FEEDBACK_NOTE_ID,
+                    WS_BORDER.0 as i32
+                        | WS_TABSTOP.0 as i32
+                        | WS_VSCROLL.0 as i32
+                        | ES_LEFT
+                        | ES_MULTILINE
+                        | ES_AUTOVSCROLL
+                        | ES_READONLY,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("选择反馈文件…"),
+                    20,
+                    320,
+                    160,
+                    34,
+                    FEEDBACK_OPEN_ID,
+                    BS_DEFPUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("上一条"),
+                    370,
+                    320,
+                    100,
+                    34,
+                    FEEDBACK_PREVIOUS_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("下一条"),
+                    480,
+                    320,
+                    100,
+                    34,
+                    FEEDBACK_NEXT_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+            ]
+        };
+        !controls.iter().any(Result::is_err)
+    }
+
+    fn sync_feedback_browser(window: HWND) {
+        if !unsafe { IsWindow(Some(window)) }.as_bool() {
+            return;
+        }
+        let review = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot.as_ref()?;
+            (state.feedback_window == Some(window) || state.feedback_window.is_none())
+                .then(|| state.feedback_review.clone())
+        });
+        let Some(review) = review else {
+            return;
+        };
+        let snapshot = match review.as_ref() {
+            Some(review) => feedback_browser_snapshot(Some(&review.borrow())),
+            None => feedback_browser_snapshot(None),
+        };
+        set_window_text(window, &snapshot.title);
+        set_control_text(window, FEEDBACK_SUMMARY_ID, &snapshot.summary);
+        set_control_text(window, FEEDBACK_HITS_ID, &snapshot.hits);
+        set_control_text(window, FEEDBACK_NOTE_ID, &snapshot.note);
+        if let Ok(previous) = unsafe { GetDlgItem(Some(window), FEEDBACK_PREVIOUS_ID) } {
+            let _ = unsafe { EnableWindow(previous, snapshot.can_select_previous) };
+        }
+        if let Ok(next) = unsafe { GetDlgItem(Some(window), FEEDBACK_NEXT_ID) } {
+            let _ = unsafe { EnableWindow(next, snapshot.can_select_next) };
+        }
+    }
+
+    fn choose_and_load_feedback(window: HWND) {
+        let selected = match choose_feedback_file(window) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(error) => return notify_error(window, &error),
+        };
+        let batch = match read_candidate_ui_lab_feedback_file(&selected) {
+            Ok(batch) => batch,
+            Err(error) => return notify_error(window, &error.to_string()),
+        };
+        let review = match CandidateUiLabFeedbackReview::new(batch) {
+            Ok(review) => review,
+            Err(error) => return notify_error(window, &error.to_string()),
+        };
+        APP_STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(state) = slot.as_mut() else {
+                return;
+            };
+            if state.feedback_window == Some(window) {
+                state.feedback_review = Some(Rc::new(RefCell::new(review)));
+            }
+        });
+        sync_feedback_browser(window);
+    }
+
+    fn navigate_feedback(window: HWND, next: bool) {
+        let review = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot.as_ref()?;
+            (state.feedback_window == Some(window))
+                .then(|| state.feedback_review.clone())
+                .flatten()
+        });
+        let Some(review) = review else {
+            return;
+        };
+        let changed = if next {
+            review.borrow_mut().select_next()
+        } else {
+            review.borrow_mut().select_previous()
+        };
+        if changed {
+            sync_feedback_browser(window);
+        }
+    }
+
+    fn choose_feedback_file(owner: HWND) -> Result<Option<PathBuf>, String> {
+        const MAX_PATH_CHARACTERS: usize = 32_768;
+        let mut path = vec![0_u16; MAX_PATH_CHARACTERS];
+        let filter = "候选窗反馈 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let initial_directory = annotation_export_directory();
+        let initial_directory = initial_directory.is_dir().then(|| {
+            initial_directory
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        });
+        let mut request = OPENFILENAMEW {
+            lStructSize: u32::try_from(std::mem::size_of::<OPENFILENAMEW>()).unwrap_or(u32::MAX),
+            hwndOwner: owner,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrFile: PWSTR(path.as_mut_ptr()),
+            nMaxFile: u32::try_from(path.len()).unwrap_or(u32::MAX),
+            lpstrInitialDir: initial_directory
+                .as_ref()
+                .map_or(PCWSTR::null(), |directory| PCWSTR(directory.as_ptr())),
+            lpstrTitle: w!("选择一份候选窗实验反馈"),
+            Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR,
+            ..Default::default()
+        };
+        if unsafe { GetOpenFileNameW(&mut request) }.as_bool() {
+            let length = path
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(0);
+            if length == 0 {
+                return Err("Windows 文件选择器没有返回有效文件".to_owned());
+            }
+            return Ok(Some(PathBuf::from(OsString::from_wide(&path[..length]))));
+        }
+        if unsafe { CommDlgExtendedError() }.0 == 0 {
+            Ok(None)
+        } else {
+            Err("Windows 文件选择器没有成功打开".to_owned())
+        }
+    }
+
+    fn clear_feedback_browser() {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.feedback_window = None;
+                state.feedback_owner = None;
+            }
+        });
+    }
+
     fn notify_error(window: HWND, message: &str) {
         let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
         unsafe {
@@ -1955,7 +2419,7 @@ mod windows_app {
             format!(" · 批注 {}（仅内存）", state.annotations.len())
         };
         format!(
-            "候选窗实验室 · {} · {} DPI · {} · {}{}{}    P 参数 / C 并排 / H D S 场景 / 圈选 N 批注 / E 导出 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {} · {}{}{}    P 参数 / C 并排 / O 浏览反馈 / H D S 场景 / 圈选 N 批注 / E 导出 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
@@ -2390,6 +2854,7 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::candidate_ui_lab_feedback::parse_candidate_ui_lab_feedback;
         use crate::candidate_ui_lab_visual::CandidateUiLabVariant;
 
         fn assert_scene_builds(state: &LabState, spec: CandidateVisualSpec) {
@@ -2444,6 +2909,88 @@ mod windows_app {
             assert_eq!(scene.items.len(), content.candidates.len());
             assert_eq!(scene.client.right, metrics.width);
             assert_eq!(scene.client.bottom, metrics.height);
+        }
+
+        fn test_feedback_review() -> CandidateUiLabFeedbackReview {
+            let state = LabState::default();
+            let spec = state.active_spec();
+            let content = state.scenario().content();
+            let metrics = frame_metrics(&state);
+            let widths = allocate_horizontal_candidate_widths(
+                spec,
+                state.dpi(),
+                metrics.width,
+                metrics.footer_width,
+                &content.candidates,
+                false,
+                MAX_CANDIDATE_CHARACTERS,
+            );
+            let scene = build_candidate_scene(
+                spec,
+                CandidateSceneRequest {
+                    layout: state.layout,
+                    dpi: state.dpi(),
+                    width: metrics.width,
+                    height: metrics.height,
+                    candidate_count: content.candidates.len(),
+                    horizontal_candidate_widths: &widths,
+                    footer_width: metrics.footer_width,
+                    footer_mode: content.mode_label.is_some(),
+                    footer_page: content.page_label.is_some(),
+                    selected_surface: true,
+                    show_rank: true,
+                    notice_icon: false,
+                    personalized: &content.personalized,
+                    rank_metrics: None,
+                    candidate_text_metrics: None,
+                    selected_text_metrics: None,
+                    action_detail_metrics: None,
+                },
+            )
+            .unwrap();
+            let context = capture_candidate_ui_lab_annotation_context(
+                state.scenario().stable_id(),
+                state.visual.active_variant().stable_id(),
+                state.layout,
+                state.dpi(),
+                scene.client,
+                &scene,
+                spec,
+            )
+            .unwrap();
+            let mut session = CandidateUiLabAnnotationSession::default();
+            session.add(context.clone(), "第一条界面批注").unwrap();
+            session.add(context, "第二条界面批注").unwrap();
+            CandidateUiLabFeedbackReview::new(
+                parse_candidate_ui_lab_feedback(session.to_canonical_json().as_bytes()).unwrap(),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn feedback_browser_snapshot_has_an_explicit_empty_and_bounded_loaded_state() {
+            let empty = feedback_browser_snapshot(None);
+            assert_eq!(empty.title, "反馈浏览");
+            assert!(empty.summary.contains("尚未选择反馈文件"));
+            assert!(!empty.can_select_previous);
+            assert!(!empty.can_select_next);
+
+            let mut review = test_feedback_review();
+            let first = feedback_browser_snapshot(Some(&review));
+            assert_eq!(first.title, "反馈浏览 · 1/2");
+            assert!(first.summary.contains("日常短词 · 横排 · 96 DPI · B 草案"));
+            assert!(first.summary.contains("同规格批注 2 条"));
+            assert!(first.hits.contains("共 "));
+            assert_eq!(first.note, "第一条界面批注");
+            assert!(!first.can_select_previous);
+            assert!(first.can_select_next);
+
+            assert!(review.select_next());
+            let second = feedback_browser_snapshot(Some(&review));
+            assert_eq!(second.title, "反馈浏览 · 2/2");
+            assert_eq!(second.note, "第二条界面批注");
+            assert!(second.can_select_previous);
+            assert!(!second.can_select_next);
         }
 
         #[test]
