@@ -502,6 +502,19 @@ target\release\candidatectl.exe exact-phrase-layer-preflight `
 Context、候选窗或桌面帧，因此不能替代 TSF 三层宿主预检、首帧与分页验证，也不构成
 启用许可。
 
+三包专项门之后新增了一个仍不可启用的运行时骨架。独立根内预留严格三行
+`exact-phrase.zcl`，并继续复用不可变 `slots.zcs`、`packages` 与普通包 `.zpf`；
+`load_candidate_runtime_snapshots_with_all_layers` 只在调用方显式给出该根时读取。启用
+选择必须与 current 包一致，补充层必须同时有效，载荷必须逐条满足三汉字、三音节、
+六键且每码唯一，四源 provenance 还须包含当前核心与补充载荷摘要。
+
+即便上述检查全部通过，加载器仍要求独立 `exact-phrase-preflight.zep` 同时绑定三包
+认证摘要、补充层影响上限、页宽 6 和未来的真实
+`tsf-exact-phrase-first-page-context-v1` 宿主。当前没有任何命令会生成该凭据，也没有
+prepare/enable、安装脚本或 TSF 类工厂根发现逻辑；已有日用加载入口仍不传入三字根。
+因此这一步只冻结了默认关闭、失败回退的状态与认证契约，为下一阶段真实 Context
+预检提供目标，不能通过手工写一个开关绕过缺失的宿主证据。
+
 ### 同修订固定短语表审计
 
 万象固定修订 `fdda7afb` 还包含一份独立的

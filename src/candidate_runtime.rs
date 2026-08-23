@@ -5,6 +5,7 @@
 //! a network. An absent root is distinct from a present but invalid root so a
 //! host cannot silently fall back after configuration damage.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
@@ -13,19 +14,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE,
+    CANDIDATE_DECODER_COMPATIBILITY_V1, CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_FILE,
+    CANDIDATE_EXACT_PHRASE_STATE_FILE, CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE,
     CANDIDATE_EXACT_SHORT_STATE_FILE, CANDIDATE_PACKAGE_PROVENANCE_FILE,
-    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactShortPreflightReceipt,
+    CANDIDATE_SUPPLEMENTAL_STATE_FILE, CandidateExactPhrasePreflightReceipt,
+    CandidateExactPhrasePreflightReceiptError, CandidateExactPhraseState,
+    CandidateExactPhraseStateError, CandidateExactShortPreflightReceipt,
     CandidateExactShortPreflightReceiptError, CandidateExactShortState,
     CandidateExactShortStateError, CandidatePackageError, CandidatePackageManifest,
     CandidatePackageProvenance, CandidateProvenanceError, CandidateSlotError, CandidateSlotState,
     CandidateSnapshot, CandidateSupplementalState, CandidateSupplementalStateError,
     ExactShortWordCatalog, ExactShortWordCatalogError,
+    MAX_CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_EXACT_PHRASE_STATE_BYTES,
     MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES, MAX_CANDIDATE_EXACT_SHORT_STATE_BYTES,
     MAX_CANDIDATE_PACKAGE_MANIFEST_BYTES, MAX_CANDIDATE_PROVENANCE_BYTES,
     MAX_CANDIDATE_SLOT_STATE_BYTES, MAX_CANDIDATE_SNAPSHOT_BYTES,
     MAX_CANDIDATE_SUPPLEMENTAL_STATE_BYTES, SupplementalCandidateLayerConfig,
-    candidate_package_authentication_sha256,
+    candidate_package_authentication_sha256, candidate_sha256_hex, parse_lexicon_tsv,
 };
 
 /// Fixed directory beside the TSF DLL that opts into managed candidate data.
@@ -57,6 +62,8 @@ pub struct CandidateRuntimeSnapshots {
     supplemental_fell_back: bool,
     exact_short: Option<CandidateRuntimeExactShort>,
     exact_short_fell_back: bool,
+    exact_phrase: Option<CandidateRuntimeExactPhrase>,
+    exact_phrase_fell_back: bool,
 }
 
 impl CandidateRuntimeSnapshots {
@@ -89,6 +96,16 @@ impl CandidateRuntimeSnapshots {
     pub fn exact_short_fell_back(&self) -> bool {
         self.exact_short_fell_back
     }
+
+    /// Returns the enabled, validated exact three-character phrase snapshot.
+    pub fn exact_phrase(&self) -> Option<&CandidateRuntimeExactPhrase> {
+        self.exact_phrase.as_ref()
+    }
+
+    /// Reports that an explicit exact-phrase configuration failed closed.
+    pub fn exact_phrase_fell_back(&self) -> bool {
+        self.exact_phrase_fell_back
+    }
 }
 
 /// Validated supplemental snapshot and its fixed candidate influence cap.
@@ -97,6 +114,7 @@ pub struct CandidateRuntimeSupplemental {
     package_id: String,
     snapshot: Arc<CandidateSnapshot>,
     authentication_sha256: String,
+    payload_sha256: String,
     config: SupplementalCandidateLayerConfig,
 }
 
@@ -116,9 +134,36 @@ impl CandidateRuntimeSupplemental {
         &self.authentication_sha256
     }
 
+    /// Returns the exact supplemental payload digest bound by phrase provenance.
+    pub fn payload_sha256(&self) -> &str {
+        &self.payload_sha256
+    }
+
     /// Returns the exact-word merge configuration bound by local state.
     pub fn config(&self) -> SupplementalCandidateLayerConfig {
         self.config
+    }
+}
+
+/// Validated exact three-character phrase snapshot.
+#[derive(Clone, Debug)]
+pub struct CandidateRuntimeExactPhrase {
+    package_id: String,
+    snapshot: Arc<CandidateSnapshot>,
+    authentication_sha256: String,
+}
+
+impl CandidateRuntimeExactPhrase {
+    pub fn package_id(&self) -> &str {
+        &self.package_id
+    }
+
+    pub fn snapshot(&self) -> &Arc<CandidateSnapshot> {
+        &self.snapshot
+    }
+
+    pub fn authentication_sha256(&self) -> &str {
+        &self.authentication_sha256
     }
 }
 
@@ -182,15 +227,24 @@ pub enum CandidateRuntimeExactShortSelection {
     },
 }
 
+/// Small exact-phrase selection that can be polled without loading its payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateRuntimeExactPhraseSelection {
+    Disabled,
+    Enabled { package_id: String },
+}
+
 struct LoadedRuntimeCandidate {
     package_id: String,
     snapshot: Arc<CandidateSnapshot>,
     authentication_sha256: String,
+    payload_sha256: String,
 }
 
 struct LoadedRuntimePackage {
     package_id: String,
     manifest: CandidatePackageManifest,
+    provenance: CandidatePackageProvenance,
     payload: String,
     authentication_sha256: String,
 }
@@ -256,6 +310,25 @@ pub fn load_candidate_runtime_snapshots_with_layers(
     supplemental_root: Option<&Path>,
     exact_short_root: Option<&Path>,
 ) -> Result<Option<CandidateRuntimeSnapshots>, CandidateRuntimeError> {
+    load_candidate_runtime_snapshots_with_all_layers(
+        core_root,
+        supplemental_root,
+        exact_short_root,
+        None,
+    )
+}
+
+/// Loads the core plus all independently managed optional public layers.
+///
+/// The exact-phrase lane additionally requires the current supplemental
+/// package, four-source payload binding, and a real-TSF combined receipt. It
+/// therefore remains unavailable until every dependency passes together.
+pub fn load_candidate_runtime_snapshots_with_all_layers(
+    core_root: &Path,
+    supplemental_root: Option<&Path>,
+    exact_short_root: Option<&Path>,
+    exact_phrase_root: Option<&Path>,
+) -> Result<Option<CandidateRuntimeSnapshots>, CandidateRuntimeError> {
     let Some(core) = load_current_candidate_package(core_root)? else {
         return Ok(None);
     };
@@ -297,6 +370,42 @@ pub fn load_candidate_runtime_snapshots_with_layers(
         }
         None => (None, false),
     };
+    let (exact_phrase, exact_phrase_fell_back) = match exact_phrase_root {
+        Some(root) => {
+            let loaded = (|| {
+                let selection = load_candidate_runtime_exact_phrase_selection(root)?;
+                if selection == CandidateRuntimeExactPhraseSelection::Disabled {
+                    return Ok(None);
+                }
+                let supplemental = supplemental
+                    .as_ref()
+                    .ok_or(CandidateRuntimeError::ExactPhraseSupplementalUnavailable)?;
+                let exact_phrase = load_candidate_runtime_exact_phrase(
+                    root,
+                    &selection,
+                    &core.payload_sha256,
+                    supplemental.payload_sha256(),
+                )?;
+                if exact_phrase.is_some() {
+                    let receipt = load_candidate_runtime_exact_phrase_preflight(root, &selection)?
+                        .ok_or(CandidateRuntimeError::ExactPhraseCombinedPreflightUnavailable)?;
+                    if !receipt.matches_runtime(
+                        &core.authentication_sha256,
+                        supplemental.authentication_sha256(),
+                        supplemental.config().exact_promotions,
+                    ) {
+                        return Err(CandidateRuntimeError::ExactPhraseCombinedPreflightMismatch);
+                    }
+                }
+                Ok(exact_phrase)
+            })();
+            match loaded {
+                Ok(exact_phrase) => (exact_phrase, false),
+                Err(_) => (None, true),
+            }
+        }
+        None => (None, false),
+    };
     Ok(Some(CandidateRuntimeSnapshots {
         core: core.snapshot,
         core_authentication_sha256: core.authentication_sha256,
@@ -304,6 +413,8 @@ pub fn load_candidate_runtime_snapshots_with_layers(
         supplemental_fell_back,
         exact_short,
         exact_short_fell_back,
+        exact_phrase,
+        exact_phrase_fell_back,
     }))
 }
 
@@ -381,6 +492,7 @@ pub fn load_candidate_runtime_supplemental(
                 package_id: loaded.package_id,
                 snapshot: loaded.snapshot,
                 authentication_sha256: loaded.authentication_sha256,
+                payload_sha256: loaded.payload_sha256,
                 config: *config,
             })
         }
@@ -514,6 +626,173 @@ pub fn load_candidate_runtime_exact_short_preflight(
     Ok(receipt)
 }
 
+/// Reads only the exact-phrase activation and slot pointers.
+///
+/// Package bytes and the combined receipt remain unopened until a caller sees
+/// a changed enabled selection.
+pub fn load_candidate_runtime_exact_phrase_selection(
+    root: &Path,
+) -> Result<CandidateRuntimeExactPhraseSelection, CandidateRuntimeError> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateRuntimeExactPhraseSelection::Disabled);
+        }
+        Err(_) => return Err(CandidateRuntimeError::ExactPhraseRootUnavailable),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CandidateRuntimeError::InvalidExactPhraseRoot);
+        }
+        Ok(_) => {}
+    }
+    let state_path = root.join(CANDIDATE_EXACT_PHRASE_STATE_FILE);
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CandidateRuntimeExactPhraseSelection::Disabled);
+        }
+        Err(_) => return Err(CandidateRuntimeError::ExactPhraseStateUnavailable),
+        Ok(_) => {}
+    }
+    let state_text = read_regular_utf8(
+        &state_path,
+        MAX_CANDIDATE_EXACT_PHRASE_STATE_BYTES,
+        CandidateRuntimeError::ExactPhraseStateUnavailable,
+    )?;
+    let state = CandidateExactPhraseState::parse(&state_text)
+        .map_err(CandidateRuntimeError::ExactPhraseState)?;
+    let Some(expected_package) = state.package() else {
+        return Ok(CandidateRuntimeExactPhraseSelection::Disabled);
+    };
+    let slot_text = read_regular_utf8(
+        &root.join(CANDIDATE_SLOT_STATE_FILE),
+        MAX_CANDIDATE_SLOT_STATE_BYTES,
+        CandidateRuntimeError::SlotStateUnavailable,
+    )?;
+    let slots = CandidateSlotState::parse(&slot_text).map_err(CandidateRuntimeError::SlotState)?;
+    if slots.current() != Some(expected_package) {
+        return Err(CandidateRuntimeError::ExactPhrasePackageMismatch);
+    }
+    Ok(CandidateRuntimeExactPhraseSelection::Enabled {
+        package_id: expected_package.to_owned(),
+    })
+}
+
+/// Loads and validates one exact three-character phrase package.
+///
+/// Besides the ordinary immutable-package checks, every identity must be a
+/// unique six-key three-syllable Han phrase and provenance must bind the exact
+/// current core and supplemental payload bytes.
+pub fn load_candidate_runtime_exact_phrase(
+    root: &Path,
+    expected: &CandidateRuntimeExactPhraseSelection,
+    core_payload_sha256: &str,
+    supplemental_payload_sha256: &str,
+) -> Result<Option<CandidateRuntimeExactPhrase>, CandidateRuntimeError> {
+    let loaded = match expected {
+        CandidateRuntimeExactPhraseSelection::Disabled => None,
+        CandidateRuntimeExactPhraseSelection::Enabled { package_id } => {
+            if !runtime_sha256(core_payload_sha256) || !runtime_sha256(supplemental_payload_sha256)
+            {
+                return Err(CandidateRuntimeError::ExactPhraseProvenanceMismatch);
+            }
+            let loaded = load_current_runtime_package(root)?
+                .ok_or(CandidateRuntimeError::ExactPhrasePackageMismatch)?;
+            if loaded.package_id != *package_id {
+                return Err(CandidateRuntimeError::ExactPhrasePackageMismatch);
+            }
+            if loaded.provenance.source_count() != 4 {
+                return Err(CandidateRuntimeError::ExactPhraseProvenanceMismatch);
+            }
+            let material_hashes = loaded
+                .provenance
+                .source_materials()
+                .iter()
+                .map(crate::CandidateSourceMaterial::sha256)
+                .collect::<HashSet<_>>();
+            if !material_hashes.contains(core_payload_sha256)
+                || !material_hashes.contains(supplemental_payload_sha256)
+            {
+                return Err(CandidateRuntimeError::ExactPhraseProvenanceMismatch);
+            }
+            let entries = parse_lexicon_tsv(&loaded.payload)
+                .map_err(|_| CandidateRuntimeError::ExactPhrasePayloadProfile)?;
+            if entries.is_empty() {
+                return Err(CandidateRuntimeError::ExactPhrasePayloadProfile);
+            }
+            let mut codes = HashSet::with_capacity(entries.len());
+            for entry in entries {
+                if entry.text.chars().count() != 3
+                    || !entry.text.chars().all(runtime_exact_phrase_character)
+                    || entry.syllable_codes.len() != 3
+                    || entry.code.as_str().len() != 6
+                    || !codes.insert(entry.code.as_str().to_owned())
+                {
+                    return Err(CandidateRuntimeError::ExactPhrasePayloadProfile);
+                }
+            }
+            let snapshot = loaded
+                .manifest
+                .load_snapshot(&loaded.payload)
+                .map_err(CandidateRuntimeError::Package)?;
+            Some(CandidateRuntimeExactPhrase {
+                package_id: loaded.package_id,
+                snapshot: Arc::new(snapshot),
+                authentication_sha256: loaded.authentication_sha256,
+            })
+        }
+    };
+    if load_candidate_runtime_exact_phrase_selection(root)? != *expected {
+        return Err(CandidateRuntimeError::ExactPhraseSelectionChanged);
+    }
+    Ok(loaded)
+}
+
+/// Loads the future real-TSF combined receipt for an enabled phrase lane.
+pub fn load_candidate_runtime_exact_phrase_preflight(
+    root: &Path,
+    expected: &CandidateRuntimeExactPhraseSelection,
+) -> Result<Option<CandidateExactPhrasePreflightReceipt>, CandidateRuntimeError> {
+    let receipt = match expected {
+        CandidateRuntimeExactPhraseSelection::Disabled => None,
+        CandidateRuntimeExactPhraseSelection::Enabled { package_id } => {
+            let loaded = load_current_runtime_package(root)?
+                .ok_or(CandidateRuntimeError::ExactPhrasePackageMismatch)?;
+            if loaded.package_id != *package_id {
+                return Err(CandidateRuntimeError::ExactPhrasePackageMismatch);
+            }
+            let text = read_regular_utf8(
+                &root.join(CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_FILE),
+                MAX_CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_BYTES,
+                CandidateRuntimeError::ExactPhraseCombinedPreflightUnavailable,
+            )?;
+            let receipt = CandidateExactPhrasePreflightReceipt::parse(&text)
+                .map_err(CandidateRuntimeError::ExactPhraseCombinedPreflight)?;
+            if receipt.phrase_package() != package_id
+                || receipt.phrase_sha256() != loaded.authentication_sha256
+            {
+                return Err(CandidateRuntimeError::ExactPhraseCombinedPreflightMismatch);
+            }
+            Some(receipt)
+        }
+    };
+    if load_candidate_runtime_exact_phrase_selection(root)? != *expected {
+        return Err(CandidateRuntimeError::ExactPhraseSelectionChanged);
+    }
+    Ok(receipt)
+}
+
+fn runtime_exact_phrase_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af
+    )
+}
+
+fn runtime_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn load_current_candidate_package(
     root: &Path,
 ) -> Result<Option<LoadedRuntimeCandidate>, CandidateRuntimeError> {
@@ -528,6 +807,7 @@ fn load_current_candidate_package(
         package_id: loaded.package_id,
         snapshot: Arc::new(snapshot),
         authentication_sha256: loaded.authentication_sha256,
+        payload_sha256: candidate_sha256_hex(loaded.payload.as_bytes()),
     }))
 }
 
@@ -603,6 +883,7 @@ fn load_current_runtime_package(
     Ok(Some(LoadedRuntimePackage {
         package_id: package_id.to_owned(),
         manifest,
+        provenance,
         payload: payload_text,
         authentication_sha256: package_authentication_sha256,
     }))
@@ -719,6 +1000,30 @@ pub enum CandidateRuntimeError {
     ExactShortCombinedPreflightMismatch,
     /// The exact-short selection changed while its immutable package was loading.
     ExactShortSelectionChanged,
+    /// The optional exact-phrase activation state could not be read safely.
+    ExactPhraseStateUnavailable,
+    /// The exact-phrase root metadata could not be inspected.
+    ExactPhraseRootUnavailable,
+    /// The existing exact-phrase root is not a regular directory.
+    InvalidExactPhraseRoot,
+    /// The exact-phrase activation state did not satisfy its strict schema.
+    ExactPhraseState(CandidateExactPhraseStateError),
+    /// The activation state and current package slot select different packages.
+    ExactPhrasePackageMismatch,
+    /// The enabled phrase layer requires an enabled, validated supplement.
+    ExactPhraseSupplementalUnavailable,
+    /// The four-source phrase provenance does not bind current payload bytes.
+    ExactPhraseProvenanceMismatch,
+    /// The phrase payload is not a unique three-Han, three-syllable, six-key catalog.
+    ExactPhrasePayloadProfile,
+    /// The combined exact-phrase TSF preflight receipt is absent or unreadable.
+    ExactPhraseCombinedPreflightUnavailable,
+    /// The combined exact-phrase receipt is malformed.
+    ExactPhraseCombinedPreflight(CandidateExactPhrasePreflightReceiptError),
+    /// The combined receipt does not bind all enabled package identities.
+    ExactPhraseCombinedPreflightMismatch,
+    /// The exact-phrase selection changed while its immutable package was loading.
+    ExactPhraseSelectionChanged,
 }
 
 impl fmt::Display for CandidateRuntimeError {
@@ -757,6 +1062,18 @@ impl fmt::Display for CandidateRuntimeError {
             Self::ExactShortCombinedPreflight(_) => "精确短词层专项预检凭据无效",
             Self::ExactShortCombinedPreflightMismatch => "精确短词层专项预检凭据不符",
             Self::ExactShortSelectionChanged => "精确短词层在载入期间发生变化",
+            Self::ExactPhraseStateUnavailable => "三字精确层状态不可用",
+            Self::ExactPhraseRootUnavailable => "无法检查三字精确层目录",
+            Self::InvalidExactPhraseRoot => "三字精确层目录无效",
+            Self::ExactPhraseState(_) => "三字精确层状态无效",
+            Self::ExactPhrasePackageMismatch => "三字精确层状态与当前候选包不符",
+            Self::ExactPhraseSupplementalUnavailable => "三字精确层缺少当前补充词层",
+            Self::ExactPhraseProvenanceMismatch => "三字精确层未绑定当前公开载荷",
+            Self::ExactPhrasePayloadProfile => "三字精确层载荷形状无效",
+            Self::ExactPhraseCombinedPreflightUnavailable => "三字精确层缺少专项预检凭据",
+            Self::ExactPhraseCombinedPreflight(_) => "三字精确层专项预检凭据无效",
+            Self::ExactPhraseCombinedPreflightMismatch => "三字精确层专项预检凭据不符",
+            Self::ExactPhraseSelectionChanged => "三字精确层在载入期间发生变化",
         };
         formatter.write_str(message)
     }
@@ -772,6 +1089,8 @@ impl Error for CandidateRuntimeError {
             Self::ExactShortState(error) => Some(error),
             Self::ExactShortCatalog(error) => Some(error),
             Self::ExactShortCombinedPreflight(error) => Some(error),
+            Self::ExactPhraseState(error) => Some(error),
+            Self::ExactPhraseCombinedPreflight(error) => Some(error),
             _ => None,
         }
     }
@@ -855,6 +1174,73 @@ mod tests {
         package_id
     }
 
+    fn install_test_exact_phrase_package(
+        root: &Path,
+        revision: &str,
+        payload: &str,
+        bound_core_payload: &str,
+        bound_supplemental_payload: &str,
+    ) -> String {
+        let manifest = CandidatePackageManifest::from_payload(revision, false, payload).unwrap();
+        let manifest_text = manifest.render();
+        let provenance_text = CandidatePackageProvenance::from_source_materials(
+            vec![
+                crate::CandidateSourceMaterial::from_bytes(
+                    "phrase-source",
+                    "CC-BY-4.0",
+                    "https://example.com/phrase-source",
+                    b"phrase-source",
+                )
+                .unwrap(),
+                crate::CandidateSourceMaterial::from_bytes(
+                    "core-payload",
+                    "Apache-2.0",
+                    "https://example.com/core-payload",
+                    bound_core_payload.as_bytes(),
+                )
+                .unwrap(),
+                crate::CandidateSourceMaterial::from_bytes(
+                    "supplemental-payload",
+                    "CC-BY-4.0",
+                    "https://example.com/supplemental-payload",
+                    bound_supplemental_payload.as_bytes(),
+                )
+                .unwrap(),
+                crate::CandidateSourceMaterial::from_bytes(
+                    "fit-corpus",
+                    "CC-BY-SA-4.0",
+                    "https://example.com/fit-corpus",
+                    b"fit-corpus",
+                )
+                .unwrap(),
+            ],
+            &manifest_text,
+            payload,
+        )
+        .unwrap()
+        .render();
+        let package_id = candidate_package_storage_id(&provenance_text, &manifest_text, payload);
+        let authentication_sha256 =
+            candidate_package_authentication_sha256(&provenance_text, &manifest_text, payload);
+        let package = root.join(CANDIDATE_PACKAGES_DIRECTORY).join(&package_id);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join(CANDIDATE_PACKAGE_MANIFEST_FILE), manifest_text).unwrap();
+        fs::write(
+            package.join(CANDIDATE_PACKAGE_PROVENANCE_FILE),
+            provenance_text,
+        )
+        .unwrap();
+        fs::write(package.join(CANDIDATE_PACKAGE_PAYLOAD_FILE), payload).unwrap();
+        let preflights = root.join(CANDIDATE_PREFLIGHTS_DIRECTORY);
+        fs::create_dir_all(&preflights).unwrap();
+        fs::write(
+            preflights.join(format!("{package_id}.zpf")),
+            candidate_preflight_receipt_body(&package_id, &authentication_sha256),
+        )
+        .unwrap();
+        package_id
+    }
+
     fn write_exact_short_test_preflight(
         exact_root: &Path,
         exact_package: &str,
@@ -881,6 +1267,34 @@ mod tests {
         .unwrap();
         fs::write(
             exact_root.join(CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_FILE),
+            receipt.render(),
+        )
+        .unwrap();
+    }
+
+    fn write_exact_phrase_test_preflight(
+        phrase_root: &Path,
+        phrase_package: &str,
+        core_root: &Path,
+        supplemental_root: &Path,
+        supplemental_promotions: usize,
+    ) {
+        let core = load_current_runtime_package(core_root).unwrap().unwrap();
+        let supplemental = load_current_runtime_package(supplemental_root)
+            .unwrap()
+            .unwrap();
+        let phrase = load_current_runtime_package(phrase_root).unwrap().unwrap();
+        assert_eq!(phrase.package_id, phrase_package);
+        let receipt = CandidateExactPhrasePreflightReceipt::new(
+            phrase_package,
+            &phrase.authentication_sha256,
+            &core.authentication_sha256,
+            &supplemental.authentication_sha256,
+            supplemental_promotions,
+        )
+        .unwrap();
+        fs::write(
+            phrase_root.join(CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_FILE),
             receipt.render(),
         )
         .unwrap();
@@ -1447,5 +1861,213 @@ mod tests {
         .unwrap();
         assert!(damaged.exact_short().is_none());
         assert!(damaged.exact_short_fell_back());
+    }
+
+    #[test]
+    fn exact_phrase_root_is_default_off_and_requires_the_complete_runtime_receipt() {
+        const SUPPLEMENTAL: &str =
+            "text\tpinyin\tfrequency\n其他词\tqi ta ci\t100\n属于\tshu yu\t90\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t80\n";
+        let (core_root, _) = configured_root("runtime-phrase-core", false);
+        let supplemental_root = TestDirectory::new();
+        let supplemental_id = install_test_package(
+            supplemental_root.path(),
+            "runtime-phrase-supplemental",
+            false,
+            SUPPLEMENTAL,
+        );
+        let mut supplemental_slots = CandidateSlotState::default();
+        supplemental_slots.adopt(&supplemental_id).unwrap();
+        fs::write(
+            supplemental_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            supplemental_slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            CandidateSupplementalState::enabled(&supplemental_id, 1)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+
+        let phrase_root = TestDirectory::new();
+        let phrase_id = install_test_exact_phrase_package(
+            phrase_root.path(),
+            "runtime-exact-phrase",
+            PHRASE,
+            PAYLOAD,
+            SUPPLEMENTAL,
+        );
+        let mut phrase_slots = CandidateSlotState::default();
+        phrase_slots.adopt(&phrase_id).unwrap();
+        fs::write(
+            phrase_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            phrase_slots.render(),
+        )
+        .unwrap();
+
+        let disabled = load_candidate_runtime_snapshots_with_all_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            None,
+            Some(phrase_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(disabled.exact_phrase().is_none());
+        assert!(!disabled.exact_phrase_fell_back());
+
+        fs::write(
+            phrase_root.path().join(CANDIDATE_EXACT_PHRASE_STATE_FILE),
+            CandidateExactPhraseState::enabled(&phrase_id)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let missing_receipt = load_candidate_runtime_snapshots_with_all_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            None,
+            Some(phrase_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(missing_receipt.exact_phrase().is_none());
+        assert!(missing_receipt.exact_phrase_fell_back());
+
+        write_exact_phrase_test_preflight(
+            phrase_root.path(),
+            &phrase_id,
+            core_root.path(),
+            supplemental_root.path(),
+            1,
+        );
+        let enabled = load_candidate_runtime_snapshots_with_all_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            None,
+            Some(phrase_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        let phrase = enabled.exact_phrase().unwrap();
+        assert_eq!(phrase.package_id(), phrase_id);
+        assert_eq!(phrase.snapshot().revision(), "runtime-exact-phrase");
+        assert_eq!(
+            phrase
+                .snapshot()
+                .exact_full_code_texts("zljnll", 1)
+                .unwrap(),
+            ["再进来"]
+        );
+        assert!(!enabled.exact_phrase_fell_back());
+
+        fs::write(
+            supplemental_root
+                .path()
+                .join(CANDIDATE_SUPPLEMENTAL_STATE_FILE),
+            CandidateSupplementalState::enabled(&supplemental_id, 2)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let cap_drift = load_candidate_runtime_snapshots_with_all_layers(
+            core_root.path(),
+            Some(supplemental_root.path()),
+            None,
+            Some(phrase_root.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(cap_drift.supplemental().is_some());
+        assert!(cap_drift.exact_phrase().is_none());
+        assert!(cap_drift.exact_phrase_fell_back());
+    }
+
+    #[test]
+    fn exact_phrase_payload_shape_and_four_source_binding_fail_closed() {
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n其他词\tqi ta ci\t100\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t80\n";
+        const WRONG_PROFILE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin\t80\n";
+        const DIFFERENT_CORE: &str = "text\tpinyin\tfrequency\n不同\tbu tong\t1\n";
+        let core_sha256 = candidate_sha256_hex(PAYLOAD.as_bytes());
+        let supplemental_sha256 = candidate_sha256_hex(SUPPLEMENTAL.as_bytes());
+
+        let wrong_binding_root = TestDirectory::new();
+        let wrong_binding_id = install_test_exact_phrase_package(
+            wrong_binding_root.path(),
+            "runtime-phrase-wrong-binding",
+            PHRASE,
+            DIFFERENT_CORE,
+            SUPPLEMENTAL,
+        );
+        let mut slots = CandidateSlotState::default();
+        slots.adopt(&wrong_binding_id).unwrap();
+        fs::write(
+            wrong_binding_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            wrong_binding_root
+                .path()
+                .join(CANDIDATE_EXACT_PHRASE_STATE_FILE),
+            CandidateExactPhraseState::enabled(&wrong_binding_id)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let wrong_binding_selection =
+            load_candidate_runtime_exact_phrase_selection(wrong_binding_root.path()).unwrap();
+        assert_eq!(
+            load_candidate_runtime_exact_phrase(
+                wrong_binding_root.path(),
+                &wrong_binding_selection,
+                &core_sha256,
+                &supplemental_sha256,
+            )
+            .unwrap_err(),
+            CandidateRuntimeError::ExactPhraseProvenanceMismatch
+        );
+
+        let wrong_profile_root = TestDirectory::new();
+        let wrong_profile_id = install_test_exact_phrase_package(
+            wrong_profile_root.path(),
+            "runtime-phrase-wrong-profile",
+            WRONG_PROFILE,
+            PAYLOAD,
+            SUPPLEMENTAL,
+        );
+        let mut slots = CandidateSlotState::default();
+        slots.adopt(&wrong_profile_id).unwrap();
+        fs::write(
+            wrong_profile_root.path().join(CANDIDATE_SLOT_STATE_FILE),
+            slots.render(),
+        )
+        .unwrap();
+        fs::write(
+            wrong_profile_root
+                .path()
+                .join(CANDIDATE_EXACT_PHRASE_STATE_FILE),
+            CandidateExactPhraseState::enabled(&wrong_profile_id)
+                .unwrap()
+                .render(),
+        )
+        .unwrap();
+        let wrong_profile_selection =
+            load_candidate_runtime_exact_phrase_selection(wrong_profile_root.path()).unwrap();
+        assert_eq!(
+            load_candidate_runtime_exact_phrase(
+                wrong_profile_root.path(),
+                &wrong_profile_selection,
+                &core_sha256,
+                &supplemental_sha256,
+            )
+            .unwrap_err(),
+            CandidateRuntimeError::ExactPhrasePayloadProfile
+        );
     }
 }

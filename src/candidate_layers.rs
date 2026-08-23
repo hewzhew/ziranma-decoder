@@ -36,6 +36,24 @@ pub const CANDIDATE_EXACT_SHORT_PREFLIGHT_PAGE_SIZE: usize = 6;
 /// Maximum accepted size of one combined exact-short preflight receipt.
 pub const MAX_CANDIDATE_EXACT_SHORT_PREFLIGHT_RECEIPT_BYTES: usize = 1024;
 
+/// Fixed state file inside an independently managed exact-phrase slot root.
+pub const CANDIDATE_EXACT_PHRASE_STATE_FILE: &str = "exact-phrase.zcl";
+/// First exact three-character phrase activation schema.
+pub const CANDIDATE_EXACT_PHRASE_STATE_SCHEMA_V1: &str = "ziranma-candidate-exact-phrase-v1";
+/// Maximum accepted size of one exact-phrase activation state.
+pub const MAX_CANDIDATE_EXACT_PHRASE_STATE_BYTES: usize = 512;
+/// Fixed receipt reserved for the future real TSF first-page composition gate.
+pub const CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_FILE: &str = "exact-phrase-preflight.zep";
+/// First combined exact-phrase preflight receipt schema.
+pub const CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_SCHEMA_V1: &str =
+    "ziranma-candidate-exact-phrase-preflight-v1";
+/// Real TSF path that must be exercised before this layer can load.
+pub const CANDIDATE_EXACT_PHRASE_PREFLIGHT_HOST_V1: &str = "tsf-exact-phrase-first-page-context-v1";
+/// Candidate page width bound by the exact-phrase combined receipt.
+pub const CANDIDATE_EXACT_PHRASE_PREFLIGHT_PAGE_SIZE: usize = 6;
+/// Maximum accepted size of one exact-phrase combined receipt.
+pub const MAX_CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_BYTES: usize = 1024;
+
 /// Explicit activation state for one public supplemental exact-word package.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CandidateSupplementalState {
@@ -270,6 +288,274 @@ impl fmt::Display for CandidateExactShortStateError {
 }
 
 impl Error for CandidateExactShortStateError {}
+
+/// Explicit activation state for one exact three-character phrase package.
+///
+/// The package identity is the only variable. Its insertion rule is fixed by
+/// the schema and must later be authenticated by a separate combined receipt.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CandidateExactPhraseState {
+    package: Option<String>,
+}
+
+impl CandidateExactPhraseState {
+    /// Constructs an enabled state bound to one immutable package.
+    pub fn enabled(package: &str) -> Result<Self, CandidateExactPhraseStateError> {
+        validate_candidate_package_id(package)
+            .map_err(|_| CandidateExactPhraseStateError::InvalidPackageId)?;
+        Ok(Self {
+            package: Some(package.to_owned()),
+        })
+    }
+
+    /// Parses the exact three-line, LF-terminated state.
+    pub fn parse(contents: &str) -> Result<Self, CandidateExactPhraseStateError> {
+        if contents.is_empty() || contents.len() > MAX_CANDIDATE_EXACT_PHRASE_STATE_BYTES {
+            return Err(CandidateExactPhraseStateError::InvalidStateSize);
+        }
+        if contents.contains('\r') || !contents.ends_with('\n') {
+            return Err(CandidateExactPhraseStateError::InvalidStructure);
+        }
+        let lines = contents.split('\n').collect::<Vec<_>>();
+        if lines.len() != 4 || !lines[3].is_empty() {
+            return Err(CandidateExactPhraseStateError::InvalidStructure);
+        }
+        if exact_phrase_state_field(lines[0], "schema")? != CANDIDATE_EXACT_PHRASE_STATE_SCHEMA_V1 {
+            return Err(CandidateExactPhraseStateError::UnsupportedSchema);
+        }
+        let enabled = match exact_phrase_state_field(lines[1], "enabled")? {
+            "true" => true,
+            "false" => false,
+            _ => return Err(CandidateExactPhraseStateError::InvalidField),
+        };
+        let package = exact_phrase_state_field(lines[2], "package")?;
+        match (enabled, package) {
+            (false, "-") => Ok(Self::default()),
+            (true, package) => Self::enabled(package),
+            _ => Err(CandidateExactPhraseStateError::InvalidCombination),
+        }
+    }
+
+    /// Renders the canonical activation state.
+    pub fn render(&self) -> String {
+        format!(
+            "schema={CANDIDATE_EXACT_PHRASE_STATE_SCHEMA_V1}\nenabled={}\npackage={}\n",
+            self.package.is_some(),
+            self.package.as_deref().unwrap_or("-"),
+        )
+    }
+
+    /// Returns whether the exact-phrase lane is explicitly enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.package.is_some()
+    }
+
+    /// Returns the immutable package selected by this state.
+    pub fn package(&self) -> Option<&str> {
+        self.package.as_deref()
+    }
+}
+
+/// Strict exact-phrase activation-state errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateExactPhraseStateError {
+    InvalidStateSize,
+    InvalidStructure,
+    InvalidField,
+    UnsupportedSchema,
+    InvalidPackageId,
+    InvalidCombination,
+}
+
+impl fmt::Display for CandidateExactPhraseStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidStateSize => "三字精确层状态大小无效",
+            Self::InvalidStructure => "三字精确层状态结构无效",
+            Self::InvalidField => "三字精确层状态字段无效",
+            Self::UnsupportedSchema => "不支持的三字精确层状态格式",
+            Self::InvalidPackageId => "三字精确层候选包标识无效",
+            Self::InvalidCombination => "三字精确层状态组合无效",
+        })
+    }
+}
+
+impl Error for CandidateExactPhraseStateError {}
+
+/// Immutable evidence reserved for a real TSF first-page three-layer gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateExactPhrasePreflightReceipt {
+    phrase_package: String,
+    phrase_sha256: String,
+    core_sha256: String,
+    supplemental_sha256: String,
+    supplemental_promotions: usize,
+}
+
+impl CandidateExactPhrasePreflightReceipt {
+    pub fn new(
+        phrase_package: &str,
+        phrase_sha256: &str,
+        core_sha256: &str,
+        supplemental_sha256: &str,
+        supplemental_promotions: usize,
+    ) -> Result<Self, CandidateExactPhrasePreflightReceiptError> {
+        validate_candidate_package_id(phrase_package)
+            .map_err(|_| CandidateExactPhrasePreflightReceiptError::InvalidPackageId)?;
+        if !exact_phrase_sha256(phrase_sha256)
+            || !exact_phrase_sha256(core_sha256)
+            || !exact_phrase_sha256(supplemental_sha256)
+        {
+            return Err(CandidateExactPhrasePreflightReceiptError::InvalidSha256);
+        }
+        if !(1..=MAX_CANDIDATE_SNAPSHOT_RANK).contains(&supplemental_promotions) {
+            return Err(CandidateExactPhrasePreflightReceiptError::InvalidPromotionLimit);
+        }
+        Ok(Self {
+            phrase_package: phrase_package.to_owned(),
+            phrase_sha256: phrase_sha256.to_owned(),
+            core_sha256: core_sha256.to_owned(),
+            supplemental_sha256: supplemental_sha256.to_owned(),
+            supplemental_promotions,
+        })
+    }
+
+    pub fn parse(contents: &str) -> Result<Self, CandidateExactPhrasePreflightReceiptError> {
+        if contents.is_empty()
+            || contents.len() > MAX_CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_BYTES
+        {
+            return Err(CandidateExactPhrasePreflightReceiptError::InvalidReceiptSize);
+        }
+        if contents.contains('\r') || !contents.ends_with('\n') {
+            return Err(CandidateExactPhrasePreflightReceiptError::InvalidStructure);
+        }
+        let lines = contents.split('\n').collect::<Vec<_>>();
+        if lines.len() != 9 || !lines[8].is_empty() {
+            return Err(CandidateExactPhrasePreflightReceiptError::InvalidStructure);
+        }
+        if exact_phrase_receipt_field(lines[0], "schema")?
+            != CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_SCHEMA_V1
+            || exact_phrase_receipt_field(lines[6], "page_size")?
+                != CANDIDATE_EXACT_PHRASE_PREFLIGHT_PAGE_SIZE.to_string()
+            || exact_phrase_receipt_field(lines[7], "host")?
+                != CANDIDATE_EXACT_PHRASE_PREFLIGHT_HOST_V1
+        {
+            return Err(CandidateExactPhrasePreflightReceiptError::UnsupportedProfile);
+        }
+        Self::new(
+            exact_phrase_receipt_field(lines[1], "phrase_package")?,
+            exact_phrase_receipt_field(lines[2], "phrase_sha256")?,
+            exact_phrase_receipt_field(lines[3], "core_sha256")?,
+            exact_phrase_receipt_field(lines[4], "supplemental_sha256")?,
+            exact_phrase_receipt_usize(exact_phrase_receipt_field(
+                lines[5],
+                "supplemental_promotions",
+            )?)?,
+        )
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "schema={CANDIDATE_EXACT_PHRASE_PREFLIGHT_RECEIPT_SCHEMA_V1}\nphrase_package={}\nphrase_sha256={}\ncore_sha256={}\nsupplemental_sha256={}\nsupplemental_promotions={}\npage_size={CANDIDATE_EXACT_PHRASE_PREFLIGHT_PAGE_SIZE}\nhost={CANDIDATE_EXACT_PHRASE_PREFLIGHT_HOST_V1}\n",
+            self.phrase_package,
+            self.phrase_sha256,
+            self.core_sha256,
+            self.supplemental_sha256,
+            self.supplemental_promotions,
+        )
+    }
+
+    pub fn phrase_package(&self) -> &str {
+        &self.phrase_package
+    }
+
+    pub fn phrase_sha256(&self) -> &str {
+        &self.phrase_sha256
+    }
+
+    pub fn matches_runtime(
+        &self,
+        core_sha256: &str,
+        supplemental_sha256: &str,
+        supplemental_promotions: usize,
+    ) -> bool {
+        self.core_sha256 == core_sha256
+            && self.supplemental_sha256 == supplemental_sha256
+            && self.supplemental_promotions == supplemental_promotions
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateExactPhrasePreflightReceiptError {
+    InvalidReceiptSize,
+    InvalidStructure,
+    InvalidField,
+    UnsupportedProfile,
+    InvalidPackageId,
+    InvalidSha256,
+    InvalidPromotionLimit,
+}
+
+impl fmt::Display for CandidateExactPhrasePreflightReceiptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidReceiptSize => "三字精确层专项预检凭据大小无效",
+            Self::InvalidStructure => "三字精确层专项预检凭据结构无效",
+            Self::InvalidField => "三字精确层专项预检凭据字段无效",
+            Self::UnsupportedProfile => "三字精确层专项预检配置不受支持",
+            Self::InvalidPackageId => "三字精确层专项预检包标识无效",
+            Self::InvalidSha256 => "三字精确层专项预检摘要无效",
+            Self::InvalidPromotionLimit => "三字精确层专项预检补充影响上限无效",
+        })
+    }
+}
+
+impl Error for CandidateExactPhrasePreflightReceiptError {}
+
+fn exact_phrase_state_field<'a>(
+    line: &'a str,
+    expected_key: &str,
+) -> Result<&'a str, CandidateExactPhraseStateError> {
+    let Some((key, value)) = line.split_once('=') else {
+        return Err(CandidateExactPhraseStateError::InvalidField);
+    };
+    if key != expected_key || value.is_empty() || value.contains('=') {
+        return Err(CandidateExactPhraseStateError::InvalidField);
+    }
+    Ok(value)
+}
+
+fn exact_phrase_receipt_field<'a>(
+    line: &'a str,
+    expected_key: &str,
+) -> Result<&'a str, CandidateExactPhrasePreflightReceiptError> {
+    let Some((key, value)) = line.split_once('=') else {
+        return Err(CandidateExactPhrasePreflightReceiptError::InvalidField);
+    };
+    if key != expected_key || value.is_empty() || value.contains('=') {
+        return Err(CandidateExactPhrasePreflightReceiptError::InvalidField);
+    }
+    Ok(value)
+}
+
+fn exact_phrase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn exact_phrase_receipt_usize(
+    value: &str,
+) -> Result<usize, CandidateExactPhrasePreflightReceiptError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| CandidateExactPhrasePreflightReceiptError::InvalidField)?;
+    if parsed.to_string() != value {
+        return Err(CandidateExactPhrasePreflightReceiptError::InvalidField);
+    }
+    Ok(parsed)
+}
 
 /// Immutable evidence that one exact-short package and its complete public
 /// runtime context passed the real TSF second-page path together.
@@ -628,6 +914,78 @@ mod tests {
             CandidateExactShortStateError::InvalidPromotionLimit
         );
         assert!(CandidateExactShortState::parse(&valid.replace('\n', "\r\n")).is_err());
+    }
+
+    #[test]
+    fn exact_phrase_state_is_canonical_and_separate_from_other_layers() {
+        let disabled = CandidateExactPhraseState::default();
+        assert_eq!(
+            disabled.render(),
+            "schema=ziranma-candidate-exact-phrase-v1\n\
+             enabled=false\n\
+             package=-\n"
+        );
+        assert_eq!(
+            CandidateExactPhraseState::parse(&disabled.render()).unwrap(),
+            disabled
+        );
+
+        let enabled = CandidateExactPhraseState::enabled(PACKAGE).unwrap();
+        assert!(enabled.is_enabled());
+        assert_eq!(enabled.package(), Some(PACKAGE));
+        assert_eq!(
+            CandidateExactPhraseState::parse(&enabled.render()).unwrap(),
+            enabled
+        );
+        assert!(
+            CandidateExactPhraseState::parse(
+                &enabled
+                    .render()
+                    .replace("exact-phrase-v1", "exact-short-v1")
+            )
+            .is_err()
+        );
+        assert!(
+            CandidateExactPhraseState::parse(
+                &enabled.render().replace("enabled=true", "enabled=yes")
+            )
+            .is_err()
+        );
+        assert!(CandidateExactPhraseState::parse(&enabled.render().replace('\n', "\r\n")).is_err());
+    }
+
+    #[test]
+    fn exact_phrase_receipt_binds_all_three_runtime_packages_and_host() {
+        let receipt = CandidateExactPhrasePreflightReceipt::new(
+            PACKAGE,
+            &"1".repeat(64),
+            &"2".repeat(64),
+            &"3".repeat(64),
+            1,
+        )
+        .unwrap();
+        let rendered = receipt.render();
+        assert_eq!(
+            CandidateExactPhrasePreflightReceipt::parse(&rendered).unwrap(),
+            receipt
+        );
+        assert!(receipt.matches_runtime(&"2".repeat(64), &"3".repeat(64), 1));
+        assert!(!receipt.matches_runtime(&"4".repeat(64), &"3".repeat(64), 1));
+        assert!(!receipt.matches_runtime(&"2".repeat(64), &"4".repeat(64), 1));
+        assert!(!receipt.matches_runtime(&"2".repeat(64), &"3".repeat(64), 2));
+        assert!(
+            CandidateExactPhrasePreflightReceipt::parse(
+                &rendered.replace("page_size=6", "page_size=7")
+            )
+            .is_err()
+        );
+        assert!(
+            CandidateExactPhrasePreflightReceipt::parse(&rendered.replace(
+                CANDIDATE_EXACT_PHRASE_PREFLIGHT_HOST_V1,
+                "pure-candidate-preview-v1"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
