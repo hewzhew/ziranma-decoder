@@ -401,6 +401,47 @@ cargo run --release --bin candidatectl -- length-coverage-audit `
 输出包就依赖第二个公开来源；在多来源哈希、许可和选择参数能够一起被认证以前，
 切片器不会提供这种构建模式。留出审计可以评价假设，但不能绕过来源绑定生成包。
 
+### 三字精确短语层审计
+
+容量内替换实验不能回答另一个问题：不删除双字、另开一个有界精确通道，能否让
+来源确认的三字整词越过机械单字组合。`exact-phrase-layer-audit` 因此把公开 UD 中
+一至三个相邻、不可跨标点的 token 合并成恰好三字的 span；完整码优先由现有核心
+token 取得，缺词时逐字取得。训练侧 span 只负责向固定万象请求相同文字/完整码，
+并排除多音文字、万象中同码对应多个三字词面以及核心/补充已经存在的身份。每码
+最终最多保留一个词，留出语料不参与选层。
+
+预览规则也比“总是插到第一”窄：已有完整词通道存在时，新词只能跟在该通道后；
+没有已有完整词时，来源确认的三字整词才可越过自由组合。安全对照分成两类：既有
+完整词必须零位移；任意相邻片段仍须保留在原分页，不能跨页或掉出 Top-10。后者不能
+被误标为金标准整词——例如公开 dev 中的“和 + 工业”让位给“核工业”，但仍由第 1
+项留在第 2 项，这属于整词与自由组合的预期取舍，不是候选消失。
+
+冻结命令如下；它只构建进程内快照并打印至多八个公开反例，不写包或槽位：
+
+```powershell
+cargo run --release --bin candidatectl -- exact-phrase-layer-audit `
+  --source .local/public-audit/wanxiang-fdda7afb/jichu.dict.yaml `
+  --core-payload .local/candidate-rime-pinyin-simp-0c6861ef-v1/lexicon.tsv `
+  --supplemental-payload .local/public-audit/wanxiang-fdda7afb/package-top100k-v1/lexicon.tsv `
+  --fit-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-train.conllu `
+  --held-out-corpus data/public/ud-chinese-gsdsimp/zh_gsdsimp-ud-test.conllu `
+  --entry-limit 5000 --repetitions 5
+```
+
+训练侧 39,456 个可编码三字 span 与固定万象相交后，排除来源同码歧义和既有身份，
+得到 2,799 条、每码唯一的实验层。独立 GSDSimp test 有 51 个目标身份（57 次）：
+基线 Top-1 为 21/51、Top-6 为 37/51；预览后 Top-1 和 Top-6 均为 51/51，新增
+30 个正确首选，没有目标变差。7 个同码自由组合对照均未跨页或掉出 Top-10，既有
+整词对照零变化，严格门通过。另一次 PUD 跨域压力测试在 17 个可比目标上新增 8 个
+正确首选，同样没有跨页或可见性损失；其中含繁体表面，只作外部压力证据。
+
+三字层载荷为 2,799 条、72,909 字节，索引首次构建约 6.8 ms。48 个公开完整码的
+同次预热查询中，既有两层与预览路径的 median 分别约 11.7 ms 和 11.2 ms、p95
+约 13.7 ms 和 13.2 ms；差异落在同机噪声内，不能声称新层更快。当前结论只是
+“独立层假设值得进入多来源认证和宿主预检”，不是自动发布许可；日用包、槽位和
+TSF 均未改变，像“再进来”这类未被训练侧公开 span 选中的个人目标仍交给新版精确
+记忆验证，不能借本审计逐条硬编码。
+
 ### 同修订固定短语表审计
 
 万象固定修订 `fdda7afb` 还包含一份独立的

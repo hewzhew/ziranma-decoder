@@ -52,13 +52,14 @@ use ziranma_core::{
     compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
     load_candidate_runtime_snapshots_with_layers, load_current_candidate_snapshot,
-    parse_lexicon_tsv, parse_public_rime_phrase_allowlist, parse_public_rime_slice,
-    parse_public_short_word_consensus, parse_rime_lexicon, parse_simplified_rime_lexicon,
-    parse_ud_conllu, select_public_bigram_training_sequences,
+    normalize_pinyin_tone_marks, parse_lexicon_tsv, parse_public_rime_phrase_allowlist,
+    parse_public_rime_slice, parse_public_short_word_consensus, parse_rime_lexicon,
+    parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
     select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_lexicon_rank_probes, select_public_single_character_context_cases,
-    select_public_static_context_cases, select_public_supplemental_composition_cases,
-    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
+    select_public_han_span_rank_probes, select_public_lexicon_rank_probes,
+    select_public_single_character_context_cases, select_public_static_context_cases,
+    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
+    supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 #[cfg(windows)]
@@ -202,6 +203,15 @@ enum Options {
         held_out_corpus: PathBuf,
         small_limit: usize,
         large_limit: usize,
+        repetitions: usize,
+    },
+    ExactPhraseLayerAudit {
+        source: PathBuf,
+        core_payload: PathBuf,
+        supplemental_payload: PathBuf,
+        fit_corpus: PathBuf,
+        held_out_corpus: PathBuf,
+        entry_limit: usize,
         repetitions: usize,
     },
     LayerAudit {
@@ -639,6 +649,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             large_limit,
             repetitions,
         })?,
+        Options::ExactPhraseLayerAudit {
+            source,
+            core_payload,
+            supplemental_payload,
+            fit_corpus,
+            held_out_corpus,
+            entry_limit,
+            repetitions,
+        } => audit_exact_phrase_layer(ExactPhraseLayerAuditRequest {
+            source: &source,
+            core_payload: &core_payload,
+            supplemental_payload: &supplemental_payload,
+            fit_corpus: &fit_corpus,
+            held_out_corpus: &held_out_corpus,
+            entry_limit,
+            repetitions,
+        })?,
         Options::LayerAudit {
             core_payload,
             supplemental_payload,
@@ -886,6 +913,7 @@ fn parse_options(
         "popup-render-preflight" => parse_popup_render_preflight(arguments),
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
+        "exact-phrase-layer-audit" => parse_exact_phrase_layer_audit(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
@@ -2043,6 +2071,59 @@ fn parse_phrase_layer_audit(
     })
 }
 
+fn parse_exact_phrase_layer_audit(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut source = None;
+    let mut core_payload = None;
+    let mut supplemental_payload = None;
+    let mut fit_corpus = None;
+    let mut held_out_corpus = None;
+    let mut entry_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => set_path(&mut source, &mut arguments, "--source")?,
+            "--core-payload" => set_path(&mut core_payload, &mut arguments, "--core-payload")?,
+            "--supplemental-payload" => set_path(
+                &mut supplemental_payload,
+                &mut arguments,
+                "--supplemental-payload",
+            )?,
+            "--fit-corpus" => set_path(&mut fit_corpus, &mut arguments, "--fit-corpus")?,
+            "--held-out-corpus" => {
+                set_path(&mut held_out_corpus, &mut arguments, "--held-out-corpus")?
+            }
+            "--entry-limit" => set_usize(&mut entry_limit, &mut arguments, "--entry-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err(
+                    "unknown exact-phrase-layer-audit argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let entry_limit = entry_limit.ok_or("exact-phrase-layer-audit requires --entry-limit")?;
+    if !(1..=MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES).contains(&entry_limit) {
+        return Err("exact-phrase-layer-audit --entry-limit is outside the fixed bound".into());
+    }
+    let repetitions = repetitions.ok_or("exact-phrase-layer-audit requires --repetitions")?;
+    if !(1..=100).contains(&repetitions) {
+        return Err("exact-phrase-layer-audit --repetitions is outside the fixed bound".into());
+    }
+    Ok(Options::ExactPhraseLayerAudit {
+        source: source.ok_or("exact-phrase-layer-audit requires --source")?,
+        core_payload: core_payload.ok_or("exact-phrase-layer-audit requires --core-payload")?,
+        supplemental_payload: supplemental_payload
+            .ok_or("exact-phrase-layer-audit requires --supplemental-payload")?,
+        fit_corpus: fit_corpus.ok_or("exact-phrase-layer-audit requires --fit-corpus")?,
+        held_out_corpus: held_out_corpus
+            .ok_or("exact-phrase-layer-audit requires --held-out-corpus")?,
+        entry_limit,
+        repetitions,
+    })
+}
+
 fn parse_runtime_query(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -2989,6 +3070,9 @@ fn print_usage() {
     );
     eprintln!(
         "  phrase-layer-audit --source <TONED_RIME.dict.yaml> --allowlist <PUBLIC_PHRASES.txt> --base-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --small-limit <N> --large-limit <N> --repetitions <1..100>"
+    );
+    eprintln!(
+        "  exact-phrase-layer-audit --source <TONED_RIME.dict.yaml> --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000> --repetitions <1..100>"
     );
     eprintln!(
         "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
@@ -6632,6 +6716,948 @@ fn audit_phrase_layers(
         "口径：新增目标与基础稳定性对照分开统计；短语层通过真实 CandidateSnapshot 和交互合并路径查询。索引结构不是堆内存估算，预热查询也不是 TSF 绘制首帧；耗时只作本机同次诊断。命令不显示词面、不构建候选包、不写槽位。双文件来源认证与宿主首帧仍是发布前独立门槛。\n本次操作：只读\n",
     );
     Ok(output)
+}
+
+const EXACT_PHRASE_CHARACTERS: usize = 3;
+const EXACT_PHRASE_MAX_TOKENS: usize = 3;
+const EXACT_PHRASE_RANK_DEPTH: usize = 10;
+const EXACT_PHRASE_FIRST_PAGE: usize = 6;
+const EXACT_PHRASE_BENCHMARK_CODE_LIMIT: usize = 48;
+
+struct ExactPhraseLayerAuditRequest<'a> {
+    source: &'a Path,
+    core_payload: &'a Path,
+    supplemental_payload: &'a Path,
+    fit_corpus: &'a Path,
+    held_out_corpus: &'a Path,
+    entry_limit: usize,
+    repetitions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactPhraseSourceSelectionStats {
+    source_rows: usize,
+    requested_surfaces: usize,
+    requested_instances: usize,
+    requested_source_rows: usize,
+    valid_requested_source_rows: usize,
+    matched_identities: usize,
+    ambiguous_surfaces: usize,
+    ambiguous_codes: usize,
+    existing_identities: usize,
+    code_collisions: usize,
+    dropped_by_entry_cap: usize,
+    selected_entries: usize,
+}
+
+struct ExactPhraseSourceSelection {
+    entries: Vec<LexiconEntry>,
+    stats: ExactPhraseSourceSelectionStats,
+}
+
+#[derive(Clone)]
+struct RankedExactPhraseEntry {
+    entry: LexiconEntry,
+    source_line: usize,
+    fit_instances: usize,
+}
+
+impl RankedExactPhraseEntry {
+    fn precedes(&self, other: &Self) -> bool {
+        self.fit_instances > other.fit_instances
+            || (self.fit_instances == other.fit_instances
+                && (self.entry.frequency > other.entry.frequency
+                    || (self.entry.frequency == other.entry.frequency
+                        && (self.source_line, self.entry.text.as_str())
+                            < (other.source_line, other.entry.text.as_str()))))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactPhraseRankCounts {
+    at_one: usize,
+    at_one_instances: usize,
+    at_six: usize,
+    at_six_instances: usize,
+    at_ten: usize,
+    at_ten_instances: usize,
+}
+
+impl ExactPhraseRankCounts {
+    fn observe(&mut self, rank: Option<usize>, instances: usize) {
+        let Some(rank) = rank else {
+            return;
+        };
+        if rank <= 10 {
+            self.at_ten += 1;
+            self.at_ten_instances += instances;
+        }
+        if rank <= EXACT_PHRASE_FIRST_PAGE {
+            self.at_six += 1;
+            self.at_six_instances += instances;
+        }
+        if rank == 1 {
+            self.at_one += 1;
+            self.at_one_instances += instances;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExactPhraseRankComparison {
+    probes: usize,
+    instances: usize,
+    baseline: ExactPhraseRankCounts,
+    preview: ExactPhraseRankCounts,
+    movement: WeightedRankMovement,
+    order_changes: usize,
+    order_change_instances: usize,
+    top_changes: usize,
+    top_change_instances: usize,
+    correct_top_gains: usize,
+    correct_top_gain_instances: usize,
+    correct_top_losses: usize,
+    correct_top_loss_instances: usize,
+    non_target_top_changes: usize,
+    non_target_top_change_instances: usize,
+    first_page_degradations: usize,
+    first_page_degradation_instances: usize,
+    cross_page_degradations: usize,
+    cross_page_degradation_instances: usize,
+}
+
+impl ExactPhraseRankComparison {
+    fn observe(&mut self, before: &[String], after: &[String], expected: &str, instances: usize) {
+        let before_rank = candidate_rank(before, expected);
+        let after_rank = candidate_rank(after, expected);
+        let order_changed = before != after;
+        let top_changed = before.first() != after.first();
+        let before_correct = before
+            .first()
+            .is_some_and(|candidate| candidate == expected);
+        let after_correct = after.first().is_some_and(|candidate| candidate == expected);
+        let first_page_degradation = before_rank
+            .is_some_and(|rank| rank <= EXACT_PHRASE_FIRST_PAGE)
+            && after_rank.is_none_or(|rank| rank > EXACT_PHRASE_FIRST_PAGE);
+        let cross_page_degradation = match (before_rank, after_rank) {
+            (Some(before), Some(after)) => {
+                (after - 1) / EXACT_PHRASE_FIRST_PAGE > (before - 1) / EXACT_PHRASE_FIRST_PAGE
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        self.probes += 1;
+        self.instances += instances;
+        self.baseline.observe(before_rank, instances);
+        self.preview.observe(after_rank, instances);
+        self.movement.observe(before_rank, after_rank, instances);
+        self.order_changes += usize::from(order_changed);
+        self.order_change_instances += instances * usize::from(order_changed);
+        self.top_changes += usize::from(top_changed);
+        self.top_change_instances += instances * usize::from(top_changed);
+        self.correct_top_gains += usize::from(!before_correct && after_correct);
+        self.correct_top_gain_instances +=
+            instances * usize::from(!before_correct && after_correct);
+        self.correct_top_losses += usize::from(before_correct && !after_correct);
+        self.correct_top_loss_instances +=
+            instances * usize::from(before_correct && !after_correct);
+        self.non_target_top_changes +=
+            usize::from(top_changed && !before_correct && !after_correct);
+        self.non_target_top_change_instances +=
+            instances * usize::from(top_changed && !before_correct && !after_correct);
+        self.first_page_degradations += usize::from(first_page_degradation);
+        self.first_page_degradation_instances += instances * usize::from(first_page_degradation);
+        self.cross_page_degradations += usize::from(cross_page_degradation);
+        self.cross_page_degradation_instances += instances * usize::from(cross_page_degradation);
+    }
+}
+
+fn audit_exact_phrase_layer(
+    request: ExactPhraseLayerAuditRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("exact-phrase-layer-audit must run from a release build".into());
+    }
+    let source_text = read_explicit_text(
+        request.source,
+        "public exact-phrase Rime source",
+        MAX_PUBLIC_RIME_SLICE_SOURCE_BYTES,
+    )?;
+    let core_text = read_explicit_text(
+        request.core_payload,
+        "core public exact-phrase payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let supplemental_text = read_explicit_text(
+        request.supplemental_payload,
+        "supplemental public exact-phrase payload",
+        MAX_CANDIDATE_SNAPSHOT_BYTES,
+    )?;
+    let fit_text = read_explicit_text(
+        request.fit_corpus,
+        "public exact-phrase fit corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let held_out_text = read_explicit_text(
+        request.held_out_corpus,
+        "public exact-phrase held-out corpus",
+        MAX_PUBLIC_COMPOSITION_AUDIT_CORPUS_BYTES,
+    )?;
+    let fit_sha256 = candidate_sha256_hex(fit_text.as_bytes());
+    let held_out_sha256 = candidate_sha256_hex(held_out_text.as_bytes());
+    if fit_sha256 == held_out_sha256 {
+        return Err("exact-phrase-layer-audit requires a distinct held-out corpus".into());
+    }
+    let core_sha256 = candidate_sha256_hex(core_text.as_bytes());
+    let supplemental_sha256 = candidate_sha256_hex(supplemental_text.as_bytes());
+    if core_sha256 == supplemental_sha256 {
+        return Err("exact-phrase-layer-audit requires distinct core and supplemental data".into());
+    }
+
+    let core_entries = parse_lexicon_tsv(&core_text)?;
+    let supplemental_entries = parse_lexicon_tsv(&supplemental_text)?;
+    let fit = parse_ud_conllu(&fit_text)?;
+    let held_out = parse_ud_conllu(&held_out_text)?;
+    let fit_spans = select_public_han_span_rank_probes(
+        &fit,
+        &core_entries,
+        EXACT_PHRASE_CHARACTERS,
+        EXACT_PHRASE_MAX_TOKENS,
+    );
+    let held_out_spans = select_public_han_span_rank_probes(
+        &held_out,
+        &core_entries,
+        EXACT_PHRASE_CHARACTERS,
+        EXACT_PHRASE_MAX_TOKENS,
+    );
+    let mut existing_entries = core_entries.clone();
+    existing_entries.extend(supplemental_entries.iter().cloned());
+    let selected = select_exact_phrase_source_entries(
+        &source_text,
+        &fit_spans.probes,
+        &existing_entries,
+        request.entry_limit,
+    )?;
+    if selected.entries.is_empty() {
+        return Err("exact-phrase-layer-audit selected no new public identities".into());
+    }
+
+    let core_started = Instant::now();
+    let core = snapshot_from_payload("exact-phrase-core-v1", &core_text)?;
+    let core_build = core_started.elapsed();
+    let supplemental_started = Instant::now();
+    let supplemental = snapshot_from_payload("exact-phrase-supplemental-v1", &supplemental_text)?;
+    let supplemental_build = supplemental_started.elapsed();
+    let phrase_payload = serialize_lexicon_payload(&selected.entries);
+    let phrase_started = Instant::now();
+    let phrase = snapshot_from_payload("exact-phrase-fit-v1", &phrase_payload)?;
+    let phrase_build = phrase_started.elapsed();
+
+    let selected_identities = selected
+        .entries
+        .iter()
+        .map(|entry| (entry.text.as_str(), entry.code.as_str()))
+        .collect::<HashSet<_>>();
+    let selected_codes = selected
+        .entries
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect::<HashSet<_>>();
+    let fit_targets = fit_spans
+        .probes
+        .iter()
+        .filter(|probe| {
+            selected_identities.contains(&(probe.expected_text.as_str(), probe.observed.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let held_out_targets = held_out_spans
+        .probes
+        .iter()
+        .filter(|probe| {
+            selected_identities.contains(&(probe.expected_text.as_str(), probe.observed.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let held_out_controls = held_out_spans
+        .probes
+        .iter()
+        .filter(|probe| {
+            selected_codes.contains(probe.observed.as_str())
+                && !selected_identities
+                    .contains(&(probe.expected_text.as_str(), probe.observed.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut held_out_exact_controls = Vec::new();
+    let mut held_out_composition_controls = Vec::new();
+    for probe in &held_out_controls {
+        if existing_exact_identity(&core, &supplemental, probe)? {
+            held_out_exact_controls.push(probe.clone());
+        } else {
+            held_out_composition_controls.push(probe.clone());
+        }
+    }
+
+    let fit_report = compare_exact_phrase_ranks(
+        &core,
+        &supplemental,
+        &phrase,
+        &fit_targets,
+        EXACT_PHRASE_RANK_DEPTH,
+    )?;
+    let held_out_target_report = compare_exact_phrase_ranks(
+        &core,
+        &supplemental,
+        &phrase,
+        &held_out_targets,
+        EXACT_PHRASE_RANK_DEPTH,
+    )?;
+    let held_out_exact_control_report = compare_exact_phrase_ranks(
+        &core,
+        &supplemental,
+        &phrase,
+        &held_out_exact_controls,
+        EXACT_PHRASE_RANK_DEPTH,
+    )?;
+    let held_out_composition_control_report = compare_exact_phrase_ranks(
+        &core,
+        &supplemental,
+        &phrase,
+        &held_out_composition_controls,
+        EXACT_PHRASE_RANK_DEPTH,
+    )?;
+
+    let benchmark_codes =
+        evenly_spaced_exact_short_codes(&selected.entries, EXACT_PHRASE_BENCHMARK_CODE_LIMIT);
+    for code in &benchmark_codes {
+        black_box(layered_candidate_texts(
+            &core,
+            &supplemental,
+            black_box(code),
+            EXACT_PHRASE_RANK_DEPTH,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )?);
+        black_box(preview_exact_phrase_candidates(
+            &core,
+            &supplemental,
+            &phrase,
+            black_box(code),
+            EXACT_PHRASE_RANK_DEPTH,
+        )?);
+    }
+    let mut baseline_durations = Vec::with_capacity(request.repetitions * benchmark_codes.len());
+    let mut preview_durations = Vec::with_capacity(request.repetitions * benchmark_codes.len());
+    let mut checksum = 0_usize;
+    for _ in 0..request.repetitions {
+        for code in &benchmark_codes {
+            let started = Instant::now();
+            let candidates = layered_candidate_texts(
+                &core,
+                &supplemental,
+                black_box(code),
+                EXACT_PHRASE_RANK_DEPTH,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )?;
+            baseline_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+
+            let started = Instant::now();
+            let candidates = preview_exact_phrase_candidates(
+                &core,
+                &supplemental,
+                &phrase,
+                black_box(code),
+                EXACT_PHRASE_RANK_DEPTH,
+            )?;
+            preview_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+        }
+    }
+    let baseline_latency = summarize_durations(&mut baseline_durations)
+        .ok_or("exact-phrase-layer-audit produced no baseline timings")?;
+    let preview_latency = summarize_durations(&mut preview_durations)
+        .ok_or("exact-phrase-layer-audit produced no preview timings")?;
+
+    let gate_has_held_out_benefit = held_out_target_report.correct_top_gains != 0;
+    let gate_has_no_target_harm = held_out_target_report.correct_top_losses == 0
+        && held_out_target_report.non_target_top_changes == 0
+        && held_out_target_report.movement.worsened == 0
+        && held_out_target_report.movement.lost_visible == 0;
+    let gate_has_no_exact_control_harm = held_out_exact_control_report.top_changes == 0
+        && held_out_exact_control_report.movement.worsened == 0
+        && held_out_exact_control_report.movement.lost_visible == 0;
+    let gate_keeps_compositions_available =
+        held_out_composition_control_report.cross_page_degradations == 0
+            && held_out_composition_control_report.movement.lost_visible == 0;
+    let safety_gate_passed = gate_has_held_out_benefit
+        && gate_has_no_target_harm
+        && gate_has_no_exact_control_harm
+        && gate_keeps_compositions_available;
+
+    let mut output = String::new();
+    writeln!(output, "公开三字精确短语层留出审计")?;
+    writeln!(
+        output,
+        "核心：{} 条 · SHA-256 {core_sha256}",
+        core_entries.len()
+    )?;
+    writeln!(
+        output,
+        "补充：{} 条 · SHA-256 {supplemental_sha256}；基线每码补 1 项",
+        supplemental_entries.len()
+    )?;
+    writeln!(
+        output,
+        "来源词典：SHA-256 {}；训练侧三字 span 选层；最多 {} 个相邻 token",
+        candidate_sha256_hex(source_text.as_bytes()),
+        EXACT_PHRASE_MAX_TOKENS,
+    )?;
+    write_exact_phrase_span_selection(&mut output, "训练选择", &fit_sha256, &fit_spans);
+    write_exact_phrase_span_selection(&mut output, "独立留出", &held_out_sha256, &held_out_spans);
+    let stats = selected.stats;
+    writeln!(
+        output,
+        "来源交集：请求词面 {}（实例 {}）；相关源行 {}，有效 {}；匹配身份 {}；多音词面排除 {}；来源同码歧义排除 {}；既有身份排除 {}；训练同码竞争舍弃 {}；配额外 {}；最终 {}",
+        stats.requested_surfaces,
+        stats.requested_instances,
+        stats.requested_source_rows,
+        stats.valid_requested_source_rows,
+        stats.matched_identities,
+        stats.ambiguous_surfaces,
+        stats.ambiguous_codes,
+        stats.existing_identities,
+        stats.code_collisions,
+        stats.dropped_by_entry_cap,
+        stats.selected_entries,
+    )?;
+    write_exact_phrase_rank_report(&mut output, "训练侧新增目标", fit_report);
+    write_exact_phrase_rank_report(&mut output, "留出侧新增目标", held_out_target_report);
+    write_exact_phrase_rank_report(
+        &mut output,
+        "留出侧同码既有整词对照",
+        held_out_exact_control_report,
+    );
+    write_exact_phrase_rank_report(
+        &mut output,
+        "留出侧同码自由组合对照",
+        held_out_composition_control_report,
+    );
+    write_exact_phrase_public_counterexamples(
+        &mut output,
+        &core,
+        &supplemental,
+        &phrase,
+        &held_out_composition_controls,
+    )?;
+    writeln!(
+        output,
+        "严格安全门：{}（留出正确首选新增 {}；目标变差 {}；既有整词首选变化 {}；自由组合跨页 {}、掉出 Top-10 {}）",
+        if safety_gate_passed {
+            "通过"
+        } else if held_out_target_report.probes == 0 {
+            "证据不足"
+        } else {
+            "未通过"
+        },
+        held_out_target_report.correct_top_gains,
+        held_out_target_report.movement.worsened,
+        held_out_exact_control_report.top_changes,
+        held_out_composition_control_report.cross_page_degradations,
+        held_out_composition_control_report.movement.lost_visible,
+    )?;
+    write_phrase_index_report(&mut output, "核心", &core, core.index_stats(), core_build);
+    write_phrase_index_report(
+        &mut output,
+        "补充",
+        &supplemental,
+        supplemental.index_stats(),
+        supplemental_build,
+    );
+    write_phrase_index_report(
+        &mut output,
+        "三字层",
+        &phrase,
+        phrase.index_stats(),
+        phrase_build,
+    );
+    writeln!(
+        output,
+        "预热查询：{} 个训练侧公开完整码 × {} 次；样本 {}",
+        benchmark_codes.len(),
+        request.repetitions,
+        baseline_latency.samples,
+    )?;
+    write_phrase_latency_report(&mut output, "既有两层", baseline_latency);
+    write_phrase_latency_report(&mut output, "加入三字精确层", preview_latency);
+    writeln!(output, "结果校验和：{checksum}")?;
+    output.push_str(
+        "口径：训练侧只用公开 UD 的一至三 token 三字 span 选择固定万象中同码、单音且既有两层缺失的完整词；独立留出才决定收益与同码伤害。层内每码最多一个词；既有完整词通道存在时保持其首项，无既有完整词时才允许来源确认的整词越过机械组合。该审计不把私人样本用于选阈值，不构建候选包、不写槽位、不安装或换代。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn select_exact_phrase_source_entries(
+    source_text: &str,
+    fit_probes: &[PublicLexiconRankProbe],
+    existing_entries: &[LexiconEntry],
+    entry_limit: usize,
+) -> Result<ExactPhraseSourceSelection, Box<dyn std::error::Error>> {
+    let fit_instances = fit_probes
+        .iter()
+        .map(|probe| {
+            (
+                (
+                    probe.expected_text.clone(),
+                    probe.observed.as_str().to_owned(),
+                ),
+                probe.instances,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let requested_surfaces = fit_probes
+        .iter()
+        .map(|probe| probe.expected_text.as_str())
+        .collect::<HashSet<_>>();
+    let requested_codes = fit_probes
+        .iter()
+        .map(|probe| probe.observed.as_str())
+        .collect::<HashSet<_>>();
+    let mut stats = ExactPhraseSourceSelectionStats {
+        requested_surfaces: requested_surfaces.len(),
+        requested_instances: fit_probes.iter().map(|probe| probe.instances).sum(),
+        ..ExactPhraseSourceSelectionStats::default()
+    };
+    let mut saw_document_start = false;
+    let mut saw_data_marker = false;
+    let mut valid_codes_by_surface = HashMap::<String, HashSet<String>>::new();
+    let mut valid_surfaces_by_code = HashMap::<String, HashSet<String>>::new();
+    let mut best_by_identity = HashMap::<(String, String), RankedExactPhraseEntry>::new();
+    for (zero_based_line, raw_line) in source_text.lines().enumerate() {
+        let source_line = zero_based_line + 1;
+        let line = raw_line.trim_end_matches('\r');
+        if !saw_data_marker {
+            match line {
+                "---" => saw_document_start = true,
+                "..." if saw_document_start => saw_data_marker = true,
+                _ => {}
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        stats.source_rows += 1;
+        let mut fields = line.split('\t');
+        let (Some(text), Some(toned_pinyin), Some(weight), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let requested_surface = requested_surfaces.contains(text);
+        stats.requested_source_rows += usize::from(requested_surface);
+        if text.chars().count() != EXACT_PHRASE_CHARACTERS
+            || !text.chars().all(is_han_phrase_character)
+        {
+            continue;
+        }
+        let Some(weight) = weight.parse::<u64>().ok().filter(|weight| *weight != 0) else {
+            continue;
+        };
+        let Some((pinyin, encoded)) = normalize_pinyin_tone_marks(toned_pinyin)
+            .ok()
+            .and_then(|pinyin| {
+                encode_pinyin_phrase(&pinyin)
+                    .ok()
+                    .map(|encoded| (pinyin, encoded))
+            })
+            .filter(|(_, encoded)| encoded.syllable_codes.len() == EXACT_PHRASE_CHARACTERS)
+        else {
+            continue;
+        };
+        let code = encoded.full_code.as_str().to_owned();
+        if requested_codes.contains(code.as_str()) {
+            valid_surfaces_by_code
+                .entry(code.clone())
+                .or_default()
+                .insert(text.to_owned());
+        }
+        if !requested_surface {
+            continue;
+        }
+        stats.valid_requested_source_rows += 1;
+        valid_codes_by_surface
+            .entry(text.to_owned())
+            .or_default()
+            .insert(code.clone());
+        let identity = (text.to_owned(), code);
+        let Some(&fit_instances) = fit_instances.get(&identity) else {
+            continue;
+        };
+        let ranked = RankedExactPhraseEntry {
+            entry: LexiconEntry {
+                text: text.to_owned(),
+                pinyin,
+                code: encoded.full_code,
+                syllable_codes: encoded.syllable_codes,
+                frequency: weight,
+            },
+            source_line,
+            fit_instances,
+        };
+        match best_by_identity.entry(identity) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(ranked);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if ranked.precedes(slot.get()) {
+                    slot.insert(ranked);
+                }
+            }
+        }
+    }
+    if !saw_document_start {
+        return Err("exact-phrase Rime source is missing the YAML document start".into());
+    }
+    if !saw_data_marker {
+        return Err("exact-phrase Rime source is missing the YAML data marker".into());
+    }
+    stats.matched_identities = best_by_identity.len();
+    let ambiguous_surfaces = valid_codes_by_surface
+        .iter()
+        .filter(|(_, codes)| codes.len() > 1)
+        .map(|(surface, _)| surface.as_str())
+        .collect::<HashSet<_>>();
+    stats.ambiguous_surfaces = ambiguous_surfaces.len();
+    let ambiguous_codes = valid_surfaces_by_code
+        .iter()
+        .filter(|(_, surfaces)| surfaces.len() > 1)
+        .map(|(code, _)| code.as_str())
+        .collect::<HashSet<_>>();
+    stats.ambiguous_codes = ambiguous_codes.len();
+    let existing_identities = existing_entries
+        .iter()
+        .map(|entry| (entry.text.as_str(), entry.code.as_str()))
+        .collect::<HashSet<_>>();
+    let mut best_by_code = HashMap::<String, RankedExactPhraseEntry>::new();
+    for ((text, code), ranked) in best_by_identity {
+        if ambiguous_surfaces.contains(text.as_str()) {
+            continue;
+        }
+        if ambiguous_codes.contains(code.as_str()) {
+            continue;
+        }
+        if existing_identities.contains(&(text.as_str(), code.as_str())) {
+            stats.existing_identities += 1;
+            continue;
+        }
+        match best_by_code.entry(code) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(ranked);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                stats.code_collisions += 1;
+                if ranked.precedes(slot.get()) {
+                    slot.insert(ranked);
+                }
+            }
+        }
+    }
+    let mut ranked = best_by_code.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        if left.precedes(right) {
+            std::cmp::Ordering::Less
+        } else if right.precedes(left) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    stats.dropped_by_entry_cap = ranked.len().saturating_sub(entry_limit);
+    ranked.truncate(entry_limit);
+    let entries = ranked
+        .into_iter()
+        .map(|ranked| ranked.entry)
+        .collect::<Vec<_>>();
+    stats.selected_entries = entries.len();
+    Ok(ExactPhraseSourceSelection { entries, stats })
+}
+
+fn is_han_phrase_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{3007}'
+    )
+}
+
+fn preview_exact_phrase_candidates(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    phrase: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+    let baseline = layered_candidate_texts(
+        core,
+        supplemental,
+        code,
+        limit,
+        SupplementalCandidateLayerConfig {
+            exact_promotions: 1,
+        },
+    )?;
+    let phrase_exact = phrase.exact_full_code_texts(code, 1)?;
+    let Some(candidate) = phrase_exact.first() else {
+        return Ok(baseline);
+    };
+    let core_exact = core.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+    let supplemental_exact =
+        supplemental.exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?;
+    let existing_exact = core_exact
+        .iter()
+        .chain(&supplemental_exact)
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let stable_prefix = baseline
+        .iter()
+        .take_while(|item| existing_exact.contains(item.as_str()))
+        .count();
+    let mut preview = Vec::with_capacity(limit);
+    let mut seen = HashSet::<String>::new();
+    for item in baseline.iter().take(stable_prefix) {
+        push_unique_candidate(&mut preview, &mut seen, item, limit);
+    }
+    push_unique_candidate(&mut preview, &mut seen, candidate, limit);
+    for item in baseline.iter().skip(stable_prefix) {
+        push_unique_candidate(&mut preview, &mut seen, item, limit);
+    }
+    Ok(preview)
+}
+
+fn push_unique_candidate(
+    output: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    candidate: &str,
+    limit: usize,
+) -> bool {
+    if output.len() == limit || !seen.insert(candidate.to_owned()) {
+        return false;
+    }
+    output.push(candidate.to_owned());
+    true
+}
+
+fn compare_exact_phrase_ranks(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    phrase: &CandidateSnapshot,
+    probes: &[PublicLexiconRankProbe],
+    limit: usize,
+) -> Result<ExactPhraseRankComparison, Box<dyn std::error::Error>> {
+    let mut report = ExactPhraseRankComparison::default();
+    for probe in probes {
+        let baseline = layered_candidate_texts(
+            core,
+            supplemental,
+            probe.observed.as_str(),
+            limit,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )?;
+        let preview = preview_exact_phrase_candidates(
+            core,
+            supplemental,
+            phrase,
+            probe.observed.as_str(),
+            limit,
+        )?;
+        report.observe(&baseline, &preview, &probe.expected_text, probe.instances);
+    }
+    Ok(report)
+}
+
+fn existing_exact_identity(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    probe: &PublicLexiconRankProbe,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let code = probe.observed.as_str();
+    let expected = probe.expected_text.as_str();
+    Ok(core
+        .exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?
+        .iter()
+        .chain(
+            supplemental
+                .exact_full_code_texts(code, MAX_CANDIDATE_SNAPSHOT_RANK)?
+                .iter(),
+        )
+        .any(|candidate| candidate == expected))
+}
+
+fn write_exact_phrase_span_selection(
+    output: &mut String,
+    label: &str,
+    corpus_sha256: &str,
+    selection: &ziranma_core::PublicHanSpanRankSelection,
+) {
+    writeln!(
+        output,
+        "{label}：候选 span {}；三字汉字 span {}；可编码 {}（单 token {}，跨 token {}）；独立文字/码身份 {} · SHA-256 {corpus_sha256}",
+        selection.source_spans,
+        selection.han_length_eligible,
+        selection.code_coverable_instances,
+        selection.one_token_instances,
+        selection.multi_token_instances,
+        selection.code_coverable_identities,
+    )
+    .unwrap();
+}
+
+fn write_exact_phrase_rank_report(
+    output: &mut String,
+    label: &str,
+    report: ExactPhraseRankComparison,
+) {
+    writeln!(
+        output,
+        "{label}：{} 个身份（实例 {}）；顺序变化 {}（实例 {}），首选变化 {}（实例 {}）",
+        report.probes,
+        report.instances,
+        report.order_changes,
+        report.order_change_instances,
+        report.top_changes,
+        report.top_change_instances,
+    )
+    .unwrap();
+    write_exact_phrase_rank_counts(output, "  基线", report.baseline);
+    write_exact_phrase_rank_counts(output, "  三字层", report.preview);
+    writeln!(
+        output,
+        "  位次：改善 {}（实例 {}），不变 {}（实例 {}），变差 {}（实例 {}），新进 Top-10 {}（实例 {}），掉出 Top-10 {}（实例 {}）",
+        report.movement.improved,
+        report.movement.improved_instances,
+        report.movement.unchanged,
+        report.movement.unchanged_instances,
+        report.movement.worsened,
+        report.movement.worsened_instances,
+        report.movement.newly_visible,
+        report.movement.newly_visible_instances,
+        report.movement.lost_visible,
+        report.movement.lost_visible_instances,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  首选正确性：新增 {}（实例 {}），丢失 {}（实例 {}），非目标变化 {}（实例 {}）",
+        report.correct_top_gains,
+        report.correct_top_gain_instances,
+        report.correct_top_losses,
+        report.correct_top_loss_instances,
+        report.non_target_top_changes,
+        report.non_target_top_change_instances,
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  分页保护：首屏掉出 {}（实例 {}），跨页变差 {}（实例 {}）",
+        report.first_page_degradations,
+        report.first_page_degradation_instances,
+        report.cross_page_degradations,
+        report.cross_page_degradation_instances,
+    )
+    .unwrap();
+}
+
+fn write_exact_phrase_rank_counts(output: &mut String, label: &str, counts: ExactPhraseRankCounts) {
+    writeln!(
+        output,
+        "{label}：Top-1 {}/{}，Top-6 {}/{}，Top-10 {}/{}（身份/实例）",
+        counts.at_one,
+        counts.at_one_instances,
+        counts.at_six,
+        counts.at_six_instances,
+        counts.at_ten,
+        counts.at_ten_instances,
+    )
+    .unwrap();
+}
+
+fn write_exact_phrase_public_counterexamples(
+    output: &mut String,
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    phrase: &CandidateSnapshot,
+    controls: &[PublicLexiconRankProbe],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut examples = Vec::new();
+    for probe in controls {
+        let baseline = layered_candidate_texts(
+            core,
+            supplemental,
+            probe.observed.as_str(),
+            EXACT_PHRASE_RANK_DEPTH,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )?;
+        let preview = preview_exact_phrase_candidates(
+            core,
+            supplemental,
+            phrase,
+            probe.observed.as_str(),
+            EXACT_PHRASE_RANK_DEPTH,
+        )?;
+        let before_rank = candidate_rank(&baseline, &probe.expected_text);
+        let after_rank = candidate_rank(&preview, &probe.expected_text);
+        let worsened = matches!((before_rank, after_rank), (Some(before), Some(after)) if after > before)
+            || matches!((before_rank, after_rank), (Some(_), None));
+        if baseline.first() != preview.first() || worsened {
+            examples.push((
+                probe.observed.as_str().to_owned(),
+                probe.expected_text.clone(),
+                baseline.first().cloned().unwrap_or_else(|| "∅".to_owned()),
+                preview.first().cloned().unwrap_or_else(|| "∅".to_owned()),
+                before_rank,
+                after_rank,
+            ));
+        }
+    }
+    examples.sort_unstable();
+    if examples.is_empty() {
+        writeln!(output, "公开同码反例：无")?;
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "公开同码反例（最多 8 个；均来自显式留出语料，不含私人数据）："
+    )?;
+    for (code, expected, before_top, after_top, before_rank, after_rank) in
+        examples.into_iter().take(8)
+    {
+        writeln!(
+            output,
+            "  {code} → {expected}：首选 {before_top} → {after_top}；目标位次 {} → {}",
+            render_optional_rank(before_rank),
+            render_optional_rank(after_rank),
+        )?;
+    }
+    Ok(())
+}
+
+fn render_optional_rank(rank: Option<usize>) -> String {
+    rank.map_or_else(|| ">10".to_owned(), |rank| rank.to_string())
 }
 
 fn compare_phrase_layer_ranks(
@@ -12504,6 +13530,51 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_layer_parser_binds_train_holdout_and_fixed_bounds() {
+        assert_eq!(
+            parse_options([
+                "exact-phrase-layer-audit".to_owned(),
+                "--source".to_owned(),
+                "jichu.dict.yaml".to_owned(),
+                "--core-payload".to_owned(),
+                "core.tsv".to_owned(),
+                "--supplemental-payload".to_owned(),
+                "supplemental.tsv".to_owned(),
+                "--fit-corpus".to_owned(),
+                "train.conllu".to_owned(),
+                "--held-out-corpus".to_owned(),
+                "test.conllu".to_owned(),
+                "--entry-limit".to_owned(),
+                "5000".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactPhraseLayerAudit {
+                source: PathBuf::from("jichu.dict.yaml"),
+                core_payload: PathBuf::from("core.tsv"),
+                supplemental_payload: PathBuf::from("supplemental.tsv"),
+                fit_corpus: PathBuf::from("train.conllu"),
+                held_out_corpus: PathBuf::from("test.conllu"),
+                entry_limit: 5000,
+                repetitions: 5,
+            }
+        );
+        for (entry_limit, repetitions) in [(0, 1), (50_001, 1), (1, 0), (1, 101)] {
+            assert!(
+                parse_options([
+                    "exact-phrase-layer-audit".to_owned(),
+                    "--entry-limit".to_owned(),
+                    entry_limit.to_string(),
+                    "--repetitions".to_owned(),
+                    repetitions.to_string(),
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn phrase_layer_build_parser_requires_all_three_public_materials() {
         let arguments = vec![
             "build-phrase-layer",
@@ -13432,6 +14503,106 @@ mod tests {
         assert_eq!(control_report.large_top_changes, 0);
         assert_eq!(control_report.small_vs_core.worsened, 0);
         assert_eq!(control_report.large_vs_core.worsened, 0);
+    }
+
+    #[test]
+    fn exact_phrase_source_selection_excludes_ambiguity_existing_and_same_code_rivals() {
+        const SOURCE: &str = "---\n...\n\
+再进来\tzài jìn lái\t20\n\
+载进来\tzǎi jìn lái\t30\n\
+新版本\txīn bǎn běn\t40\n\
+重来了\tzhòng lái le\t50\n\
+重来了\tchóng lái le\t45\n\
+好使用\thǎo shǐ yòng\t35\n";
+        let code = |pinyin: &str| encode_pinyin_phrase(pinyin).unwrap().full_code;
+        let probes = vec![
+            PublicLexiconRankProbe {
+                observed: code("zai jin lai"),
+                expected_text: "再进来".to_owned(),
+                instances: 5,
+            },
+            PublicLexiconRankProbe {
+                observed: code("zai jin lai"),
+                expected_text: "载进来".to_owned(),
+                instances: 2,
+            },
+            PublicLexiconRankProbe {
+                observed: code("xin ban ben"),
+                expected_text: "新版本".to_owned(),
+                instances: 3,
+            },
+            PublicLexiconRankProbe {
+                observed: code("zhong lai le"),
+                expected_text: "重来了".to_owned(),
+                instances: 4,
+            },
+            PublicLexiconRankProbe {
+                observed: code("hao shi yong"),
+                expected_text: "好使用".to_owned(),
+                instances: 1,
+            },
+        ];
+        let existing =
+            parse_lexicon_tsv("text\tpinyin\tfrequency\n新版本\txin ban ben\t100\n").unwrap();
+
+        let selected = select_exact_phrase_source_entries(SOURCE, &probes, &existing, 10).unwrap();
+
+        assert_eq!(selected.entries.len(), 1);
+        assert_eq!(selected.entries[0].text, "好使用");
+        assert_eq!(selected.stats.matched_identities, 5);
+        assert_eq!(selected.stats.ambiguous_surfaces, 1);
+        assert_eq!(selected.stats.ambiguous_codes, 1);
+        assert_eq!(selected.stats.existing_identities, 1);
+        assert_eq!(selected.stats.code_collisions, 0);
+    }
+
+    #[test]
+    fn exact_phrase_preview_only_leads_when_no_existing_whole_word_exists() {
+        const CORE_COMPOSED: &str = "text\tpinyin\tfrequency\n\
+在\tzai\t100\n进来\tjin lai\t90\n";
+        const CORE_EXACT: &str = "text\tpinyin\tfrequency\n\
+在进来\tzai jin lai\t100\n在\tzai\t90\n进来\tjin lai\t80\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n其他词\tqi ta ci\t10\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t20\n";
+        let composed = snapshot_from_payload("exact-phrase-composed", CORE_COMPOSED).unwrap();
+        let exact = snapshot_from_payload("exact-phrase-existing", CORE_EXACT).unwrap();
+        let supplemental =
+            snapshot_from_payload("exact-phrase-supplemental", SUPPLEMENTAL).unwrap();
+        let phrase = snapshot_from_payload("exact-phrase-new", PHRASE).unwrap();
+        let code = encode_pinyin_phrase("zai jin lai").unwrap().full_code;
+
+        let promoted =
+            preview_exact_phrase_candidates(&composed, &supplemental, &phrase, code.as_str(), 10)
+                .unwrap();
+        assert_eq!(promoted.first().map(String::as_str), Some("再进来"));
+
+        let guarded =
+            preview_exact_phrase_candidates(&exact, &supplemental, &phrase, code.as_str(), 10)
+                .unwrap();
+        assert_eq!(guarded.first().map(String::as_str), Some("在进来"));
+        assert_eq!(guarded.get(1).map(String::as_str), Some("再进来"));
+    }
+
+    #[test]
+    fn exact_phrase_composition_audit_distinguishes_page_local_and_cross_page_movement() {
+        let before = (1..=10)
+            .map(|index| format!("候选{index}"))
+            .collect::<Vec<_>>();
+        let mut page_local = ExactPhraseRankComparison::default();
+        let mut after = before.clone();
+        after.insert(0, "公开整词".to_owned());
+        after.truncate(10);
+        page_local.observe(&before, &after, "候选1", 2);
+        assert_eq!(page_local.correct_top_losses, 1);
+        assert_eq!(page_local.first_page_degradations, 0);
+        assert_eq!(page_local.cross_page_degradations, 0);
+
+        let mut cross_page = ExactPhraseRankComparison::default();
+        cross_page.observe(&before, &after, "候选6", 3);
+        assert_eq!(cross_page.first_page_degradations, 1);
+        assert_eq!(cross_page.first_page_degradation_instances, 3);
+        assert_eq!(cross_page.cross_page_degradations, 1);
+        assert_eq!(cross_page.cross_page_degradation_instances, 3);
     }
 
     #[test]

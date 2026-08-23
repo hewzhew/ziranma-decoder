@@ -454,6 +454,30 @@ pub struct PublicLexiconRankSelection {
     pub matched_token_instances: usize,
 }
 
+/// Deterministic complete-code probes assembled from short public UD spans.
+///
+/// A span may be one token or several adjacent non-punctuation tokens. Its
+/// code is assembled from exact token entries when available and otherwise
+/// from exact single-character entries, mirroring the decoder's ordinary
+/// complete-code composition boundary without consulting decoder output.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PublicHanSpanRankSelection {
+    /// Unique text/code identities, ordered by text and then code.
+    pub probes: Vec<PublicLexiconRankProbe>,
+    /// Adjacent spans examined before shape and length filtering.
+    pub source_spans: usize,
+    /// Han-only spans with exactly the requested number of characters.
+    pub han_length_eligible: usize,
+    /// Eligible span occurrences whose complete code can be assembled.
+    pub code_coverable_instances: usize,
+    /// Distinct coverable text/code identities represented by `probes`.
+    pub code_coverable_identities: usize,
+    /// Coverable occurrences made from one UD token.
+    pub one_token_instances: usize,
+    /// Coverable occurrences made from two or more adjacent UD tokens.
+    pub multi_token_instances: usize,
+}
+
 /// Filtering and size counts for public character-model training text.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PublicCharacterTrainingStats {
@@ -652,6 +676,84 @@ pub fn select_public_lexicon_rank_probes(
         source_token_instances,
         matched_token_instances,
     }
+}
+
+/// Selects complete-code probes from bounded adjacent public UD spans.
+///
+/// Punctuation is a hard boundary rather than being removed before windowing.
+/// Every span contains one through `max_tokens` adjacent tokens and exactly
+/// `characters` Han characters. Repeated text/code identities are coalesced
+/// with an occurrence count. The requested dimensions are intentionally
+/// bounded so callers cannot accidentally turn an offline audit into an
+/// unbounded phrase enumerator.
+pub fn select_public_han_span_rank_probes(
+    corpus: &UdCorpus,
+    lexicon: &[LexiconEntry],
+    characters: usize,
+    max_tokens: usize,
+) -> PublicHanSpanRankSelection {
+    if characters == 0 || characters > 4 || max_tokens == 0 || max_tokens > 4 {
+        return PublicHanSpanRankSelection::default();
+    }
+
+    let entries_by_text = best_entries_by_text(lexicon);
+    let mut selection = PublicHanSpanRankSelection::default();
+    let mut instances_by_identity = BTreeMap::<(String, String), usize>::new();
+
+    for sentence in &corpus.sentences {
+        for start in 0..sentence.tokens.len() {
+            for token_count in 1..=max_tokens {
+                let Some(end) = start.checked_add(token_count) else {
+                    break;
+                };
+                let Some(window) = sentence.tokens.get(start..end) else {
+                    break;
+                };
+                selection.source_spans += 1;
+                if window.iter().any(|token| token.upos == "PUNCT") {
+                    break;
+                }
+                let expected_text = window
+                    .iter()
+                    .map(|token| token.form.as_str())
+                    .collect::<String>();
+                if expected_text.chars().count() != characters
+                    || !expected_text.chars().all(is_han_character)
+                {
+                    continue;
+                }
+                selection.han_length_eligible += 1;
+                let token_refs = window.iter().collect::<Vec<_>>();
+                let Some((observed, _, _, _)) = observed_for_tokens(&token_refs, &entries_by_text)
+                else {
+                    continue;
+                };
+                selection.code_coverable_instances += 1;
+                if token_count == 1 {
+                    selection.one_token_instances += 1;
+                } else {
+                    selection.multi_token_instances += 1;
+                }
+                *instances_by_identity
+                    .entry((expected_text, observed.full_code))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    selection.probes = instances_by_identity
+        .into_iter()
+        .map(
+            |((expected_text, observed), instances)| PublicLexiconRankProbe {
+                observed: KeySequence::new(observed)
+                    .expect("lexicon-derived full codes are lowercase ASCII"),
+                expected_text,
+                instances,
+            },
+        )
+        .collect();
+    selection.code_coverable_identities = selection.probes.len();
+    selection
 }
 
 fn finish_sentence(
@@ -1813,9 +1915,9 @@ mod tests {
         parse_simplified_rime_lexicon as parse_rime_lexicon, parse_ud_conllu,
         select_public_bigram_training_sequences, select_public_calibration_cases,
         select_public_character_training_texts, select_public_continuous_composition_cases,
-        select_public_lexicon_rank_probes, select_public_protocol_audit_cases,
-        select_public_single_character_context_cases, select_public_static_context_cases,
-        select_public_supplemental_composition_cases,
+        select_public_han_span_rank_probes, select_public_lexicon_rank_probes,
+        select_public_protocol_audit_cases, select_public_single_character_context_cases,
+        select_public_static_context_cases, select_public_supplemental_composition_cases,
     };
 
     const RIME: &str = include_str!("../data/public/rime-pinyin-simp/pinyin_simp.dict.yaml");
@@ -1862,6 +1964,63 @@ mod tests {
         assert_eq!(audit.lengths[2].challenger_gained_token_instances, 1);
         assert!(!format!("{audit:?}").contains("三字词"));
         assert!(!format!("{audit:?}").contains("四字词语"));
+    }
+
+    #[test]
+    fn han_span_rank_probes_keep_punctuation_boundaries_and_count_phrase_repeats() {
+        const CORPUS: &str = "# sent_id = public-one\n\
+1\t再\t_\tADV\t_\t_\t2\tadvmod\t_\t_\n\
+2\t进来\t_\tVERB\t_\t_\t0\troot\t_\t_\n\
+3\t，\t_\tPUNCT\t_\t_\t2\tpunct\t_\t_\n\
+4\t新\t_\tADJ\t_\t_\t5\tamod\t_\t_\n\
+5\t版本\t_\tNOUN\t_\t_\t2\tobj\t_\t_\n\
+6\t三字词\t_\tNOUN\t_\t_\t2\tobj\t_\t_\n\n\
+# sent_id = public-two\n\
+1\t再\t_\tADV\t_\t_\t2\tadvmod\t_\t_\n\
+2\t进来\t_\tVERB\t_\t_\t0\troot\t_\t_\n\n";
+        let corpus = parse_ud_conllu(CORPUS).unwrap();
+        let lexicon = crate::parse_lexicon_tsv(
+            "text\tpinyin\tfrequency\n\
+再\tzai\t100\n\
+进来\tjin lai\t90\n\
+新\txin\t80\n\
+版本\tban ben\t70\n\
+三字词\tsan zi ci\t60\n",
+        )
+        .unwrap();
+
+        let selection = select_public_han_span_rank_probes(&corpus, &lexicon, 3, 2);
+        let probes = selection
+            .probes
+            .iter()
+            .map(|probe| {
+                (
+                    probe.expected_text.as_str(),
+                    probe.observed.as_str(),
+                    probe.instances,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            probes,
+            vec![
+                ("三字词", "sjzici", 1),
+                ("再进来", "zljnll", 2),
+                ("新版本", "xnbjbf", 1),
+            ]
+        );
+        assert_eq!(selection.han_length_eligible, 4);
+        assert_eq!(selection.code_coverable_instances, 4);
+        assert_eq!(selection.code_coverable_identities, 3);
+        assert_eq!(selection.one_token_instances, 1);
+        assert_eq!(selection.multi_token_instances, 3);
+        assert!(
+            !selection
+                .probes
+                .iter()
+                .any(|probe| probe.expected_text == "进来新")
+        );
     }
 
     #[test]
