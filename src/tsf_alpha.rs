@@ -27,8 +27,9 @@ use crate::candidate_snapshot::{
     layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
 use crate::candidate_ui::{
-    CandidateRgb, CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest,
-    DEFAULT_CANDIDATE_VISUAL_SPEC, build_candidate_scene, candidate_ui_scale,
+    CandidateRgb, CandidateSceneFontMetrics, CandidateSceneItem, CandidateSceneLayout,
+    CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
+    build_candidate_scene, candidate_ui_scale,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -4836,7 +4837,6 @@ const POPUP_NOTICE_ICON_SIZE_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.notice
 const POPUP_NOTICE_ICON_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.notice_icon_gap;
 const POPUP_CORNER_DIAMETER_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.corner_diameter;
 const POPUP_BORDER_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.border_width;
-const POPUP_PERSONAL_MARK_SIZE_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.personal_mark_size;
 const POPUP_FOOTER_HEIGHT_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_height;
 const POPUP_FOOTER_PAGE_WIDTH_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_page_width;
 const POPUP_FOOTER_MODE_GAP_LOGICAL: i32 = DEFAULT_CANDIDATE_VISUAL_SPEC.footer_mode_gap;
@@ -6001,46 +6001,7 @@ unsafe fn create_candidate_popup_font(dpi: u32, logical_height: i32, weight: u32
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PopupFontMetrics {
-    height: i32,
-    ascent: i32,
-}
-
-fn candidate_label_columns(mut content: RECT, dpi: u32) -> (RECT, RECT) {
-    let scale = |logical: i32| popup_scale(dpi, logical);
-    let mut rank = content;
-    rank.right = rank
-        .left
-        .saturating_add(scale(POPUP_RANK_WIDTH_LOGICAL))
-        .min(rank.right);
-    content.left = rank.right.saturating_add(scale(POPUP_RANK_GAP_LOGICAL));
-    (rank, content)
-}
-
-fn baseline_aligned_label_rects(
-    content: RECT,
-    dpi: u32,
-    rank_metrics: PopupFontMetrics,
-    text_metrics: PopupFontMetrics,
-) -> (RECT, RECT) {
-    let (mut rank, mut text) = candidate_label_columns(content, dpi);
-    let available_height = content.bottom.saturating_sub(content.top).max(0);
-    let text_height = text_metrics.height.clamp(0, available_height);
-    text.top = content
-        .top
-        .saturating_add(available_height.saturating_sub(text_height) / 2);
-    text.bottom = text.top.saturating_add(text_height);
-    let baseline = text
-        .top
-        .saturating_add(text_metrics.ascent.min(text_height));
-    let rank_height = rank_metrics.height.clamp(0, available_height);
-    rank.top = baseline
-        .saturating_sub(rank_metrics.ascent.min(rank_height))
-        .max(content.top);
-    rank.bottom = rank.top.saturating_add(rank_height).min(content.bottom);
-    (rank, text)
-}
+type PopupFontMetrics = CandidateSceneFontMetrics;
 
 unsafe fn selected_popup_font_metrics(hdc: HDC, font: HFONT) -> Option<PopupFontMetrics> {
     if font.is_invalid() {
@@ -6061,25 +6022,7 @@ unsafe fn selected_popup_font_metrics(hdc: HDC, font: HFONT) -> Option<PopupFont
     })
 }
 
-fn candidate_personal_mark_rect(rank: RECT, dpi: u32) -> Option<RECT> {
-    let size = popup_scale(dpi, POPUP_PERSONAL_MARK_SIZE_LOGICAL).max(2);
-    let height = rank.bottom.saturating_sub(rank.top);
-    if height < size || rank.right.saturating_sub(rank.left) < size {
-        return None;
-    }
-    let top = rank.top.saturating_add(height.saturating_sub(size) / 2);
-    Some(RECT {
-        left: rank.left,
-        top,
-        right: rank.left.saturating_add(size),
-        bottom: top.saturating_add(size),
-    })
-}
-
-unsafe fn paint_candidate_personal_mark(hdc: HDC, rank: RECT, dpi: u32) {
-    let Some(mark) = candidate_personal_mark_rect(rank, dpi) else {
-        return;
-    };
+unsafe fn paint_candidate_personal_mark(hdc: HDC, mark: RECT) {
     // A tiny rounded dot lives inside the existing rank column, so personal
     // recall remains recognizable without widening or reflowing candidates.
     let diameter = mark.right.saturating_sub(mark.left).max(1);
@@ -6116,36 +6059,25 @@ unsafe fn paint_candidate_personal_mark(hdc: HDC, rank: RECT, dpi: u32) {
 #[allow(clippy::too_many_arguments)]
 unsafe fn paint_candidate_label(
     hdc: HDC,
-    content: RECT,
+    scene_item: &CandidateSceneItem,
     dpi: u32,
-    index: usize,
     candidate: &str,
     action_detail: Option<&str>,
-    show_rank: bool,
-    selected: bool,
-    personalized: bool,
     candidate_font: HFONT,
     selected_font: HFONT,
     metadata_font: HFONT,
 ) {
+    let index = scene_item.index;
+    let selected = index == 0;
+    let show_rank = scene_item.rank.is_some();
+    let mut rank = candidate_scene_rect(scene_item.metadata_line);
+    let mut content = candidate_scene_rect(scene_item.text);
+    let baseline_aligned = scene_item.baseline_aligned;
     let font = if selected {
         selected_font
     } else {
         candidate_font
     };
-    let rank_metrics = unsafe { selected_popup_font_metrics(hdc, metadata_font) };
-    let text_metrics = unsafe { selected_popup_font_metrics(hdc, font) };
-    let baseline_aligned = rank_metrics.is_some() && text_metrics.is_some();
-    let original_content = content;
-    let (mut rank, mut content) = match (rank_metrics, text_metrics) {
-        (Some(rank_metrics), Some(text_metrics)) => {
-            baseline_aligned_label_rects(content, dpi, rank_metrics, text_metrics)
-        }
-        _ => candidate_label_columns(content, dpi),
-    };
-    if !show_rank {
-        content.left = original_content.left;
-    }
     if show_rank {
         let mut rank_label = (index + 1).to_string().encode_utf16().collect::<Vec<_>>();
         if !metadata_font.is_invalid() {
@@ -6174,11 +6106,11 @@ unsafe fn paint_candidate_label(
                     | DT_NOPREFIX,
             );
         }
-        if personalized {
+        if let Some(mark) = scene_item.personal_mark {
             // SAFETY: the marker is confined to the already measured rank
             // rectangle and owns every temporary GDI object it creates.
             unsafe {
-                paint_candidate_personal_mark(hdc, rank, dpi);
+                paint_candidate_personal_mark(hdc, candidate_scene_rect(mark));
             }
         }
     }
@@ -6524,31 +6456,24 @@ fn load_inline_wish_notice_icon(dpi: u32) -> Option<HICON> {
     Some(HICON(image.0))
 }
 
-unsafe fn paint_candidate_notice_icon(
-    hdc: HDC,
-    item: RECT,
-    dpi: u32,
-    icon: CandidateNoticeIcon,
-) -> i32 {
-    if icon != CandidateNoticeIcon::WishReceived {
-        return 0;
-    }
-    let Some(icon) = load_inline_wish_notice_icon(dpi) else {
-        return 0;
-    };
-    let size = popup_scale(dpi, POPUP_NOTICE_ICON_SIZE_LOGICAL);
-    let gap = popup_scale(dpi, POPUP_NOTICE_ICON_GAP_LOGICAL);
-    let left = item
-        .left
-        .saturating_add(popup_scale(dpi, POPUP_TEXT_PADDING_LOGICAL));
-    let available_height = item.bottom.saturating_sub(item.top).max(0);
-    let top = item
-        .top
-        .saturating_add(available_height.saturating_sub(size).max(0) / 2);
+unsafe fn paint_candidate_notice_icon(hdc: HDC, bounds: RECT, icon: HICON) {
+    let width = bounds.right.saturating_sub(bounds.left).max(0);
+    let height = bounds.bottom.saturating_sub(bounds.top).max(0);
     // SAFETY: the shared resource icon and the current paint DC remain valid
     // for this bounded draw call.
-    let _ = unsafe { DrawIconEx(hdc, left, top, icon, size, size, 0, None, DI_NORMAL) };
-    size.saturating_add(gap)
+    let _ = unsafe {
+        DrawIconEx(
+            hdc,
+            bounds.left,
+            bounds.top,
+            icon,
+            width,
+            height,
+            0,
+            None,
+            DI_NORMAL,
+        )
+    };
 }
 
 unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState) {
@@ -6645,9 +6570,14 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
     }
+    let candidate_text_metrics = unsafe { selected_popup_font_metrics(hdc, candidate_font) };
     let selected_text_metrics = unsafe { selected_popup_font_metrics(hdc, selected_font) };
-
-    let text_padding = scale(POPUP_TEXT_PADDING_LOGICAL);
+    let rank_metrics = unsafe { selected_popup_font_metrics(hdc, metadata_font) };
+    let notice_icon = if state.display.notice_icon() == CandidateNoticeIcon::WishReceived {
+        load_inline_wish_notice_icon(state.dpi)
+    } else {
+        None
+    };
     let pages = state.display.page_starts().len();
     let mode_label = candidate_popup_mode_label(&state.display);
     let footer_needed = pages > 1 || mode_label.is_some();
@@ -6668,14 +6598,18 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             footer_width: scale(candidate_popup_footer_logical_width(&state.display)),
             footer_needed,
             selected_surface: !state.display.is_notice(),
-            selected_text_height: selected_text_metrics.map(|metrics| metrics.height),
+            show_rank: !state.display.is_notice(),
+            notice_icon: notice_icon.is_some(),
+            personalized: state.display.visible_personalized(),
+            rank_metrics,
+            candidate_text_metrics,
+            selected_text_metrics,
         },
     );
 
     if let Some(scene) = scene.as_ref() {
         for (scene_item, candidate) in scene.items.iter().zip(state.display.visible()) {
             let index = scene_item.index;
-            let mut item = candidate_scene_rect(scene_item.bounds);
             if let (Some(selected), Some(accent)) =
                 (scene_item.selected_surface, scene_item.selection_accent)
             {
@@ -6692,38 +6626,22 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
                     );
                 }
             }
-            let notice_inset = unsafe {
-                paint_candidate_notice_icon(hdc, item, state.dpi, state.display.notice_icon())
-            };
-            item.left = item
-                .left
-                .saturating_add(if index == 0 && !state.display.is_notice() {
-                    scale(POPUP_SELECTED_TEXT_INSET_LOGICAL)
-                } else {
-                    text_padding
-                })
-                .saturating_add(notice_inset);
-            item.right = item.right.saturating_sub(text_padding);
+            if let (Some(bounds), Some(icon)) = (scene_item.notice_icon, notice_icon) {
+                unsafe {
+                    paint_candidate_notice_icon(hdc, candidate_scene_rect(bounds), icon);
+                }
+            }
             // SAFETY: fonts and shared-scene paint rectangles remain owned by
             // this WM_PAINT operation.
             unsafe {
                 paint_candidate_label(
                     hdc,
-                    item,
+                    scene_item,
                     state.dpi,
-                    index,
                     candidate,
                     (index == 0)
                         .then(|| state.display.action_detail())
                         .flatten(),
-                    !state.display.is_notice(),
-                    index == 0,
-                    state
-                        .display
-                        .visible_personalized()
-                        .get(index)
-                        .copied()
-                        .unwrap_or(false),
                     candidate_font,
                     selected_font,
                     metadata_font,
@@ -26160,7 +26078,12 @@ mod tests {
                         ),
                         footer_needed,
                         selected_surface: !display.is_notice(),
-                        selected_text_height: None,
+                        show_rank: !display.is_notice(),
+                        notice_icon: display.notice_icon() == CandidateNoticeIcon::WishReceived,
+                        personalized: display.visible_personalized(),
+                        rank_metrics: None,
+                        candidate_text_metrics: None,
+                        selected_text_metrics: None,
                     },
                 )
                 .unwrap();
@@ -26404,55 +26327,6 @@ mod tests {
     }
 
     #[test]
-    fn candidate_label_metadata_shares_one_measured_baseline() {
-        let content = RECT {
-            left: 10,
-            top: 8,
-            right: 110,
-            bottom: 44,
-        };
-        let rank_metrics = PopupFontMetrics {
-            height: 14,
-            ascent: 11,
-        };
-        let text_metrics = PopupFontMetrics {
-            height: 17,
-            ascent: 13,
-        };
-        let (rank, text) = baseline_aligned_label_rects(content, 96, rank_metrics, text_metrics);
-
-        assert_eq!(rank.left, 10);
-        assert_eq!(rank.right, 26);
-        assert_eq!(rank.top, 19);
-        assert_eq!(rank.bottom, 33);
-        assert_eq!(text.left, 30);
-        assert_eq!(text.top, 17);
-        assert_eq!(text.bottom, 34);
-        assert_eq!(
-            rank.top + rank_metrics.ascent,
-            text.top + text_metrics.ascent
-        );
-    }
-
-    #[test]
-    fn personal_memory_marker_stays_inside_the_rank_column_without_reflow() {
-        let rank = RECT {
-            left: 10,
-            top: 19,
-            right: 26,
-            bottom: 33,
-        };
-        let mark = candidate_personal_mark_rect(rank, 96).unwrap();
-
-        assert_eq!(mark.left, rank.left);
-        assert_eq!(mark.right - mark.left, POPUP_PERSONAL_MARK_SIZE_LOGICAL);
-        assert_eq!(mark.bottom - mark.top, POPUP_PERSONAL_MARK_SIZE_LOGICAL);
-        assert!(mark.top >= rank.top);
-        assert!(mark.bottom <= rank.bottom);
-        assert!(mark.right <= rank.right);
-    }
-
-    #[test]
     fn candidate_selection_surface_keeps_breathing_room() {
         let selected_text_metrics = PopupFontMetrics {
             height: 17,
@@ -26470,13 +26344,21 @@ mod tests {
                 footer_width: 0,
                 footer_needed: false,
                 selected_surface: true,
-                selected_text_height: Some(selected_text_metrics.height),
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false],
+                rank_metrics: Some(PopupFontMetrics {
+                    height: 14,
+                    ascent: 11,
+                }),
+                candidate_text_metrics: Some(selected_text_metrics),
+                selected_text_metrics: Some(selected_text_metrics),
             },
         )
         .unwrap();
-        let item = candidate_scene_rect(scene.items[0].bounds);
         let selected = candidate_scene_rect(scene.items[0].selected_surface.unwrap());
         let accent = candidate_scene_rect(scene.items[0].selection_accent.unwrap());
+        let text = candidate_scene_rect(scene.items[0].text);
 
         assert_eq!(selected.left, 6);
         assert_eq!(selected.top, 9);
@@ -26489,15 +26371,6 @@ mod tests {
         assert!(
             (accent.top + accent.bottom - selected.top - selected.bottom).abs() <= 1,
             "odd font heights may land half a pixel above the even selection surface"
-        );
-        let (_, text) = baseline_aligned_label_rects(
-            item,
-            96,
-            PopupFontMetrics {
-                height: 14,
-                ascent: 11,
-            },
-            selected_text_metrics,
         );
         assert_eq!((accent.top, accent.bottom), (text.top, text.bottom));
     }

@@ -141,6 +141,13 @@ pub(crate) struct CandidateSceneRect {
     pub(crate) bottom: i32,
 }
 
+/// Physical font measurements supplied by the active renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateSceneFontMetrics {
+    pub(crate) height: i32,
+    pub(crate) ascent: i32,
+}
+
 impl CandidateSceneRect {
     fn width(self) -> i32 {
         self.right.saturating_sub(self.left).max(0)
@@ -148,6 +155,13 @@ impl CandidateSceneRect {
 
     fn height(self) -> i32 {
         self.bottom.saturating_sub(self.top).max(0)
+    }
+
+    fn contains(self, other: Self) -> bool {
+        other.left >= self.left
+            && other.top >= self.top
+            && other.right <= self.right
+            && other.bottom <= self.bottom
     }
 }
 
@@ -159,6 +173,10 @@ impl CandidateSceneRect {
 pub(crate) enum CandidateSceneSemantic {
     CandidateItem,
     CandidateSelectedSurface,
+    CandidateRank,
+    CandidateText,
+    CandidatePersonalMark,
+    NoticeIcon,
     SelectionAccent,
     Footer,
     FooterDivider,
@@ -170,6 +188,10 @@ impl CandidateSceneSemantic {
         match self {
             Self::CandidateItem => "candidate.item",
             Self::CandidateSelectedSurface => "candidate.selected.surface",
+            Self::CandidateRank => "candidate.rank",
+            Self::CandidateText => "candidate.text",
+            Self::CandidatePersonalMark => "candidate.personal-mark",
+            Self::NoticeIcon => "notice.icon",
             Self::SelectionAccent => "selection.accent",
             Self::Footer => "footer",
             Self::FooterDivider => "footer.divider",
@@ -184,6 +206,12 @@ pub(crate) struct CandidateSceneItem {
     pub(crate) bounds: CandidateSceneRect,
     pub(crate) selected_surface: Option<CandidateSceneRect>,
     pub(crate) selection_accent: Option<CandidateSceneRect>,
+    pub(crate) rank: Option<CandidateSceneRect>,
+    pub(crate) text: CandidateSceneRect,
+    pub(crate) metadata_line: CandidateSceneRect,
+    pub(crate) personal_mark: Option<CandidateSceneRect>,
+    pub(crate) notice_icon: Option<CandidateSceneRect>,
+    pub(crate) baseline_aligned: bool,
 }
 
 /// Shared geometry consumed by the production GDI painter and future labs.
@@ -208,8 +236,12 @@ pub(crate) struct CandidateSceneRequest<'a> {
     pub(crate) footer_width: i32,
     pub(crate) footer_needed: bool,
     pub(crate) selected_surface: bool,
-    /// The selected font's physical-pixel height, when GDI measured it.
-    pub(crate) selected_text_height: Option<i32>,
+    pub(crate) show_rank: bool,
+    pub(crate) notice_icon: bool,
+    pub(crate) personalized: &'a [bool],
+    pub(crate) rank_metrics: Option<CandidateSceneFontMetrics>,
+    pub(crate) candidate_text_metrics: Option<CandidateSceneFontMetrics>,
+    pub(crate) selected_text_metrics: Option<CandidateSceneFontMetrics>,
 }
 
 /// Scales a reviewed 96-DPI token to physical pixels with deterministic
@@ -232,11 +264,76 @@ fn centered_vertical(bounds: CandidateSceneRect, height: i32) -> (i32, i32) {
     (top, top.saturating_add(height))
 }
 
+fn label_columns(
+    spec: CandidateVisualSpec,
+    dpi: u32,
+    content: CandidateSceneRect,
+) -> (CandidateSceneRect, CandidateSceneRect) {
+    let mut rank = content;
+    rank.right = rank
+        .left
+        .saturating_add(candidate_ui_scale(dpi, spec.rank_width))
+        .min(rank.right);
+    let mut text = content;
+    text.left = rank
+        .right
+        .saturating_add(candidate_ui_scale(dpi, spec.rank_gap));
+    (rank, text)
+}
+
+fn label_rects(
+    spec: CandidateVisualSpec,
+    dpi: u32,
+    content: CandidateSceneRect,
+    rank_metrics: Option<CandidateSceneFontMetrics>,
+    text_metrics: Option<CandidateSceneFontMetrics>,
+) -> (CandidateSceneRect, CandidateSceneRect, bool) {
+    let (mut rank, mut text) = label_columns(spec, dpi, content);
+    let (Some(rank_metrics), Some(text_metrics)) = (rank_metrics, text_metrics) else {
+        return (rank, text, false);
+    };
+    let available_height = content.height();
+    let text_height = text_metrics.height.clamp(0, available_height);
+    text.top = content
+        .top
+        .saturating_add(available_height.saturating_sub(text_height) / 2);
+    text.bottom = text.top.saturating_add(text_height);
+    let baseline = text
+        .top
+        .saturating_add(text_metrics.ascent.min(text_height));
+    let rank_height = rank_metrics.height.clamp(0, available_height);
+    rank.top = baseline
+        .saturating_sub(rank_metrics.ascent.min(rank_height))
+        .max(content.top);
+    rank.bottom = rank.top.saturating_add(rank_height).min(content.bottom);
+    (rank, text, true)
+}
+
+fn personal_mark_rect(
+    spec: CandidateVisualSpec,
+    dpi: u32,
+    rank: CandidateSceneRect,
+) -> Option<CandidateSceneRect> {
+    let size = candidate_ui_scale(dpi, spec.personal_mark_size).max(2);
+    if rank.height() < size || rank.width() < size {
+        return None;
+    }
+    let top = rank
+        .top
+        .saturating_add(rank.height().saturating_sub(size) / 2);
+    Some(CandidateSceneRect {
+        left: rank.left,
+        top,
+        right: rank.left.saturating_add(size),
+        bottom: top.saturating_add(size),
+    })
+}
+
 fn selected_geometry(
     spec: CandidateVisualSpec,
     dpi: u32,
     item: CandidateSceneRect,
-    selected_text_height: Option<i32>,
+    selected_text_metrics: Option<CandidateSceneFontMetrics>,
 ) -> (CandidateSceneRect, CandidateSceneRect) {
     let scale = |logical| candidate_ui_scale(dpi, logical);
     let (selected_top, selected_bottom) =
@@ -251,8 +348,9 @@ fn selected_geometry(
             .saturating_sub(scale(spec.selected_surface_right_inset)),
         bottom: selected_bottom,
     };
-    let accent_height =
-        selected_text_height.unwrap_or_else(|| scale(spec.selection_accent_fallback_height));
+    let accent_height = selected_text_metrics
+        .map(|metrics| metrics.height)
+        .unwrap_or_else(|| scale(spec.selection_accent_fallback_height));
     let (accent_top, accent_bottom) = centered_vertical(item, accent_height);
     let accent_left = selected
         .left
@@ -272,6 +370,14 @@ pub(crate) fn build_candidate_scene(
     spec: CandidateVisualSpec,
     request: CandidateSceneRequest<'_>,
 ) -> Option<CandidateScene> {
+    let invalid_metrics = [
+        request.rank_metrics,
+        request.candidate_text_metrics,
+        request.selected_text_metrics,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|metrics| metrics.height <= 0 || metrics.ascent < 0 || metrics.ascent > metrics.height);
     if request.width <= 0
         || request.height <= 0
         || (request.layout == CandidateSceneLayout::Horizontal
@@ -281,6 +387,8 @@ pub(crate) fn build_candidate_scene(
                     .iter()
                     .any(|width| *width <= 0)
                 || (request.footer_needed && request.footer_width <= 0)))
+        || request.personalized.len() != request.candidate_count
+        || invalid_metrics
     {
         return None;
     }
@@ -332,16 +440,93 @@ pub(crate) fn build_candidate_scene(
         }
         let (selected_surface, selection_accent) = if index == 0 && request.selected_surface {
             let (selected, accent) =
-                selected_geometry(spec, request.dpi, bounds, request.selected_text_height);
+                selected_geometry(spec, request.dpi, bounds, request.selected_text_metrics);
             (Some(selected), Some(accent))
         } else {
             (None, None)
         };
+        let notice_icon = if index == 0 && request.notice_icon {
+            let size = scale(spec.notice_icon_size);
+            let top = bounds
+                .top
+                .saturating_add(bounds.height().saturating_sub(size).max(0) / 2);
+            Some(CandidateSceneRect {
+                left: bounds.left.saturating_add(scale(spec.text_padding)),
+                top,
+                right: bounds
+                    .left
+                    .saturating_add(scale(spec.text_padding))
+                    .saturating_add(size),
+                bottom: top.saturating_add(size),
+            })
+        } else {
+            None
+        };
+        let leading_inset = if index == 0 && request.selected_surface {
+            scale(spec.selected_text_inset)
+        } else {
+            scale(spec.text_padding)
+        };
+        let notice_inset = notice_icon
+            .map(|_| scale(spec.notice_icon_size.saturating_add(spec.notice_icon_gap)))
+            .unwrap_or(0);
+        let content = CandidateSceneRect {
+            left: bounds
+                .left
+                .saturating_add(leading_inset)
+                .saturating_add(notice_inset),
+            top: bounds.top,
+            right: bounds.right.saturating_sub(scale(spec.text_padding)),
+            bottom: bounds.bottom,
+        };
+        if content.width() <= 0 || content.height() <= 0 {
+            return None;
+        }
+        let text_metrics = if index == 0 {
+            request.selected_text_metrics
+        } else {
+            request.candidate_text_metrics
+        };
+        let (metadata_line, mut text, baseline_aligned) = label_rects(
+            spec,
+            request.dpi,
+            content,
+            request.rank_metrics,
+            text_metrics,
+        );
+        let rank = request.show_rank.then_some(metadata_line);
+        if rank.is_none() {
+            text.left = content.left;
+        }
+        let personal_mark = if request.personalized[index] {
+            rank.and_then(|rank| personal_mark_rect(spec, request.dpi, rank))
+        } else {
+            None
+        };
+        if text.width() <= 0
+            || text.height() <= 0
+            || !bounds.contains(text)
+            || selected_surface
+                .is_some_and(|selected| selected.width() <= 0 || !bounds.contains(selected))
+            || selection_accent
+                .is_some_and(|accent| accent.width() <= 0 || !bounds.contains(accent))
+            || rank.is_some_and(|rank| rank.width() <= 0 || !bounds.contains(rank))
+            || personal_mark.is_some_and(|mark| !bounds.contains(mark))
+            || notice_icon.is_some_and(|icon| !bounds.contains(icon))
+        {
+            return None;
+        }
         items.push(CandidateSceneItem {
             index,
             bounds,
             selected_surface,
             selection_accent,
+            rank,
+            text,
+            metadata_line,
+            personal_mark,
+            notice_icon,
+            baseline_aligned,
         });
     }
 
@@ -447,6 +632,22 @@ mod tests {
             CandidateSceneSemantic::CandidateItem.stable_id(),
             "candidate.item"
         );
+        assert_eq!(
+            CandidateSceneSemantic::CandidateRank.stable_id(),
+            "candidate.rank"
+        );
+        assert_eq!(
+            CandidateSceneSemantic::CandidateText.stable_id(),
+            "candidate.text"
+        );
+        assert_eq!(
+            CandidateSceneSemantic::CandidatePersonalMark.stable_id(),
+            "candidate.personal-mark"
+        );
+        assert_eq!(
+            CandidateSceneSemantic::NoticeIcon.stable_id(),
+            "notice.icon"
+        );
         assert_eq!(CandidateSceneSemantic::Footer.stable_id(), "footer");
         assert_eq!(
             CandidateSceneSemantic::FooterDivider.stable_id(),
@@ -468,7 +669,21 @@ mod tests {
                 footer_width: 62,
                 footer_needed: true,
                 selected_surface: true,
-                selected_text_height: Some(17),
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[true, false],
+                rank_metrics: Some(CandidateSceneFontMetrics {
+                    height: 14,
+                    ascent: 11,
+                }),
+                candidate_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+                selected_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
             },
         )
         .unwrap();
@@ -510,6 +725,38 @@ mod tests {
             })
         );
         assert_eq!(
+            scene.items[0].rank,
+            Some(CandidateSceneRect {
+                left: 18,
+                top: 16,
+                right: 34,
+                bottom: 30,
+            })
+        );
+        assert_eq!(
+            scene.items[0].text,
+            CandidateSceneRect {
+                left: 38,
+                top: 14,
+                right: 98,
+                bottom: 31,
+            }
+        );
+        assert_eq!(
+            scene.items[0].personal_mark,
+            Some(CandidateSceneRect {
+                left: 18,
+                top: 21,
+                right: 21,
+                bottom: 24,
+            })
+        );
+        let rank = scene.items[0].rank.unwrap();
+        assert_eq!(rank.top + 11, scene.items[0].text.top + 13);
+        let mark = scene.items[0].personal_mark.unwrap();
+        assert!(mark.left >= rank.left && mark.right <= rank.right);
+        assert!(mark.top >= rank.top && mark.bottom <= rank.bottom);
+        assert_eq!(
             scene.footer_divider,
             Some(CandidateSceneRect {
                 left: 418,
@@ -543,7 +790,12 @@ mod tests {
                 footer_width: 93,
                 footer_needed: true,
                 selected_surface: true,
-                selected_text_height: None,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false; 3],
+                rank_metrics: None,
+                candidate_text_metrics: None,
+                selected_text_metrics: None,
             },
         )
         .unwrap();
@@ -556,6 +808,55 @@ mod tests {
         assert_eq!(scene.footer.unwrap().top, 173);
         assert_eq!(scene.footer.unwrap().bottom, 204);
         assert!(scene.items[0].selection_accent.is_some());
+    }
+
+    #[test]
+    fn notice_scene_reserves_one_icon_without_a_rank_column() {
+        let scene = build_candidate_scene(
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+            CandidateSceneRequest {
+                layout: CandidateSceneLayout::Horizontal,
+                dpi: 96,
+                width: 210,
+                height: 46,
+                candidate_count: 1,
+                horizontal_candidate_widths: &[200],
+                footer_width: 0,
+                footer_needed: false,
+                selected_surface: false,
+                show_rank: false,
+                notice_icon: true,
+                personalized: &[false],
+                rank_metrics: Some(CandidateSceneFontMetrics {
+                    height: 14,
+                    ascent: 11,
+                }),
+                candidate_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+                selected_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+            },
+        )
+        .unwrap();
+
+        let item = scene.items[0];
+        assert!(item.selected_surface.is_none());
+        assert!(item.rank.is_none());
+        assert_eq!(
+            item.notice_icon,
+            Some(CandidateSceneRect {
+                left: 12,
+                top: 11,
+                right: 36,
+                bottom: 35,
+            })
+        );
+        assert_eq!(item.text.left, 43);
+        assert_eq!((item.text.top, item.text.bottom), (14, 31));
     }
 
     #[test]
@@ -572,7 +873,12 @@ mod tests {
                 footer_width: 0,
                 footer_needed: false,
                 selected_surface: true,
-                selected_text_height: None,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false; 2],
+                rank_metrics: None,
+                candidate_text_metrics: None,
+                selected_text_metrics: None,
             },
         );
         assert!(invalid_widths.is_none());
@@ -589,7 +895,12 @@ mod tests {
                 footer_width: 0,
                 footer_needed: false,
                 selected_surface: true,
-                selected_text_height: None,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false],
+                rank_metrics: None,
+                candidate_text_metrics: None,
+                selected_text_metrics: None,
             },
         );
         assert!(invalid_size.is_none());
@@ -606,9 +917,39 @@ mod tests {
                 footer_width: 62,
                 footer_needed: true,
                 selected_surface: true,
-                selected_text_height: None,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false; 2],
+                rank_metrics: None,
+                candidate_text_metrics: None,
+                selected_text_metrics: None,
             },
         );
         assert!(overlapping_footer.is_none());
+
+        let invalid_metrics = build_candidate_scene(
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+            CandidateSceneRequest {
+                layout: CandidateSceneLayout::Horizontal,
+                dpi: 96,
+                width: 110,
+                height: 46,
+                candidate_count: 1,
+                horizontal_candidate_widths: &[100],
+                footer_width: 0,
+                footer_needed: false,
+                selected_surface: true,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[false],
+                rank_metrics: Some(CandidateSceneFontMetrics {
+                    height: 14,
+                    ascent: 15,
+                }),
+                candidate_text_metrics: None,
+                selected_text_metrics: None,
+            },
+        );
+        assert!(invalid_metrics.is_none());
     }
 }
