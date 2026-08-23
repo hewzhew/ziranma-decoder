@@ -215,6 +215,13 @@ enum Options {
         entry_limit: usize,
         repetitions: usize,
     },
+    ExactPhraseLayerPreflight {
+        core_package: PathBuf,
+        supplemental_package: PathBuf,
+        phrase_package: PathBuf,
+        sample_limit: usize,
+        repetitions: usize,
+    },
     LayerAudit {
         core_payload: PathBuf,
         supplemental_payload: PathBuf,
@@ -685,6 +692,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             entry_limit,
             repetitions,
         })?,
+        Options::ExactPhraseLayerPreflight {
+            core_package,
+            supplemental_package,
+            phrase_package,
+            sample_limit,
+            repetitions,
+        } => preflight_exact_phrase_layer(ExactPhraseLayerPreflightRequest {
+            core_package: &core_package,
+            supplemental_package: &supplemental_package,
+            phrase_package: &phrase_package,
+            sample_limit,
+            repetitions,
+        })?,
         Options::LayerAudit {
             core_payload,
             supplemental_payload,
@@ -934,6 +954,7 @@ fn parse_options(
         "phrase-coverage-audit" => parse_phrase_coverage_audit(arguments),
         "phrase-layer-audit" => parse_phrase_layer_audit(arguments),
         "exact-phrase-layer-audit" => parse_exact_phrase_layer_audit(arguments),
+        "exact-phrase-layer-preflight" => parse_exact_phrase_layer_preflight(arguments),
         "layer-audit" => parse_layer_audit(arguments),
         "layer-benchmark" => parse_layer_benchmark(arguments),
         "layer-composition-audit" => parse_layer_composition_audit(arguments),
@@ -2276,6 +2297,56 @@ fn parse_exact_phrase_layer_audit(
     })
 }
 
+fn parse_exact_phrase_layer_preflight(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Options, Box<dyn std::error::Error>> {
+    let mut core_package = None;
+    let mut supplemental_package = None;
+    let mut phrase_package = None;
+    let mut sample_limit = None;
+    let mut repetitions = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--core-package" => set_path(&mut core_package, &mut arguments, "--core-package")?,
+            "--supplemental-package" => set_path(
+                &mut supplemental_package,
+                &mut arguments,
+                "--supplemental-package",
+            )?,
+            "--phrase-package" => {
+                set_path(&mut phrase_package, &mut arguments, "--phrase-package")?
+            }
+            "--sample-limit" => set_usize(&mut sample_limit, &mut arguments, "--sample-limit")?,
+            "--repetitions" => set_usize(&mut repetitions, &mut arguments, "--repetitions")?,
+            _ => {
+                return Err(
+                    "unknown exact-phrase-layer-preflight argument; value was suppressed".into(),
+                );
+            }
+        }
+    }
+    let sample_limit =
+        sample_limit.ok_or("exact-phrase-layer-preflight requires --sample-limit")?;
+    if !(1..=32).contains(&sample_limit) {
+        return Err(
+            "exact-phrase-layer-preflight --sample-limit is outside the fixed bound".into(),
+        );
+    }
+    let repetitions = repetitions.ok_or("exact-phrase-layer-preflight requires --repetitions")?;
+    if !(1..=20).contains(&repetitions) {
+        return Err("exact-phrase-layer-preflight --repetitions is outside the fixed bound".into());
+    }
+    Ok(Options::ExactPhraseLayerPreflight {
+        core_package: core_package.ok_or("exact-phrase-layer-preflight requires --core-package")?,
+        supplemental_package: supplemental_package
+            .ok_or("exact-phrase-layer-preflight requires --supplemental-package")?,
+        phrase_package: phrase_package
+            .ok_or("exact-phrase-layer-preflight requires --phrase-package")?,
+        sample_limit,
+        repetitions,
+    })
+}
+
 fn parse_runtime_query(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Options, Box<dyn std::error::Error>> {
@@ -3228,6 +3299,9 @@ fn print_usage() {
     );
     eprintln!(
         "  exact-phrase-layer-audit --source <TONED_RIME.dict.yaml> --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --fit-corpus <PUBLIC-TRAIN.conllu> --held-out-corpus <PUBLIC-TEST.conllu> --entry-limit <1..50000> --repetitions <1..100>"
+    );
+    eprintln!(
+        "  exact-phrase-layer-preflight --core-package <PUBLIC_PACKAGE_DIR> --supplemental-package <PUBLIC_PACKAGE_DIR> --phrase-package <FOUR_SOURCE_PUBLIC_PACKAGE_DIR> --sample-limit <1..32> --repetitions <1..20>"
     );
     eprintln!(
         "  layer-audit --core-payload <LEXICON.tsv> --supplemental-payload <LEXICON.tsv> --frontier-limit <1..50> --exact-promotions <0..50>"
@@ -7467,6 +7541,362 @@ fn audit_exact_phrase_layer(
         "口径：训练侧只用公开 UD 的一至三 token 三字 span 选择固定万象中同码、单音且既有两层缺失的完整词；独立留出才决定收益与同码伤害。层内每码最多一个词；既有完整词通道存在时保持其首项，无既有完整词时才允许来源确认的整词越过机械组合。该审计不把私人样本用于选阈值，不构建候选包、不写槽位、不安装或换代。\n本次操作：只读\n",
     );
     Ok(output)
+}
+
+struct ExactPhraseLayerPreflightRequest<'a> {
+    core_package: &'a Path,
+    supplemental_package: &'a Path,
+    phrase_package: &'a Path,
+    sample_limit: usize,
+    repetitions: usize,
+}
+
+struct ExactPhraseLayerPreflightSummary {
+    core_revision: String,
+    supplemental_revision: String,
+    phrase_revision: String,
+    core_authentication_sha256: String,
+    supplemental_authentication_sha256: String,
+    phrase_authentication_sha256: String,
+    core_load: Duration,
+    supplemental_load: Duration,
+    phrase_load: Duration,
+    phrase_entries: usize,
+    phrase_codes: usize,
+    sampled_codes: usize,
+    sampled_without_existing_exact: usize,
+    sampled_after_existing_exact: usize,
+    negative_control_codes: usize,
+    repetitions: usize,
+    baseline_latency: DurationSummary,
+    preview_latency: DurationSummary,
+    checksum: usize,
+}
+
+fn preflight_exact_phrase_layer(
+    request: ExactPhraseLayerPreflightRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        return Err("exact-phrase-layer-preflight must run from a release build".into());
+    }
+    let core_started = Instant::now();
+    let core = load_public_package_directory(request.core_package)?;
+    let core_load = core_started.elapsed();
+    let supplemental_started = Instant::now();
+    let supplemental = load_public_package_directory(request.supplemental_package)?;
+    let supplemental_load = supplemental_started.elapsed();
+    let phrase_started = Instant::now();
+    let phrase = load_public_package_directory(request.phrase_package)?;
+    let phrase_load = phrase_started.elapsed();
+    let summary = preflight_loaded_exact_phrase_layer(
+        &core,
+        &supplemental,
+        &phrase,
+        request.sample_limit,
+        request.repetitions,
+        [core_load, supplemental_load, phrase_load],
+    )?;
+    let mut output = String::new();
+    writeln!(output, "公开三字精确层三包组合预检")?;
+    writeln!(
+        output,
+        "核心：{} · 认证 SHA-256 {} · 加载 {:.3} ms",
+        summary.core_revision,
+        summary.core_authentication_sha256,
+        duration_ms(summary.core_load),
+    )?;
+    writeln!(
+        output,
+        "补充：{} · 认证 SHA-256 {} · 加载 {:.3} ms",
+        summary.supplemental_revision,
+        summary.supplemental_authentication_sha256,
+        duration_ms(summary.supplemental_load),
+    )?;
+    writeln!(
+        output,
+        "三字层：{} · 认证 SHA-256 {} · 加载 {:.3} ms",
+        summary.phrase_revision,
+        summary.phrase_authentication_sha256,
+        duration_ms(summary.phrase_load),
+    )?;
+    writeln!(
+        output,
+        "形状门：{} 条、{} 个唯一六键码；provenance 为四份公开材料并绑定当前核心/补充载荷",
+        summary.phrase_entries, summary.phrase_codes,
+    )?;
+    writeln!(
+        output,
+        "功能门：抽样 {} 个码（无既有整词 {}，跟随既有整词 {}）；负对照 {} 个码；既有整词前缀、第一页位置、去重和无层回退全部通过",
+        summary.sampled_codes,
+        summary.sampled_without_existing_exact,
+        summary.sampled_after_existing_exact,
+        summary.negative_control_codes,
+    )?;
+    writeln!(
+        output,
+        "预热查询：{} 个目标码 × {} 次；样本 {}",
+        summary.sampled_codes, summary.repetitions, summary.baseline_latency.samples,
+    )?;
+    write_phrase_latency_report(&mut output, "既有两层", summary.baseline_latency);
+    write_phrase_latency_report(&mut output, "三包预览", summary.preview_latency);
+    writeln!(output, "结果校验和：{}", summary.checksum)?;
+    output.push_str(
+        "边界：本预检认证真实三包与纯候选合并路径，但不创建运行时根、不写开关、不注册或调用 TSF，也不测窗口绘制和真实首帧。通过不等于允许安装或换代。\n本次操作：只读\n",
+    );
+    Ok(output)
+}
+
+fn preflight_loaded_exact_phrase_layer(
+    core: &LoadedPackage,
+    supplemental: &LoadedPackage,
+    phrase: &LoadedPackage,
+    sample_limit: usize,
+    repetitions: usize,
+    load_durations: [Duration; 3],
+) -> Result<ExactPhraseLayerPreflightSummary, Box<dyn std::error::Error>> {
+    if !(1..=32).contains(&sample_limit) || !(1..=20).contains(&repetitions) {
+        return Err("exact phrase preflight workload is outside the fixed bound".into());
+    }
+    if phrase.provenance.source_count() != 4 {
+        return Err("exact phrase package must bind exactly four public materials".into());
+    }
+    let core_payload_sha256 = candidate_sha256_hex(core.payload_text.as_bytes());
+    let supplemental_payload_sha256 = candidate_sha256_hex(supplemental.payload_text.as_bytes());
+    let phrase_materials = phrase
+        .provenance
+        .source_materials()
+        .iter()
+        .map(CandidateSourceMaterial::sha256)
+        .collect::<HashSet<_>>();
+    if !phrase_materials.contains(core_payload_sha256.as_str())
+        || !phrase_materials.contains(supplemental_payload_sha256.as_str())
+    {
+        return Err(
+            "exact phrase provenance does not bind the supplied core and supplemental payloads"
+                .into(),
+        );
+    }
+
+    let phrase_entries = parse_lexicon_tsv(&phrase.payload_text)?;
+    if phrase_entries.is_empty() || phrase_entries.len() > MAX_PUBLIC_RIME_PHRASE_ALLOWLIST_ENTRIES
+    {
+        return Err("exact phrase package entry count is outside the fixed bound".into());
+    }
+    let mut texts_by_code = HashMap::<&str, &str>::new();
+    for entry in &phrase_entries {
+        if entry.text.chars().count() != EXACT_PHRASE_CHARACTERS
+            || !entry.text.chars().all(is_han_phrase_character)
+            || entry.syllable_codes.len() != EXACT_PHRASE_CHARACTERS
+            || entry.code.as_str().len() != EXACT_PHRASE_CHARACTERS * 2
+        {
+            return Err("exact phrase package contains a non-three-character identity".into());
+        }
+        if texts_by_code
+            .insert(entry.code.as_str(), entry.text.as_str())
+            .is_some()
+        {
+            return Err("exact phrase package contains more than one identity for a code".into());
+        }
+    }
+
+    let sampled_codes = evenly_spaced_exact_short_codes(&phrase_entries, sample_limit);
+    if sampled_codes.is_empty() {
+        return Err("exact phrase preflight selected no target codes".into());
+    }
+    let mut sampled_without_existing_exact = 0_usize;
+    let mut sampled_after_existing_exact = 0_usize;
+    for code in &sampled_codes {
+        let expected = texts_by_code
+            .get(code.as_str())
+            .copied()
+            .ok_or("exact phrase sample is missing its expected identity")?;
+        verify_exact_phrase_preview(code, expected, core, supplemental, phrase)?;
+        let existing_exact = existing_exact_texts(
+            &core.snapshot,
+            &supplemental.snapshot,
+            code,
+            MAX_CANDIDATE_SNAPSHOT_RANK,
+        )?;
+        if existing_exact.is_empty() {
+            sampled_without_existing_exact += 1;
+        } else {
+            sampled_after_existing_exact += 1;
+        }
+    }
+
+    let phrase_codes = texts_by_code.keys().copied().collect::<HashSet<_>>();
+    let negative_entries = parse_lexicon_tsv(&core.payload_text)?
+        .into_iter()
+        .filter(|entry| !phrase_codes.contains(entry.code.as_str()))
+        .collect::<Vec<_>>();
+    let negative_codes = evenly_spaced_exact_short_codes(&negative_entries, sample_limit);
+    if negative_codes.is_empty() {
+        return Err("exact phrase preflight selected no negative-control codes".into());
+    }
+    for code in &negative_codes {
+        let baseline = layered_candidate_texts(
+            &core.snapshot,
+            &supplemental.snapshot,
+            code,
+            EXACT_PHRASE_RANK_DEPTH,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )?;
+        let preview = preview_exact_phrase_candidates(
+            &core.snapshot,
+            &supplemental.snapshot,
+            &phrase.snapshot,
+            code,
+            EXACT_PHRASE_RANK_DEPTH,
+        )?;
+        if preview != baseline {
+            return Err("exact phrase layer changed a code absent from the layer".into());
+        }
+    }
+
+    for code in &sampled_codes {
+        black_box(layered_candidate_texts(
+            &core.snapshot,
+            &supplemental.snapshot,
+            black_box(code),
+            EXACT_PHRASE_RANK_DEPTH,
+            SupplementalCandidateLayerConfig {
+                exact_promotions: 1,
+            },
+        )?);
+        black_box(preview_exact_phrase_candidates(
+            &core.snapshot,
+            &supplemental.snapshot,
+            &phrase.snapshot,
+            black_box(code),
+            EXACT_PHRASE_RANK_DEPTH,
+        )?);
+    }
+    let mut baseline_durations = Vec::with_capacity(repetitions * sampled_codes.len());
+    let mut preview_durations = Vec::with_capacity(repetitions * sampled_codes.len());
+    let mut checksum = 0_usize;
+    for _ in 0..repetitions {
+        for code in &sampled_codes {
+            let started = Instant::now();
+            let candidates = layered_candidate_texts(
+                &core.snapshot,
+                &supplemental.snapshot,
+                black_box(code),
+                EXACT_PHRASE_RANK_DEPTH,
+                SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )?;
+            baseline_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+
+            let started = Instant::now();
+            let candidates = preview_exact_phrase_candidates(
+                &core.snapshot,
+                &supplemental.snapshot,
+                &phrase.snapshot,
+                black_box(code),
+                EXACT_PHRASE_RANK_DEPTH,
+            )?;
+            preview_durations.push(started.elapsed());
+            checksum = update_candidate_text_checksum(checksum, &candidates);
+            black_box(candidates);
+        }
+    }
+    let baseline_latency = summarize_durations(&mut baseline_durations)
+        .ok_or("exact phrase preflight produced no baseline timings")?;
+    let preview_latency = summarize_durations(&mut preview_durations)
+        .ok_or("exact phrase preflight produced no preview timings")?;
+    Ok(ExactPhraseLayerPreflightSummary {
+        core_revision: core.snapshot.revision().to_owned(),
+        supplemental_revision: supplemental.snapshot.revision().to_owned(),
+        phrase_revision: phrase.snapshot.revision().to_owned(),
+        core_authentication_sha256: core.authentication_sha256.clone(),
+        supplemental_authentication_sha256: supplemental.authentication_sha256.clone(),
+        phrase_authentication_sha256: phrase.authentication_sha256.clone(),
+        core_load: load_durations[0],
+        supplemental_load: load_durations[1],
+        phrase_load: load_durations[2],
+        phrase_entries: phrase_entries.len(),
+        phrase_codes: texts_by_code.len(),
+        sampled_codes: sampled_codes.len(),
+        sampled_without_existing_exact,
+        sampled_after_existing_exact,
+        negative_control_codes: negative_codes.len(),
+        repetitions,
+        baseline_latency,
+        preview_latency,
+        checksum,
+    })
+}
+
+fn verify_exact_phrase_preview(
+    code: &str,
+    expected: &str,
+    core: &LoadedPackage,
+    supplemental: &LoadedPackage,
+    phrase: &LoadedPackage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let baseline = layered_candidate_texts(
+        &core.snapshot,
+        &supplemental.snapshot,
+        code,
+        EXACT_PHRASE_RANK_DEPTH,
+        SupplementalCandidateLayerConfig {
+            exact_promotions: 1,
+        },
+    )?;
+    let preview = preview_exact_phrase_candidates(
+        &core.snapshot,
+        &supplemental.snapshot,
+        &phrase.snapshot,
+        code,
+        EXACT_PHRASE_RANK_DEPTH,
+    )?;
+    let existing_exact = existing_exact_texts(
+        &core.snapshot,
+        &supplemental.snapshot,
+        code,
+        MAX_CANDIDATE_SNAPSHOT_RANK,
+    )?;
+    let stable_prefix = baseline
+        .iter()
+        .take_while(|candidate| existing_exact.contains(candidate.as_str()))
+        .count();
+    if stable_prefix >= EXACT_PHRASE_FIRST_PAGE {
+        return Err("exact phrase target would fall outside the first page".into());
+    }
+    if baseline
+        .iter()
+        .take(stable_prefix)
+        .ne(preview.iter().take(stable_prefix))
+    {
+        return Err("exact phrase preview changed the existing exact prefix".into());
+    }
+    if preview.get(stable_prefix).map(String::as_str) != Some(expected) {
+        return Err("exact phrase target did not occupy its guarded exact position".into());
+    }
+    if preview.len() > EXACT_PHRASE_RANK_DEPTH
+        || preview.iter().collect::<HashSet<_>>().len() != preview.len()
+    {
+        return Err("exact phrase preview is unbounded or contains duplicates".into());
+    }
+    Ok(())
+}
+
+fn existing_exact_texts(
+    core: &CandidateSnapshot,
+    supplemental: &CandidateSnapshot,
+    code: &str,
+    limit: usize,
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    Ok(core
+        .exact_full_code_texts(code, limit)?
+        .into_iter()
+        .chain(supplemental.exact_full_code_texts(code, limit)?)
+        .collect())
 }
 
 fn select_exact_phrase_source_entries(
@@ -13840,6 +14270,45 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_layer_preflight_parser_binds_three_packages_and_workload() {
+        assert_eq!(
+            parse_options([
+                "exact-phrase-layer-preflight".to_owned(),
+                "--core-package".to_owned(),
+                "core".to_owned(),
+                "--supplemental-package".to_owned(),
+                "supplemental".to_owned(),
+                "--phrase-package".to_owned(),
+                "phrase".to_owned(),
+                "--sample-limit".to_owned(),
+                "16".to_owned(),
+                "--repetitions".to_owned(),
+                "5".to_owned(),
+            ])
+            .unwrap(),
+            Options::ExactPhraseLayerPreflight {
+                core_package: PathBuf::from("core"),
+                supplemental_package: PathBuf::from("supplemental"),
+                phrase_package: PathBuf::from("phrase"),
+                sample_limit: 16,
+                repetitions: 5,
+            }
+        );
+        for (sample_limit, repetitions) in [(0, 1), (33, 1), (1, 0), (1, 21)] {
+            assert!(
+                parse_options([
+                    "exact-phrase-layer-preflight".to_owned(),
+                    "--sample-limit".to_owned(),
+                    sample_limit.to_string(),
+                    "--repetitions".to_owned(),
+                    repetitions.to_string(),
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn phrase_layer_build_parser_requires_all_three_public_materials() {
         let arguments = vec![
             "build-phrase-layer",
@@ -15642,6 +16111,8 @@ mod tests {
         let fit = root.join("train.conllu");
         let package_a = root.join("package-a");
         let package_b = root.join("package-b");
+        let core_package = root.join("core-package");
+        let supplemental_package = root.join("supplemental-package");
         fs::write(&source, SOURCE).unwrap();
         fs::write(&core, CORE).unwrap();
         fs::write(&supplemental, SUPPLEMENTAL).unwrap();
@@ -15656,6 +16127,14 @@ mod tests {
         let core_declaration = declaration("core", CORE);
         let supplemental_declaration = declaration("supplemental", SUPPLEMENTAL);
         let fit_declaration = declaration("fit", FIT);
+        write_public_package(&core_package, "core-v1", &core_declaration, CORE).unwrap();
+        write_public_package(
+            &supplemental_package,
+            "supplemental-v1",
+            &supplemental_declaration,
+            SUPPLEMENTAL,
+        )
+        .unwrap();
         let build = |output: PathBuf| {
             build_exact_phrase_layer_public_package(ExactPhraseLayerBuildOptions {
                 source: source.clone(),
@@ -15688,6 +16167,22 @@ mod tests {
         assert!(report.contains("写入 1 条"));
         assert!(report.contains("未接入、未安装、未启用"));
         assert!(!report.contains("再进来"));
+        let loaded_core = load_public_package_directory(&core_package).unwrap();
+        let loaded_supplemental = load_public_package_directory(&supplemental_package).unwrap();
+        let summary = preflight_loaded_exact_phrase_layer(
+            &loaded_core,
+            &loaded_supplemental,
+            &loaded,
+            2,
+            2,
+            [Duration::ZERO; 3],
+        )
+        .unwrap();
+        assert_eq!(summary.phrase_entries, 1);
+        assert_eq!(summary.sampled_codes, 1);
+        assert_eq!(summary.sampled_without_existing_exact, 1);
+        assert_eq!(summary.sampled_after_existing_exact, 0);
+        assert_eq!(summary.negative_control_codes, 2);
         for filename in [
             CANDIDATE_PACKAGE_MANIFEST_FILE,
             CANDIDATE_PACKAGE_PAYLOAD_FILE,
@@ -15719,6 +16214,93 @@ mod tests {
             .is_err()
         );
         assert!(!failed_output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_phrase_layer_preflight_rejects_a_different_core_payload_without_text() {
+        const BOUND_CORE: &str = "text\tpinyin\tfrequency\n\
+再\tzai\t100\n进来\tjin lai\t90\n";
+        const DIFFERENT_CORE: &str = "text\tpinyin\tfrequency\n\
+在\tzai\t100\n进来\tjin lai\t90\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n其他词\tqi ta ci\t80\n";
+        const PHRASE: &str = "text\tpinyin\tfrequency\n再进来\tzai jin lai\t20\n";
+        let root = temporary_test_root();
+        fs::create_dir(&root).unwrap();
+        let different_core_package = root.join("different-core");
+        let supplemental_package = root.join("supplemental");
+        let phrase_package = root.join("phrase");
+        write_public_package(
+            &different_core_package,
+            "different-core-v1",
+            &phrase_material_declaration("different-core", DIFFERENT_CORE),
+            DIFFERENT_CORE,
+        )
+        .unwrap();
+        write_public_package(
+            &supplemental_package,
+            "supplemental-v1",
+            &phrase_material_declaration("supplemental", SUPPLEMENTAL),
+            SUPPLEMENTAL,
+        )
+        .unwrap();
+        write_multi_source_public_package(
+            &phrase_package,
+            "exact-phrase-v1",
+            vec![
+                CandidateSourceMaterial::from_bytes(
+                    "source",
+                    "CC-BY-4.0",
+                    "https://example.com/source",
+                    b"source",
+                )
+                .unwrap(),
+                CandidateSourceMaterial::from_bytes(
+                    "bound-core",
+                    "Apache-2.0",
+                    "https://example.com/bound-core",
+                    BOUND_CORE.as_bytes(),
+                )
+                .unwrap(),
+                CandidateSourceMaterial::from_bytes(
+                    "supplemental",
+                    "CC-BY-4.0",
+                    "https://example.com/supplemental",
+                    SUPPLEMENTAL.as_bytes(),
+                )
+                .unwrap(),
+                CandidateSourceMaterial::from_bytes(
+                    "fit",
+                    "CC-BY-SA-4.0",
+                    "https://example.com/fit",
+                    b"fit",
+                )
+                .unwrap(),
+            ],
+            PHRASE,
+        )
+        .unwrap();
+
+        let result = preflight_loaded_exact_phrase_layer(
+            &load_public_package_directory(&different_core_package).unwrap(),
+            &load_public_package_directory(&supplemental_package).unwrap(),
+            &load_public_package_directory(&phrase_package).unwrap(),
+            1,
+            1,
+            [Duration::ZERO; 3],
+        );
+        let error = match result {
+            Ok(_) => panic!("a mismatched core payload must fail before candidate queries"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            error,
+            "exact phrase provenance does not bind the supplied core and supplemental payloads"
+        );
+        for candidate_text in ["再进来", "进来", "其他词"] {
+            assert!(!error.contains(candidate_text));
+        }
 
         fs::remove_dir_all(root).unwrap();
     }

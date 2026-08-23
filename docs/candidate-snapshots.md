@@ -476,6 +476,32 @@ cargo run --release --bin candidatectl -- build-exact-phrase-layer `
 忽略的公开审计目录。通用预检只证明包本身可加载和提交一个三字词，不证明三层合并
 顺序、真实首帧或热切换，因此仍不能安装或启用。
 
+`exact-phrase-layer-preflight` 随后补上三包组合专项门。它同时认证现行核心包、
+Top-100k 补充包和四源三字包，并要求三字包 provenance 精确包含前两包的载荷
+SHA-256；即使三个包各自合法，换成另一份核心或补充载荷也会在候选查询前失败。
+三字载荷还必须全部为三汉字、三音节、六键完整码且每码唯一。等距目标样本检查
+既有整词前缀不动、目标守住第一页、结果去重和有界；等距负对照则要求没有三字层
+身份的码逐项等于原两层。命令全程只读，不创建运行时根、槽位或开关，也不调用 TSF：
+
+```powershell
+target\release\candidatectl.exe exact-phrase-layer-preflight `
+  --core-package .local\candidate-rime-pinyin-simp-0c6861ef-v1 `
+  --supplemental-package .local\public-audit\wanxiang-fdda7afb\package-top100k-v1 `
+  --phrase-package .local\public-audit\wanxiang-fdda7afb\package-exact-phrase-train-span-v1 `
+  --sample-limit 16 --repetitions 5
+```
+
+固定 release 运行认证了核心
+`38c4697bdea55857bbe03ee970528d4658e80ce4c258ebbe2d074550ab852c1d`、补充
+`ae268a35f8e0125598a98205a3ce1c057f7567d08bec84e148804b70e7330eb7` 和三字层
+`570abd32582e695e5a4d042a2c4cb1a67a6bb137cf52c1f72c6e9f41b19a181e`。两次固定
+运行中，三字层加载分别为 4.608 和 5.506 ms；16 个目标码均没有既有整词，
+16 个负对照全部保持原样。两层查询 median 为 11.286/13.219 ms、p95 为
+13.209/15.249 ms，三包预览 median 为 10.755/13.061 ms、p95 为
+12.667/15.240 ms。这些差异只视作同机噪声，不声称新层更快。该门仍没有创建真实
+Context、候选窗或桌面帧，因此不能替代 TSF 三层宿主预检、首帧与分页验证，也不构成
+启用许可。
+
 ### 同修订固定短语表审计
 
 万象固定修订 `fdda7afb` 还包含一份独立的
