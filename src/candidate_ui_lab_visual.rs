@@ -9,6 +9,13 @@ pub(crate) enum CandidateUiLabVariant {
 }
 
 impl CandidateUiLabVariant {
+    pub(crate) const fn stable_id(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Draft => "draft",
+        }
+    }
+
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Baseline => "A 基线",
@@ -305,6 +312,12 @@ mod tests {
     fn baseline_is_immutable_and_draft_reset_is_exact() {
         let mut state = CandidateUiLabVisualState::default();
         let baseline = state.active_spec();
+        assert_eq!(CandidateUiLabVariant::Baseline.stable_id(), "baseline");
+        assert_eq!(CandidateUiLabVariant::Draft.stable_id(), "draft");
+        assert_ne!(
+            CandidateUiLabVariant::Baseline.stable_id(),
+            CandidateUiLabVariant::Draft.stable_id()
+        );
         assert_eq!(state.active_variant(), CandidateUiLabVariant::Draft);
         assert_eq!(state.comparison_variant(), CandidateUiLabVariant::Baseline);
         assert_eq!(state.comparison_spec(), baseline);

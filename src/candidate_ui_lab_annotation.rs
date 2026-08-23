@@ -4,6 +4,7 @@
 //! bounded in memory; only an explicit export writes one bounded, non-replacing
 //! batch into a caller-selected local directory.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -18,20 +19,22 @@ use crate::candidate_ui::{
     CandidateVisualSpec,
 };
 
-pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_SCHEMA: &str = "candidate-ui-lab-annotation-v1";
+pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_SCHEMA: &str = "candidate-ui-lab-annotation-v2";
 pub(crate) const CANDIDATE_UI_LAB_ANNOTATION_BATCH_SCHEMA: &str =
-    "candidate-ui-lab-annotation-batch-v1";
+    "candidate-ui-lab-annotation-batch-v2";
 pub(crate) const MAX_CANDIDATE_UI_LAB_ANNOTATIONS: usize = 64;
 pub(crate) const MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS: usize = 240;
 const MAX_CANDIDATE_UI_LAB_HITS: usize = 64;
 const MAX_CANDIDATE_UI_LAB_EXPORT_BYTES: usize = 1024 * 1024;
 const MAX_CANDIDATE_UI_LAB_EXPORT_ATTEMPTS: usize = 128;
 const REVIEWED_DPIS: [u32; 4] = [96, 120, 144, 192];
+const REVIEWED_VARIANTS: [&str; 2] = ["baseline", "draft"];
 static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CandidateUiLabAnnotationContext {
     pub(crate) scenario_id: String,
+    pub(crate) variant_id: String,
     pub(crate) layout: CandidateSceneLayout,
     pub(crate) dpi: u32,
     pub(crate) selection: CandidateSceneRect,
@@ -48,6 +51,7 @@ pub(crate) struct CandidateUiLabAnnotation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CandidateUiLabAnnotationError {
     InvalidScenario,
+    InvalidVariant,
     InvalidDpi,
     SelectionOutsideScene,
     TooManySemanticHits,
@@ -74,6 +78,7 @@ impl std::fmt::Display for CandidateUiLabAnnotationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::InvalidScenario => "公开场景标识无效",
+            Self::InvalidVariant => "A/B 变体标识无效",
             Self::InvalidDpi => "DPI 不在实验室固定集合中",
             Self::SelectionOutsideScene => "圈选区域没有落在候选窗内",
             Self::TooManySemanticHits => "圈选命中的语义区域超过固定上限",
@@ -116,14 +121,30 @@ impl CandidateUiLabAnnotationSession {
     }
 
     pub(crate) fn to_canonical_json(&self) -> String {
+        let spec_groups = self.spec_groups();
         let mut output = String::new();
         let _ = write!(
             output,
-            "{{\"schema\":\"{}\",\"annotation_schema\":\"{}\",\"count\":{},\"annotations\":[",
+            "{{\"schema\":\"{}\",\"annotation_schema\":\"{}\",\"count\":{},\"spec_groups\":[",
             CANDIDATE_UI_LAB_ANNOTATION_BATCH_SCHEMA,
             CANDIDATE_UI_LAB_ANNOTATION_SCHEMA,
             self.annotations.len(),
         );
+        for (index, ((variant_id, visual_spec_sha256), annotation_count)) in
+            spec_groups.iter().enumerate()
+        {
+            if index > 0 {
+                output.push(',');
+            }
+            let _ = write!(
+                output,
+                "{{\"variant\":\"{}\",\"visual_spec_sha256\":\"{}\",\"annotation_count\":{}}}",
+                json_escape(variant_id),
+                visual_spec_sha256,
+                annotation_count,
+            );
+        }
+        output.push_str("],\"annotations\":[");
         for (index, annotation) in self.annotations.iter().enumerate() {
             if index > 0 {
                 output.push(',');
@@ -132,6 +153,20 @@ impl CandidateUiLabAnnotationSession {
         }
         output.push_str("]}");
         output
+    }
+
+    fn spec_groups(&self) -> BTreeMap<(String, String), usize> {
+        let mut groups = BTreeMap::new();
+        for annotation in &self.annotations {
+            let context = &annotation.context;
+            *groups
+                .entry((
+                    context.variant_id.clone(),
+                    context.visual_spec_sha256.clone(),
+                ))
+                .or_insert(0) += 1;
+        }
+        groups
     }
 
     pub(crate) fn add(
@@ -210,6 +245,7 @@ pub(crate) fn export_candidate_ui_lab_annotations(
 
 pub(crate) fn capture_candidate_ui_lab_annotation_context(
     scenario_id: &str,
+    variant_id: &str,
     layout: CandidateSceneLayout,
     dpi: u32,
     selection: CandidateSceneRect,
@@ -218,6 +254,9 @@ pub(crate) fn capture_candidate_ui_lab_annotation_context(
 ) -> Result<CandidateUiLabAnnotationContext, CandidateUiLabAnnotationError> {
     if !valid_scenario_id(scenario_id) {
         return Err(CandidateUiLabAnnotationError::InvalidScenario);
+    }
+    if !REVIEWED_VARIANTS.contains(&variant_id) {
+        return Err(CandidateUiLabAnnotationError::InvalidVariant);
     }
     if !REVIEWED_DPIS.contains(&dpi) {
         return Err(CandidateUiLabAnnotationError::InvalidDpi);
@@ -230,6 +269,7 @@ pub(crate) fn capture_candidate_ui_lab_annotation_context(
     }
     Ok(CandidateUiLabAnnotationContext {
         scenario_id: scenario_id.to_owned(),
+        variant_id: variant_id.to_owned(),
         layout,
         dpi,
         selection,
@@ -248,9 +288,10 @@ impl CandidateUiLabAnnotation {
         let mut output = String::new();
         let _ = write!(
             output,
-            "{{\"schema\":\"{}\",\"scenario\":\"{}\",\"layout\":\"{}\",\"dpi\":{},\"selection\":{{\"left\":{},\"top\":{},\"right\":{},\"bottom\":{}}},\"visual_spec_sha256\":\"{}\",\"hits\":[",
+            "{{\"schema\":\"{}\",\"scenario\":\"{}\",\"variant\":\"{}\",\"layout\":\"{}\",\"dpi\":{},\"selection\":{{\"left\":{},\"top\":{},\"right\":{},\"bottom\":{}}},\"visual_spec_sha256\":\"{}\",\"hits\":[",
             CANDIDATE_UI_LAB_ANNOTATION_SCHEMA,
             json_escape(&context.scenario_id),
+            json_escape(&context.variant_id),
             layout,
             context.dpi,
             context.selection.left,
@@ -525,6 +566,7 @@ mod tests {
         let scene = test_scene();
         let context = capture_candidate_ui_lab_annotation_context(
             "everyday",
+            "draft",
             CandidateSceneLayout::Horizontal,
             96,
             CandidateSceneRect {
@@ -553,6 +595,7 @@ mod tests {
         changed.rank_gap += 1;
         let changed = capture_candidate_ui_lab_annotation_context(
             "everyday",
+            "draft",
             CandidateSceneLayout::Horizontal,
             96,
             context.selection,
@@ -568,6 +611,7 @@ mod tests {
         let scene = test_scene();
         let context = capture_candidate_ui_lab_annotation_context(
             "long-candidate",
+            "draft",
             CandidateSceneLayout::Horizontal,
             144,
             CandidateSceneRect {
@@ -585,11 +629,113 @@ mod tests {
             .add(context, "  字号\r\n想再清楚一点 \"呀\"  ")
             .unwrap();
         let json = session.annotations()[0].to_canonical_json();
-        assert!(json.starts_with("{\"schema\":\"candidate-ui-lab-annotation-v1\""));
+        assert!(json.starts_with("{\"schema\":\"candidate-ui-lab-annotation-v2\""));
         assert!(json.contains("\"scenario\":\"long-candidate\""));
+        assert!(json.contains("\"variant\":\"draft\""));
         assert!(json.contains("字号\\n想再清楚一点 \\\"呀\\\""));
         assert!(!json.contains("春风"));
         assert!(!json.contains("\r"));
+    }
+
+    #[test]
+    fn batch_groups_are_stable_by_variant_and_complete_visual_spec() {
+        let scene = test_scene();
+        let selection = scene.client;
+        let draft_default = capture_candidate_ui_lab_annotation_context(
+            "everyday",
+            "draft",
+            CandidateSceneLayout::Horizontal,
+            96,
+            selection,
+            &scene,
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+        )
+        .unwrap();
+        let baseline_default = capture_candidate_ui_lab_annotation_context(
+            "everyday",
+            "baseline",
+            CandidateSceneLayout::Horizontal,
+            96,
+            selection,
+            &scene,
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+        )
+        .unwrap();
+        let mut changed_spec = DEFAULT_CANDIDATE_VISUAL_SPEC;
+        changed_spec.rank_gap += 1;
+        let draft_changed = capture_candidate_ui_lab_annotation_context(
+            "everyday",
+            "draft",
+            CandidateSceneLayout::Horizontal,
+            96,
+            selection,
+            &scene,
+            changed_spec,
+        )
+        .unwrap();
+        let default_hash = draft_default.visual_spec_sha256.clone();
+        let changed_hash = draft_changed.visual_spec_sha256.clone();
+        assert_ne!(default_hash, changed_hash);
+
+        let mut session = CandidateUiLabAnnotationSession::default();
+        session
+            .add(draft_default.clone(), "draft-default-first")
+            .unwrap();
+        session
+            .add(baseline_default.clone(), "baseline-default")
+            .unwrap();
+        session.add(draft_changed.clone(), "draft-changed").unwrap();
+        session
+            .add(draft_default.clone(), "draft-default-second")
+            .unwrap();
+
+        let groups = session.spec_groups();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups.get(&("baseline".to_owned(), default_hash.clone())),
+            Some(&1)
+        );
+        assert_eq!(
+            groups.get(&("draft".to_owned(), default_hash.clone())),
+            Some(&2)
+        );
+        assert_eq!(
+            groups.get(&("draft".to_owned(), changed_hash.clone())),
+            Some(&1)
+        );
+
+        let json = session.to_canonical_json();
+        assert!(json.starts_with(
+            "{\"schema\":\"candidate-ui-lab-annotation-batch-v2\",\"annotation_schema\":\"candidate-ui-lab-annotation-v2\""
+        ));
+        let (group_summary, _) = json.split_once(",\"annotations\":[").unwrap();
+        assert!(!group_summary.contains("draft-default-first"));
+        assert!(!group_summary.contains("baseline-default"));
+        assert!(!group_summary.contains("draft-changed"));
+        assert!(!group_summary.contains("春风"));
+
+        let first = json.find("\"note\":\"draft-default-first\"").unwrap();
+        let second = json.find("\"note\":\"baseline-default\"").unwrap();
+        let third = json.find("\"note\":\"draft-changed\"").unwrap();
+        let fourth = json.find("\"note\":\"draft-default-second\"").unwrap();
+        assert!(first < second && second < third && third < fourth);
+
+        let mut reordered = CandidateUiLabAnnotationSession::default();
+        reordered
+            .add(draft_changed, "reordered-draft-changed")
+            .unwrap();
+        reordered
+            .add(draft_default.clone(), "reordered-draft-default-first")
+            .unwrap();
+        reordered
+            .add(baseline_default, "reordered-baseline-default")
+            .unwrap();
+        reordered
+            .add(draft_default, "reordered-draft-default-second")
+            .unwrap();
+        let reordered_json = reordered.to_canonical_json();
+        let (reordered_group_summary, _) = reordered_json.split_once(",\"annotations\":[").unwrap();
+        assert_eq!(group_summary, reordered_group_summary);
     }
 
     #[test]
@@ -605,6 +751,7 @@ mod tests {
         let scene = test_scene();
         let context = capture_candidate_ui_lab_annotation_context(
             "everyday",
+            "draft",
             CandidateSceneLayout::Horizontal,
             96,
             scene.client,
@@ -635,6 +782,7 @@ mod tests {
         assert_eq!(
             capture_candidate_ui_lab_annotation_context(
                 "Bad Scenario",
+                "draft",
                 CandidateSceneLayout::Horizontal,
                 96,
                 scene.client,
@@ -646,6 +794,19 @@ mod tests {
         assert_eq!(
             capture_candidate_ui_lab_annotation_context(
                 "everyday",
+                "unknown",
+                CandidateSceneLayout::Horizontal,
+                96,
+                scene.client,
+                &scene,
+                DEFAULT_CANDIDATE_VISUAL_SPEC,
+            ),
+            Err(CandidateUiLabAnnotationError::InvalidVariant)
+        );
+        assert_eq!(
+            capture_candidate_ui_lab_annotation_context(
+                "everyday",
+                "draft",
                 CandidateSceneLayout::Horizontal,
                 110,
                 scene.client,
@@ -657,6 +818,7 @@ mod tests {
         assert_eq!(
             capture_candidate_ui_lab_annotation_context(
                 "everyday",
+                "draft",
                 CandidateSceneLayout::Horizontal,
                 96,
                 CandidateSceneRect {
@@ -672,6 +834,7 @@ mod tests {
         );
         let context = capture_candidate_ui_lab_annotation_context(
             "everyday",
+            "draft",
             CandidateSceneLayout::Horizontal,
             96,
             scene.client,
@@ -709,6 +872,7 @@ mod tests {
         let scene = test_scene();
         let context = capture_candidate_ui_lab_annotation_context(
             "everyday",
+            "draft",
             CandidateSceneLayout::Horizontal,
             96,
             scene.client,

@@ -1237,6 +1237,7 @@ mod windows_app {
                 .ok_or_else(|| "候选窗预览尚未完成绘制".to_owned())?;
             capture_candidate_ui_lab_annotation_context(
                 state.scenario().stable_id(),
+                state.visual.active_variant().stable_id(),
                 state.layout,
                 state.dpi(),
                 selection,
