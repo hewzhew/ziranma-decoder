@@ -174,6 +174,10 @@ impl CandidateSceneRect {
             && other.right <= self.right
             && other.bottom <= self.bottom
     }
+
+    fn contains_point(self, x: i32, y: i32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
 }
 
 /// Stable semantic identities exposed by the shared candidate scene.
@@ -241,6 +245,103 @@ pub(crate) struct CandidateScene {
     pub(crate) footer_divider: Option<CandidateSceneRect>,
     pub(crate) footer_mode: Option<CandidateSceneRect>,
     pub(crate) footer_page: Option<CandidateSceneRect>,
+}
+
+/// One semantic region under a scene point. Candidate indices are present
+/// only for regions that belong to a candidate item.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateSceneHit {
+    pub(crate) semantic: CandidateSceneSemantic,
+    pub(crate) candidate_index: Option<usize>,
+    pub(crate) bounds: CandidateSceneRect,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CandidateScene {
+    /// Returns every semantic region at a physical-pixel point, ordered from
+    /// the most specific painted feature to its enclosing container.
+    ///
+    /// Rectangles follow GDI's right-and-bottom-exclusive convention. The
+    /// stable order makes overlapping regions deterministic for future native
+    /// inspection and annotation tools without changing production input.
+    pub(crate) fn semantic_hits_at(&self, x: i32, y: i32) -> Vec<CandidateSceneHit> {
+        if !self.client.contains_point(x, y) {
+            return Vec::new();
+        }
+
+        let mut hits = Vec::new();
+        let mut push = |semantic, candidate_index, bounds: Option<CandidateSceneRect>| {
+            if let Some(bounds) = bounds.filter(|bounds| bounds.contains_point(x, y)) {
+                hits.push(CandidateSceneHit {
+                    semantic,
+                    candidate_index,
+                    bounds,
+                });
+            }
+        };
+
+        // Footer labels are painted after candidates. The current scene
+        // builder keeps them disjoint, while this order also stays defined if
+        // a future layout intentionally overlays a compact footer.
+        push(CandidateSceneSemantic::FooterPage, None, self.footer_page);
+        push(CandidateSceneSemantic::FooterMode, None, self.footer_mode);
+        push(
+            CandidateSceneSemantic::FooterDivider,
+            None,
+            self.footer_divider,
+        );
+        push(CandidateSceneSemantic::Footer, None, self.footer);
+
+        for item in &self.items {
+            if !item.bounds.contains_point(x, y) {
+                continue;
+            }
+            let candidate_index = Some(item.index);
+            push(
+                CandidateSceneSemantic::CandidatePersonalMark,
+                candidate_index,
+                item.personal_mark,
+            );
+            push(
+                CandidateSceneSemantic::CandidateActionDetail,
+                candidate_index,
+                item.action_detail,
+            );
+            push(
+                CandidateSceneSemantic::NoticeIcon,
+                candidate_index,
+                item.notice_icon,
+            );
+            push(
+                CandidateSceneSemantic::CandidateRank,
+                candidate_index,
+                item.rank,
+            );
+            push(
+                CandidateSceneSemantic::CandidateText,
+                candidate_index,
+                Some(item.text),
+            );
+            push(
+                CandidateSceneSemantic::SelectionAccent,
+                candidate_index,
+                item.selection_accent,
+            );
+            push(
+                CandidateSceneSemantic::CandidateSelectedSurface,
+                candidate_index,
+                item.selected_surface,
+            );
+            push(
+                CandidateSceneSemantic::CandidateItem,
+                candidate_index,
+                Some(item.bounds),
+            );
+            break;
+        }
+        hits
+    }
 }
 
 /// Fixed inputs that contain no candidate text or platform window handles.
@@ -1021,6 +1122,95 @@ mod tests {
                 bottom: 41,
             })
         );
+    }
+
+    #[test]
+    fn semantic_hit_testing_prefers_specific_features_and_excludes_far_edges() {
+        let scene = build_candidate_scene(
+            DEFAULT_CANDIDATE_VISUAL_SPEC,
+            CandidateSceneRequest {
+                layout: CandidateSceneLayout::Horizontal,
+                dpi: 96,
+                width: 480,
+                height: 46,
+                candidate_count: 2,
+                horizontal_candidate_widths: &[100, 120],
+                footer_width: 62,
+                footer_mode: false,
+                footer_page: true,
+                selected_surface: true,
+                show_rank: true,
+                notice_icon: false,
+                personalized: &[true, false],
+                rank_metrics: Some(CandidateSceneFontMetrics {
+                    height: 14,
+                    ascent: 11,
+                }),
+                candidate_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+                selected_text_metrics: Some(CandidateSceneFontMetrics {
+                    height: 17,
+                    ascent: 13,
+                }),
+                action_detail_metrics: None,
+            },
+        )
+        .unwrap();
+
+        let semantics = |x, y| {
+            scene
+                .semantic_hits_at(x, y)
+                .into_iter()
+                .map(|hit| (hit.semantic, hit.candidate_index))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            semantics(19, 22),
+            vec![
+                (CandidateSceneSemantic::CandidatePersonalMark, Some(0)),
+                (CandidateSceneSemantic::CandidateRank, Some(0)),
+                (CandidateSceneSemantic::CandidateSelectedSurface, Some(0)),
+                (CandidateSceneSemantic::CandidateItem, Some(0)),
+            ]
+        );
+        assert_eq!(
+            semantics(40, 20),
+            vec![
+                (CandidateSceneSemantic::CandidateText, Some(0)),
+                (CandidateSceneSemantic::CandidateSelectedSurface, Some(0)),
+                (CandidateSceneSemantic::CandidateItem, Some(0)),
+            ]
+        );
+        assert_eq!(
+            semantics(12, 20),
+            vec![
+                (CandidateSceneSemantic::SelectionAccent, Some(0)),
+                (CandidateSceneSemantic::CandidateSelectedSurface, Some(0)),
+                (CandidateSceneSemantic::CandidateItem, Some(0)),
+            ]
+        );
+        assert_eq!(
+            semantics(430, 20),
+            vec![
+                (CandidateSceneSemantic::FooterPage, None),
+                (CandidateSceneSemantic::Footer, None),
+            ]
+        );
+        assert_eq!(
+            semantics(418, 20),
+            vec![(CandidateSceneSemantic::FooterDivider, None)]
+        );
+
+        // The first item's right edge belongs to the adjacent item, while the
+        // client's right and bottom edges lie outside the scene altogether.
+        assert_eq!(
+            semantics(105, 6),
+            vec![(CandidateSceneSemantic::CandidateItem, Some(1))]
+        );
+        assert!(semantics(480, 20).is_empty());
+        assert!(semantics(20, 46).is_empty());
     }
 
     #[test]
