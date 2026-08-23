@@ -3421,7 +3421,7 @@ fn candidate_source_label(source: NativeCandidateSource) -> &'static str {
         NativeCandidateSource::Decoder => "普通组合",
         NativeCandidateSource::TranspositionRecovery => "自动换序",
         NativeCandidateSource::Shape => "Tab 找字",
-        NativeCandidateSource::FourCharacterCorrection => "四字纠错",
+        NativeCandidateSource::FourCharacterCorrection => "公开整词纠错",
     }
 }
 

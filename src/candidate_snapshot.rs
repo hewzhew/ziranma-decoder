@@ -8,8 +8,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Correction, Decoder, DecoderIndexStats, KeySequence, KeySequenceError, MAX_LEXICON_SYLLABLES,
-    ScoreBreakdown, parse_lexicon_tsv, spelling_is_complete_or_anchored_suffix,
+    Correction, DecodeConfig, Decoder, DecoderIndexStats, KeySequence, KeySequenceError,
+    MAX_LEXICON_SYLLABLES, ScoreBreakdown, parse_lexicon_tsv,
+    spelling_is_complete_or_anchored_suffix,
 };
 
 /// First read-only candidate snapshot schema.
@@ -64,7 +65,7 @@ pub(crate) enum InteractiveCandidateSource {
     FinalInitialSentence,
     Decoder,
     #[cfg(windows)]
-    FourCharacterCorrection,
+    FullWordCorrection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +176,58 @@ pub struct FourCharacterCorrectionOffer {
     /// Core candidates first, then new supplemental candidates, without
     /// comparing unrelated raw frequency scales across the two sources.
     pub candidates: Vec<FourCharacterCorrectionCandidate>,
+}
+
+/// One complete two- or three-character word recovered by deleting one
+/// physically adjacent accidental key.
+///
+/// This evidence lane is deliberately narrower than the decoder's general
+/// one-edit channel: only [`Correction::ExtraKey`] is admitted, and the extra
+/// key must be a QWERTY neighbor of at least one key beside it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortWordExtraKeyCorrectionCandidate {
+    /// Public whole-word text recorded by the snapshot.
+    pub text: String,
+    /// Full pinyin recorded by the public lexicon.
+    pub pinyin: String,
+    /// Corrected canonical four- or six-key double-pinyin code.
+    pub intended_code: String,
+    /// The admitted extra-key edit relating the observed keys to the full code.
+    pub correction: Correction,
+    /// Transparent score produced by the ordinary decoder configuration.
+    pub score: ScoreBreakdown,
+}
+
+/// Host-independent decision for the narrow short-word extra-key lane.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShortWordExtraKeyCorrectionDecision {
+    /// Preserve the ordinary candidates without inserting a recovery.
+    KeepOrdinary(ShortWordExtraKeyCorrectionKeepReason),
+    /// Two independent public layers agree on one best corrected code.
+    Offer(ShortWordExtraKeyCorrectionOffer),
+}
+
+/// Structural reason why short-word extra-key recovery stayed hidden.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShortWordExtraKeyCorrectionKeepReason {
+    /// Only five- and seven-key observations are accepted.
+    UnsupportedInputShape,
+    /// At least one of the two independent public layers had no qualifying word.
+    MissingIndependentPublicEvidence,
+    /// Neither public layer yielded a complete adjacent-key extra recovery.
+    NoNeighborExtraKeyRecovery,
+    /// The two public layers preferred different corrected canonical codes.
+    ConflictingIntendedCodes,
+}
+
+/// One cross-dictionary-consensus corrected code and its bounded candidates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortWordExtraKeyCorrectionOffer {
+    /// The canonical complete code preferred independently by both layers.
+    pub intended_code: String,
+    /// Core candidates first, then new supplemental candidates, without
+    /// comparing unrelated raw frequency scales across the two sources.
+    pub candidates: Vec<ShortWordExtraKeyCorrectionCandidate>,
 }
 
 /// Explicit influence bound for one independent supplemental public lexicon.
@@ -488,6 +541,94 @@ impl CandidateSnapshot {
             })
     }
 
+    /// Finds complete public short words behind one adjacent accidental key.
+    ///
+    /// Only two or three full double-pinyin syllables are accepted. General
+    /// substitutions, omissions, transpositions, abbreviations, sentence
+    /// paths, unresolved input, and a second correction are excluded.
+    pub fn short_word_extra_key_correction_candidates(
+        &self,
+        code: &str,
+        syllable_count: usize,
+        limit: usize,
+    ) -> Result<Vec<ShortWordExtraKeyCorrectionCandidate>, KeySequenceError> {
+        let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+        let observed = KeySequence::new(code)?;
+        if limit == 0
+            || !matches!(syllable_count, 2 | 3)
+            || observed.as_str().len() != syllable_count.saturating_mul(2) + 1
+        {
+            return Ok(Vec::new());
+        }
+
+        let observed_bytes = observed.as_str().as_bytes();
+        let mut intended_codes = Vec::new();
+        let mut seen_codes = HashSet::new();
+        for index in 0..observed_bytes.len() {
+            let actual = observed_bytes[index];
+            let is_neighbor = index
+                .checked_sub(1)
+                .and_then(|neighbor| observed_bytes.get(neighbor))
+                .is_some_and(|&neighbor| crate::are_qwerty_neighbors(actual, neighbor))
+                || observed_bytes
+                    .get(index.saturating_add(1))
+                    .is_some_and(|&neighbor| crate::are_qwerty_neighbors(actual, neighbor));
+            if !is_neighbor {
+                continue;
+            }
+            let mut intended = observed_bytes.to_vec();
+            intended.remove(index);
+            let intended = String::from_utf8(intended)
+                .expect("removing one validated lowercase ASCII key preserves UTF-8");
+            if seen_codes.insert(intended.clone()) {
+                intended_codes.push((
+                    intended,
+                    Correction::ExtraKey {
+                        index,
+                        actual: actual as char,
+                    },
+                ));
+            }
+        }
+
+        let extra_key_penalty = DecodeConfig::default().extra_key_penalty;
+        let mut candidates = Vec::new();
+        for (intended_code, correction) in intended_codes {
+            for candidate in self
+                .decoder
+                .decode_exact_full_code(&intended_code, MAX_CANDIDATE_SNAPSHOT_RANK)?
+            {
+                if candidate.text.chars().count() != syllable_count {
+                    continue;
+                }
+                let mut score = candidate.score;
+                score.correction_penalty = extra_key_penalty;
+                score.total -= extra_key_penalty;
+                candidates.push(ShortWordExtraKeyCorrectionCandidate {
+                    text: candidate.text,
+                    pinyin: candidate.pinyin,
+                    intended_code: candidate.code.as_str().to_owned(),
+                    correction: correction.clone(),
+                    score,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .total
+                .total_cmp(&left.score.total)
+                .then_with(|| left.text.cmp(&right.text))
+                .then_with(|| left.intended_code.cmp(&right.intended_code))
+        });
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| {
+            seen.insert((candidate.text.clone(), candidate.intended_code.clone()))
+        });
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
     fn interactive_candidate_texts(
         &self,
         code: &str,
@@ -693,6 +834,85 @@ pub fn layered_four_character_correction_decision(
     }
     Ok(FourCharacterCorrectionDecision::Offer(
         FourCharacterCorrectionOffer {
+            intended_code,
+            candidates,
+        },
+    ))
+}
+
+/// Decides whether two independent public snapshots agree on a complete
+/// short word reached by deleting one physically adjacent accidental key.
+///
+/// The observation must contain exactly one key beyond two or three complete
+/// double-pinyin syllables. Each public layer chooses its own best qualifying
+/// canonical code using only its internal ordering; their unrelated raw
+/// frequencies are never compared. A missing layer, missing evidence, or a
+/// disagreement keeps the ordinary candidates unchanged.
+pub fn layered_short_word_extra_key_correction_decision(
+    core: &CandidateSnapshot,
+    supplemental: Option<&CandidateSnapshot>,
+    code: &str,
+    limit: usize,
+) -> Result<ShortWordExtraKeyCorrectionDecision, KeySequenceError> {
+    let observed = KeySequence::new(code)?;
+    let syllable_count = match observed.as_str().len() {
+        5 => 2,
+        7 => 3,
+        _ => {
+            return Ok(ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+                ShortWordExtraKeyCorrectionKeepReason::UnsupportedInputShape,
+            ));
+        }
+    };
+    let Some(supplemental) = supplemental else {
+        return Ok(ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+            ShortWordExtraKeyCorrectionKeepReason::MissingIndependentPublicEvidence,
+        ));
+    };
+
+    let core_candidates = core.short_word_extra_key_correction_candidates(
+        observed.as_str(),
+        syllable_count,
+        MAX_CANDIDATE_SNAPSHOT_RANK,
+    )?;
+    let supplemental_candidates = supplemental.short_word_extra_key_correction_candidates(
+        observed.as_str(),
+        syllable_count,
+        MAX_CANDIDATE_SNAPSHOT_RANK,
+    )?;
+
+    if core_candidates.is_empty() || supplemental_candidates.is_empty() {
+        let reason = if core_candidates.is_empty() && supplemental_candidates.is_empty() {
+            ShortWordExtraKeyCorrectionKeepReason::NoNeighborExtraKeyRecovery
+        } else {
+            ShortWordExtraKeyCorrectionKeepReason::MissingIndependentPublicEvidence
+        };
+        return Ok(ShortWordExtraKeyCorrectionDecision::KeepOrdinary(reason));
+    }
+    let core_code = core_candidates[0].intended_code.as_str();
+    let supplemental_code = supplemental_candidates[0].intended_code.as_str();
+    if core_code != supplemental_code {
+        return Ok(ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+            ShortWordExtraKeyCorrectionKeepReason::ConflictingIntendedCodes,
+        ));
+    }
+    let intended_code = core_code.to_owned();
+    let limit = limit.min(MAX_CANDIDATE_SNAPSHOT_RANK);
+    let mut seen = HashSet::new();
+    let candidates = core_candidates
+        .into_iter()
+        .chain(supplemental_candidates)
+        .filter(|candidate| candidate.intended_code == intended_code)
+        .filter(|candidate| seen.insert((candidate.text.clone(), candidate.intended_code.clone())))
+        .take(limit)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+            ShortWordExtraKeyCorrectionKeepReason::NoNeighborExtraKeyRecovery,
+        ));
+    }
+    Ok(ShortWordExtraKeyCorrectionDecision::Offer(
+        ShortWordExtraKeyCorrectionOffer {
             intended_code,
             candidates,
         },
@@ -3412,6 +3632,172 @@ mod tests {
                 FourCharacterCorrectionKeepReason::AmbiguousIntendedCodes
             )
         );
+    }
+
+    #[test]
+    fn short_word_extra_key_gate_requires_neighbor_and_independent_consensus() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+可以\tke yi\t1000\n\
+刻意\tke yi\t100\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+可以\tke yi\t800\n\
+可依\tke yi\t80\n";
+        let core = load_test_snapshot("short-extra-key-core-v1", CORE, 2);
+        let supplemental = load_test_snapshot("short-extra-key-supplemental-v1", SUPPLEMENTAL, 2);
+
+        let direct = core
+            .short_word_extra_key_correction_candidates("kehyi", 2, 7)
+            .unwrap();
+        assert_eq!(direct[0].text, "可以");
+        assert_eq!(direct[0].intended_code, "keyi");
+        assert!(matches!(
+            direct[0].correction,
+            Correction::ExtraKey {
+                index: 2,
+                actual: 'h'
+            }
+        ));
+        let general = core
+            .decoder
+            .decode_complete_word_single_edit("kehyi", 2, 7)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.text == "可以"
+                    && candidate.code.as_str() == "keyi"
+                    && matches!(
+                        candidate.correction,
+                        Correction::ExtraKey {
+                            index: 2,
+                            actual: 'h'
+                        }
+                    )
+            })
+            .unwrap();
+        assert_eq!(direct[0].score, general.score);
+
+        let decision = layered_short_word_extra_key_correction_decision(
+            &core,
+            Some(&supplemental),
+            "kehyi",
+            7,
+        )
+        .unwrap();
+        let ShortWordExtraKeyCorrectionDecision::Offer(offer) = decision else {
+            panic!("independent layers should agree on keyi: {decision:?}");
+        };
+        assert_eq!(offer.intended_code, "keyi");
+        assert_eq!(
+            offer
+                .candidates
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>(),
+            ["可以", "刻意", "可依"]
+        );
+
+        assert_eq!(
+            layered_short_word_extra_key_correction_decision(&core, None, "kehyi", 7).unwrap(),
+            ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+                ShortWordExtraKeyCorrectionKeepReason::MissingIndependentPublicEvidence
+            )
+        );
+        assert_eq!(
+            layered_short_word_extra_key_correction_decision(
+                &core,
+                Some(&supplemental),
+                "kexyi",
+                7,
+            )
+            .unwrap(),
+            ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+                ShortWordExtraKeyCorrectionKeepReason::NoNeighborExtraKeyRecovery
+            )
+        );
+        assert_eq!(
+            layered_short_word_extra_key_correction_decision(
+                &core,
+                Some(&supplemental),
+                "keyi",
+                7,
+            )
+            .unwrap(),
+            ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+                ShortWordExtraKeyCorrectionKeepReason::UnsupportedInputShape
+            )
+        );
+    }
+
+    #[test]
+    fn short_word_extra_key_gate_rejects_conflicting_best_codes() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+可以\tke yi\t1000\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+夸一\tkua yi\t1000\n";
+        let core = load_test_snapshot("short-extra-key-conflict-core-v1", CORE, 1);
+        let supplemental =
+            load_test_snapshot("short-extra-key-conflict-supplemental-v1", SUPPLEMENTAL, 1);
+        assert_eq!(
+            crate::encode_pinyin_phrase("ke yi")
+                .unwrap()
+                .full_code
+                .as_str(),
+            "keyi"
+        );
+        assert_eq!(
+            crate::encode_pinyin_phrase("kua yi")
+                .unwrap()
+                .full_code
+                .as_str(),
+            "kwyi"
+        );
+
+        assert_eq!(
+            layered_short_word_extra_key_correction_decision(
+                &core,
+                Some(&supplemental),
+                "kewyi",
+                7,
+            )
+            .unwrap(),
+            ShortWordExtraKeyCorrectionDecision::KeepOrdinary(
+                ShortWordExtraKeyCorrectionKeepReason::ConflictingIntendedCodes
+            )
+        );
+    }
+
+    #[test]
+    fn short_word_extra_key_gate_accepts_one_extra_key_after_three_full_syllables() {
+        const LEXICON: &str = "text\tpinyin\tfrequency\n\
+麻烦猫\tma fan mao\t1000\n";
+        let core = load_test_snapshot("three-syllable-extra-key-core-v1", LEXICON, 1);
+        let supplemental =
+            load_test_snapshot("three-syllable-extra-key-supplemental-v1", LEXICON, 1);
+        let intended = crate::encode_pinyin_phrase("ma fan mao").unwrap().full_code;
+        assert_eq!(intended.as_str().len(), 6);
+        let last = intended.as_str().as_bytes()[5];
+        let extra = (b'a'..=b'z')
+            .find(|&key| crate::are_qwerty_neighbors(last, key))
+            .unwrap();
+        let mut observed = intended.as_str().to_owned();
+        observed.push(extra as char);
+
+        let decision = layered_short_word_extra_key_correction_decision(
+            &core,
+            Some(&supplemental),
+            &observed,
+            1,
+        )
+        .unwrap();
+        let ShortWordExtraKeyCorrectionDecision::Offer(offer) = decision else {
+            panic!("three-syllable consensus recovery should be offered: {decision:?}");
+        };
+        assert_eq!(offer.intended_code, intended.as_str());
+        assert_eq!(offer.candidates[0].text, "麻烦猫");
+        assert!(matches!(
+            offer.candidates[0].correction,
+            Correction::ExtraKey { index: 6, .. }
+        ));
     }
 
     #[test]

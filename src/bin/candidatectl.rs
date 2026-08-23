@@ -44,22 +44,22 @@ use ziranma_core::{
     PublicLexiconRankProbe, PublicLexiconTokenCoverageAudit, PublicRimeSliceConfig,
     PublicRimeSliceImportStats, PublicSupplementalCompositionProbe,
     SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH, SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH,
-    SentenceCandidate, SupplementalCandidateLayerConfig, SupplementalCompositionCandidate,
-    SupplementalCompositionOrder, UdCorpusImportStats, are_qwerty_neighbors,
-    audit_public_lexicon_token_coverage, audit_public_rime_target, audit_public_supplemental_layer,
-    candidate_package_authentication_sha256, candidate_package_storage_id,
-    candidate_payload_fingerprint, candidate_preflight_receipt_body, candidate_sha256_hex,
-    compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
+    SentenceCandidate, ShortWordExtraKeyCorrectionDecision, SupplementalCandidateLayerConfig,
+    SupplementalCompositionCandidate, SupplementalCompositionOrder, UdCorpusImportStats,
+    are_qwerty_neighbors, audit_public_lexicon_token_coverage, audit_public_rime_target,
+    audit_public_supplemental_layer, candidate_package_authentication_sha256,
+    candidate_package_storage_id, candidate_payload_fingerprint, candidate_preflight_receipt_body,
+    candidate_sha256_hex, compare_public_lexicons, encode_pinyin_phrase, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
-    load_candidate_runtime_snapshots_with_layers, load_current_candidate_snapshot,
-    normalize_pinyin_tone_marks, parse_lexicon_tsv, parse_public_rime_phrase_allowlist,
-    parse_public_rime_slice, parse_public_short_word_consensus, parse_rime_lexicon,
-    parse_simplified_rime_lexicon, parse_ud_conllu, select_public_bigram_training_sequences,
-    select_public_character_training_texts, select_public_continuous_composition_cases,
-    select_public_han_span_rank_probes, select_public_lexicon_rank_probes,
-    select_public_single_character_context_cases, select_public_static_context_cases,
-    select_public_supplemental_composition_cases, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    layered_short_word_extra_key_correction_decision, load_candidate_runtime_snapshots_with_layers,
+    load_current_candidate_snapshot, normalize_pinyin_tone_marks, parse_lexicon_tsv,
+    parse_public_rime_phrase_allowlist, parse_public_rime_slice, parse_public_short_word_consensus,
+    parse_rime_lexicon, parse_simplified_rime_lexicon, parse_ud_conllu,
+    select_public_bigram_training_sequences, select_public_character_training_texts,
+    select_public_continuous_composition_cases, select_public_han_span_rank_probes,
+    select_public_lexicon_rank_probes, select_public_single_character_context_cases,
+    select_public_static_context_cases, select_public_supplemental_composition_cases,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 #[cfg(windows)]
@@ -12477,6 +12477,7 @@ fn benchmark_candidate_layers(
     let config = SupplementalCandidateLayerConfig { exact_promotions };
     let codes = layer_benchmark_codes()?;
     let correction_codes = four_character_correction_benchmark_codes()?;
+    let short_correction_codes = short_word_extra_key_correction_benchmark_codes()?;
 
     for code in &codes {
         black_box(core.candidate_texts(black_box(code), 6)?);
@@ -12496,11 +12497,21 @@ fn benchmark_candidate_layers(
             1,
         )?);
     }
+    for code in &short_correction_codes {
+        black_box(layered_short_word_extra_key_correction_decision(
+            &core,
+            Some(&supplemental),
+            black_box(code),
+            1,
+        )?);
+    }
 
     let mut core_durations = Vec::with_capacity(repetitions * codes.len());
     let mut layered_durations = Vec::with_capacity(repetitions * codes.len());
     let mut correction_durations =
         Vec::with_capacity(repetitions.saturating_mul(correction_codes.len()));
+    let mut short_correction_durations =
+        Vec::with_capacity(repetitions.saturating_mul(short_correction_codes.len()));
     let mut checksum = 0usize;
     for _ in 0..repetitions {
         for code in &codes {
@@ -12538,6 +12549,27 @@ fn benchmark_candidate_layers(
             }
             black_box(decision);
         }
+        for code in &short_correction_codes {
+            let started = Instant::now();
+            let decision = layered_short_word_extra_key_correction_decision(
+                &core,
+                Some(&supplemental),
+                black_box(code),
+                1,
+            )?;
+            short_correction_durations.push(started.elapsed());
+            if let ShortWordExtraKeyCorrectionDecision::Offer(offer) = &decision {
+                checksum = update_candidate_text_checksum(
+                    checksum,
+                    &offer
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.text.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            black_box(decision);
+        }
     }
 
     let mut core_top_changes = 0;
@@ -12563,6 +12595,8 @@ fn benchmark_candidate_layers(
         .ok_or("layer benchmark produced no layered samples")?;
     let correction_latency = summarize_durations(&mut correction_durations)
         .ok_or("layer benchmark produced no correction samples")?;
+    let short_correction_latency = summarize_durations(&mut short_correction_durations)
+        .ok_or("layer benchmark produced no short correction samples")?;
     let median_delta_ms = layered_latency.median.as_secs_f64() * 1_000.0
         - core_latency.median.as_secs_f64() * 1_000.0;
     let mut correction_audit_summary = String::new();
@@ -12584,7 +12618,7 @@ fn benchmark_candidate_layers(
         )?;
     }
     Ok(format!(
-        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n{correction_audit_summary}候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
+        "公开补充词层 release 热路径\n固定查询：{}；重复：{repetitions}；样本：{}\n索引构建：核心 {:.3} ms；补充 {:.3} ms\n核心基线：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n启用补充：median {:.3} ms；p95 {:.3} ms；max {:.3} ms\nmedian 差值：{median_delta_ms:+.3} ms\n四字纠错安全门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n短词邻键多按门：查询 {}；样本 {}；median {:.3} ms；p95 {:.3} ms；max {:.3} ms\n{correction_audit_summary}候选顺序发生变化的固定查询：{query_order_changes}\n核心完整码首选变化：{core_top_changes}\n结果校验和：{checksum}\n口径：同机、预热、固定公开完整码与音节边界前缀；不是跨设备性能结论。\n本次操作：只读\n",
         codes.len(),
         core_latency.samples,
         duration_ms(core_build),
@@ -12600,6 +12634,11 @@ fn benchmark_candidate_layers(
         duration_ms(correction_latency.median),
         duration_ms(correction_latency.p95),
         duration_ms(correction_latency.maximum),
+        short_correction_codes.len(),
+        short_correction_latency.samples,
+        duration_ms(short_correction_latency.median),
+        duration_ms(short_correction_latency.p95),
+        duration_ms(short_correction_latency.maximum),
     ))
 }
 
@@ -12670,6 +12709,24 @@ fn four_character_correction_benchmark_codes() -> Result<Vec<String>, Box<dyn st
             }
         }
     }
+    Ok(codes)
+}
+
+fn short_word_extra_key_correction_benchmark_codes()
+-> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut codes = vec!["kehyi".to_owned(), "xnkui".to_owned()];
+    let intended = encode_pinyin_phrase("ma fan mao")?.full_code;
+    let last = *intended
+        .as_str()
+        .as_bytes()
+        .last()
+        .ok_or("fixed short correction phrase has no code")?;
+    let extra = (b'a'..=b'z')
+        .find(|&key| are_qwerty_neighbors(last, key))
+        .ok_or("fixed short correction phrase has no neighbor key")?;
+    let mut observed = intended.as_str().to_owned();
+    observed.push(extra as char);
+    codes.push(observed);
     Ok(codes)
 }
 
@@ -13114,28 +13171,51 @@ fn runtime_query(
             }
             None => runtime.core().candidate_texts(code, query_limit)?,
         };
-        if query_limit >= 2
-            && !candidates.is_empty()
-            && let FourCharacterCorrectionDecision::Offer(offer) =
-                layered_four_character_correction_decision(
+        if query_limit >= 2 && !candidates.is_empty() {
+            let supplemental = runtime
+                .supplemental()
+                .map(|supplemental| supplemental.snapshot().as_ref());
+            let recovered_text = match layered_short_word_extra_key_correction_decision(
+                runtime.core(),
+                supplemental,
+                code,
+                1,
+            )? {
+                ShortWordExtraKeyCorrectionDecision::Offer(offer) => offer
+                    .candidates
+                    .into_iter()
+                    .next()
+                    .map(|candidate| candidate.text),
+                ShortWordExtraKeyCorrectionDecision::KeepOrdinary(_) => None,
+            };
+            let recovered_text = if recovered_text.is_some() {
+                recovered_text
+            } else {
+                match layered_four_character_correction_decision(
                     runtime.core(),
-                    runtime
-                        .supplemental()
-                        .map(|supplemental| supplemental.snapshot().as_ref()),
+                    supplemental,
                     code,
                     1,
-                )?
-            && let Some(recovered) = offer.candidates.into_iter().next()
-        {
-            let existing_index = candidates
-                .iter()
-                .position(|candidate| candidate == &recovered.text);
-            if existing_index != Some(0) {
-                if let Some(existing_index) = existing_index {
-                    candidates.remove(existing_index);
+                )? {
+                    FourCharacterCorrectionDecision::Offer(offer) => offer
+                        .candidates
+                        .into_iter()
+                        .next()
+                        .map(|candidate| candidate.text),
+                    FourCharacterCorrectionDecision::KeepOrdinary(_) => None,
                 }
-                candidates.insert(1.min(candidates.len()), recovered.text);
-                candidates.truncate(query_limit);
+            };
+            if let Some(recovered_text) = recovered_text {
+                let existing_index = candidates
+                    .iter()
+                    .position(|candidate| candidate == &recovered_text);
+                if existing_index != Some(0) {
+                    if let Some(existing_index) = existing_index {
+                        candidates.remove(existing_index);
+                    }
+                    candidates.insert(1.min(candidates.len()), recovered_text);
+                    candidates.truncate(query_limit);
+                }
             }
         }
         Ok(candidates)

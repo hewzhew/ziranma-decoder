@@ -128,6 +128,8 @@ pub enum NativeCandidateSource {
     CharacterPair,
     Decoder,
     TranspositionRecovery,
+    /// Stable wire identity originally introduced for four-character
+    /// correction; now covers every bounded public whole-word correction lane.
     FourCharacterCorrection,
     Shape,
 }

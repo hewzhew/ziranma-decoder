@@ -189,13 +189,15 @@ pub use candidate_snapshot::{
     FourCharacterCorrectionOffer, LayeredCandidateTextsError, MAX_CANDIDATE_SNAPSHOT_BYTES,
     MAX_CANDIDATE_SNAPSHOT_ENTRIES, MAX_CANDIDATE_SNAPSHOT_RANK,
     MAX_SUPPLEMENTAL_COMPOSITION_SYLLABLES, SUPPLEMENTAL_COMPOSITION_CORE_EDGE_DEPTH,
-    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, SupplementalCandidateLayerConfig,
+    SUPPLEMENTAL_COMPOSITION_EDGE_DEPTH, ShortWordExtraKeyCorrectionCandidate,
+    ShortWordExtraKeyCorrectionDecision, ShortWordExtraKeyCorrectionKeepReason,
+    ShortWordExtraKeyCorrectionOffer, SupplementalCandidateLayerConfig,
     SupplementalCandidateLayerError, SupplementalCompositionCandidate,
     SupplementalCompositionOrder, SupplementalCompositionSegment,
     SupplementalCompositionSegmentSource, candidate_payload_fingerprint, layered_candidate_texts,
     layered_candidate_texts_with_consensus, layered_four_character_correction_decision,
-    merge_candidate_text_layers, supplemental_complete_composition_texts,
-    supplemental_complete_composition_texts_with_order,
+    layered_short_word_extra_key_correction_decision, merge_candidate_text_layers,
+    supplemental_complete_composition_texts, supplemental_complete_composition_texts_with_order,
     supplemental_complete_compositions_with_order,
 };
 pub use capsule_replay::{

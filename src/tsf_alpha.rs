@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use crate::candidate_snapshot::{
     FourCharacterCorrectionDecision, InteractiveCandidateQuery, InteractiveCandidateSource,
-    MAX_TAB_SHAPE_SOURCE_RANK, layered_candidate_query_with_consensus_sources,
-    layered_candidate_query_with_sources, layered_four_character_correction_decision,
+    MAX_TAB_SHAPE_SOURCE_RANK, ShortWordExtraKeyCorrectionDecision,
+    layered_candidate_query_with_consensus_sources, layered_candidate_query_with_sources,
+    layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -1176,36 +1177,58 @@ impl SnapshotCandidateProvider {
                                 automatic_transposition_blocked: true,
                             })
                     });
-                if !has_explicit_exact_prefix
-                    && limit >= 2
-                    && !snapshot_query.candidates.is_empty()
-                    && let Ok(FourCharacterCorrectionDecision::Offer(offer)) =
-                        layered_four_character_correction_decision(
+                if !has_explicit_exact_prefix && limit >= 2 && !snapshot_query.candidates.is_empty()
+                {
+                    let supplemental_snapshot =
+                        supplemental.as_ref().map(|(snapshot, _)| snapshot.as_ref());
+                    let recovered_text = match layered_short_word_extra_key_correction_decision(
+                        &self.snapshot,
+                        supplemental_snapshot,
+                        code,
+                        1,
+                    ) {
+                        Ok(ShortWordExtraKeyCorrectionDecision::Offer(offer)) => offer
+                            .candidates
+                            .into_iter()
+                            .next()
+                            .map(|candidate| candidate.text),
+                        _ => None,
+                    }
+                    .or_else(|| {
+                        match layered_four_character_correction_decision(
                             &self.snapshot,
-                            supplemental.as_ref().map(|(snapshot, _)| snapshot.as_ref()),
+                            supplemental_snapshot,
                             code,
                             1,
-                        )
-                    && let Some(recovered) = offer.candidates.into_iter().next()
-                {
-                    let existing_index = snapshot_query
-                        .candidates
-                        .iter()
-                        .position(|candidate| candidate.text == recovered.text);
-                    if existing_index != Some(0) {
-                        if let Some(existing_index) = existing_index {
-                            snapshot_query.candidates.remove(existing_index);
+                        ) {
+                            Ok(FourCharacterCorrectionDecision::Offer(offer)) => offer
+                                .candidates
+                                .into_iter()
+                                .next()
+                                .map(|candidate| candidate.text),
+                            _ => None,
                         }
-                        let insertion_index = 1.min(snapshot_query.candidates.len());
-                        snapshot_query.candidates.insert(
-                            insertion_index,
-                            crate::candidate_snapshot::InteractiveCandidateText {
-                                text: recovered.text,
-                                source: InteractiveCandidateSource::FourCharacterCorrection,
-                            },
-                        );
-                        snapshot_query.candidates.truncate(limit);
-                        automatic_transposition_blocked = true;
+                    });
+                    if let Some(recovered_text) = recovered_text {
+                        let existing_index = snapshot_query
+                            .candidates
+                            .iter()
+                            .position(|candidate| candidate.text == recovered_text);
+                        if existing_index != Some(0) {
+                            if let Some(existing_index) = existing_index {
+                                snapshot_query.candidates.remove(existing_index);
+                            }
+                            let insertion_index = 1.min(snapshot_query.candidates.len());
+                            snapshot_query.candidates.insert(
+                                insertion_index,
+                                crate::candidate_snapshot::InteractiveCandidateText {
+                                    text: recovered_text,
+                                    source: InteractiveCandidateSource::FullWordCorrection,
+                                },
+                            );
+                            snapshot_query.candidates.truncate(limit);
+                            automatic_transposition_blocked = true;
+                        }
                     }
                 }
                 if let (Some((supplemental, config)), Some(phrase)) =
@@ -1338,7 +1361,7 @@ fn native_candidate_source(source: InteractiveCandidateSource) -> NativeCandidat
         InteractiveCandidateSource::CompleteSentence
         | InteractiveCandidateSource::FinalInitialSentence => NativeCandidateSource::Decoder,
         InteractiveCandidateSource::Decoder => NativeCandidateSource::Decoder,
-        InteractiveCandidateSource::FourCharacterCorrection => {
+        InteractiveCandidateSource::FullWordCorrection => {
             NativeCandidateSource::FourCharacterCorrection
         }
     }
@@ -15590,6 +15613,73 @@ mod tests {
                 .provenance
                 .iter()
                 .all(|item| item.source() != NativeCandidateSource::FourCharacterCorrection)
+        );
+    }
+
+    #[test]
+    fn snapshot_provider_places_consensus_neighbor_extra_key_short_word_second() {
+        const CORE: &str = "text\tpinyin\tfrequency\n\
+可\tke\t1000\n\
+坏\thuai\t900\n\
+一\tyi\t800\n\
+可以\tke yi\t700\n";
+        const SUPPLEMENTAL: &str = "text\tpinyin\tfrequency\n\
+可以\tke yi\t900\n\
+可依\tke yi\t100\n";
+        let load = |revision: &str, lexicon: &'static str, count| {
+            Arc::new(
+                CandidateSnapshot::load(crate::CandidateSnapshotDescriptor {
+                    schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1,
+                    revision,
+                    contains_private_text: false,
+                    lexicon_tsv: lexicon,
+                    expected_payload_bytes: lexicon.len(),
+                    expected_payload_fingerprint: crate::candidate_payload_fingerprint(
+                        lexicon.as_bytes(),
+                    ),
+                    expected_entry_count: count,
+                })
+                .unwrap(),
+            )
+        };
+        let core = load("tsf-short-extra-key-core-v1", CORE, 4);
+        let supplemental = load("tsf-short-extra-key-supplemental-v1", SUPPLEMENTAL, 2);
+        let provider = SnapshotCandidateProvider::new(
+            Arc::clone(&core),
+            Some((
+                supplemental,
+                crate::SupplementalCandidateLayerConfig {
+                    exact_promotions: 1,
+                },
+            )),
+            None,
+        );
+
+        let shallow =
+            provider.candidates_with_provenance("kehyi", 1, InteractiveCandidateView::Primary);
+        assert_ne!(shallow.candidates.first().map(String::as_str), Some("可以"));
+
+        let visible =
+            provider.candidates_with_provenance("kehyi", 6, InteractiveCandidateView::Primary);
+        assert_eq!(visible.candidates[1], "可以");
+        assert_eq!(
+            visible.provenance[1].source(),
+            NativeCandidateSource::FourCharacterCorrection
+        );
+        assert!(visible.automatic_transposition_blocked);
+
+        let core_only = SnapshotCandidateProvider::new(core, None, None);
+        let without_consensus =
+            core_only.candidates_with_provenance("kehyi", 6, InteractiveCandidateView::Primary);
+        assert!(
+            without_consensus
+                .candidates
+                .iter()
+                .zip(&without_consensus.provenance)
+                .filter(|(text, _)| text.as_str() == "可以")
+                .all(|(_, provenance)| {
+                    provenance.source() != NativeCandidateSource::FourCharacterCorrection
+                })
         );
     }
 

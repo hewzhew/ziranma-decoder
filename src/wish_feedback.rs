@@ -2285,6 +2285,8 @@ fn candidate_source_tag(value: NativeCandidateSource) -> u8 {
         NativeCandidateSource::Decoder => 7,
         NativeCandidateSource::TranspositionRecovery => 8,
         NativeCandidateSource::Shape => 9,
+        // Tag 10 is retained for wire compatibility after the source widened
+        // from four-character-only to bounded public whole-word correction.
         NativeCandidateSource::FourCharacterCorrection => 10,
         NativeCandidateSource::PublicConsensusExact => 11,
     }
