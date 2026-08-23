@@ -72,22 +72,22 @@ impl CandidateUiLabToken {
         }
     }
 
-    const fn range(self) -> CandidateUiLabTokenRange {
+    pub(crate) const fn bounds(self) -> CandidateUiLabTokenBounds {
         match self {
-            Self::OuterPadding => CandidateUiLabTokenRange::new(0, 16, 1),
-            Self::RowHeight => CandidateUiLabTokenRange::new(28, 56, 1),
-            Self::TextPadding => CandidateUiLabTokenRange::new(2, 16, 1),
-            Self::SelectedTextInset => CandidateUiLabTokenRange::new(4, 24, 1),
-            Self::RankWidth => CandidateUiLabTokenRange::new(10, 28, 1),
-            Self::RankGap => CandidateUiLabTokenRange::new(0, 12, 1),
-            Self::HorizontalMaxWidth => CandidateUiLabTokenRange::new(740, 1200, 10),
-            Self::HorizontalMinItemWidth => CandidateUiLabTokenRange::new(48, 160, 2),
-            Self::VerticalMinWidth => CandidateUiLabTokenRange::new(280, 620, 10),
-            Self::CornerDiameter => CandidateUiLabTokenRange::new(0, 24, 1),
-            Self::SelectedSurfaceHeight => CandidateUiLabTokenRange::new(20, 48, 1),
-            Self::SelectionAccentWidth => CandidateUiLabTokenRange::new(1, 8, 1),
-            Self::CandidateFontHeight => CandidateUiLabTokenRange::new(13, 24, 1),
-            Self::MetadataFontHeight => CandidateUiLabTokenRange::new(10, 20, 1),
+            Self::OuterPadding => CandidateUiLabTokenBounds::new(0, 16, 1),
+            Self::RowHeight => CandidateUiLabTokenBounds::new(28, 56, 1),
+            Self::TextPadding => CandidateUiLabTokenBounds::new(2, 16, 1),
+            Self::SelectedTextInset => CandidateUiLabTokenBounds::new(4, 24, 1),
+            Self::RankWidth => CandidateUiLabTokenBounds::new(10, 28, 1),
+            Self::RankGap => CandidateUiLabTokenBounds::new(0, 12, 1),
+            Self::HorizontalMaxWidth => CandidateUiLabTokenBounds::new(740, 1200, 10),
+            Self::HorizontalMinItemWidth => CandidateUiLabTokenBounds::new(48, 160, 2),
+            Self::VerticalMinWidth => CandidateUiLabTokenBounds::new(280, 620, 10),
+            Self::CornerDiameter => CandidateUiLabTokenBounds::new(0, 24, 1),
+            Self::SelectedSurfaceHeight => CandidateUiLabTokenBounds::new(20, 48, 1),
+            Self::SelectionAccentWidth => CandidateUiLabTokenBounds::new(1, 8, 1),
+            Self::CandidateFontHeight => CandidateUiLabTokenBounds::new(13, 24, 1),
+            Self::MetadataFontHeight => CandidateUiLabTokenBounds::new(10, 20, 1),
         }
     }
 
@@ -131,19 +131,31 @@ impl CandidateUiLabToken {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CandidateUiLabTokenRange {
+pub(crate) struct CandidateUiLabTokenBounds {
     minimum: i32,
     maximum: i32,
     step: i32,
 }
 
-impl CandidateUiLabTokenRange {
+impl CandidateUiLabTokenBounds {
     const fn new(minimum: i32, maximum: i32, step: i32) -> Self {
         Self {
             minimum,
             maximum,
             step,
         }
+    }
+
+    pub(crate) const fn minimum(self) -> i32 {
+        self.minimum
+    }
+
+    pub(crate) const fn maximum(self) -> i32 {
+        self.maximum
+    }
+
+    pub(crate) const fn step(self) -> i32 {
+        self.step
     }
 
     fn shifted(self, value: i32, steps: i32) -> i32 {
@@ -188,8 +200,28 @@ impl CandidateUiLabVisualState {
         CandidateUiLabToken::ALL[self.token_index]
     }
 
+    pub(crate) const fn selected_token_index(self) -> usize {
+        self.token_index
+    }
+
     pub(crate) fn selected_value(self) -> i32 {
         self.selected_token().value(self.active_spec())
+    }
+
+    pub(crate) fn selected_baseline_value(self) -> i32 {
+        self.selected_token().value(self.baseline)
+    }
+
+    pub(crate) fn selected_draft_value(self) -> i32 {
+        self.selected_token().value(self.draft)
+    }
+
+    pub(crate) fn select_token(&mut self, index: usize) -> bool {
+        if index >= CandidateUiLabToken::ALL.len() || index == self.token_index {
+            return false;
+        }
+        self.token_index = index;
+        true
     }
 
     pub(crate) fn cycle_token(&mut self) {
@@ -207,7 +239,7 @@ impl CandidateUiLabVisualState {
     pub(crate) fn adjust_draft(&mut self, steps: i32) -> bool {
         let token = self.selected_token();
         let current = token.value(self.draft);
-        let value = token.range().shifted(current, steps);
+        let value = token.bounds().shifted(current, steps);
         if value == current {
             return false;
         }
@@ -269,8 +301,13 @@ mod tests {
     #[test]
     fn every_token_is_bounded_and_cycling_has_one_stable_order() {
         let mut state = CandidateUiLabVisualState::default();
-        for expected in CandidateUiLabToken::ALL {
+        for (index, expected) in CandidateUiLabToken::ALL.into_iter().enumerate() {
             assert_eq!(state.selected_token(), expected);
+            assert_eq!(state.selected_token_index(), index);
+            let bounds = expected.bounds();
+            assert!(bounds.minimum() <= state.selected_baseline_value());
+            assert!(bounds.maximum() >= state.selected_baseline_value());
+            assert!(bounds.step() > 0);
             let original = state.selected_value();
             let _ = state.adjust_draft(i32::MAX);
             let maximum = state.selected_value();
@@ -283,6 +320,14 @@ mod tests {
             state.cycle_token();
         }
         assert_eq!(state.selected_token(), CandidateUiLabToken::ALL[0]);
+        assert!(!state.select_token(CandidateUiLabToken::ALL.len()));
+        assert_eq!(state.selected_token_index(), 0);
+        assert!(state.select_token(CandidateUiLabToken::ALL.len() - 1));
+        assert_eq!(
+            state.selected_token(),
+            CandidateUiLabToken::ALL[CandidateUiLabToken::ALL.len() - 1]
+        );
+        assert!(!state.select_token(CandidateUiLabToken::ALL.len() - 1));
     }
 
     #[test]

@@ -48,14 +48,15 @@ mod windows_app {
         MAX_CANDIDATE_UI_LAB_NOTE_CHARACTERS, capture_candidate_ui_lab_annotation_context,
         export_candidate_ui_lab_annotations,
     };
-    use crate::candidate_ui_lab_visual::CandidateUiLabVisualState;
+    use crate::candidate_ui_lab_visual::{CandidateUiLabToken, CandidateUiLabVisualState};
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
-        CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, FrameRect,
-        GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, TEXTMETRICW, TRANSPARENT,
+        BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
+        CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
+        DEFAULT_GUI_FONT, DEFAULT_PITCH, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL,
+        FW_SEMIBOLD, FillRect, FrameRect, GetStockObject, GetSysColorBrush, GetTextMetricsW,
+        HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY,
+        SelectObject, SetBkMode, TEXTMETRICW, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::HiDpi::{
@@ -65,7 +66,8 @@ mod windows_app {
         EnableWindow, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+        BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
+        CBN_SELCHANGE, CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
         DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE,
         ES_WANTRETURN, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW,
         GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow, LoadCursorW, MB_ICONERROR,
@@ -73,9 +75,9 @@ mod windows_app {
         SET_WINDOW_POS_FLAGS, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
         SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
         WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
-        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_BORDER,
-        WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP,
-        WS_VISIBLE, WS_VSCROLL,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETFONT, WNDCLASSW,
+        WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_TOOLWINDOW, WS_MINIMIZEBOX,
+        WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, w};
 
@@ -84,6 +86,12 @@ mod windows_app {
     const NOTE_EDIT_ID: i32 = 201;
     const NOTE_SAVE_ID: i32 = 202;
     const NOTE_CANCEL_ID: i32 = 203;
+    const PANEL_TOKEN_ID: i32 = 301;
+    const PANEL_DETAILS_ID: i32 = 302;
+    const PANEL_TOGGLE_ID: i32 = 303;
+    const PANEL_DECREASE_ID: i32 = 304;
+    const PANEL_INCREASE_ID: i32 = 305;
+    const PANEL_RESET_ID: i32 = 306;
     const EDIT_SET_LIMIT_TEXT: u32 = 0x00c5;
 
     thread_local! {
@@ -177,6 +185,8 @@ mod windows_app {
         pending_annotation: Option<CandidateUiLabAnnotationContext>,
         note_window: Option<HWND>,
         note_owner: Option<HWND>,
+        panel_window: Option<HWND>,
+        panel_owner: Option<HWND>,
     }
 
     impl Default for LabState {
@@ -194,6 +204,8 @@ mod windows_app {
                 pending_annotation: None,
                 note_window: None,
                 note_owner: None,
+                panel_window: None,
+                panel_owner: None,
             }
         }
     }
@@ -264,6 +276,56 @@ mod windows_app {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LabVisualCommand {
+        ToggleVariant,
+        CycleToken,
+        SelectToken(usize),
+        AdjustDraft(i32),
+        ResetDraft,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LabVisualChange {
+        None,
+        Metadata,
+        Scene,
+    }
+
+    fn apply_visual_command(state: &mut LabState, command: LabVisualCommand) -> LabVisualChange {
+        match command {
+            LabVisualCommand::ToggleVariant => {
+                state.toggle_visual_variant();
+                LabVisualChange::Scene
+            }
+            LabVisualCommand::CycleToken => {
+                state.cycle_visual_token();
+                LabVisualChange::Metadata
+            }
+            LabVisualCommand::SelectToken(index) => {
+                if state.visual.select_token(index) {
+                    LabVisualChange::Metadata
+                } else {
+                    LabVisualChange::None
+                }
+            }
+            LabVisualCommand::AdjustDraft(steps) => {
+                if state.adjust_visual_draft(steps) {
+                    LabVisualChange::Scene
+                } else {
+                    LabVisualChange::None
+                }
+            }
+            LabVisualCommand::ResetDraft => {
+                if state.reset_visual_draft() {
+                    LabVisualChange::Scene
+                } else {
+                    LabVisualChange::None
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct LabFrameMetrics {
         width: i32,
         height: i32,
@@ -299,10 +361,24 @@ mod windows_app {
                 lpfnWndProc: Some(note_window_proc),
                 hCursor: LoadCursorW(None, IDC_ARROW)
                     .map_err(|_| "无法载入批注窗口光标".to_owned())?,
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
                 ..Default::default()
             };
             if RegisterClassW(&note_class) == 0 {
                 return Err("无法注册候选窗批注窗口".to_owned());
+            }
+            let panel_class_name = w!("ZiranmaCandidateUiLabPanelWindow");
+            let panel_class = WNDCLASSW {
+                hInstance: instance,
+                lpszClassName: panel_class_name,
+                lpfnWndProc: Some(panel_window_proc),
+                hCursor: LoadCursorW(None, IDC_ARROW)
+                    .map_err(|_| "无法载入参数面板光标".to_owned())?,
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                ..Default::default()
+            };
+            if RegisterClassW(&panel_class) == 0 {
+                return Err("无法注册候选窗参数面板".to_owned());
             }
             APP_STATE.with(|slot| slot.replace(Some(LabState::default())));
             let window = match CreateWindowExW(
@@ -328,6 +404,7 @@ mod windows_app {
             refresh_window(window, true);
             let _ = ShowWindow(window, SW_SHOW);
             let _ = SetForegroundWindow(window);
+            open_visual_panel(window);
 
             let mut message = MSG::default();
             loop {
@@ -338,9 +415,17 @@ mod windows_app {
                 if result == 0 {
                     break;
                 }
-                let note_window = APP_STATE
-                    .with(|slot| slot.borrow().as_ref().and_then(|state| state.note_window));
-                if note_window.is_some_and(|window| IsDialogMessageW(window, &message).as_bool()) {
+                let dialog_windows = APP_STATE.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|state| [state.note_window, state.panel_window])
+                        .unwrap_or([None, None])
+                });
+                if dialog_windows
+                    .into_iter()
+                    .flatten()
+                    .any(|window| IsDialogMessageW(window, &message).as_bool())
+                {
                     continue;
                 }
                 let _ = TranslateMessage(&message);
@@ -376,40 +461,40 @@ mod windows_app {
                     export_annotations(window);
                     return LRESULT(0);
                 }
-                let changed = APP_STATE.with(|slot| {
+                if u32::try_from(wparam.0).unwrap_or_default() == 0x50 {
+                    open_visual_panel(window);
+                    return LRESULT(0);
+                }
+                let change = APP_STATE.with(|slot| {
                     let mut slot = slot.borrow_mut();
                     let Some(state) = slot.as_mut() else {
-                        return false;
+                        return LabVisualChange::None;
                     };
                     match u32::try_from(wparam.0).unwrap_or_default() {
-                        0x41 => {
-                            state.toggle_visual_variant();
-                            true
-                        }
+                        0x41 => apply_visual_command(state, LabVisualCommand::ToggleVariant),
                         0x44 => {
                             state.cycle_dpi();
-                            true
+                            LabVisualChange::Scene
                         }
                         0x48 => {
                             state.toggle_layout();
-                            true
+                            LabVisualChange::Scene
                         }
-                        0x52 => state.reset_visual_draft(),
+                        0x52 => apply_visual_command(state, LabVisualCommand::ResetDraft),
                         0x53 => {
                             state.cycle_scenario();
-                            true
+                            LabVisualChange::Scene
                         }
-                        0x54 => {
-                            state.cycle_visual_token();
-                            true
-                        }
-                        0xbb => state.adjust_visual_draft(1),
-                        0xbd => state.adjust_visual_draft(-1),
-                        _ => false,
+                        0x54 => apply_visual_command(state, LabVisualCommand::CycleToken),
+                        0xbb => apply_visual_command(state, LabVisualCommand::AdjustDraft(1)),
+                        0xbd => apply_visual_command(state, LabVisualCommand::AdjustDraft(-1)),
+                        _ => LabVisualChange::None,
                     }
                 });
-                if changed {
-                    refresh_window(window, true);
+                match change {
+                    LabVisualChange::None => {}
+                    LabVisualChange::Metadata => refresh_visual_views(window, false),
+                    LabVisualChange::Scene => refresh_visual_views(window, true),
                 }
                 LRESULT(0)
             }
@@ -476,17 +561,18 @@ mod windows_app {
                 LRESULT(0)
             }
             WM_DESTROY => {
-                let note_window = APP_STATE.with(|slot| {
+                let owned_windows = APP_STATE.with(|slot| {
                     let mut slot = slot.borrow_mut();
                     let state = slot.as_mut()?;
                     state.note_owner = None;
                     state.pending_annotation = None;
-                    state.note_window.take()
+                    state.panel_owner = None;
+                    Some([state.note_window.take(), state.panel_window.take()])
                 });
-                if let Some(note_window) = note_window
-                    .filter(|note_window| unsafe { IsWindow(Some(*note_window)) }.as_bool())
-                {
-                    let _ = unsafe { DestroyWindow(note_window) };
+                for owned_window in owned_windows.into_iter().flatten().flatten() {
+                    if unsafe { IsWindow(Some(owned_window)) }.as_bool() {
+                        let _ = unsafe { DestroyWindow(owned_window) };
+                    }
                 }
                 APP_STATE.with(|slot| slot.replace(None));
                 unsafe { PostQuitMessage(0) };
@@ -494,6 +580,346 @@ mod windows_app {
             }
             _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
         }
+    }
+
+    fn open_visual_panel(owner: HWND) {
+        let existing =
+            APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_window));
+        if existing.is_some_and(|window| unsafe { IsWindow(Some(window)) }.as_bool()) {
+            if let Some(window) = existing {
+                let _ = unsafe { SetForegroundWindow(window) };
+            }
+            return;
+        }
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.panel_owner = Some(owner);
+            }
+        });
+        let mut owner_rect = RECT::default();
+        let (x, y) = if unsafe { GetWindowRect(owner, &mut owner_rect) }.is_ok() {
+            (owner_rect.right.saturating_add(12), owner_rect.top)
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
+        let window = unsafe {
+            let module = match GetModuleHandleW(None) {
+                Ok(module) => module,
+                Err(_) => {
+                    clear_visual_panel();
+                    return notify_error(owner, "无法读取参数面板模块");
+                }
+            };
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+                w!("ZiranmaCandidateUiLabPanelWindow"),
+                w!("视觉参数"),
+                WS_CAPTION | WS_SYSMENU,
+                x,
+                y,
+                500,
+                270,
+                Some(owner),
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        };
+        let window = match window {
+            Ok(window) => window,
+            Err(_) => {
+                clear_visual_panel();
+                return notify_error(owner, "无法创建候选窗参数面板");
+            }
+        };
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.panel_window = Some(window);
+            }
+        });
+        sync_visual_panel(window);
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOW);
+        }
+    }
+
+    unsafe extern "system" fn panel_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CREATE => {
+                if create_visual_panel_controls(window) {
+                    LRESULT(0)
+                } else {
+                    LRESULT(-1)
+                }
+            }
+            WM_COMMAND => {
+                handle_visual_panel_command(
+                    window,
+                    (wparam.0 & 0xffff) as i32,
+                    u32::try_from((wparam.0 >> 16) & 0xffff).unwrap_or_default(),
+                );
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                APP_STATE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(state) = slot.as_mut() else {
+                        return;
+                    };
+                    if state.panel_window == Some(window) {
+                        state.panel_window = None;
+                        state.panel_owner = None;
+                    }
+                });
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    fn create_visual_panel_controls(window: HWND) -> bool {
+        let instance = unsafe { GetModuleHandleW(None) }
+            .ok()
+            .map(|module| HINSTANCE(module.0));
+        let controls = unsafe {
+            [
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    w!("A 是生产默认基线；所有调整只进入本次实验的 B 草案。"),
+                    20,
+                    16,
+                    445,
+                    24,
+                    0,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("COMBOBOX"),
+                    PCWSTR::null(),
+                    20,
+                    46,
+                    290,
+                    260,
+                    PANEL_TOKEN_ID,
+                    CBS_DROPDOWNLIST | WS_TABSTOP.0 as i32 | WS_VSCROLL.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("切换 A / B"),
+                    326,
+                    45,
+                    138,
+                    32,
+                    PANEL_TOGGLE_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    20,
+                    88,
+                    445,
+                    44,
+                    PANEL_DETAILS_ID,
+                    0,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("−"),
+                    20,
+                    136,
+                    72,
+                    34,
+                    PANEL_DECREASE_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("+"),
+                    102,
+                    136,
+                    72,
+                    34,
+                    PANEL_INCREASE_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("BUTTON"),
+                    w!("恢复 B 草案"),
+                    326,
+                    136,
+                    138,
+                    34,
+                    PANEL_RESET_ID,
+                    BS_PUSHBUTTON | WS_TABSTOP.0 as i32,
+                    instance,
+                ),
+                create_control(
+                    window,
+                    w!("STATIC"),
+                    w!("候选预览仍使用独立窗口和共享 GDI painter；关闭面板后按 P 可重新打开。"),
+                    20,
+                    184,
+                    445,
+                    42,
+                    0,
+                    0,
+                    instance,
+                ),
+            ]
+        };
+        if controls.iter().any(Result::is_err) {
+            return false;
+        }
+        let combo = match unsafe { GetDlgItem(Some(window), PANEL_TOKEN_ID) } {
+            Ok(combo) => combo,
+            Err(_) => return false,
+        };
+        for token in CandidateUiLabToken::ALL {
+            let label = token
+                .label()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let result = unsafe {
+                SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(label.as_ptr() as isize)),
+                )
+            };
+            if result.0 < 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn handle_visual_panel_command(window: HWND, id: i32, notification: u32) {
+        if id == PANEL_TOKEN_ID && notification == CBN_SELCHANGE {
+            let combo = match unsafe { GetDlgItem(Some(window), PANEL_TOKEN_ID) } {
+                Ok(combo) => combo,
+                Err(_) => return,
+            };
+            let selected = unsafe { SendMessageW(combo, CB_GETCURSEL, None, None) }.0;
+            let Ok(selected) = usize::try_from(selected) else {
+                return;
+            };
+            let result = APP_STATE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let state = slot.as_mut()?;
+                (state.panel_window == Some(window)).then_some(())?;
+                let owner = state.panel_owner?;
+                Some((
+                    owner,
+                    apply_visual_command(state, LabVisualCommand::SelectToken(selected)),
+                ))
+            });
+            if let Some((owner, change)) = result {
+                match change {
+                    LabVisualChange::None => sync_visual_panel(window),
+                    LabVisualChange::Metadata => refresh_visual_views(owner, false),
+                    LabVisualChange::Scene => refresh_visual_views(owner, true),
+                }
+            }
+            return;
+        }
+        if notification != BN_CLICKED {
+            return;
+        }
+        let result = APP_STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let state = slot.as_mut()?;
+            (state.panel_window == Some(window)).then_some(())?;
+            let owner = state.panel_owner?;
+            let command = match id {
+                PANEL_TOGGLE_ID => LabVisualCommand::ToggleVariant,
+                PANEL_DECREASE_ID => LabVisualCommand::AdjustDraft(-1),
+                PANEL_INCREASE_ID => LabVisualCommand::AdjustDraft(1),
+                PANEL_RESET_ID => LabVisualCommand::ResetDraft,
+                _ => return None,
+            };
+            Some((owner, apply_visual_command(state, command)))
+        });
+        if let Some((owner, change)) = result {
+            match change {
+                LabVisualChange::None => sync_visual_panel(window),
+                LabVisualChange::Metadata => refresh_visual_views(owner, false),
+                LabVisualChange::Scene => refresh_visual_views(owner, true),
+            }
+        }
+    }
+
+    fn sync_visual_panel(window: HWND) {
+        if !unsafe { IsWindow(Some(window)) }.as_bool() {
+            return;
+        }
+        let visual = APP_STATE.with(|slot| {
+            let slot = slot.borrow();
+            let state = slot.as_ref()?;
+            (state.panel_window == Some(window) || state.panel_window.is_none())
+                .then_some(state.visual)
+        });
+        let Some(visual) = visual else {
+            return;
+        };
+        let token = visual.selected_token();
+        let bounds = token.bounds();
+        let title = format!("视觉参数 · {}", visual.active_variant().label());
+        set_window_text(window, &title);
+        let details = format!(
+            "{}：当前 {}  ·  A {}  ·  B {}  ·  范围 {}–{}  ·  步长 {}",
+            token.label(),
+            visual.selected_value(),
+            visual.selected_baseline_value(),
+            visual.selected_draft_value(),
+            bounds.minimum(),
+            bounds.maximum(),
+            bounds.step(),
+        );
+        set_control_text(window, PANEL_DETAILS_ID, &details);
+        if let Ok(combo) = unsafe { GetDlgItem(Some(window), PANEL_TOKEN_ID) } {
+            let _ = unsafe {
+                SendMessageW(
+                    combo,
+                    CB_SETCURSEL,
+                    Some(WPARAM(visual.selected_token_index())),
+                    None,
+                )
+            };
+        }
+    }
+
+    fn clear_visual_panel() {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.panel_window = None;
+                state.panel_owner = None;
+            }
+        });
     }
 
     fn open_note_window(owner: HWND) {
@@ -576,6 +1002,11 @@ mod windows_app {
         });
         unsafe {
             let _ = EnableWindow(owner, false);
+            let panel =
+                APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_window));
+            if let Some(panel) = panel.filter(|panel| IsWindow(Some(*panel)).as_bool()) {
+                let _ = EnableWindow(panel, false);
+            }
             let _ = ShowWindow(window, SW_SHOW);
             let _ = SetForegroundWindow(window);
             if let Ok(editor) = GetDlgItem(Some(window), NOTE_EDIT_ID) {
@@ -628,6 +1059,13 @@ mod windows_app {
                 {
                     unsafe {
                         let _ = EnableWindow(owner, true);
+                        let panel = APP_STATE.with(|slot| {
+                            slot.borrow().as_ref().and_then(|state| state.panel_window)
+                        });
+                        if let Some(panel) = panel.filter(|panel| IsWindow(Some(*panel)).as_bool())
+                        {
+                            let _ = EnableWindow(panel, true);
+                        }
                         let _ = SetForegroundWindow(owner);
                     }
                     refresh_window(owner, false);
@@ -729,7 +1167,7 @@ mod windows_app {
         extra_style: i32,
         instance: Option<HINSTANCE>,
     ) -> windows::core::Result<HWND> {
-        unsafe {
+        let control = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 class_name,
@@ -746,7 +1184,19 @@ mod windows_app {
                 instance,
                 None,
             )
+        }?;
+        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        if !font.is_invalid() {
+            let _ = unsafe {
+                SendMessageW(
+                    control,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                )
+            };
         }
+        Ok(control)
     }
 
     fn save_note(window: HWND) {
@@ -910,12 +1360,32 @@ mod windows_app {
         if resize {
             resize_client(window, metrics.width, metrics.height);
         }
-        let title = title.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-        // SAFETY: the title is NUL-terminated for the synchronous call.
-        unsafe {
-            let _ = SetWindowTextW(window, PCWSTR(title.as_ptr()));
-        }
+        set_window_text(window, &title);
         invalidate_window(window);
+    }
+
+    fn refresh_visual_views(window: HWND, resize: bool) {
+        refresh_window(window, resize);
+        let panel =
+            APP_STATE.with(|slot| slot.borrow().as_ref().and_then(|state| state.panel_window));
+        if let Some(panel) = panel.filter(|panel| unsafe { IsWindow(Some(*panel)) }.as_bool()) {
+            sync_visual_panel(panel);
+        }
+    }
+
+    fn set_control_text(window: HWND, id: i32, text: &str) {
+        if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
+            set_window_text(control, text);
+        }
+    }
+
+    fn set_window_text(window: HWND, text: &str) {
+        let text = text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        // SAFETY: the text is NUL-terminated and the call consumes it
+        // synchronously.
+        unsafe {
+            let _ = SetWindowTextW(window, PCWSTR(text.as_ptr()));
+        }
     }
 
     fn window_title(state: &LabState) -> String {
@@ -933,15 +1403,12 @@ mod windows_app {
         } else {
             format!(" · 批注 {}（仅内存）", state.annotations.len())
         };
-        let token = state.visual.selected_token();
         format!(
-            "候选窗实验室 · {} · {} DPI · {} · {} · {} {}{}{}    A 对照 / T 参数 / - + 调整 / R 重置 / H D S 场景 / 圈选 N 批注 E 导出 / Esc 退出",
+            "候选窗实验室 · {} · {} DPI · {} · {}{}{}    P 参数 / H D S 场景 / 圈选 N 批注 / E 导出 / Esc 退出",
             layout,
             state.dpi(),
             state.scenario().label(),
             state.visual.active_variant().label(),
-            token.label(),
-            state.visual.selected_value(),
             hit,
             annotations,
         )
@@ -1344,7 +1811,7 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::candidate_ui_lab_visual::CandidateUiLabToken;
+        use crate::candidate_ui_lab_visual::CandidateUiLabVariant;
 
         fn assert_current_scene_builds(state: &LabState) {
             let content = state.scenario().content();
@@ -1469,6 +1936,58 @@ mod windows_app {
                 state.cycle_scenario();
                 assert_eq!(state.scenario(), expected);
             }
+        }
+
+        #[test]
+        fn panel_and_keyboard_visual_commands_share_one_change_contract() {
+            let mut state = LabState {
+                selection: Some(CandidateSceneRect {
+                    left: 1,
+                    top: 2,
+                    right: 3,
+                    bottom: 4,
+                }),
+                last_hit: Some("candidate.text".to_owned()),
+                ..LabState::default()
+            };
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::CycleToken),
+                LabVisualChange::Metadata
+            );
+            assert!(state.selection.is_some());
+            assert_eq!(
+                apply_visual_command(
+                    &mut state,
+                    LabVisualCommand::SelectToken(CandidateUiLabToken::ALL.len())
+                ),
+                LabVisualChange::None
+            );
+
+            let baseline = state.active_spec();
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::AdjustDraft(1)),
+                LabVisualChange::Scene
+            );
+            assert_ne!(state.active_spec(), baseline);
+            assert!(state.selection.is_none());
+            assert!(state.last_hit.is_none());
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::ToggleVariant),
+                LabVisualChange::Scene
+            );
+            assert_eq!(
+                state.visual.active_variant(),
+                CandidateUiLabVariant::Baseline
+            );
+            assert_eq!(state.active_spec(), baseline);
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::ResetDraft),
+                LabVisualChange::Scene
+            );
+            assert_eq!(
+                apply_visual_command(&mut state, LabVisualCommand::ResetDraft),
+                LabVisualChange::None
+            );
         }
 
         #[test]
