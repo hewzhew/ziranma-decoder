@@ -30,6 +30,7 @@ mod candidate_runtime;
 mod candidate_signature;
 mod candidate_slots;
 mod candidate_snapshot;
+#[cfg(any(windows, test))]
 mod candidate_ui;
 #[cfg(windows)]
 mod candidate_ui_gdi;

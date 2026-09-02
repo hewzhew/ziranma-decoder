@@ -66,8 +66,8 @@ use ziranma_core::{
 #[cfg(windows)]
 use ziranma_core::{
     CandidatePopupRenderPreflightReport, CandidatePopupRenderSample, CandidatePopupRenderScenario,
-    ExactPhrasePopupRenderPreflightReport, TSF_ALPHA_CANDIDATE_PAGE_SIZE,
-    TsfCandidatePreflightError, preflight_candidate_popup_rendering, preflight_candidate_snapshot,
+    ExactPhrasePopupRenderPreflightReport, TsfCandidatePreflightError,
+    preflight_candidate_popup_rendering, preflight_candidate_snapshot,
     preflight_exact_phrase_candidate_layers, preflight_exact_phrase_candidate_popup_rendering,
     preflight_exact_short_candidate_layers,
 };
@@ -5464,6 +5464,7 @@ struct ExactShortLayerBenchmarkRequest<'a> {
     repetitions: usize,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ExactShortTsfPreflightRequest<'a> {
     core_package: &'a Path,
     supplemental_package: Option<&'a Path>,
@@ -5485,12 +5486,14 @@ struct ExactShortPrepareRequest<'a> {
     repetitions: usize,
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 struct ExactShortTsfLayerIdentity {
     revision: String,
     authentication_sha256: String,
     load_duration: Duration,
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 struct ExactShortTsfPreflightSummary {
     core: ExactShortTsfLayerIdentity,
     supplemental: Option<ExactShortTsfLayerIdentity>,
@@ -6411,6 +6414,7 @@ fn run_exact_short_tsf_preflight(
     Err("exact-short TSF preflight requires Windows".into())
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn render_exact_short_tsf_preflight_report(summary: &ExactShortTsfPreflightSummary) -> String {
     let mut output = String::new();
     writeln!(output, "TSF 精确短词第二页 release 预检").unwrap();
@@ -6449,7 +6453,7 @@ fn render_exact_short_tsf_preflight_report(summary: &ExactShortTsfPreflightSumma
         summary.inspected_codes,
         summary.repetitions,
         summary.first_page.samples,
-        TSF_ALPHA_CANDIDATE_PAGE_SIZE,
+        RUNTIME_QUERY_PAGE_SIZE,
     )
     .unwrap();
     write_tsf_preflight_duration(&mut output, "输入至第一页状态就绪", summary.first_page);
@@ -6479,6 +6483,7 @@ fn render_exact_short_tsf_preflight_report(summary: &ExactShortTsfPreflightSumma
     output
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn write_tsf_preflight_duration(output: &mut String, label: &str, summary: DurationSummary) {
     writeln!(
         output,
@@ -7213,6 +7218,7 @@ const EXACT_PHRASE_CHARACTERS: usize = 3;
 const EXACT_PHRASE_MAX_TOKENS: usize = 3;
 const EXACT_PHRASE_RANK_DEPTH: usize = 10;
 const EXACT_PHRASE_FIRST_PAGE: usize = 6;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const EXACT_PHRASE_TSF_MAX_SCAN_PER_ANCHOR: usize = 64;
 const EXACT_PHRASE_BENCHMARK_CODE_LIMIT: usize = 48;
 
@@ -7717,6 +7723,7 @@ struct ExactPhraseLayerPreflightSummary {
     phrase_entries: usize,
     phrase_codes: usize,
     catalog_audit: ExactPhraseCatalogAudit,
+    #[cfg_attr(not(windows), allow(dead_code))]
     catalog_codes_by_rank: [Vec<String>; EXACT_PHRASE_FIRST_PAGE],
     catalog_audit_duration: Duration,
     sampled_codes: usize,
@@ -7728,11 +7735,13 @@ struct ExactPhraseLayerPreflightSummary {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 enum ExactPhraseTsfProbeSource {
     RankBucket { rank_index: usize, anchor: usize },
     Catalog { anchor: usize },
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn plan_exact_phrase_tsf_probe_sources(
     rank_counts: [usize; EXACT_PHRASE_FIRST_PAGE],
     catalog_len: usize,
@@ -7853,6 +7862,7 @@ impl ExactPhraseCatalogAudit {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ExactPhraseTsfPreflightRequest<'a> {
     core_package: &'a Path,
     supplemental_package: &'a Path,
@@ -7861,6 +7871,7 @@ struct ExactPhraseTsfPreflightRequest<'a> {
     repetitions: usize,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ExactPhrasePopupPreflightRequest<'a> {
     core_package: &'a Path,
     supplemental_package: &'a Path,
@@ -7869,12 +7880,14 @@ struct ExactPhrasePopupPreflightRequest<'a> {
     repetitions: usize,
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 struct ExactPhraseTsfLayerIdentity {
     revision: String,
     authentication_sha256: String,
     load_duration: Duration,
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 struct ExactPhraseTsfPreflightSummary {
     core: ExactPhraseTsfLayerIdentity,
     supplemental: ExactPhraseTsfLayerIdentity,
@@ -8485,6 +8498,7 @@ fn preflight_exact_phrase_tsf(
     Err("exact phrase TSF preflight requires Windows".into())
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn render_exact_phrase_tsf_preflight_report(summary: &ExactPhraseTsfPreflightSummary) -> String {
     let mut output = String::new();
     writeln!(output, "TSF 三字精确词第一页 release 预检").unwrap();

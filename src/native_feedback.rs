@@ -347,14 +347,17 @@ impl NativeCandidateProvenance {
         self
     }
 
+    #[cfg(windows)]
     pub(crate) fn set_short_exact_abstention(&mut self, decision: NativeShortExactAbstention) {
         self.short_exact_abstention = decision;
     }
 
+    #[cfg(windows)]
     pub(crate) fn add_personalization(&mut self, reason: NativeCandidatePersonalization) {
         self.personalization = self.personalization.with(reason);
     }
 
+    #[cfg(windows)]
     pub(crate) fn add_ranking_personalization(
         &mut self,
         reason: NativeCandidatePersonalization,
