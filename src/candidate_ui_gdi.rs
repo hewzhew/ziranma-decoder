@@ -6,14 +6,15 @@
 //! native lab can render through the same drawing path.
 
 use crate::candidate_ui::{
-    CandidateRgb, CandidateScene, CandidateSceneItem, CandidateSceneRect, CandidateVisualSpec,
+    CandidatePreferenceOverlayAction, CandidatePreferenceOverlayScene, CandidateRgb,
+    CandidateScene, CandidateSceneItem, CandidateSceneRect, CandidateVisualSpec,
     candidate_ui_scale,
 };
 use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_TOP, DT_VCENTER, DeleteObject, DrawTextW, FillRect, FillRgn, GetTextExtentPoint32W, HDC,
-    HFONT, HGDIOBJ, SelectObject, SetTextColor,
+    CreateRoundRectRgn, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_TOP, DT_VCENTER, DeleteObject, DrawTextW, FillRect, FillRgn,
+    GetTextExtentPoint32W, HDC, HFONT, HGDIOBJ, SelectObject, SetTextColor,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DrawIconEx, HICON};
 
@@ -389,6 +390,96 @@ pub(crate) unsafe fn paint_candidate_scene(
                 &mut label,
                 &mut bounds,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+        }
+    }
+}
+
+/// Paints the nonactivating candidate-order action strip appended to an
+/// existing candidate scene. The target remains visible in the original row;
+/// this compact duplicate label only confirms which identity will be changed.
+#[allow(dead_code)]
+pub(crate) unsafe fn paint_candidate_preference_overlay_scene(
+    hdc: HDC,
+    dpi: u32,
+    spec: CandidateVisualSpec,
+    scene: &CandidatePreferenceOverlayScene,
+    target: &str,
+    fonts: CandidateSceneFonts,
+) {
+    let bounds = scene_rect(scene.bounds);
+    let background = unsafe { CreateSolidBrush(color_ref(spec.background)) };
+    if !background.is_invalid() {
+        unsafe {
+            let _ = FillRect(hdc, &bounds, background);
+            let _ = DeleteObject(HGDIOBJ(background.0));
+        }
+    }
+
+    let divider = scene_rect(scene.divider);
+    let divider_brush = unsafe { CreateSolidBrush(color_ref(spec.footer_divider)) };
+    if !divider_brush.is_invalid() {
+        unsafe {
+            let _ = FillRect(hdc, &divider, divider_brush);
+            let _ = DeleteObject(HGDIOBJ(divider_brush.0));
+        }
+    }
+
+    if !fonts.metadata.is_invalid() {
+        unsafe {
+            let _ = SelectObject(hdc, HGDIOBJ(fonts.metadata.0));
+        }
+    }
+    let mut target_bounds = scene_rect(scene.target);
+    let target_label = format!("调整 · {target}");
+    let mut target_label = unsafe {
+        popup_text(
+            hdc,
+            &target_label,
+            target_bounds.right.saturating_sub(target_bounds.left),
+            12,
+        )
+    };
+    unsafe {
+        let _ = SetTextColor(hdc, color_ref(spec.rank));
+        let _ = DrawTextW(
+            hdc,
+            &mut target_label,
+            &mut target_bounds,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+    }
+
+    for item in &scene.actions {
+        unsafe {
+            fill_rounded_rect(
+                hdc,
+                scene_rect(item.bounds),
+                candidate_ui_scale(dpi, spec.selected_surface_corner_diameter),
+                spec.selected_background,
+            );
+        }
+        let (label, color) = match item.action {
+            CandidatePreferenceOverlayAction::Prefer => ("提高", spec.mode_accent),
+            CandidatePreferenceOverlayAction::DeferToPublic => ("公共排序", spec.candidate_text),
+            CandidatePreferenceOverlayAction::RestorePersonalization => {
+                ("撤销降低", spec.candidate_text)
+            }
+        };
+        if !fonts.metadata.is_invalid() {
+            unsafe {
+                let _ = SelectObject(hdc, HGDIOBJ(fonts.metadata.0));
+            }
+        }
+        let mut label = label.encode_utf16().collect::<Vec<_>>();
+        let mut label_bounds = scene_rect(item.bounds);
+        unsafe {
+            let _ = SetTextColor(hdc, color_ref(color));
+            let _ = DrawTextW(
+                hdc,
+                &mut label,
+                &mut label_bounds,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
             );
         }
     }

@@ -27,16 +27,19 @@ use crate::candidate_snapshot::{
     layered_four_character_correction_decision, layered_short_word_extra_key_correction_decision,
 };
 use crate::candidate_ui::{
-    CandidateRgb, CandidateScene, CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics,
-    CandidateSceneLayout, CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
-    allocate_horizontal_candidate_widths, build_candidate_scene,
+    CandidatePreferenceOverlayAction, CandidateRgb, CandidateScene,
+    CandidateSceneActionDetailMetrics, CandidateSceneFontMetrics, CandidateSceneLayout,
+    CandidateSceneRect, CandidateSceneRequest, DEFAULT_CANDIDATE_VISUAL_SPEC,
+    allocate_horizontal_candidate_widths, build_candidate_preference_overlay_scene,
+    build_candidate_scene,
     candidate_horizontal_logical_width as shared_candidate_horizontal_logical_width,
-    candidate_ui_scale,
+    candidate_preference_overlay_height, candidate_ui_scale,
     candidate_vertical_logical_width as shared_candidate_vertical_logical_width,
     estimated_candidate_logical_text_width,
 };
 use crate::candidate_ui_gdi::{
-    CandidateSceneFonts, CandidateScenePaintContent, paint_candidate_scene,
+    CandidateSceneFonts, CandidateScenePaintContent, paint_candidate_preference_overlay_scene,
+    paint_candidate_scene,
 };
 use crate::composition::{MAX_TAB_ASSEMBLY_CHARACTERS, TabAssemblySelection, TabAssemblyStage};
 use crate::personal_ranking::CandidateTextPromotion;
@@ -87,13 +90,13 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CombineRgn,
-    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL,
-    FW_SEMIBOLD, FillRect, FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW,
-    HBITMAP, HDC, HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject,
-    SetBkMode, SetWindowRgn, TEXTMETRICW, TRANSPARENT, UpdateWindow,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CombineRgn, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
+    FillRgn, GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, RGN_DIFF, RGN_ERROR, SRCCOPY, SelectObject, SetBkMode, SetWindowRgn, TEXTMETRICW,
+    TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -142,13 +145,13 @@ use windows::Win32::UI::TextServices::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetForegroundWindow,
-    GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON, IsWindow, IsWindowVisible,
-    KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MA_NOACTIVATE, MENU_ITEM_FLAGS, MF_CHECKED,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
-    WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HWND_TOPMOST, IMAGE_ICON, IsWindow,
+    IsWindowVisible, KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MA_NOACTIVATE,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, SET_WINDOW_POS_FLAGS, SW_HIDE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONUP, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -5148,9 +5151,6 @@ struct CompletedCandidatePopupRenderTiming {
     sample: CandidatePopupRenderSample,
 }
 
-const CANDIDATE_PREFERENCE_MENU_PREFER: u32 = 41_001;
-const CANDIDATE_PREFERENCE_MENU_DEFER: u32 = 41_002;
-const CANDIDATE_PREFERENCE_MENU_RESTORE: u32 = 41_003;
 const MAX_PENDING_CANDIDATE_PREFERENCE_LABELS: usize = 32;
 const MANUAL_PREFERENCE_SUPPORT_VOTES: usize = 4;
 
@@ -5160,6 +5160,40 @@ struct PendingCandidatePreferenceLabel {
     text: String,
     action: NativeCandidatePreferenceAction,
     context: NativeFeedbackContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidatePreferenceTarget {
+    code: String,
+    text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidatePreferenceOverlay {
+    target: CandidatePreferenceTarget,
+    base_window: CandidatePopupPlacement,
+    base_client_height: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CandidatePreferenceOverlayIntent {
+    Ignore,
+    Close,
+    Open(CandidatePreferenceTarget),
+}
+
+fn candidate_preference_overlay_intent(
+    current: Option<&CandidatePreferenceTarget>,
+    clicked: Option<CandidatePreferenceTarget>,
+) -> CandidatePreferenceOverlayIntent {
+    match (current, clicked) {
+        (None, None) => CandidatePreferenceOverlayIntent::Ignore,
+        (Some(_), None) => CandidatePreferenceOverlayIntent::Close,
+        (Some(current), Some(clicked)) if current == &clicked => {
+            CandidatePreferenceOverlayIntent::Close
+        }
+        (_, Some(clicked)) => CandidatePreferenceOverlayIntent::Open(clicked),
+    }
 }
 
 #[derive(Default)]
@@ -5200,6 +5234,7 @@ struct CandidatePopupPaintState {
     transient_notice: bool,
     transient_hidden: bool,
     preference_queue: Weak<RefCell<CandidatePreferenceQueue>>,
+    preference_overlay: Option<CandidatePreferenceOverlay>,
     feedback_context: NativeFeedbackContext,
 }
 
@@ -5242,6 +5277,32 @@ fn configure_candidate_popup_corners(hwnd: HWND) -> CandidatePopupCornerStrategy
         CandidatePopupCornerStrategy::SystemDwm
     } else {
         CandidatePopupCornerStrategy::RegionFallback
+    }
+}
+
+fn apply_candidate_popup_fallback_region(
+    hwnd: HWND,
+    strategy: CandidatePopupCornerStrategy,
+    dpi: u32,
+    width: i32,
+    height: i32,
+) {
+    if !strategy.uses_custom_region() || width <= 0 || height <= 0 {
+        return;
+    }
+    let corner = candidate_popup_corner_diameter(dpi);
+    // SAFETY: the region uses popup-local coordinates. Windows owns it after
+    // a successful SetWindowRgn call; otherwise this function releases it.
+    let region = unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner) };
+    if region.is_invalid() {
+        return;
+    }
+    // SAFETY: the HWND belongs to the live candidate popup.
+    if unsafe { SetWindowRgn(hwnd, Some(region), false) } == 0 {
+        // SAFETY: ownership did not transfer after failure.
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(region.0));
+        }
     }
 }
 
@@ -5425,6 +5486,12 @@ impl CandidatePopup {
             // SAFETY: this controller owns the popup and its fixed timer id.
             let _ = unsafe { KillTimer(Some(hwnd), INLINE_WISH_NOTICE_TIMER_ID) };
         }
+        if self.paint.preference_overlay.take().is_some() {
+            // The window procedure may have temporarily expanded the HWND for
+            // its nonactivating action strip. Force the normal placement path
+            // to restore the exact candidate dimensions for fresh content.
+            self.placement = None;
+        }
         if self.paint.transient_hidden {
             self.visible = false;
             self.paint.transient_hidden = false;
@@ -5553,22 +5620,13 @@ impl CandidatePopup {
         if self.paint.corner_strategy.uses_custom_region()
             && placement.size_differs_from(self.placement)
         {
-            let corner = candidate_popup_corner_diameter(dpi);
-            // SAFETY: the region uses popup-local coordinates. On success
-            // Windows owns it; on failure this method retains cleanup
-            // responsibility. Content-only updates reuse the existing region
-            // so Windows does not erase and reshape the popup for every key.
-            let region = unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner) };
-            if !region.is_invalid() {
-                // SAFETY: the popup belongs to this controller. The explicit
-                // invalidation below redraws the completed frame once.
-                if unsafe { SetWindowRgn(hwnd, Some(region), false) } == 0 {
-                    // SAFETY: ownership did not transfer after failure.
-                    unsafe {
-                        let _ = DeleteObject(HGDIOBJ(region.0));
-                    }
-                }
-            }
+            apply_candidate_popup_fallback_region(
+                hwnd,
+                self.paint.corner_strategy,
+                dpi,
+                width,
+                height,
+            );
         }
         let was_visible = self.visible;
         if self.placement != Some(placement) || !was_visible {
@@ -5656,6 +5714,9 @@ impl CandidatePopup {
         if !visible {
             self.paint
                 .fail_pending_timing(CandidatePopupRenderPreflightError::PaintNotObserved);
+            if self.paint.preference_overlay.take().is_some() {
+                self.placement = None;
+            }
         }
         let Some(hwnd) = self.hwnd else {
             return;
@@ -5713,6 +5774,7 @@ impl CandidatePopup {
         self.visible = false;
         self.paint.transient_notice = false;
         self.paint.transient_hidden = false;
+        self.paint.preference_overlay = None;
     }
 }
 
@@ -6130,7 +6192,7 @@ fn candidate_popup_candidate_at(
     state: &CandidatePopupPaintState,
     x: i32,
     y: i32,
-) -> Option<(String, String)> {
+) -> Option<CandidatePreferenceTarget> {
     if state.display.notice
         || state.display.mode != CandidateDisplayMode::Normal
         || state.display.view != InteractiveCandidateView::Primary
@@ -6147,74 +6209,205 @@ fn candidate_popup_candidate_at(
         .find_map(|hit| hit.candidate_index)?;
     let absolute_index = state.display.page_start.checked_add(visible_index)?;
     let text = state.display.candidates.get(absolute_index)?.clone();
-    Some((code, text))
+    Some(CandidatePreferenceTarget { code, text })
 }
 
-fn queue_candidate_popup_preference(
+fn candidate_preference_expanded_placement(
+    base: CandidatePopupPlacement,
+    added_height: i32,
+    work_area: Option<RECT>,
+) -> CandidatePopupPlacement {
+    let height = base.height.saturating_add(added_height.max(0));
+    let mut y = base.y;
+    if let Some(work) = work_area {
+        if y.saturating_add(height) > work.bottom {
+            y = y.saturating_sub(added_height.max(0));
+        }
+        y = y.clamp(work.top, work.bottom.saturating_sub(height).max(work.top));
+    }
+    CandidatePopupPlacement { height, y, ..base }
+}
+
+fn open_candidate_popup_preference_overlay(
+    hwnd: HWND,
+    state: &mut CandidatePopupPaintState,
+    target: CandidatePreferenceTarget,
+) -> bool {
+    if state.preference_queue.upgrade().is_none() {
+        return false;
+    }
+    if let Some(overlay) = state.preference_overlay.as_mut() {
+        overlay.target = target;
+        // SAFETY: only the popup's already allocated client area is redrawn.
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        return true;
+    }
+
+    let mut window = RECT::default();
+    let mut client = RECT::default();
+    // SAFETY: both rectangles are stack-owned outputs for this live popup.
+    if unsafe { GetWindowRect(hwnd, &mut window) }.is_err()
+        || unsafe { GetClientRect(hwnd, &mut client) }.is_err()
+    {
+        return false;
+    }
+    let base_window = CandidatePopupPlacement {
+        x: window.left,
+        y: window.top,
+        width: window.right.saturating_sub(window.left),
+        height: window.bottom.saturating_sub(window.top),
+    };
+    let base_client_height = client.bottom.saturating_sub(client.top);
+    if base_window.width <= 0 || base_window.height <= 0 || base_client_height <= 0 {
+        return false;
+    }
+    let added_height = candidate_preference_overlay_height(state.dpi);
+    let monitor = unsafe { MonitorFromRect(&window, MONITOR_DEFAULTTONEAREST) };
+    let mut monitor_info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    let work_area = (!monitor.is_invalid()
+        && unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool())
+    .then_some(monitor_info.rcWork);
+    let expanded = candidate_preference_expanded_placement(base_window, added_height, work_area);
+    state.preference_overlay = Some(CandidatePreferenceOverlay {
+        target,
+        base_window,
+        base_client_height,
+    });
+    let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0);
+    // SAFETY: resizing this WS_EX_NOACTIVATE popup cannot activate it. The
+    // editor remains the keyboard focus owner throughout the interaction.
+    if unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            expanded.x,
+            expanded.y,
+            expanded.width,
+            expanded.height,
+            flags,
+        )
+    }
+    .is_err()
+    {
+        state.preference_overlay = None;
+        return false;
+    }
+    apply_candidate_popup_fallback_region(
+        hwnd,
+        state.corner_strategy,
+        state.dpi,
+        expanded.width,
+        expanded.height,
+    );
+    // SAFETY: redraws the expanded popup without activating it.
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    true
+}
+
+fn close_candidate_popup_preference_overlay(
+    hwnd: HWND,
+    state: &mut CandidatePopupPaintState,
+) -> bool {
+    let Some(overlay) = state.preference_overlay.take() else {
+        return false;
+    };
+    let base = overlay.base_window;
+    let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0);
+    // SAFETY: restoring the saved size and position preserves nonactivation.
+    if unsafe { SetWindowPos(hwnd, None, base.x, base.y, base.width, base.height, flags) }.is_err()
+    {
+        state.preference_overlay = Some(overlay);
+        return false;
+    }
+    apply_candidate_popup_fallback_region(
+        hwnd,
+        state.corner_strategy,
+        state.dpi,
+        base.width,
+        base.height,
+    );
+    // SAFETY: redraws only the restored candidate popup.
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    true
+}
+
+fn handle_candidate_popup_preference_right_click(
     hwnd: HWND,
     state: &mut CandidatePopupPaintState,
     client_point: POINT,
 ) -> bool {
-    let Some((code, text)) = candidate_popup_candidate_at(state, client_point.x, client_point.y)
-    else {
+    let clicked = candidate_popup_candidate_at(state, client_point.x, client_point.y);
+    let current = state
+        .preference_overlay
+        .as_ref()
+        .map(|overlay| &overlay.target);
+    match candidate_preference_overlay_intent(current, clicked) {
+        CandidatePreferenceOverlayIntent::Ignore => false,
+        CandidatePreferenceOverlayIntent::Close => {
+            close_candidate_popup_preference_overlay(hwnd, state)
+        }
+        CandidatePreferenceOverlayIntent::Open(target) => {
+            open_candidate_popup_preference_overlay(hwnd, state, target)
+        }
+    }
+}
+
+fn activate_candidate_popup_preference(
+    hwnd: HWND,
+    state: &mut CandidatePopupPaintState,
+    client_point: POINT,
+) -> bool {
+    let Some(overlay) = state.preference_overlay.as_ref().cloned() else {
         return false;
+    };
+    let mut client = RECT::default();
+    // SAFETY: client is a stack-owned output for this live popup.
+    if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+        return false;
+    }
+    let action = build_candidate_preference_overlay_scene(
+        state.dpi,
+        client.right.saturating_sub(client.left),
+        overlay.base_client_height,
+        client.bottom.saturating_sub(client.top),
+    )
+    .and_then(|scene| scene.action_at(client_point.x, client_point.y));
+    let Some(action) = action else {
+        return close_candidate_popup_preference_overlay(hwnd, state);
+    };
+    let action = match action {
+        CandidatePreferenceOverlayAction::Prefer => NativeCandidatePreferenceAction::Prefer,
+        CandidatePreferenceOverlayAction::DeferToPublic => {
+            NativeCandidatePreferenceAction::DeferToPublic
+        }
+        CandidatePreferenceOverlayAction::RestorePersonalization => {
+            NativeCandidatePreferenceAction::RestorePersonalization
+        }
     };
     let Some(queue) = state.preference_queue.upgrade() else {
         return false;
-    };
-    let Ok(menu) = NativeFeedbackPopupMenu::create() else {
-        return false;
-    };
-    if menu
-        .append(CANDIDATE_PREFERENCE_MENU_PREFER, MF_STRING.0, "提高优先级")
-        .and_then(|()| {
-            menu.append(
-                CANDIDATE_PREFERENCE_MENU_DEFER,
-                MF_STRING.0,
-                "降低优先级（使用公共排序）",
-            )
-        })
-        .and_then(|()| {
-            menu.append(
-                CANDIDATE_PREFERENCE_MENU_RESTORE,
-                MF_STRING.0,
-                "撤销降低，重新允许个人学习",
-            )
-        })
-        .is_err()
-    {
-        return false;
-    }
-    let mut screen_point = client_point;
-    // SAFETY: this converts one stack-owned point for the live popup.
-    if !unsafe { ClientToScreen(hwnd, &mut screen_point) }.as_bool() {
-        return false;
-    }
-    let action = match menu.track(&screen_point) {
-        Some(CANDIDATE_PREFERENCE_MENU_PREFER) => NativeCandidatePreferenceAction::Prefer,
-        Some(CANDIDATE_PREFERENCE_MENU_DEFER) => NativeCandidatePreferenceAction::DeferToPublic,
-        Some(CANDIDATE_PREFERENCE_MENU_RESTORE) => {
-            NativeCandidatePreferenceAction::RestorePersonalization
-        }
-        _ => return false,
     };
     let Ok(mut queue) = queue.try_borrow_mut() else {
         return false;
     };
     queue.push(PendingCandidatePreferenceLabel {
-        code,
-        text,
+        code: overlay.target.code,
+        text: overlay.target.text,
         action,
         context: state.feedback_context,
     });
     drop(queue);
     state.display.mode_label_override = Some("已标记 · 下次输入生效".to_owned());
-    // SAFETY: only the popup's already allocated client area is invalidated;
-    // the editor remains the active keyboard window.
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, false);
-    }
-    true
+    close_candidate_popup_preference_overlay(hwnd, state)
 }
 
 unsafe extern "system" fn candidate_popup_window_proc(
@@ -6237,7 +6430,22 @@ unsafe extern "system" fn candidate_popup_window_proc(
             y: i32::from(((packed >> 16) as u16) as i16),
         };
         // SAFETY: the boxed state outlives this synchronous callback.
-        if queue_candidate_popup_preference(hwnd, unsafe { &mut *state_pointer }, point) {
+        if handle_candidate_popup_preference_right_click(
+            hwnd,
+            unsafe { &mut *state_pointer },
+            point,
+        ) {
+            return LRESULT(0);
+        }
+    }
+    if message == WM_LBUTTONUP && !state_pointer.is_null() {
+        let packed = u32::try_from(lparam.0).unwrap_or(lparam.0 as u32);
+        let point = POINT {
+            x: i32::from((packed as u16) as i16),
+            y: i32::from(((packed >> 16) as u16) as i16),
+        };
+        // SAFETY: the boxed state outlives this synchronous callback.
+        if activate_candidate_popup_preference(hwnd, unsafe { &mut *state_pointer }, point) {
             return LRESULT(0);
         }
     }
@@ -6435,6 +6643,12 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             format!("{}{separator}{}", state.display.current_page() + 1, pages)
         }
     });
+    let preference_overlay = state.preference_overlay.clone();
+    let scene_height = preference_overlay
+        .as_ref()
+        .map_or(client_height, |overlay| overlay.base_client_height)
+        .min(client_height)
+        .max(0);
     let horizontal_widths = if state.layout == CandidatePopupLayout::Horizontal {
         horizontal_candidate_widths(&state.display, state.dpi, client_width)
     } else {
@@ -6446,7 +6660,7 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
             layout: state.layout,
             dpi: state.dpi,
             width: client_width,
-            height: client_height,
+            height: scene_height,
             candidate_count: state.display.visible().len(),
             horizontal_candidate_widths: &horizontal_widths,
             footer_width: scale(candidate_popup_footer_logical_width(&state.display)),
@@ -6497,10 +6711,38 @@ unsafe fn paint_candidate_popup(hwnd: HWND, state: &mut CandidatePopupPaintState
         }
     }
 
-    let painted_client = scene
-        .as_ref()
-        .map(|scene| candidate_scene_rect(scene.client))
-        .unwrap_or(client);
+    if let Some(overlay) = preference_overlay.as_ref()
+        && let Some(overlay_scene) = build_candidate_preference_overlay_scene(
+            state.dpi,
+            client_width,
+            overlay.base_client_height,
+            client_height,
+        )
+    {
+        unsafe {
+            paint_candidate_preference_overlay_scene(
+                hdc,
+                state.dpi,
+                DEFAULT_CANDIDATE_VISUAL_SPEC,
+                &overlay_scene,
+                &overlay.target.text,
+                CandidateSceneFonts {
+                    candidate: candidate_font,
+                    selected: selected_font,
+                    metadata: metadata_font,
+                },
+            );
+        }
+    }
+
+    let painted_client = if preference_overlay.is_some() {
+        client
+    } else {
+        scene
+            .as_ref()
+            .map(|scene| candidate_scene_rect(scene.client))
+            .unwrap_or(client)
+    };
     if state.corner_strategy.uses_custom_region() {
         // SAFETY: the compatibility border is bounded to this popup's paint
         // DC and shares its corner geometry with the fallback window region.
@@ -26189,6 +26431,91 @@ mod tests {
         assert!(candidate_popup_should_show(true, true, true));
         assert!(!candidate_popup_should_show(false, true, true));
         assert!(!candidate_popup_should_show(true, false, true));
+    }
+
+    fn preference_target(code: &str, text: &str) -> CandidatePreferenceTarget {
+        CandidatePreferenceTarget {
+            code: code.to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn candidate_preference_overlay_right_clicks_open_switch_and_cancel_deterministically() {
+        let first = preference_target("ab", "甲");
+        let second = preference_target("ab", "乙");
+        assert_eq!(
+            candidate_preference_overlay_intent(None, None),
+            CandidatePreferenceOverlayIntent::Ignore
+        );
+        assert_eq!(
+            candidate_preference_overlay_intent(None, Some(first.clone())),
+            CandidatePreferenceOverlayIntent::Open(first.clone())
+        );
+        assert_eq!(
+            candidate_preference_overlay_intent(Some(&first), Some(first.clone())),
+            CandidatePreferenceOverlayIntent::Close
+        );
+        assert_eq!(
+            candidate_preference_overlay_intent(Some(&first), None),
+            CandidatePreferenceOverlayIntent::Close
+        );
+        assert_eq!(
+            candidate_preference_overlay_intent(Some(&first), Some(second.clone())),
+            CandidatePreferenceOverlayIntent::Open(second)
+        );
+    }
+
+    #[test]
+    fn candidate_preference_overlay_expands_without_leaving_the_work_area() {
+        let base = CandidatePopupPlacement {
+            x: 24,
+            y: 100,
+            width: 280,
+            height: 46,
+        };
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1_920,
+            bottom: 200,
+        };
+        assert_eq!(
+            candidate_preference_expanded_placement(base, 42, Some(work)),
+            CandidatePopupPlacement { height: 88, ..base }
+        );
+
+        let near_bottom = CandidatePopupPlacement { y: 130, ..base };
+        assert_eq!(
+            candidate_preference_expanded_placement(near_bottom, 42, Some(work)),
+            CandidatePopupPlacement {
+                y: 88,
+                height: 88,
+                ..near_bottom
+            }
+        );
+    }
+
+    #[test]
+    fn candidate_preference_queue_keeps_only_the_latest_intent_per_identity() {
+        let mut queue = CandidatePreferenceQueue::default();
+        for action in [
+            NativeCandidatePreferenceAction::Prefer,
+            NativeCandidatePreferenceAction::DeferToPublic,
+            NativeCandidatePreferenceAction::RestorePersonalization,
+        ] {
+            queue.push(PendingCandidatePreferenceLabel {
+                code: "ab".to_owned(),
+                text: "甲".to_owned(),
+                action,
+                context: NativeFeedbackContext::Eligible,
+            });
+        }
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(
+            queue.pending.front().map(|label| label.action),
+            Some(NativeCandidatePreferenceAction::RestorePersonalization)
+        );
     }
 
     fn pending_popup_render_timing() -> PendingCandidatePopupTiming {

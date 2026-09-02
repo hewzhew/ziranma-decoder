@@ -191,6 +191,145 @@ impl CandidateSceneRect {
     }
 }
 
+/// One explicit ordering action exposed by the nonactivating candidate
+/// preference strip. This UI-local identity keeps the geometry module
+/// independent from the feedback journal and personal-ranking store.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidatePreferenceOverlayAction {
+    Prefer,
+    DeferToPublic,
+    RestorePersonalization,
+}
+
+/// One action button in the candidate preference strip.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidatePreferenceOverlayItem {
+    pub(crate) action: CandidatePreferenceOverlayAction,
+    pub(crate) bounds: CandidateSceneRect,
+}
+
+/// Deterministic physical-pixel geometry for the candidate preference strip.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidatePreferenceOverlayScene {
+    pub(crate) bounds: CandidateSceneRect,
+    pub(crate) divider: CandidateSceneRect,
+    pub(crate) target: CandidateSceneRect,
+    pub(crate) actions: [CandidatePreferenceOverlayItem; 3],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CandidatePreferenceOverlayScene {
+    pub(crate) fn action_at(&self, x: i32, y: i32) -> Option<CandidatePreferenceOverlayAction> {
+        self.actions
+            .iter()
+            .find(|item| item.bounds.contains_point(x, y))
+            .map(|item| item.action)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const CANDIDATE_PREFERENCE_OVERLAY_HEIGHT_LOGICAL: i32 = 42;
+#[cfg_attr(not(test), allow(dead_code))]
+const CANDIDATE_PREFERENCE_OVERLAY_BUTTON_HEIGHT_LOGICAL: i32 = 28;
+#[cfg_attr(not(test), allow(dead_code))]
+const CANDIDATE_PREFERENCE_OVERLAY_GAP_LOGICAL: i32 = 4;
+#[cfg_attr(not(test), allow(dead_code))]
+const CANDIDATE_PREFERENCE_OVERLAY_TARGET_MIN_WIDTH_LOGICAL: i32 = 42;
+#[cfg_attr(not(test), allow(dead_code))]
+const CANDIDATE_PREFERENCE_OVERLAY_ACTION_WIDTHS_LOGICAL: [i32; 3] = [44, 72, 72];
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn candidate_preference_overlay_height(dpi: u32) -> i32 {
+    candidate_ui_scale(dpi, CANDIDATE_PREFERENCE_OVERLAY_HEIGHT_LOGICAL)
+}
+
+/// Builds the compact action strip appended below the normal candidate scene.
+/// Invalid or too-narrow clients fail closed instead of creating overlapping
+/// click targets.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_candidate_preference_overlay_scene(
+    dpi: u32,
+    width: i32,
+    base_height: i32,
+    height: i32,
+) -> Option<CandidatePreferenceOverlayScene> {
+    let scale = |logical| candidate_ui_scale(dpi, logical);
+    let overlay_height = candidate_preference_overlay_height(dpi);
+    if width <= 0 || base_height <= 0 || height < base_height.saturating_add(overlay_height) {
+        return None;
+    }
+
+    let padding = scale(DEFAULT_CANDIDATE_VISUAL_SPEC.outer_padding);
+    let gap = scale(CANDIDATE_PREFERENCE_OVERLAY_GAP_LOGICAL);
+    let button_height = scale(CANDIDATE_PREFERENCE_OVERLAY_BUTTON_HEIGHT_LOGICAL);
+    let action_widths = CANDIDATE_PREFERENCE_OVERLAY_ACTION_WIDTHS_LOGICAL.map(scale);
+    let content_left = padding;
+    let content_right = width.saturating_sub(padding);
+    let content_width = content_right.saturating_sub(content_left);
+    let required_width = scale(CANDIDATE_PREFERENCE_OVERLAY_TARGET_MIN_WIDTH_LOGICAL)
+        .saturating_add(action_widths.into_iter().sum::<i32>())
+        .saturating_add(gap.saturating_mul(3));
+    if content_width < required_width || button_height <= 0 {
+        return None;
+    }
+
+    let bounds = CandidateSceneRect {
+        left: 0,
+        top: base_height,
+        right: width,
+        bottom: height,
+    };
+    let button_top = base_height.saturating_add(overlay_height.saturating_sub(button_height) / 2);
+    let button_bottom = button_top.saturating_add(button_height);
+    let mut right = content_right;
+    let actions = [
+        CandidatePreferenceOverlayAction::RestorePersonalization,
+        CandidatePreferenceOverlayAction::DeferToPublic,
+        CandidatePreferenceOverlayAction::Prefer,
+    ]
+    .into_iter()
+    .zip(action_widths.into_iter().rev())
+    .map(|(action, action_width)| {
+        let item = CandidatePreferenceOverlayItem {
+            action,
+            bounds: CandidateSceneRect {
+                left: right.saturating_sub(action_width),
+                top: button_top,
+                right,
+                bottom: button_bottom,
+            },
+        };
+        right = item.bounds.left.saturating_sub(gap);
+        item
+    })
+    .collect::<Vec<_>>();
+    let actions: [CandidatePreferenceOverlayItem; 3] = actions.try_into().ok()?;
+    let actions = [actions[2], actions[1], actions[0]];
+    let target = CandidateSceneRect {
+        left: content_left,
+        top: button_top,
+        right: actions[0].bounds.left.saturating_sub(gap),
+        bottom: button_bottom,
+    };
+    if target.width() < scale(CANDIDATE_PREFERENCE_OVERLAY_TARGET_MIN_WIDTH_LOGICAL) {
+        return None;
+    }
+    Some(CandidatePreferenceOverlayScene {
+        bounds,
+        divider: CandidateSceneRect {
+            left: content_left,
+            top: base_height,
+            right: content_right,
+            bottom: base_height.saturating_add(scale(1)),
+        },
+        target,
+        actions,
+    })
+}
+
 /// Stable semantic identities exposed by the shared candidate scene.
 // The first production consumer needs geometry; the future native lab will
 // consume these names for hit testing and local annotations.
@@ -1546,5 +1685,59 @@ mod tests {
             },
         );
         assert!(invalid_metrics.is_none());
+    }
+
+    #[test]
+    fn candidate_preference_overlay_has_disjoint_stable_action_targets() {
+        let scene = build_candidate_preference_overlay_scene(96, 280, 46, 88).unwrap();
+        assert_eq!(
+            scene.bounds,
+            CandidateSceneRect {
+                left: 0,
+                top: 46,
+                right: 280,
+                bottom: 88,
+            }
+        );
+        assert_eq!(scene.target.left, 5);
+        assert_eq!(scene.target.right, 75);
+        assert_eq!(
+            scene.actions[0].action,
+            CandidatePreferenceOverlayAction::Prefer
+        );
+        assert_eq!(scene.actions[0].bounds.left, 79);
+        assert_eq!(
+            scene.actions[1].action,
+            CandidatePreferenceOverlayAction::DeferToPublic
+        );
+        assert_eq!(scene.actions[1].bounds.left, 127);
+        assert_eq!(
+            scene.actions[2].action,
+            CandidatePreferenceOverlayAction::RestorePersonalization
+        );
+        assert_eq!(scene.actions[2].bounds.left, 203);
+
+        assert_eq!(
+            scene.action_at(79, 60),
+            Some(CandidatePreferenceOverlayAction::Prefer)
+        );
+        assert_eq!(scene.action_at(123, 60), None);
+        assert_eq!(
+            scene.action_at(127, 60),
+            Some(CandidatePreferenceOverlayAction::DeferToPublic)
+        );
+        assert_eq!(
+            scene.action_at(274, 80),
+            Some(CandidatePreferenceOverlayAction::RestorePersonalization)
+        );
+        assert_eq!(scene.action_at(275, 60), None);
+        assert_eq!(scene.action_at(40, 60), None);
+    }
+
+    #[test]
+    fn candidate_preference_overlay_fails_closed_when_space_is_insufficient() {
+        assert!(build_candidate_preference_overlay_scene(96, 251, 46, 88).is_none());
+        assert!(build_candidate_preference_overlay_scene(96, 280, 46, 87).is_none());
+        assert!(build_candidate_preference_overlay_scene(96, 280, 0, 42).is_none());
     }
 }
