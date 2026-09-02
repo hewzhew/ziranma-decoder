@@ -52,6 +52,10 @@ fn main() {
     }
     println!("cargo:rustc-link-arg-bin=wishpad={}", output.display());
     println!(
+        "cargo:rustc-link-arg-bin=mode-indicator={}",
+        output.display()
+    );
+    println!(
         "cargo:rustc-link-arg-bin=ziranma-launcher={}",
         output.display()
     );

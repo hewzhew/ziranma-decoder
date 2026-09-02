@@ -3139,6 +3139,7 @@ mod tests {
             "--lib",
             "--bin tsf-devctl",
             "--bin candidatectl",
+            "--bin mode-indicator",
             "--bin aliasctl",
             "--bin aliaspad",
             "--bin personalctl",
@@ -3240,6 +3241,7 @@ mod tests {
             "aliasctl",
             "aliaspad",
             "candidatectl",
+            "mode-indicator",
             "personalctl",
             "researchctl",
             "typing-practice",
@@ -3258,6 +3260,7 @@ mod tests {
         assert!(script.contains("ziranma-user-tools-slots-v1"));
         assert!(script.contains("ziranma-user-tools-bundle-v2"));
         assert!(script.contains("ziranma-user-tools-bundle-v3"));
+        assert!(script.contains("ziranma-user-tools-bundle-v4"));
         assert!(script.contains("Publish-DesktopLauncher -BundleId $bundleId"));
         assert!(script.contains("Potential reclaim:"));
         assert!(script.contains("No files were deleted"));

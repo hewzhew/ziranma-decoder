@@ -35,6 +35,7 @@ mod windows_launcher {
     enum LauncherAction {
         Wish,
         Alias,
+        Mode,
         Practice,
         Update,
     }
@@ -47,6 +48,9 @@ mod windows_launcher {
         match action {
             LauncherAction::Wish => launch_user_tool(&repository, LaunchableUserTool::WishPad),
             LauncherAction::Alias => launch_user_tool(&repository, LaunchableUserTool::AliasPad),
+            LauncherAction::Mode => {
+                launch_user_tool(&repository, LaunchableUserTool::ModeIndicator)
+            }
             LauncherAction::Practice => {
                 launch_user_tool(&repository, LaunchableUserTool::TypingPractice)
             }
@@ -61,9 +65,10 @@ mod windows_launcher {
         match arguments.as_slice() {
             [action] if action == OsStr::new("wish") => Ok(LauncherAction::Wish),
             [action] if action == OsStr::new("alias") => Ok(LauncherAction::Alias),
+            [action] if action == OsStr::new("mode") => Ok(LauncherAction::Mode),
             [action] if action == OsStr::new("practice") => Ok(LauncherAction::Practice),
             [action] if action == OsStr::new("update") => Ok(LauncherAction::Update),
-            _ => Err("启动器只接受 wish、alias、practice 或 update 中的一个固定动作"),
+            _ => Err("启动器只接受 wish、alias、mode、practice 或 update 中的一个固定动作"),
         }
     }
 
@@ -137,6 +142,7 @@ mod windows_launcher {
         fn parser_accepts_only_one_fixed_action() {
             assert_eq!(parse_action(["wish".into()]), Ok(LauncherAction::Wish));
             assert_eq!(parse_action(["alias".into()]), Ok(LauncherAction::Alias));
+            assert_eq!(parse_action(["mode".into()]), Ok(LauncherAction::Mode));
             assert_eq!(
                 parse_action(["practice".into()]),
                 Ok(LauncherAction::Practice)

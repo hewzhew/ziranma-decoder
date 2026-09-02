@@ -23,6 +23,7 @@ cargo.exe build --release --locked --offline ^
     --lib ^
     --bin tsf-devctl ^
     --bin candidatectl ^
+    --bin mode-indicator ^
     --bin aliasctl ^
     --bin aliaspad ^
     --bin personalctl ^

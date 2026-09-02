@@ -53,21 +53,21 @@ use crate::{
     DEFAULT_NATIVE_FEEDBACK_WISH_EPISODES, DEFAULT_NATIVE_FEEDBACK_WISH_LOOKBACK_MS,
     DEFAULT_NATIVE_FEEDBACK_WISH_MAX_EVENTS, Decoder, ExactShortPageSession, ExactShortWordCatalog,
     ExactShortWordCatalogError, ExplicitAliasSnapshot, FrozenNativeFeedbackSnapshot,
-    LoadedPersonalRanking, LoadedPersonalRankingSuppressions, MAX_CANDIDATE_SNAPSHOT_RANK,
-    NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS, NativeAutomaticTranspositionDecision,
-    NativeAutomaticTranspositionOutcome, NativeAutomaticTranspositionTier,
-    NativeCancellationSource, NativeCandidatePersonalization, NativeCandidatePreferenceAction,
-    NativeCandidateProvenance, NativeCandidateRankingMovement, NativeCandidateSource,
-    NativeCandidateSuppressionAction, NativeCandidateView, NativeFeedbackAuthorization,
-    NativeFeedbackClearResult, NativeFeedbackContext, NativeFeedbackEvent,
-    NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError, NativeFeedbackLifecycle,
-    NativeFeedbackLimits, NativeFeedbackRecordResult, NativeFeedbackSession,
-    NativeFeedbackStartResult, NativeFeedbackStopResult, NativeFeedbackSummary,
-    NativePersonalPhraseAdjacency, NativeSelectionSource, NativeShortExactAbstention,
-    NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH, PERSONAL_RANKING_SUPPRESSION_DIRECTORY,
-    PersonalContextRanking, PersonalRankingBatch, PersonalRankingSelection,
-    PersonalRankingSnapshot, PersonalRankingSuppressionAction,
-    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot,
+    INPUT_MODE_STATUS_COMPARTMENT_GUID, LoadedPersonalRanking, LoadedPersonalRankingSuppressions,
+    MAX_CANDIDATE_SNAPSHOT_RANK, NATIVE_FEEDBACK_HALF_PAIR_GAP_BUCKET_UPPER_BOUNDS_MS,
+    NativeAutomaticTranspositionDecision, NativeAutomaticTranspositionOutcome,
+    NativeAutomaticTranspositionTier, NativeCancellationSource, NativeCandidatePersonalization,
+    NativeCandidatePreferenceAction, NativeCandidateProvenance, NativeCandidateRankingMovement,
+    NativeCandidateSource, NativeCandidateSuppressionAction, NativeCandidateView,
+    NativeFeedbackAuthorization, NativeFeedbackClearResult, NativeFeedbackContext,
+    NativeFeedbackEvent, NativeFeedbackFreezeAuthorization, NativeFeedbackFreezeError,
+    NativeFeedbackLifecycle, NativeFeedbackLimits, NativeFeedbackRecordResult,
+    NativeFeedbackSession, NativeFeedbackStartResult, NativeFeedbackStopResult,
+    NativeFeedbackSummary, NativePersonalPhraseAdjacency, NativeSelectionSource,
+    NativeShortExactAbstention, NativeTabAssemblyState, PERSONAL_CONTEXT_SEARCH_DEPTH,
+    PERSONAL_RANKING_SUPPRESSION_DIRECTORY, PersonalContextRanking, PersonalRankingBatch,
+    PersonalRankingSelection, PersonalRankingSnapshot, PersonalRankingSuppressionAction,
+    PersonalRankingSuppressionActionKind, PersonalRankingSuppressionSnapshot, PublishedInputMode,
     RESEARCH_FEEDBACK_DIRECTORY, SessionSelectionMemory, SupplementalCandidateLayerConfig,
     WISH_ACK_COMPARTMENT_GUID, WISH_COMMAND_COMPARTMENT_GUID, WindowsUserDataProtector,
     WishCaptureScope, WishCategory, WishCommand, WishCommandAck, WishCommandAckStatus,
@@ -8911,6 +8911,80 @@ fn read_input_mode_compartment_i32(compartment: &ITfCompartment) -> Option<i32> 
         .and_then(|value| i32::try_from(&value).ok())
 }
 
+struct NativePublishedInputModeController {
+    enabled: bool,
+    input_mode: Rc<Cell<InputMode>>,
+    status_guid: GUID,
+    client_id: u32,
+    compartment: Option<ITfCompartment>,
+}
+
+impl NativePublishedInputModeController {
+    fn new(enabled: bool, input_mode: Rc<Cell<InputMode>>) -> Self {
+        Self::new_with_guid(enabled, input_mode, INPUT_MODE_STATUS_COMPARTMENT_GUID)
+    }
+
+    fn new_with_guid(enabled: bool, input_mode: Rc<Cell<InputMode>>, status_guid: GUID) -> Self {
+        Self {
+            enabled,
+            input_mode,
+            status_guid,
+            client_id: 0,
+            compartment: None,
+        }
+    }
+
+    fn activate(&mut self, thread_manager: &ITfThreadMgr, client_id: u32) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.compartment.is_some() || self.client_id != 0 {
+            return Err(lifecycle_error(E_UNEXPECTED));
+        }
+        // SAFETY: this current-user global compartment contains only the
+        // bounded Chinese/English word defined in `input_mode_status`.
+        let manager = unsafe { thread_manager.GetGlobalCompartment() }?;
+        let compartment = unsafe { manager.GetCompartment(&self.status_guid) }?;
+        self.client_id = client_id;
+        self.compartment = Some(compartment);
+        if let Err(error) = self.publish_current() {
+            self.deactivate();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn publish_current(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let compartment = self
+            .compartment
+            .as_ref()
+            .ok_or_else(|| lifecycle_error(E_UNEXPECTED))?;
+        let published = match self.input_mode.get() {
+            InputMode::Chinese => PublishedInputMode::Chinese,
+            InputMode::English => PublishedInputMode::English,
+        };
+        // SAFETY: SetValue synchronously copies this bounded VT_I4 value and
+        // no document, key, candidate, or process identity enters the channel.
+        unsafe { compartment.SetValue(self.client_id, &VARIANT::from(published.raw())) }
+    }
+
+    fn deactivate(&mut self) {
+        // Keep the most recently focused mode readable while applications
+        // close. A newly focused service instance republishes its own mode.
+        self.compartment = None;
+        self.client_id = 0;
+    }
+}
+
+impl Drop for NativePublishedInputModeController {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
+
 struct NativeWishCommandShared {
     state: Weak<NativeFeedbackLanguageBarState>,
     command_guid: GUID,
@@ -10184,6 +10258,7 @@ struct TsfTextService {
     native_feedback_language_bar_state: Rc<NativeFeedbackLanguageBarState>,
     native_feedback_language_bar: RefCell<NativeFeedbackLanguageBarController>,
     input_mode_compartments: RefCell<NativeInputModeCompartmentController>,
+    published_input_mode: RefCell<NativePublishedInputModeController>,
     native_wish_commands: RefCell<NativeWishCommandController>,
     input_mode: Rc<Cell<InputMode>>,
     shift_tap_armed: Cell<bool>,
@@ -10698,6 +10773,10 @@ impl TsfTextService {
             matches!(key_advice_mode, KeyAdviceMode::Foreground),
             Rc::clone(&input_mode),
         ));
+        let published_input_mode = RefCell::new(NativePublishedInputModeController::new(
+            matches!(key_advice_mode, KeyAdviceMode::Foreground),
+            Rc::clone(&input_mode),
+        ));
         let personal_ranking_roots = matches!(key_advice_mode, KeyAdviceMode::Foreground)
             .then(|| {
                 module_path().ok().map(|module| {
@@ -10750,6 +10829,7 @@ impl TsfTextService {
                 Rc::clone(&native_feedback_language_bar_state),
             )),
             input_mode_compartments,
+            published_input_mode,
             native_wish_commands,
             native_feedback_language_bar_state,
             input_mode,
@@ -11949,6 +12029,9 @@ impl TsfTextService_Impl {
             // standard status compartments; the next mode transition retries.
             let _ = compartments.publish_current();
         }
+        if let Ok(published) = self.published_input_mode.try_borrow() {
+            let _ = published.publish_current();
+        }
         self.native_feedback_language_bar_state.notify();
         Ok(())
     }
@@ -12267,6 +12350,11 @@ impl TsfTextService_Impl {
             // Standard TSF mode publication is optional for activation: hosts
             // that reject it must not lose the input method itself.
             let _ = compartments.activate(&ui_thread_manager, client_id);
+        }
+        if let Ok(mut published) = self.published_input_mode.try_borrow_mut() {
+            // The optional status companion must never gate text-service
+            // activation when the global compartment is unavailable.
+            let _ = published.activate(&ui_thread_manager, client_id);
         }
         if let Ok(mut language_bar) = self.native_feedback_language_bar.try_borrow_mut() {
             // The language-bar surface is optional. Failure keeps feedback
@@ -13617,6 +13705,11 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
             .try_borrow_mut()
             .map(|mut compartments| compartments.deactivate())
             .map_err(|_| lifecycle_error(E_UNEXPECTED));
+        let published_input_mode_result = self
+            .published_input_mode
+            .try_borrow_mut()
+            .map(|mut published| published.deactivate())
+            .map_err(|_| lifecycle_error(E_UNEXPECTED));
         let wish_command_result = self
             .native_wish_commands
             .try_borrow_mut()
@@ -13676,6 +13769,7 @@ impl ITfTextInputProcessor_Impl for TsfTextService_Impl {
         feedback_context_result?;
         native_feedback_result?;
         wish_command_result?;
+        published_input_mode_result?;
         input_mode_compartment_result?;
         language_bar_result?;
         candidate_ui_result
@@ -13690,7 +13784,11 @@ impl ITfTextInputProcessorEx_Impl for TsfTextService_Impl {
 
 impl ITfKeyEventSink_Impl for TsfTextService_Impl {
     fn OnSetFocus(&self, fforeground: windows::core::BOOL) -> Result<()> {
-        if !fforeground.as_bool() {
+        if fforeground.as_bool() {
+            if let Ok(published) = self.published_input_mode.try_borrow() {
+                let _ = published.publish_current();
+            }
+        } else {
             self.cleanup_after_focus_loss()?;
         }
         Ok(())
@@ -13865,7 +13963,11 @@ impl ITfThreadMgrEventSink_Impl for TsfTextService_Impl {
         focused: Ref<ITfDocumentMgr>,
         _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
-        if !self.active_document_has_focus(focused)? {
+        if self.active_document_has_focus(focused)? {
+            if let Ok(published) = self.published_input_mode.try_borrow() {
+                let _ = published.publish_current();
+            }
+        } else {
             self.cleanup_after_focus_loss()?;
         }
         Ok(())
@@ -20816,6 +20918,45 @@ mod tests {
             manager
                 .ClearCompartment(client_id, &conversion_guid)
                 .unwrap();
+            thread_manager.Deactivate().unwrap();
+        }
+    }
+
+    #[test]
+    fn published_input_mode_controller_exposes_only_one_bounded_global_word() {
+        let _guard = test_lock();
+        let _apartment = ComApartment::enter();
+        let mode = Rc::new(Cell::new(InputMode::Chinese));
+        let status_guid = GUID::from_u128(0xc6267b82_348f_42db_98a5_33812f612f14);
+        let mut controller =
+            NativePublishedInputModeController::new_with_guid(true, Rc::clone(&mode), status_guid);
+        let thread_manager: ITfThreadMgr = unsafe {
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        }
+        .expect("TSF thread manager should be available");
+        let client_id = unsafe { thread_manager.Activate() }.expect("thread manager activation");
+        controller
+            .activate(&thread_manager, client_id)
+            .expect("global input-mode publication");
+
+        let manager = unsafe { thread_manager.GetGlobalCompartment() }.unwrap();
+        let compartment = unsafe { manager.GetCompartment(&status_guid) }.unwrap();
+        assert_eq!(
+            read_input_mode_compartment_i32(&compartment),
+            Some(PublishedInputMode::Chinese.raw())
+        );
+
+        mode.set(InputMode::English);
+        controller.publish_current().unwrap();
+        assert_eq!(
+            read_input_mode_compartment_i32(&compartment),
+            Some(PublishedInputMode::English.raw())
+        );
+
+        controller.deactivate();
+        assert!(controller.compartment.is_none());
+        unsafe {
+            manager.ClearCompartment(client_id, &status_guid).unwrap();
             thread_manager.Deactivate().unwrap();
         }
     }

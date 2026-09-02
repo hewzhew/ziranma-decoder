@@ -37,8 +37,9 @@ $desktopLauncherRoot = Join-Path $repositoryRoot '.local\tsf-alpha\desktop-launc
 $desktopLauncherPath = Join-Path $desktopLauncherRoot 'ziranma-launcher.exe'
 $schema = 'ziranma-user-tools-slots-v1'
 $legacyBundleSchema = 'ziranma-user-tools-bundle-v1'
-$previousBundleSchema = 'ziranma-user-tools-bundle-v2'
-$bundleSchema = 'ziranma-user-tools-bundle-v3'
+$olderBundleSchema = 'ziranma-user-tools-bundle-v2'
+$previousBundleSchema = 'ziranma-user-tools-bundle-v3'
+$bundleSchema = 'ziranma-user-tools-bundle-v4'
 $legacyToolNames = @(
     'aliasctl',
     'aliaspad',
@@ -48,7 +49,7 @@ $legacyToolNames = @(
     'wishctl',
     'wishpad'
 )
-$previousToolNames = @(
+$olderToolNames = @(
     'aliasctl',
     'aliaspad',
     'candidatectl',
@@ -58,10 +59,22 @@ $previousToolNames = @(
     'wishpad',
     'ziranma-launcher'
 )
+$previousToolNames = @(
+    'aliasctl',
+    'aliaspad',
+    'candidatectl',
+    'personalctl',
+    'researchctl',
+    'typing-practice',
+    'wishctl',
+    'wishpad',
+    'ziranma-launcher'
+)
 $toolNames = @(
     'aliasctl',
     'aliaspad',
     'candidatectl',
+    'mode-indicator',
     'personalctl',
     'researchctl',
     'typing-practice',
@@ -189,6 +202,8 @@ function Assert-Bundle {
         $manifestToolNames = @($toolNames)
     } elseif ($manifestSchema -eq "schema=$previousBundleSchema") {
         $manifestToolNames = @($previousToolNames)
+    } elseif ($manifestSchema -eq "schema=$olderBundleSchema") {
+        $manifestToolNames = @($olderToolNames)
     } elseif ($manifestSchema -eq "schema=$legacyBundleSchema") {
         $manifestToolNames = @($legacyToolNames)
     } else {
@@ -673,7 +688,7 @@ function Show-Status {
     if ($null -eq $state) {
         Write-Host 'Current: not published; launchers use target/release'
         Write-Host 'Previous: none'
-        Write-Host 'Tools: 9 managed tools'
+        Write-Host 'Tools: 10 managed tools'
     } else {
         Assert-Bundle -BundleId $state.Current
         if ($null -ne $state.Previous) {
@@ -820,7 +835,7 @@ try {
     Write-Host 'IME user tool refresh completed'
     Write-Host "Current: $(Short-Id -Value $bundleId) ($result)"
     Write-Host "Previous: $(Short-Id -Value $previous)"
-    Write-Host 'Tools: alias, candidate, personal, research, typing practice, wish, and desktop launch management'
+    Write-Host 'Tools: alias, candidate, mode indicator, personal, research, typing practice, wish, and desktop launch management'
     Write-Host 'TSF DLL: unchanged'
     Write-Host 'Administrator: not required'
     Write-Host 'Existing tool processes: unchanged; reopen them when convenient'

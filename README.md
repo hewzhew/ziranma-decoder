@@ -204,6 +204,10 @@ Windows 11 现代输入指示器并不可靠展示第三方语言栏项目，因
 `KEYBOARD_OPENCLOSE` 与 `KEYBOARD_INPUTMODE_CONVERSION` compartment：中文发布
 打开及 `NATIVE`，英文发布关闭并只清除 `NATIVE`，其他转换位保持不动；这让系统和
 辅助工具能读取真实模式，但不保证 Windows 11 一定显示第三方猫图标。
+可选的单实例原生 `mode-indicator` 因此改走 Windows 通知区：新版文本服务只向
+当前用户 TSF 全局 compartment 发布一个无正文整数，伴侣订阅后显示彼此分离的
+“小猫 + 中”或“小猫 + A”图标。它不读取输入码、候选、正文或窗口标题，Explorer
+重启后会恢复图标，右键可查看当前状态或退出；当前阶段只手动启动，不写开机启动项。
 `wish-ime.cmd mark` 通过 TSF 当前用户全局 compartment 发送无正文整数
 命令，`wishpad` 则是按需打开的本地“猫猫应愿”管理器。输入码、候选、留言、
 路径和快照都不进入控制通道，不注册全局快捷键，也不连接网络。真实 Codex 与
@@ -270,7 +274,7 @@ Typora 等进程使用的旧 DLL。
 这些入口都从脚本自身位置定位仓库和 `Cargo.toml`，可以在任意当前目录中使用绝对路径
 调用，不要求先执行 `Set-Location`。
 
-显式 `refresh` 离线、锁定依赖地构建九个别名、候选、个人排序、研究、打字练习、
+显式 `refresh` 离线、锁定依赖地构建十个别名、候选、模式图标、个人排序、研究、打字练习、
 许愿和桌面启动 EXE，并发布到 Git 忽略的不可变 `current / previous` 用户工具槽；不带参数和显式
 `status` 都只读，避免调用者漏写动作时发布工具。现有工具进程不被
 关闭，新打开的 `aliaspad` / `wishpad` 和下一次管理命令使用 current；状态只读，
@@ -281,9 +285,9 @@ Typora 等进程使用的旧 DLL。
 
 刷新还会原子更新固定的原生启动器
 `.local/tsf-alpha/desktop-launcher/ziranma-launcher.exe`。桌面上的“向猫猫许愿”、
-“自定义短语”、“打字练习实验室”和“自然码换代”快捷方式可以分别传入 `wish`、
-`alias`、`practice`、`update`；前三项直接启动摘要校验通过的 current GUI，不再经过
-`.cmd` 或闪出命令窗口，换代仍保留可见控制台、诊断输出和既有确认边界。启动器只接受这四个固定动作，
+“自定义短语”、“输入模式图标”、“打字练习实验室”和“自然码换代”快捷方式可以分别传入 `wish`、
+`alias`、`mode`、`practice`、`update`；前四项直接启动摘要校验通过的 current GUI，不再经过
+`.cmd` 或闪出命令窗口，换代仍保留可见控制台、诊断输出和既有确认边界。启动器只接受这五个固定动作，
 不会执行调用者提供的程序名或路径。
 
 本地许愿放在 Git 忽略的 `.local/tsf-alpha/user-data/wishes`。默认管理命令只显示

@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 
 const SLOT_SCHEMA: &str = "ziranma-user-tools-slots-v1";
 const LEGACY_BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v1";
-const PREVIOUS_BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v2";
-const BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v3";
+const OLDER_BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v2";
+const PREVIOUS_BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v3";
+const BUNDLE_SCHEMA: &str = "ziranma-user-tools-bundle-v4";
 const MAX_SLOT_BYTES: u64 = 512;
 const MAX_MANIFEST_BYTES: u64 = 4_096;
 
@@ -29,7 +30,7 @@ const LEGACY_TOOL_NAMES: [&str; 7] = [
     "wishpad",
 ];
 
-const PREVIOUS_TOOL_NAMES: [&str; 8] = [
+const OLDER_TOOL_NAMES: [&str; 8] = [
     "aliasctl",
     "aliaspad",
     "candidatectl",
@@ -40,11 +41,24 @@ const PREVIOUS_TOOL_NAMES: [&str; 8] = [
     "ziranma-launcher",
 ];
 
-/// Exact executable set stored in newly published user-tool bundles.
-pub const MANAGED_USER_TOOL_NAMES: [&str; 9] = [
+const PREVIOUS_TOOL_NAMES: [&str; 9] = [
     "aliasctl",
     "aliaspad",
     "candidatectl",
+    "personalctl",
+    "researchctl",
+    "typing-practice",
+    "wishctl",
+    "wishpad",
+    "ziranma-launcher",
+];
+
+/// Exact executable set stored in newly published user-tool bundles.
+pub const MANAGED_USER_TOOL_NAMES: [&str; 10] = [
+    "aliasctl",
+    "aliaspad",
+    "candidatectl",
+    "mode-indicator",
     "personalctl",
     "researchctl",
     "typing-practice",
@@ -57,6 +71,7 @@ pub const MANAGED_USER_TOOL_NAMES: [&str; 9] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchableUserTool {
     AliasPad,
+    ModeIndicator,
     TypingPractice,
     WishPad,
 }
@@ -65,6 +80,7 @@ impl LaunchableUserTool {
     fn executable_name(self) -> &'static str {
         match self {
             Self::AliasPad => "aliaspad.exe",
+            Self::ModeIndicator => "mode-indicator.exe",
             Self::TypingPractice => "typing-practice.exe",
             Self::WishPad => "wishpad.exe",
         }
@@ -182,6 +198,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<(String, String)>, UserToolRuntime
     let names: &[&str] = match lines.first().copied() {
         Some(line) if line == format!("schema={BUNDLE_SCHEMA}") => &MANAGED_USER_TOOL_NAMES,
         Some(line) if line == format!("schema={PREVIOUS_BUNDLE_SCHEMA}") => &PREVIOUS_TOOL_NAMES,
+        Some(line) if line == format!("schema={OLDER_BUNDLE_SCHEMA}") => &OLDER_TOOL_NAMES,
         Some(line) if line == format!("schema={LEGACY_BUNDLE_SCHEMA}") => &LEGACY_TOOL_NAMES,
         _ => return Err(UserToolRuntimeError::InvalidManifest),
     };
@@ -341,6 +358,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TestBundleVersion {
         Legacy,
+        Older,
         Previous,
         Current,
     }
@@ -349,6 +367,7 @@ mod tests {
         fn schema(self) -> &'static str {
             match self {
                 Self::Legacy => LEGACY_BUNDLE_SCHEMA,
+                Self::Older => OLDER_BUNDLE_SCHEMA,
                 Self::Previous => PREVIOUS_BUNDLE_SCHEMA,
                 Self::Current => BUNDLE_SCHEMA,
             }
@@ -357,6 +376,7 @@ mod tests {
         fn names(self) -> &'static [&'static str] {
             match self {
                 Self::Legacy => &LEGACY_TOOL_NAMES,
+                Self::Older => &OLDER_TOOL_NAMES,
                 Self::Previous => &PREVIOUS_TOOL_NAMES,
                 Self::Current => &MANAGED_USER_TOOL_NAMES,
             }
@@ -393,6 +413,7 @@ mod tests {
     fn resolves_launchable_tools_from_current_and_older_bundles() {
         for version in [
             TestBundleVersion::Legacy,
+            TestBundleVersion::Older,
             TestBundleVersion::Previous,
             TestBundleVersion::Current,
         ] {
@@ -407,10 +428,19 @@ mod tests {
                 bundle.join("aliaspad.exe")
             );
             let practice = resolve_current_user_tool(&root.0, LaunchableUserTool::TypingPractice);
-            if matches!(version, TestBundleVersion::Current) {
+            if matches!(
+                version,
+                TestBundleVersion::Previous | TestBundleVersion::Current
+            ) {
                 assert_eq!(practice.unwrap(), bundle.join("typing-practice.exe"));
             } else {
                 assert_eq!(practice, Err(UserToolRuntimeError::ToolUnavailable));
+            }
+            let indicator = resolve_current_user_tool(&root.0, LaunchableUserTool::ModeIndicator);
+            if matches!(version, TestBundleVersion::Current) {
+                assert_eq!(indicator.unwrap(), bundle.join("mode-indicator.exe"));
+            } else {
+                assert_eq!(indicator, Err(UserToolRuntimeError::ToolUnavailable));
             }
         }
     }

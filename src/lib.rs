@@ -45,6 +45,7 @@ mod evaluation;
 mod event_capsule;
 mod exact_short_catalog;
 mod explicit_alias;
+mod input_mode_status;
 mod language_model;
 mod native_feedback;
 mod personal_context;
@@ -281,6 +282,9 @@ pub use explicit_alias::{
     load_explicit_alias_slot_state, protect_explicit_alias_snapshot,
     unprotect_explicit_alias_snapshot,
 };
+#[cfg(windows)]
+pub use input_mode_status::INPUT_MODE_STATUS_COMPARTMENT_GUID;
+pub use input_mode_status::PublishedInputMode;
 pub use language_model::{
     BigramLanguageModel, BigramLanguageModelStats, BigramScore, CharacterBigramLanguageModel,
     CharacterBigramLanguageModelStats, CharacterLanguageModelError, CharacterSequenceScore,
