@@ -33,7 +33,8 @@ use crate::candidate_ui::{
     allocate_horizontal_candidate_widths, build_candidate_preference_overlay_scene,
     build_candidate_scene,
     candidate_horizontal_logical_width as shared_candidate_horizontal_logical_width,
-    candidate_preference_overlay_height, candidate_ui_scale,
+    candidate_preference_overlay_height, candidate_preference_overlay_minimum_width,
+    candidate_ui_scale,
     candidate_vertical_logical_width as shared_candidate_vertical_logical_width,
     estimated_candidate_logical_text_width,
 };
@@ -151,7 +152,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -6196,7 +6198,7 @@ fn candidate_popup_candidate_at(
     if state.display.notice
         || state.display.mode != CandidateDisplayMode::Normal
         || state.display.view != InteractiveCandidateView::Primary
-        || state.feedback_context != NativeFeedbackContext::Eligible
+        || !candidate_preference_context_allows_explicit_label(state.feedback_context)
     {
         return None;
     }
@@ -6212,20 +6214,44 @@ fn candidate_popup_candidate_at(
     Some(CandidatePreferenceTarget { code, text })
 }
 
+fn candidate_preference_context_allows_explicit_label(context: NativeFeedbackContext) -> bool {
+    // A missing InputScope is common in Chromium editors and is not itself a
+    // declaration that the field is sensitive. It must still suppress passive
+    // feedback and automatic learning, but it need not disable an explicit
+    // two-step user gesture on text already visible in our own candidate UI.
+    // Concrete password, private, restricted and disabled classifications
+    // remain fail-closed.
+    matches!(
+        context,
+        NativeFeedbackContext::Eligible | NativeFeedbackContext::Unknown
+    )
+}
+
 fn candidate_preference_expanded_placement(
     base: CandidatePopupPlacement,
     added_height: i32,
+    minimum_width: i32,
     work_area: Option<RECT>,
 ) -> CandidatePopupPlacement {
     let height = base.height.saturating_add(added_height.max(0));
+    let mut width = base.width.max(minimum_width.max(0));
+    let mut x = base.x;
     let mut y = base.y;
     if let Some(work) = work_area {
+        let work_width = work.right.saturating_sub(work.left).max(0);
+        width = width.min(work_width);
+        x = x.clamp(work.left, work.right.saturating_sub(width).max(work.left));
         if y.saturating_add(height) > work.bottom {
             y = y.saturating_sub(added_height.max(0));
         }
         y = y.clamp(work.top, work.bottom.saturating_sub(height).max(work.top));
     }
-    CandidatePopupPlacement { height, y, ..base }
+    CandidatePopupPlacement {
+        width,
+        height,
+        x,
+        y,
+    }
 }
 
 fn open_candidate_popup_preference_overlay(
@@ -6260,10 +6286,18 @@ fn open_candidate_popup_preference_overlay(
         height: window.bottom.saturating_sub(window.top),
     };
     let base_client_height = client.bottom.saturating_sub(client.top);
-    if base_window.width <= 0 || base_window.height <= 0 || base_client_height <= 0 {
+    let base_client_width = client.right.saturating_sub(client.left);
+    if base_window.width <= 0
+        || base_window.height <= 0
+        || base_client_width <= 0
+        || base_client_height <= 0
+    {
         return false;
     }
     let added_height = candidate_preference_overlay_height(state.dpi);
+    let nonclient_width = base_window.width.saturating_sub(base_client_width).max(0);
+    let minimum_window_width =
+        candidate_preference_overlay_minimum_width(state.dpi).saturating_add(nonclient_width);
     let monitor = unsafe { MonitorFromRect(&window, MONITOR_DEFAULTTONEAREST) };
     let mut monitor_info = MONITORINFO {
         cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(u32::MAX),
@@ -6272,7 +6306,15 @@ fn open_candidate_popup_preference_overlay(
     let work_area = (!monitor.is_invalid()
         && unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool())
     .then_some(monitor_info.rcWork);
-    let expanded = candidate_preference_expanded_placement(base_window, added_height, work_area);
+    let expanded = candidate_preference_expanded_placement(
+        base_window,
+        added_height,
+        minimum_window_width,
+        work_area,
+    );
+    if expanded.width < minimum_window_width {
+        return false;
+    }
     state.preference_overlay = Some(CandidatePreferenceOverlay {
         target,
         base_window,
@@ -6422,6 +6464,23 @@ unsafe extern "system" fn candidate_popup_window_proc(
         unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CandidatePopupPaintState;
     if message == WM_MOUSEACTIVATE && !state_pointer.is_null() {
         return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3));
+    }
+    if message == WM_RBUTTONDOWN && !state_pointer.is_null() {
+        let packed = u32::try_from(lparam.0).unwrap_or(lparam.0 as u32);
+        let point = POINT {
+            x: i32::from((packed as u16) as i16),
+            y: i32::from(((packed >> 16) as u16) as i16),
+        };
+        // Consume the button-down before STATIC's default procedure can route
+        // it toward the editor owner. Opening remains on button-up, matching
+        // normal Windows activation semantics and allowing the user to abort
+        // by moving off the candidate.
+        let state = unsafe { &mut *state_pointer };
+        if state.preference_overlay.is_some()
+            || candidate_popup_candidate_at(state, point.x, point.y).is_some()
+        {
+            return LRESULT(0);
+        }
     }
     if message == WM_RBUTTONUP && !state_pointer.is_null() {
         let packed = u32::try_from(lparam.0).unwrap_or(lparam.0 as u32);
@@ -26481,19 +26540,53 @@ mod tests {
             bottom: 200,
         };
         assert_eq!(
-            candidate_preference_expanded_placement(base, 42, Some(work)),
+            candidate_preference_expanded_placement(base, 42, 252, Some(work)),
             CandidatePopupPlacement { height: 88, ..base }
         );
 
         let near_bottom = CandidatePopupPlacement { y: 130, ..base };
         assert_eq!(
-            candidate_preference_expanded_placement(near_bottom, 42, Some(work)),
+            candidate_preference_expanded_placement(near_bottom, 42, 252, Some(work)),
             CandidatePopupPlacement {
                 y: 88,
                 height: 88,
                 ..near_bottom
             }
         );
+
+        let narrow = CandidatePopupPlacement {
+            x: 1_800,
+            width: 120,
+            ..base
+        };
+        assert_eq!(
+            candidate_preference_expanded_placement(narrow, 42, 252, Some(work)),
+            CandidatePopupPlacement {
+                x: 1_668,
+                width: 252,
+                height: 88,
+                ..narrow
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_candidate_labels_accept_undeclared_but_not_sensitive_contexts() {
+        assert!(candidate_preference_context_allows_explicit_label(
+            NativeFeedbackContext::Eligible
+        ));
+        assert!(candidate_preference_context_allows_explicit_label(
+            NativeFeedbackContext::Unknown
+        ));
+        for context in [
+            NativeFeedbackContext::Password,
+            NativeFeedbackContext::Private,
+            NativeFeedbackContext::KeyboardDisabled,
+            NativeFeedbackContext::Empty,
+            NativeFeedbackContext::Restricted,
+        ] {
+            assert!(!candidate_preference_context_allows_explicit_label(context));
+        }
     }
 
     #[test]

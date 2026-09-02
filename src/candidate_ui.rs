@@ -246,6 +246,24 @@ pub(crate) fn candidate_preference_overlay_height(dpi: u32) -> i32 {
     candidate_ui_scale(dpi, CANDIDATE_PREFERENCE_OVERLAY_HEIGHT_LOGICAL)
 }
 
+/// Smallest client width that can show the target preview and all three
+/// preference actions without overlapping. The native popup may widen to
+/// this value while the strip is open, then restore its exact prior bounds.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn candidate_preference_overlay_minimum_width(dpi: u32) -> i32 {
+    let scale = |logical| candidate_ui_scale(dpi, logical);
+    scale(DEFAULT_CANDIDATE_VISUAL_SPEC.outer_padding)
+        .saturating_mul(2)
+        .saturating_add(scale(CANDIDATE_PREFERENCE_OVERLAY_TARGET_MIN_WIDTH_LOGICAL))
+        .saturating_add(
+            CANDIDATE_PREFERENCE_OVERLAY_ACTION_WIDTHS_LOGICAL
+                .into_iter()
+                .map(scale)
+                .sum::<i32>(),
+        )
+        .saturating_add(scale(CANDIDATE_PREFERENCE_OVERLAY_GAP_LOGICAL).saturating_mul(3))
+}
+
 /// Builds the compact action strip appended below the normal candidate scene.
 /// Invalid or too-narrow clients fail closed instead of creating overlapping
 /// click targets.
@@ -1689,6 +1707,7 @@ mod tests {
 
     #[test]
     fn candidate_preference_overlay_has_disjoint_stable_action_targets() {
+        assert_eq!(candidate_preference_overlay_minimum_width(96), 252);
         let scene = build_candidate_preference_overlay_scene(96, 280, 46, 88).unwrap();
         assert_eq!(
             scene.bounds,
@@ -1737,6 +1756,7 @@ mod tests {
     #[test]
     fn candidate_preference_overlay_fails_closed_when_space_is_insufficient() {
         assert!(build_candidate_preference_overlay_scene(96, 251, 46, 88).is_none());
+        assert!(build_candidate_preference_overlay_scene(96, 252, 46, 88).is_some());
         assert!(build_candidate_preference_overlay_scene(96, 280, 46, 87).is_none());
         assert!(build_candidate_preference_overlay_scene(96, 280, 0, 42).is_none());
     }
